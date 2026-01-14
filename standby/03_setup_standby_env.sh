@@ -55,6 +55,61 @@ if [[ "$CURRENT_HOST" != "$STANDBY_HOSTNAME" ]]; then
     fi
 fi
 
+# ============================================================
+# Validate Disk Space
+# ============================================================
+
+log_section "Validating Disk Space"
+
+if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
+    log_info "Primary database requires approximately ${REQUIRED_SPACE_MB} MB (including 20% buffer)"
+    log_info "  Datafiles:  ${DATAFILE_SIZE_MB:-N/A} MB"
+    log_info "  Tempfiles:  ${TEMPFILE_SIZE_MB:-N/A} MB"
+    log_info "  Redo logs:  ${REDOLOG_SIZE_MB:-N/A} MB"
+
+    # Get the parent directory of standby data path
+    STANDBY_DATA_PARENT=$(dirname "$STANDBY_DATA_PATH")
+
+    # Ensure the parent directory exists for df check
+    if [[ -d "$STANDBY_DATA_PARENT" ]]; then
+        CHECK_PATH="$STANDBY_DATA_PARENT"
+    elif [[ -d "$STANDBY_DATA_PATH" ]]; then
+        CHECK_PATH="$STANDBY_DATA_PATH"
+    else
+        # Find the closest existing parent
+        CHECK_PATH="$STANDBY_DATA_PARENT"
+        while [[ ! -d "$CHECK_PATH" && "$CHECK_PATH" != "/" ]]; do
+            CHECK_PATH=$(dirname "$CHECK_PATH")
+        done
+    fi
+
+    log_info "Checking available space on: $CHECK_PATH"
+
+    # Get available space in MB
+    AVAILABLE_SPACE_KB=$(df -k "$CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+    AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
+
+    log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
+    log_info "Required space:  ${REQUIRED_SPACE_MB} MB"
+
+    if [[ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]]; then
+        log_error "INSUFFICIENT DISK SPACE!"
+        log_error "  Available: ${AVAILABLE_SPACE_MB} MB"
+        log_error "  Required:  ${REQUIRED_SPACE_MB} MB"
+        log_error "  Shortfall: $((REQUIRED_SPACE_MB - AVAILABLE_SPACE_MB)) MB"
+        log_error ""
+        log_error "Please free up space or add storage before proceeding."
+        exit 1
+    else
+        SPACE_REMAINING=$((AVAILABLE_SPACE_MB - REQUIRED_SPACE_MB))
+        log_info "PASS: Sufficient disk space available"
+        log_info "  Space remaining after clone: ${SPACE_REMAINING} MB"
+    fi
+else
+    log_warn "Database size information not available in config file"
+    log_warn "Skipping disk space validation - please verify manually"
+fi
+
 # Check Oracle environment
 if [[ -z "$ORACLE_HOME" ]]; then
     # Try to set from config

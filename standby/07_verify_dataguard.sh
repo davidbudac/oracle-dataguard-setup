@@ -1,9 +1,9 @@
 #!/bin/bash
 # ============================================================
-# Oracle Data Guard Setup - Step 6: Verify Data Guard
+# Oracle Data Guard Setup - Step 7: Verify Data Guard
 # ============================================================
-# Run this script on the STANDBY database server.
-# It validates the Data Guard configuration and reports status.
+# Run this script on the STANDBY (or PRIMARY) database server.
+# It validates the Data Guard Broker configuration and reports status.
 # ============================================================
 
 set -e
@@ -19,10 +19,10 @@ source "${COMMON_DIR}/dg_functions.sh"
 # Main Script
 # ============================================================
 
-print_banner "Step 6: Verify Data Guard"
+print_banner "Step 7: Verify Data Guard"
 
 # Initialize logging
-init_log "06_verify_dataguard"
+init_log "07_verify_dataguard"
 
 # ============================================================
 # Pre-flight Checks
@@ -226,6 +226,30 @@ else
 fi
 
 # ============================================================
+# Check Data Guard Broker Configuration
+# ============================================================
+
+log_section "Data Guard Broker Configuration"
+
+echo ""
+echo "Broker Configuration Status:"
+"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
+SHOW CONFIGURATION;
+EOF
+
+echo ""
+echo "Primary Database Status:"
+"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
+SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}';
+EOF
+
+echo ""
+echo "Standby Database Status:"
+"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
+SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
+EOF
+
+# ============================================================
 # Check Data Guard Parameters
 # ============================================================
 
@@ -242,11 +266,9 @@ FROM V\$PARAMETER
 WHERE NAME IN (
     'db_name',
     'db_unique_name',
-    'log_archive_config',
+    'dg_broker_start',
     'log_archive_dest_1',
     'log_archive_dest_2',
-    'fal_server',
-    'fal_client',
     'standby_file_management'
 )
 ORDER BY NAME;
@@ -372,17 +394,30 @@ echo ""
 echo "USEFUL MONITORING COMMANDS:"
 echo "==========================="
 echo ""
-echo "# Check apply lag in real-time:"
+echo "# DGMGRL - Show configuration status:"
+echo "dgmgrl / \"show configuration\""
+echo ""
+echo "# DGMGRL - Show database details:"
+echo "dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\""
+echo "dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\""
+echo ""
+echo "# DGMGRL - Validate configuration:"
+echo "dgmgrl / \"validate database '$STANDBY_DB_UNIQUE_NAME'\""
+echo ""
+echo "# SQL - Check apply lag in real-time:"
 echo "SELECT NAME, VALUE, TIME_COMPUTED FROM V\$DATAGUARD_STATS WHERE NAME LIKE '%lag%';"
 echo ""
-echo "# Monitor log apply:"
+echo "# SQL - Monitor log apply:"
 echo "SELECT PROCESS, STATUS, SEQUENCE# FROM V\$MANAGED_STANDBY;"
 echo ""
-echo "# Check for gaps:"
+echo "# SQL - Check for gaps:"
 echo "SELECT * FROM V\$ARCHIVE_GAP;"
 echo ""
 echo "# Force log switch on primary (for testing):"
 echo "ALTER SYSTEM SWITCH LOGFILE;"
+echo ""
+echo "# DGMGRL - Switchover to standby:"
+echo "dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\""
 echo ""
 echo "# Open standby in read-only mode (Active Data Guard):"
 echo "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;"

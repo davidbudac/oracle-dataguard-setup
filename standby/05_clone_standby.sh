@@ -191,8 +191,10 @@ echo ""
 RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
 
 cat > "$RMAN_SCRIPT" <<EOF
-# RMAN Duplicate for Standby
+# RMAN Duplicate for Standby (Data Guard Broker Managed)
 # Generated: $(date)
+# Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
+#       configured by Data Guard Broker after duplication completes.
 
 DUPLICATE TARGET DATABASE
   FOR STANDBY
@@ -202,13 +204,10 @@ DUPLICATE TARGET DATABASE
     SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'
     SET CONTROL_FILES='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'
     SET LOG_ARCHIVE_DEST_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'
-    SET LOG_ARCHIVE_DEST_2='SERVICE=${PRIMARY_TNS_ALIAS} ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME=${PRIMARY_DB_UNIQUE_NAME}'
-    SET FAL_SERVER='${PRIMARY_TNS_ALIAS}'
-    SET FAL_CLIENT='${STANDBY_TNS_ALIAS}'
-    SET STANDBY_FILE_MANAGEMENT='AUTO'
-    SET LOG_ARCHIVE_CONFIG='DG_CONFIG=(${PRIMARY_DB_UNIQUE_NAME},${STANDBY_DB_UNIQUE_NAME})'
     SET DB_FILE_NAME_CONVERT=${DB_FILE_NAME_CONVERT}
     SET LOG_FILE_NAME_CONVERT=${LOG_FILE_NAME_CONVERT}
+    SET STANDBY_FILE_MANAGEMENT='AUTO'
+    SET DG_BROKER_START='TRUE'
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
 EOF
@@ -353,7 +352,7 @@ echo "COMPLETED ACTIONS:"
 echo "=================="
 echo "  - Started instance in NOMOUNT"
 echo "  - Executed RMAN DUPLICATE FOR STANDBY FROM ACTIVE DATABASE"
-echo "  - Created SPFILE"
+echo "  - Created SPFILE with DG_BROKER_START=TRUE"
 echo "  - Started Managed Recovery Process (MRP)"
 echo ""
 echo "RMAN LOG: $RMAN_LOG"
@@ -361,12 +360,13 @@ echo ""
 echo "NEXT STEPS:"
 echo "==========="
 echo ""
-echo "Run verification script:"
-echo "   ./06_verify_dataguard.sh"
+echo "IMPORTANT: Configure Data Guard Broker to enable log shipping:"
 echo ""
-echo "To monitor log apply:"
-echo "   SELECT PROCESS, STATUS, SEQUENCE# FROM V\$MANAGED_STANDBY;"
+echo "On PRIMARY server:"
+echo "   Run: ./primary/06_configure_broker.sh"
 echo ""
-echo "To check for gaps:"
-echo "   SELECT * FROM V\$ARCHIVE_GAP;"
+echo "After broker configuration, verify the setup:"
+echo "   Run: ./standby/07_verify_dataguard.sh"
+echo ""
+echo "Note: Log shipping will not work until the broker is configured!"
 echo ""

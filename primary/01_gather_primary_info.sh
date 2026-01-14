@@ -162,6 +162,29 @@ SELECT FILE#, BYTES/1024/1024 AS SIZE_MB, NAME
 FROM V\$DATAFILE ORDER BY FILE#;
 "
 
+# Calculate total database size (datafiles + tempfiles + redo logs)
+log_info "Calculating total database size..."
+
+DATAFILE_SIZE_MB=$(run_sql "SELECT ROUND(SUM(BYTES)/1024/1024) FROM V\$DATAFILE;")
+DATAFILE_SIZE_MB=$(echo "$DATAFILE_SIZE_MB" | tr -d ' \n\r')
+
+TEMPFILE_SIZE_MB=$(run_sql "SELECT NVL(ROUND(SUM(BYTES)/1024/1024), 0) FROM V\$TEMPFILE;")
+TEMPFILE_SIZE_MB=$(echo "$TEMPFILE_SIZE_MB" | tr -d ' \n\r')
+
+REDOLOG_SIZE_MB=$(run_sql "SELECT ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;")
+REDOLOG_SIZE_MB=$(echo "$REDOLOG_SIZE_MB" | tr -d ' \n\r')
+
+# Total size with 20% buffer for growth and standby redo logs
+TOTAL_DB_SIZE_MB=$((DATAFILE_SIZE_MB + TEMPFILE_SIZE_MB + REDOLOG_SIZE_MB))
+REQUIRED_SPACE_MB=$((TOTAL_DB_SIZE_MB * 120 / 100))
+
+log_info "Database size breakdown:"
+log_info "  Datafiles:     ${DATAFILE_SIZE_MB} MB"
+log_info "  Tempfiles:     ${TEMPFILE_SIZE_MB} MB"
+log_info "  Redo logs:     ${REDOLOG_SIZE_MB} MB"
+log_info "  Total:         ${TOTAL_DB_SIZE_MB} MB"
+log_info "  Required (with 20% buffer): ${REQUIRED_SPACE_MB} MB"
+
 # ============================================================
 # Gather Control File Locations
 # ============================================================
@@ -192,10 +215,18 @@ else
 fi
 log_info "Archive destination: $ARCHIVE_DEST_PATH"
 
-# Check for existing DG configuration
-LOG_ARCHIVE_CONFIG=$(get_db_parameter "log_archive_config")
-if [[ -n "$LOG_ARCHIVE_CONFIG" && "$LOG_ARCHIVE_CONFIG" != "DG_CONFIG=" ]]; then
-    log_info "Existing LOG_ARCHIVE_CONFIG: $LOG_ARCHIVE_CONFIG"
+# Check Data Guard Broker status
+DG_BROKER_START=$(get_db_parameter "dg_broker_start")
+log_info "DG_BROKER_START: $DG_BROKER_START"
+
+# Check for existing DG Broker configuration
+if [[ "$DG_BROKER_START" == "TRUE" ]]; then
+    log_info "Data Guard Broker is enabled on primary"
+    BROKER_CONFIG=$(run_sql "SELECT NAME FROM V\$DG_BROKER_CONFIG WHERE ROWNUM=1;")
+    if [[ -n "$BROKER_CONFIG" ]]; then
+        log_warn "Existing Broker configuration found: $BROKER_CONFIG"
+        log_warn "This setup will create a new configuration"
+    fi
 fi
 
 # ============================================================
@@ -216,20 +247,47 @@ log_info "DB_RECOVERY_FILE_DEST_SIZE: $DB_RECOVERY_FILE_DEST_SIZE"
 
 log_section "Gathering Network Configuration"
 
-# Get listener port from listener.ora or use default
-LISTENER_PORT=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;")
+# Get listener port - try multiple methods
+LISTENER_PORT=""
+
+# Method 1: Get from running listener using lsnrctl status
+log_info "Detecting listener port from running listener..."
+LSNRCTL_OUTPUT=$("$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null || true)
+if [[ -n "$LSNRCTL_OUTPUT" ]]; then
+    # Extract PORT from listener output (e.g., "(PORT = 1521)")
+    LISTENER_PORT=$(echo "$LSNRCTL_OUTPUT" | grep -oP 'PORT\s*=\s*\K\d+' | head -1)
+    if [[ -n "$LISTENER_PORT" ]]; then
+        log_info "Listener port detected from lsnrctl: $LISTENER_PORT"
+    fi
+fi
+
+# Method 2: Try V$LISTENER_NETWORK view
 if [[ -z "$LISTENER_PORT" ]]; then
-    # Try to extract from local_listener parameter
+    LISTENER_PORT=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;")
+    LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d ' \n\r')
+    if [[ -n "$LISTENER_PORT" ]]; then
+        log_info "Listener port from V\$LISTENER_NETWORK: $LISTENER_PORT"
+    fi
+fi
+
+# Method 3: Try local_listener parameter
+if [[ -z "$LISTENER_PORT" ]]; then
     LOCAL_LISTENER=$(get_db_parameter "local_listener")
     if [[ -n "$LOCAL_LISTENER" ]]; then
         LISTENER_PORT=$(echo "$LOCAL_LISTENER" | grep -oP '\d{4,5}' | head -1)
+        if [[ -n "$LISTENER_PORT" ]]; then
+            log_info "Listener port from local_listener parameter: $LISTENER_PORT"
+        fi
     fi
 fi
 
 # Default to 1521 if not found
-LISTENER_PORT=${LISTENER_PORT:-1521}
-LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d ' \n\r')
-log_info "Listener port: $LISTENER_PORT"
+if [[ -z "$LISTENER_PORT" ]]; then
+    LISTENER_PORT=1521
+    log_warn "Could not detect listener port - defaulting to $LISTENER_PORT"
+fi
+
+log_info "Using listener port: $LISTENER_PORT"
 
 # Service names
 SERVICE_NAMES=$(get_db_parameter "service_names")
@@ -341,6 +399,13 @@ ONLINE_REDO_GROUPS="$ONLINE_REDO_GROUPS"
 STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"
 STANDBY_REDO_COUNT="$STANDBY_REDO_COUNT"
 
+# --- Database Size ---
+DATAFILE_SIZE_MB="$DATAFILE_SIZE_MB"
+TEMPFILE_SIZE_MB="$TEMPFILE_SIZE_MB"
+REDOLOG_SIZE_MB="$REDOLOG_SIZE_MB"
+TOTAL_DB_SIZE_MB="$TOTAL_DB_SIZE_MB"
+REQUIRED_SPACE_MB="$REQUIRED_SPACE_MB"
+
 # --- Network Configuration ---
 LISTENER_PORT="$LISTENER_PORT"
 SERVICE_NAMES="$SERVICE_NAMES"
@@ -349,6 +414,9 @@ SERVICE_NAMES="$SERVICE_NAMES"
 LOG_MODE="$LOG_MODE"
 FORCE_LOGGING="$FORCE_LOGGING"
 REMOTE_LOGIN_PASSWORDFILE="$REMOTE_LOGIN_PWFILE"
+
+# --- Data Guard Broker ---
+DG_BROKER_START="$DG_BROKER_START"
 EOF
 
 log_info "Primary info written to: $OUTPUT_FILE"

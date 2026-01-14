@@ -148,39 +148,96 @@ else
 fi
 
 # ============================================================
-# Configure Data Guard Parameters
+# Enable Data Guard Broker
 # ============================================================
 
-log_section "Configuring Data Guard Parameters"
+log_section "Enabling Data Guard Broker"
 
-# LOG_ARCHIVE_CONFIG
-log_info "Setting LOG_ARCHIVE_CONFIG..."
-run_sql "ALTER SYSTEM SET LOG_ARCHIVE_CONFIG='${LOG_ARCHIVE_CONFIG}' SCOPE=BOTH;"
+# Check current DG_BROKER_START setting
+DG_BROKER_START=$(get_db_parameter "dg_broker_start")
+log_info "Current DG_BROKER_START: $DG_BROKER_START"
 
-# LOG_ARCHIVE_DEST_2 - Ship to standby
-log_info "Setting LOG_ARCHIVE_DEST_2..."
-run_sql "ALTER SYSTEM SET LOG_ARCHIVE_DEST_2='SERVICE=${STANDBY_TNS_ALIAS} ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}' SCOPE=BOTH;"
+if [[ "$DG_BROKER_START" != "TRUE" ]]; then
+    log_info "Enabling DG_BROKER_START..."
+    run_sql "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;"
+    log_info "DG_BROKER_START enabled"
 
-# Enable destination 2
-log_info "Enabling LOG_ARCHIVE_DEST_STATE_2..."
-run_sql "ALTER SYSTEM SET LOG_ARCHIVE_DEST_STATE_2=ENABLE SCOPE=BOTH;"
+    # Wait for broker processes to start
+    log_info "Waiting for Data Guard Broker processes to start..."
+    sleep 5
+else
+    log_info "DG_BROKER_START is already enabled"
+fi
 
-# FAL_SERVER
-log_info "Setting FAL_SERVER..."
-run_sql "ALTER SYSTEM SET FAL_SERVER='${STANDBY_TNS_ALIAS}' SCOPE=BOTH;"
+# Verify broker processes are running
+DMON_COUNT=$(run_sql "SELECT COUNT(*) FROM V\$PROCESS WHERE PNAME LIKE 'DMON%';")
+DMON_COUNT=$(echo "$DMON_COUNT" | tr -d ' \n\r')
 
-# STANDBY_FILE_MANAGEMENT
-log_info "Setting STANDBY_FILE_MANAGEMENT..."
-run_sql "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=${STANDBY_FILE_MANAGEMENT} SCOPE=BOTH;"
+if [[ "$DMON_COUNT" -gt 0 ]]; then
+    log_info "Data Guard Broker process (DMON) is running"
+else
+    log_warn "DMON process not detected yet - it may take a moment to start"
+fi
 
-log_info "Data Guard parameters configured successfully"
+# Set STANDBY_FILE_MANAGEMENT (still needed for automatic file creation)
+log_info "Setting STANDBY_FILE_MANAGEMENT=AUTO..."
+run_sql "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH;"
+
+log_info "Data Guard Broker enabled successfully"
+log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
 
 # ============================================================
-# Verify TNS Connectivity to Standby
+# Verify Network Connectivity to Standby
 # ============================================================
 
 log_section "Verifying Network Connectivity"
 
+# Basic port connectivity check (before tnsping which requires listener)
+# Port is taken from primary listener configuration (via standby_config.env)
+if [[ -z "$STANDBY_LISTENER_PORT" ]]; then
+    log_error "STANDBY_LISTENER_PORT not set in configuration"
+    log_error "Please re-run 02_generate_standby_config.sh"
+    exit 1
+fi
+STANDBY_PORT="$STANDBY_LISTENER_PORT"
+log_info "Testing basic port connectivity to ${STANDBY_HOSTNAME}:${STANDBY_PORT}..."
+log_info "(Port ${STANDBY_PORT} taken from primary listener configuration)"
+
+PORT_CHECK_RESULT=0
+if command -v nc &> /dev/null; then
+    # Use netcat if available
+    if nc -z -w 5 "$STANDBY_HOSTNAME" "$STANDBY_PORT" 2>/dev/null; then
+        log_info "PASS: Port ${STANDBY_PORT} is reachable on ${STANDBY_HOSTNAME}"
+    else
+        log_error "FAILED: Cannot reach port ${STANDBY_PORT} on ${STANDBY_HOSTNAME}"
+        log_error "Please check:"
+        log_error "  1. Network connectivity between servers"
+        log_error "  2. Firewall rules allow port ${STANDBY_PORT}"
+        log_error "  3. Hostname '${STANDBY_HOSTNAME}' resolves correctly"
+        PORT_CHECK_RESULT=1
+    fi
+elif command -v timeout &> /dev/null; then
+    # Use bash /dev/tcp with timeout
+    if timeout 5 bash -c "echo > /dev/tcp/${STANDBY_HOSTNAME}/${STANDBY_PORT}" 2>/dev/null; then
+        log_info "PASS: Port ${STANDBY_PORT} is reachable on ${STANDBY_HOSTNAME}"
+    else
+        log_error "FAILED: Cannot reach port ${STANDBY_PORT} on ${STANDBY_HOSTNAME}"
+        log_error "Please check:"
+        log_error "  1. Network connectivity between servers"
+        log_error "  2. Firewall rules allow port ${STANDBY_PORT}"
+        log_error "  3. Hostname '${STANDBY_HOSTNAME}' resolves correctly"
+        PORT_CHECK_RESULT=1
+    fi
+else
+    log_warn "Neither 'nc' nor 'timeout' available - skipping basic port check"
+fi
+
+if [[ "$PORT_CHECK_RESULT" -ne 0 ]]; then
+    log_error "Network connectivity check failed. Cannot proceed."
+    exit 1
+fi
+
+# TNS connectivity check (requires listener to be running)
 log_info "Testing tnsping to standby ($STANDBY_TNS_ALIAS)..."
 
 if "$ORACLE_HOME/bin/tnsping" "$STANDBY_TNS_ALIAS" > /dev/null 2>&1; then
@@ -199,28 +256,25 @@ fi
 log_section "Current Data Guard Configuration"
 
 echo ""
-echo "Archive Destinations:"
-run_sql_with_header "
-SELECT DEST_ID, DEST_NAME, STATUS, TARGET, DESTINATION
-FROM V\$ARCHIVE_DEST
-WHERE DEST_ID IN (1,2);
-"
-
-echo ""
-echo "Data Guard Parameters:"
+echo "Data Guard Broker Status:"
 run_sql_with_header "
 SELECT NAME, VALUE
 FROM V\$PARAMETER
 WHERE NAME IN (
-    'log_archive_config',
-    'log_archive_dest_1',
-    'log_archive_dest_2',
-    'log_archive_dest_state_1',
-    'log_archive_dest_state_2',
-    'fal_server',
+    'dg_broker_start',
+    'dg_broker_config_file1',
+    'dg_broker_config_file2',
     'standby_file_management'
 )
 ORDER BY NAME;
+"
+
+echo ""
+echo "Archive Destination 1 (Local):"
+run_sql_with_header "
+SELECT DEST_ID, STATUS, DESTINATION
+FROM V\$ARCHIVE_DEST
+WHERE DEST_ID = 1;
 "
 
 echo ""
@@ -230,6 +284,10 @@ SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS
 FROM V\$STANDBY_LOG
 ORDER BY GROUP#;
 "
+
+echo ""
+echo "Note: LOG_ARCHIVE_DEST_2 and other DG parameters will be"
+echo "      configured automatically when the broker is enabled."
 
 # ============================================================
 # Summary
@@ -243,17 +301,18 @@ echo "=================="
 echo "  - Configured tnsnames.ora with standby entry"
 echo "  - Enabled FORCE LOGGING (if needed)"
 echo "  - Created standby redo logs (if needed)"
-echo "  - Set LOG_ARCHIVE_CONFIG"
-echo "  - Set LOG_ARCHIVE_DEST_2 for standby"
-echo "  - Set FAL_SERVER"
+echo "  - Enabled DG_BROKER_START=TRUE"
 echo "  - Set STANDBY_FILE_MANAGEMENT=AUTO"
 echo ""
 echo "NEXT STEPS:"
 echo "==========="
 echo ""
 echo "On STANDBY server:"
-echo "   Run: ./05_clone_standby.sh"
+echo "   Run: ./standby/05_clone_standby.sh"
 echo ""
 echo "IMPORTANT: Ensure the standby listener is running with"
 echo "static registration before running the clone script."
+echo ""
+echo "After cloning, run the broker configuration:"
+echo "   ./primary/06_configure_broker.sh"
 echo ""

@@ -305,7 +305,7 @@ ALTER DATABASE FORCE LOGGING;
     │                     │                   │
     │ • Adds standby      │                   │
     │   redo logs         │                   │
-    │ • Sets DG params    │                   │
+    │ • Enables DG Broker │                   │
     │ • Configures tns    │                   │
     └─────────────────────┘                   │
                                               │
@@ -319,16 +319,28 @@ ALTER DATABASE FORCE LOGGING;
     │ • RMAN duplicate    │
     │ • Creates standby   │
     │ • Starts recovery   │
+    └─────────────────────┘
+              │
+              │
+    ┌─────────┴───────────┐
+    │ STEP 6              │
+    │ 06_configure        │
+    │ _broker.sh          │
+    │ (on PRIMARY)        │
+    │                     │
+    │ • Creates DG config │
+    │ • Adds databases    │
+    │ • Enables broker    │
     └─────────┬───────────┘
               │
               ▼
     ┌─────────────────────┐
-    │ STEP 6              │
-    │ 06_verify           │
+    │ STEP 7              │
+    │ 07_verify           │
     │ _dataguard.sh       │
     │                     │
     │ • Validates setup   │
-    │ • Reports status    │
+    │ • DGMGRL status     │
     └─────────────────────┘
 ```
 
@@ -339,9 +351,10 @@ ALTER DATABASE FORCE LOGGING;
 | `01_gather_primary_info.sh` | primary/ | Collects all database information from primary and validates prerequisites |
 | `02_generate_standby_config.sh` | common/ | Creates the master configuration file - **this is where you review and approve settings** |
 | `03_setup_standby_env.sh` | standby/ | Prepares the standby server (directories, files, network config) |
-| `04_prepare_primary_dg.sh` | primary/ | Configures the primary database for Data Guard |
+| `04_prepare_primary_dg.sh` | primary/ | Enables DG Broker, creates standby redo logs, configures tnsnames |
 | `05_clone_standby.sh` | standby/ | Performs the actual database duplication using RMAN |
-| `06_verify_dataguard.sh` | standby/ | Validates the Data Guard setup and reports status |
+| `06_configure_broker.sh` | primary/ | Creates and enables Data Guard Broker configuration using DGMGRL |
+| `07_verify_dataguard.sh` | standby/ | Validates the Data Guard setup using DGMGRL and reports status |
 
 ---
 
@@ -804,41 +817,48 @@ The status `UNKNOWN` indicates static registration (this is expected and correct
 │     │           create 4 standby redo log groups                   │   │
 │     └──────────────────────────────────────────────────────────────┘   │
 │                                                                         │
-│  3. SET DATA GUARD PARAMETERS                                           │
-│     • LOG_ARCHIVE_CONFIG - Lists all databases in DG config             │
-│     • LOG_ARCHIVE_DEST_2 - Where to ship redo (standby)                 │
-│     • FAL_SERVER - Where to fetch missing logs from                     │
-│     • STANDBY_FILE_MANAGEMENT - Auto-create files on standby            │
+│  3. ENABLE DATA GUARD BROKER                                            │
+│     • Sets DG_BROKER_START=TRUE                                         │
+│     • Starts DMON (Data Guard Monitor) process                          │
+│     • Note: DG parameters will be set by DGMGRL in Step 6               │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### Understanding Key Parameters
+#### About Data Guard Broker
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                      DATA GUARD PARAMETERS EXPLAINED                    │
+│                      DATA GUARD BROKER (DGMGRL)                         │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
-│  LOG_ARCHIVE_CONFIG='DG_CONFIG=(PROD,PRODSTBY)'                         │
-│  └─────────────────────────────────────────────┘                        │
-│    Lists all databases in the Data Guard configuration                  │
+│  Data Guard Broker is Oracle's centralized management framework for     │
+│  Data Guard configurations. Instead of manually setting parameters      │
+│  like LOG_ARCHIVE_DEST_2, FAL_SERVER, etc., the broker manages them     │
+│  automatically.                                                         │
 │                                                                         │
-│  LOG_ARCHIVE_DEST_1='LOCATION=/u01/archive/PROD ...'                    │
-│  └────────────────────────────────────────────────┘                     │
-│    Where to write archive logs locally                                  │
+│  BENEFITS OF USING BROKER:                                              │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │  • Centralized management - one place to configure everything    │  │
+│  │  • Automatic parameter management - no manual ALTER SYSTEM       │  │
+│  │  • Easy switchover/failover - single command operations          │  │
+│  │  • Health monitoring - continuous validation of configuration    │  │
+│  │  • Consistent configuration - prevents parameter mismatches      │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
-│  LOG_ARCHIVE_DEST_2='SERVICE=PRODSTBY ASYNC ...'                        │
-│  └───────────────────────────────────────────┘                          │
-│    Ship redo to standby (ASYNC = don't wait for confirmation)           │
+│  KEY COMPONENTS:                                                        │
 │                                                                         │
-│  FAL_SERVER='PRODSTBY'                                                  │
-│  └────────────────────┘                                                 │
-│    Fetch Archive Log server - where to get missing logs                 │
+│  DG_BROKER_START=TRUE                                                   │
+│  └──────────────────┘                                                   │
+│    Enables the Data Guard Broker on this database                       │
 │                                                                         │
-│  STANDBY_FILE_MANAGEMENT=AUTO                                           │
-│  └──────────────────────────┘                                           │
-│    Automatically create data files on standby when created on primary   │
+│  DMON Process                                                           │
+│  └───────────┘                                                          │
+│    Data Guard Monitor - background process that manages DG              │
+│                                                                         │
+│  DGMGRL (Command-line tool)                                             │
+│  └─────────────────────────┘                                            │
+│    Used to create configuration, add databases, enable/disable          │
 │                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
@@ -884,15 +904,17 @@ Checking Standby Redo Logs
 [INFO] Standby redo logs created successfully
 
 ============================================================
-Configuring Data Guard Parameters
+Enabling Data Guard Broker
 ============================================================
 
-[INFO] Setting LOG_ARCHIVE_CONFIG...
-[INFO] Setting LOG_ARCHIVE_DEST_2...
-[INFO] Enabling LOG_ARCHIVE_DEST_STATE_2...
-[INFO] Setting FAL_SERVER...
-[INFO] Setting STANDBY_FILE_MANAGEMENT...
-[INFO] Data Guard parameters configured successfully
+[INFO] Current DG_BROKER_START: FALSE
+[INFO] Enabling DG_BROKER_START...
+[INFO] DG_BROKER_START enabled
+[INFO] Waiting for Data Guard Broker processes to start...
+[INFO] Data Guard Broker process (DMON) is running
+[INFO] Setting STANDBY_FILE_MANAGEMENT=AUTO...
+[INFO] Data Guard Broker enabled successfully
+[INFO] Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL
 
 ============================================================
 Verifying Network Connectivity
@@ -909,7 +931,10 @@ NEXT STEPS:
 ===========
 
 On STANDBY server:
-   Run: ./05_clone_standby.sh
+   Run: ./standby/05_clone_standby.sh
+
+After cloning, run the broker configuration:
+   ./primary/06_configure_broker.sh
 ```
 
 #### Verify Configuration
@@ -920,10 +945,8 @@ You can verify the settings with:
 -- Connect to primary
 sqlplus / as sysdba
 
--- Check Data Guard parameters
-SHOW PARAMETER LOG_ARCHIVE_CONFIG;
-SHOW PARAMETER LOG_ARCHIVE_DEST_2;
-SHOW PARAMETER FAL_SERVER;
+-- Check Data Guard Broker is enabled
+SHOW PARAMETER DG_BROKER_START;
 
 -- Check standby redo logs
 SELECT GROUP#, BYTES/1024/1024 AS SIZE_MB, STATUS FROM V$STANDBY_LOG;
@@ -1094,8 +1117,15 @@ RMAN LOG: /OINSTALL/_dataguard_setup/logs/rman_duplicate_20240115_103500.log
 NEXT STEPS:
 ===========
 
-Run verification script:
-   ./06_verify_dataguard.sh
+IMPORTANT: Configure Data Guard Broker to enable log shipping:
+
+On PRIMARY server:
+   Run: ./primary/06_configure_broker.sh
+
+After broker configuration, verify the setup:
+   Run: ./standby/07_verify_dataguard.sh
+
+Note: Log shipping will not work until the broker is configured!
 ```
 
 #### Understanding the Output
@@ -1108,16 +1138,220 @@ Run verification script:
 
 ---
 
-### Step 6: Verify Data Guard
+### Step 6: Configure Data Guard Broker
 
-**Server:** STANDBY
-**Script:** `./standby/06_verify_dataguard.sh`
+**Server:** PRIMARY
+**Script:** `./primary/06_configure_broker.sh`
+
+#### What This Step Does
+
+The Data Guard Broker (DGMGRL) provides centralized management of your Data Guard configuration.
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                 STEP 6: CONFIGURE DATA GUARD BROKER                     │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  Why use Data Guard Broker?                                             │
+│  • Centralized management of primary and standby databases              │
+│  • Automatic configuration of redo transport (LOG_ARCHIVE_DEST_2)       │
+│  • Easy switchover and failover operations                              │
+│  • Unified monitoring and health checks                                 │
+│                                                                         │
+│  ┌──────────────────────────────────────────────────────────────────┐  │
+│  │                                                                   │  │
+│  │   PRIMARY                              STANDBY                    │  │
+│  │   ════════                              ═══════                   │  │
+│  │                                                                   │  │
+│  │   ┌─────────────────┐                  ┌─────────────────┐       │  │
+│  │   │  DG Broker      │◄────────────────►│  DG Broker      │       │  │
+│  │   │  (DMON process) │   Configuration  │  (DMON process) │       │  │
+│  │   └────────┬────────┘   Sync           └────────┬────────┘       │  │
+│  │            │                                    │                │  │
+│  │            ▼                                    ▼                │  │
+│  │   ┌─────────────────┐                  ┌─────────────────┐       │  │
+│  │   │  Database       │ ════════════════►│  Database       │       │  │
+│  │   │  Instance       │   Redo Transport │  Instance       │       │  │
+│  │   └─────────────────┘                  └─────────────────┘       │  │
+│  │                                                                   │  │
+│  │   DGMGRL automatically configures:                                │  │
+│  │   • LOG_ARCHIVE_DEST_2 (redo shipping)                            │  │
+│  │   • FAL_SERVER (gap resolution)                                   │  │
+│  │   • LOG_ARCHIVE_CONFIG                                            │  │
+│  │                                                                   │  │
+│  └──────────────────────────────────────────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Instructions
+
+1. **On the PRIMARY server**, run:
+   ```bash
+   ./primary/06_configure_broker.sh
+   ```
+
+2. **Review the configuration** shown in the output
+
+#### Expected Output
+
+```
+============================================================
+     Oracle Data Guard Setup - Step 6: Configure Data Guard Broker
+============================================================
+
+============================================================
+Pre-flight Checks
+============================================================
+
+[INFO] Loading standby configuration...
+[INFO] Primary DG_BROKER_START: TRUE
+[INFO] DMON process is running on primary
+
+============================================================
+Verifying Network Connectivity
+============================================================
+
+[INFO] Testing tnsping to primary (PROD)...
+[INFO] tnsping to primary successful
+[INFO] Testing tnsping to standby (PRODSTBY)...
+[INFO] tnsping to standby successful
+
+============================================================
+Creating Data Guard Broker Configuration
+============================================================
+
+[INFO] Configuration name: PROD_DG
+[INFO] Primary database: PROD
+[INFO] Standby database: PRODSTBY
+[INFO] Creating broker configuration...
+[INFO] Configuration created successfully
+[INFO] Adding standby database to configuration...
+[INFO] Standby database added successfully
+
+============================================================
+Enabling Data Guard Broker Configuration
+============================================================
+
+[INFO] Enabling configuration...
+[INFO] Waiting for configuration to stabilize...
+
+============================================================
+Verifying Broker Configuration
+============================================================
+
+Data Guard Broker Configuration:
+=================================
+
+Configuration - PROD_DG
+
+  Protection Mode: MaxPerformance
+  Members:
+  PROD     - Primary database
+    PRODSTBY - Physical standby database
+
+Fast-Start Failover: DISABLED
+
+Configuration Status:
+SUCCESS   (status updated 5 seconds ago)
+
+Primary Database Details:
+=========================
+
+Database - PROD
+
+  Role:               PRIMARY
+  Intended State:     TRANSPORT-ON
+  Instance(s):
+    PROD
+
+Database Status:
+SUCCESS
+
+Standby Database Details:
+=========================
+
+Database - PRODSTBY
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      0 seconds
+  Apply Lag:          0 seconds
+  Average Apply Rate: 1.00 KByte/s
+  Real Time Query:    OFF
+  Instance(s):
+    PRODSTBY
+
+Database Status:
+SUCCESS
+
+============================================================
+Testing Log Shipping
+============================================================
+
+[INFO] Forcing log switch to test redo transport...
+[INFO] Checking log shipping status...
+
+============================================================
+SUCCESS: Data Guard Broker configured successfully
+============================================================
+
+BROKER MANAGEMENT COMMANDS:
+===========================
+
+  # Show configuration status:
+  dgmgrl / "show configuration"
+
+  # Show database details:
+  dgmgrl / "show database 'PROD'"
+  dgmgrl / "show database 'PRODSTBY'"
+
+  # Switchover to standby:
+  dgmgrl / "switchover to 'PRODSTBY'"
+
+  # Failover to standby (if primary is down):
+  dgmgrl / "failover to 'PRODSTBY'"
+
+NEXT STEPS:
+===========
+
+Run verification script:
+   ./standby/07_verify_dataguard.sh
+```
+
+#### Understanding DGMGRL Output
+
+| Field | Expected Value | Meaning |
+|-------|----------------|---------|
+| Configuration Status | SUCCESS | Broker is working correctly |
+| Protection Mode | MaxPerformance | Async redo transport (no data loss vs. performance trade-off) |
+| Primary Role | PRIMARY | Database is serving as primary |
+| Standby Role | PHYSICAL STANDBY | Database is receiving and applying redo |
+| Intended State | TRANSPORT-ON / APPLY-ON | Redo transport and apply are enabled |
+| Transport Lag | 0 seconds | No delay in shipping redo |
+| Apply Lag | 0 seconds (or low) | Standby is caught up |
+
+#### Troubleshooting
+
+| Issue | Solution |
+|-------|----------|
+| `ORA-16625: cannot reach database` | Check TNS connectivity and listener status |
+| `ORA-16698: member has a LOG_ARCHIVE_DEST_n parameter conflict` | Broker needs exclusive control - let it manage destinations |
+| Configuration shows WARNING | Run `SHOW DATABASE 'dbname' 'StatusReport'` for details |
+| DMON process not running | Check `DG_BROKER_START=TRUE` and restart if needed |
+
+---
+
+### Step 7: Verify Data Guard
+
+**Server:** STANDBY (or PRIMARY)
+**Script:** `./standby/07_verify_dataguard.sh`
 
 #### What This Step Does
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                     STEP 6: VERIFY DATA GUARD                           │
+│                     STEP 7: VERIFY DATA GUARD                           │
 ├─────────────────────────────────────────────────────────────────────────┤
 │                                                                         │
 │  This script validates that Data Guard is working correctly:            │
@@ -1132,6 +1366,7 @@ Run verification script:
 │  │  ✓ Redo is being applied                                          │  │
 │  │  ✓ Network connectivity to primary                                │  │
 │  │  ✓ Archive destinations are healthy                               │  │
+│  │  ✓ Data Guard Broker configuration status                         │  │
 │  └──────────────────────────────────────────────────────────────────┘  │
 │                                                                         │
 │  OUTPUT: Health report with status of each check                        │
@@ -1143,14 +1378,14 @@ Run verification script:
 
 1. **On the STANDBY server**, run:
    ```bash
-   ./standby/06_verify_dataguard.sh
+   ./standby/07_verify_dataguard.sh
    ```
 
 #### Expected Output (Healthy Configuration)
 
 ```
 ============================================================
-     Oracle Data Guard Setup - Step 6: Verify Data Guard
+     Oracle Data Guard Setup - Step 7: Verify Data Guard
 ============================================================
 
 ============================================================
@@ -1193,6 +1428,46 @@ Archive Log Sequences:
   Apply Lag:      1 sequence(s)
 
 [INFO] Minor apply lag: 1 sequence(s) - this is normal during activity
+
+============================================================
+Data Guard Broker Configuration
+============================================================
+
+Broker Configuration Status:
+
+Configuration - PROD_DG
+
+  Protection Mode: MaxPerformance
+  Members:
+  PROD     - Primary database
+    PRODSTBY - Physical standby database
+
+Fast-Start Failover: DISABLED
+
+Configuration Status:
+SUCCESS   (status updated 3 seconds ago)
+
+Primary Database Status:
+
+Database - PROD
+
+  Role:               PRIMARY
+  Intended State:     TRANSPORT-ON
+
+Database Status:
+SUCCESS
+
+Standby Database Status:
+
+Database - PRODSTBY
+
+  Role:               PHYSICAL STANDBY
+  Intended State:     APPLY-ON
+  Transport Lag:      0 seconds
+  Apply Lag:          0 seconds
+
+Database Status:
+SUCCESS
 
 ============================================================
 Data Guard Health Summary
@@ -1258,6 +1533,26 @@ The `SEQUENCE#` should increment.
 
 ### Monitoring Commands
 
+#### Using DGMGRL (Recommended)
+
+```bash
+# Show overall configuration status
+dgmgrl / "show configuration"
+
+# Show detailed status of a database
+dgmgrl / "show database 'PROD'"
+dgmgrl / "show database 'PRODSTBY'"
+
+# Validate configuration (comprehensive check)
+dgmgrl / "validate database 'PRODSTBY'"
+
+# Show lag information
+dgmgrl / "show database 'PRODSTBY' 'TransportLag'"
+dgmgrl / "show database 'PRODSTBY' 'ApplyLag'"
+```
+
+#### Using SQL
+
 ```sql
 -- Check apply lag (on standby)
 SELECT NAME, VALUE, TIME_COMPUTED
@@ -1316,7 +1611,32 @@ A switchover is a planned role reversal where primary becomes standby and vice v
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-> **Note:** Switchover is beyond the scope of this setup guide. Refer to Oracle documentation for switchover procedures.
+With Data Guard Broker, switchover is simple:
+
+```bash
+# Check if switchover is possible
+dgmgrl / "validate database 'PRODSTBY'"
+
+# Perform switchover (from either server)
+dgmgrl / "switchover to 'PRODSTBY'"
+```
+
+The broker will:
+1. Verify all redo has been applied
+2. Convert primary to standby
+3. Convert standby to primary
+4. Update all parameters automatically
+
+### Failover (Unplanned)
+
+If the primary is unavailable, you can fail over to the standby:
+
+```bash
+# Failover (use only when primary is down!)
+dgmgrl / "failover to 'PRODSTBY'"
+```
+
+> **Warning:** Failover may result in data loss in Maximum Performance mode. After failover, the old primary must be reinstated or rebuilt.
 
 ---
 
@@ -1487,8 +1807,11 @@ WHERE ITEM = 'Active Apply Rate';
 | **Archive Log** | A copy of a filled online redo log, saved for recovery purposes |
 | **ARCHIVELOG Mode** | Database mode where redo logs are archived before being overwritten |
 | **Data Guard** | Oracle's disaster recovery solution maintaining synchronized copies of a database |
+| **Data Guard Broker** | Centralized management framework for Data Guard configurations |
 | **DB_NAME** | The name of the database (same on primary and standby) |
 | **DB_UNIQUE_NAME** | Unique identifier for each database in a Data Guard configuration |
+| **DGMGRL** | Data Guard Manager Command Line Interface - tool for managing Data Guard Broker |
+| **DMON** | Data Guard Monitor process - background process for broker communication |
 | **Failover** | Unplanned transition where standby becomes primary (primary is unavailable) |
 | **FAL (Fetch Archive Log)** | Mechanism for standby to request missing archive logs from primary |
 | **MRP (Managed Recovery Process)** | Background process that applies redo to the standby database |
@@ -1519,19 +1842,25 @@ WHERE ITEM = 'Active Apply Rate';
 │  STANDBY:  ./standby/03_setup_standby_env.sh                            │
 │  PRIMARY:  ./primary/04_prepare_primary_dg.sh                           │
 │  STANDBY:  ./standby/05_clone_standby.sh           ← ENTER PASSWORD     │
-│  STANDBY:  ./standby/06_verify_dataguard.sh                             │
+│  PRIMARY:  ./primary/06_configure_broker.sh        ← ENABLES SHIPPING   │
+│  STANDBY:  ./standby/07_verify_dataguard.sh                             │
 │                                                                         │
-│  KEY MONITORING COMMANDS:                                               │
-│  ════════════════════════                                               │
+│  KEY DGMGRL COMMANDS (RECOMMENDED):                                     │
+│  ══════════════════════════════════                                     │
+│                                                                         │
+│  dgmgrl / "show configuration"                                          │
+│  dgmgrl / "show database 'PRODSTBY'"                                    │
+│  dgmgrl / "validate database 'PRODSTBY'"                                │
+│  dgmgrl / "switchover to 'PRODSTBY'"                                    │
+│                                                                         │
+│  KEY SQL COMMANDS:                                                      │
+│  ═════════════════                                                      │
 │                                                                         │
 │  -- Check MRP status                                                    │
 │  SELECT PROCESS, STATUS, SEQUENCE# FROM V$MANAGED_STANDBY;              │
 │                                                                         │
 │  -- Check for gaps                                                      │
 │  SELECT * FROM V$ARCHIVE_GAP;                                           │
-│                                                                         │
-│  -- Check apply lag                                                     │
-│  SELECT NAME, VALUE FROM V$DATAGUARD_STATS WHERE NAME LIKE '%lag%';     │
 │                                                                         │
 │  -- Force log switch (on primary)                                       │
 │  ALTER SYSTEM SWITCH LOGFILE;                                           │

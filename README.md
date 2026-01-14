@@ -10,6 +10,7 @@ These scripts automate the process of creating a physical standby database from 
 
 - **Automated Information Gathering** - Collects all required parameters from the primary database
 - **Single Source of Truth** - Generates a master configuration file (`standby_config.env`) for consistent setup
+- **Data Guard Broker (DGMGRL)** - Centralized management of Data Guard configuration
 - **Prerequisite Validation** - Checks archivelog mode, force logging, password files, etc.
 - **NFS-Based File Sharing** - Uses shared storage for configuration and file transfer
 - **Secure Password Handling** - Passwords prompted at runtime, never stored
@@ -42,11 +43,12 @@ dataguard_setup/
 ├── WALKTHROUGH.md                     # Detailed step-by-step guide
 ├── primary/
 │   ├── 01_gather_primary_info.sh      # Collect DB info from primary
-│   └── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
+│   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
+│   └── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
 ├── standby/
 │   ├── 03_setup_standby_env.sh        # Prepare standby environment
 │   ├── 05_clone_standby.sh            # RMAN duplicate execution
-│   └── 06_verify_dataguard.sh         # Validation and health check
+│   └── 07_verify_dataguard.sh         # Validation and health check
 ├── common/
 │   ├── 02_generate_standby_config.sh  # Generate standby configuration
 │   └── dg_functions.sh                # Shared utility functions
@@ -67,7 +69,8 @@ dataguard_setup/
 | 3 | STANDBY | `./standby/03_setup_standby_env.sh` |
 | 4 | PRIMARY | `./primary/04_prepare_primary_dg.sh` |
 | 5 | STANDBY | `./standby/05_clone_standby.sh` |
-| 6 | STANDBY | `./standby/06_verify_dataguard.sh` |
+| 6 | PRIMARY | `./primary/06_configure_broker.sh` |
+| 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
 
 ### Workflow Diagram
 
@@ -85,8 +88,9 @@ Step 4: Prepare Primary ◄─────────────────�
     │
     └────────────────────────────────────► Step 5: RMAN Clone
                                                       │
-                                                      ▼
-                                          Step 6: Verify Setup
+Step 6: Configure Broker ◄────────────────────────────┘
+    │
+    └────────────────────────────────────► Step 7: Verify Setup
 ```
 
 ## Configuration
@@ -123,6 +127,24 @@ For a detailed walkthrough with explanations, diagrams, and troubleshooting:
 
 ## Post-Setup Monitoring
 
+### Using DGMGRL (Recommended)
+
+```bash
+# Show overall configuration status
+dgmgrl / "show configuration"
+
+# Show detailed status of standby
+dgmgrl / "show database 'PRODSTBY'"
+
+# Validate configuration (comprehensive check)
+dgmgrl / "validate database 'PRODSTBY'"
+
+# Perform switchover
+dgmgrl / "switchover to 'PRODSTBY'"
+```
+
+### Using SQL
+
 ```sql
 -- Check MRP status (on standby)
 SELECT PROCESS, STATUS, SEQUENCE# FROM V$MANAGED_STANDBY;
@@ -151,7 +173,7 @@ Common issues are documented in [WALKTHROUGH.md](WALKTHROUGH.md#7-troubleshootin
 
 - Oracle Database 19c
 - Bash shell
-- `sqlplus`, `rman`, `lsnrctl` in PATH
+- `sqlplus`, `rman`, `lsnrctl`, `dgmgrl` in PATH
 - NFS mount at `/OINSTALL/_dataguard_setup`
 
 ## License

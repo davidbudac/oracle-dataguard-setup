@@ -212,11 +212,10 @@ STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"
 # --- Admin Directories ---
 STANDBY_ADMIN_DIR="$STANDBY_ADMIN_DIR"
 
-# --- Data Guard Parameters ---
-LOG_ARCHIVE_CONFIG="DG_CONFIG=(${DB_UNIQUE_NAME},${STANDBY_DB_UNIQUE_NAME})"
-FAL_SERVER="${PRIMARY_TNS_ALIAS}"
-FAL_CLIENT="${STANDBY_TNS_ALIAS}"
-STANDBY_FILE_MANAGEMENT="AUTO"
+# --- Data Guard Broker ---
+# Note: Data Guard parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.)
+# are managed by Data Guard Broker (DGMGRL), not set manually
+DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
 EOF
 
 log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
@@ -253,20 +252,19 @@ $(if [[ -n "$DB_DOMAIN" ]]; then echo "*.db_domain='${DB_DOMAIN}'"; fi)
 # --- Control Files ---
 *.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'
 
-# --- Redo and Archive ---
+# --- Archive Log Destination (local only) ---
 *.log_archive_dest_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'
-*.log_archive_dest_2='SERVICE=${PRIMARY_TNS_ALIAS} ASYNC VALID_FOR=(ONLINE_LOGFILES,PRIMARY_ROLE) DB_UNIQUE_NAME=${DB_UNIQUE_NAME}'
 *.log_archive_dest_state_1=ENABLE
-*.log_archive_dest_state_2=ENABLE
 *.log_archive_format='%t_%s_%r.arc'
-*.log_archive_config='DG_CONFIG=(${DB_UNIQUE_NAME},${STANDBY_DB_UNIQUE_NAME})'
 
-# --- Data Guard Configuration ---
-*.fal_server='${PRIMARY_TNS_ALIAS}'
-*.fal_client='${STANDBY_TNS_ALIAS}'
-*.standby_file_management=AUTO
+# --- File Name Conversions ---
 *.db_file_name_convert=${DB_FILE_NAME_CONVERT}
 *.log_file_name_convert=${LOG_FILE_NAME_CONVERT}
+*.standby_file_management=AUTO
+
+# --- Data Guard Broker ---
+# DG Broker will manage LOG_ARCHIVE_DEST_2, FAL_SERVER, LOG_ARCHIVE_CONFIG, etc.
+*.dg_broker_start=TRUE
 
 # --- Diagnostic Destinations ---
 *.audit_file_dest='${STANDBY_ADMIN_DIR}/adump'
@@ -361,6 +359,41 @@ EOF
 log_info "Listener entries written to: $LISTENER_FILE"
 
 # ============================================================
+# Generate Data Guard Broker Configuration Script
+# ============================================================
+
+log_section "Generating Data Guard Broker Configuration Script"
+
+DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
+DGMGRL_SCRIPT="${NFS_SHARE}/configure_broker.dgmgrl"
+
+cat > "$DGMGRL_SCRIPT" <<EOF
+# ============================================================
+# Data Guard Broker Configuration Script
+# Generated: $(date)
+# Run this script using: dgmgrl / @configure_broker.dgmgrl
+# ============================================================
+
+# Create the Data Guard Broker configuration
+CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}';
+
+# Add the standby database to the configuration
+ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL;
+
+# Enable the configuration
+ENABLE CONFIGURATION;
+
+# Show the configuration status
+SHOW CONFIGURATION;
+
+# Show database details
+SHOW DATABASE '${DB_UNIQUE_NAME}';
+SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
+EOF
+
+log_info "DGMGRL script written to: $DGMGRL_SCRIPT"
+
+# ============================================================
 # Display Configuration for Review
 # ============================================================
 
@@ -394,6 +427,10 @@ echo "  Online Redo Groups:  $ONLINE_REDO_GROUPS"
 echo "  Standby Redo Groups: $RECOMMENDED_STBY_GROUPS"
 echo "  Redo Log Size:       ${REDO_LOG_SIZE_MB}MB"
 echo ""
+echo "DATA GUARD BROKER:"
+echo "  Configuration Name:  $DG_BROKER_CONFIG_NAME"
+echo "  (Parameters will be managed automatically by DGMGRL)"
+echo ""
 echo "================================================================"
 echo ""
 echo "Generated Files:"
@@ -401,6 +438,7 @@ echo "  - Standby config:    $STANDBY_CONFIG_FILE"
 echo "  - Standby pfile:     $STANDBY_PFILE"
 echo "  - TNS entries:       $TNSNAMES_FILE"
 echo "  - Listener config:   $LISTENER_FILE"
+echo "  - DGMGRL script:     $DGMGRL_SCRIPT"
 echo ""
 echo "================================================================"
 
@@ -424,14 +462,17 @@ echo "NEXT STEPS:"
 echo "==========="
 echo ""
 echo "1. On STANDBY server:"
-echo "   Run: ./03_setup_standby_env.sh"
+echo "   Run: ./standby/03_setup_standby_env.sh"
 echo ""
 echo "2. On PRIMARY server:"
-echo "   Run: ./04_prepare_primary_dg.sh"
+echo "   Run: ./primary/04_prepare_primary_dg.sh"
 echo ""
 echo "3. On STANDBY server:"
-echo "   Run: ./05_clone_standby.sh"
+echo "   Run: ./standby/05_clone_standby.sh"
 echo ""
-echo "4. On STANDBY server:"
-echo "   Run: ./06_verify_dataguard.sh"
+echo "4. On PRIMARY server:"
+echo "   Run: ./primary/06_configure_broker.sh"
+echo ""
+echo "5. On either server:"
+echo "   Run: ./standby/07_verify_dataguard.sh"
 echo ""
