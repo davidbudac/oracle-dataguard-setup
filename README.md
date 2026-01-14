@@ -33,6 +33,7 @@ These scripts automate the process of creating a physical standby database from 
 
 ### Shared Infrastructure
 - NFS mount accessible at `/OINSTALL/_dataguard_setup` on both servers
+  - Use `nfs/01_setup_nfs_server.sh` and `nfs/02_mount_nfs_client.sh` to set this up
 - Network connectivity between servers (port 1521)
 
 ## Directory Structure
@@ -41,6 +42,9 @@ These scripts automate the process of creating a physical standby database from 
 dataguard_setup/
 ├── README.md                          # This file
 ├── WALKTHROUGH.md                     # Detailed step-by-step guide
+├── nfs/
+│   ├── 01_setup_nfs_server.sh         # Setup NFS server and export share
+│   └── 02_mount_nfs_client.sh         # Mount NFS share on client
 ├── primary/
 │   ├── 01_gather_primary_info.sh      # Collect DB info from primary
 │   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
