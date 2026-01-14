@@ -1,0 +1,348 @@
+#!/bin/bash
+# ============================================================
+# Oracle Data Guard Setup - Step 3: Setup Standby Environment
+# ============================================================
+# Run this script on the STANDBY database server.
+# It prepares the environment for RMAN duplicate.
+# ============================================================
+
+set -e
+
+# Get script directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
+
+# Source common functions
+source "${COMMON_DIR}/dg_functions.sh"
+
+# ============================================================
+# Main Script
+# ============================================================
+
+print_banner "Step 3: Setup Standby Environment"
+
+# Initialize logging
+init_log "03_setup_standby_env"
+
+# ============================================================
+# Pre-flight Checks
+# ============================================================
+
+log_section "Pre-flight Checks"
+
+check_nfs_mount || exit 1
+
+# Check standby config file exists
+STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
+if [[ ! -f "$STANDBY_CONFIG_FILE" ]]; then
+    log_error "Standby config file not found: $STANDBY_CONFIG_FILE"
+    log_error "Please run 02_generate_standby_config.sh first"
+    exit 1
+fi
+
+log_info "Loading standby configuration..."
+source "$STANDBY_CONFIG_FILE"
+
+# Verify we're on the correct host
+CURRENT_HOST=$(hostname -f 2>/dev/null || hostname)
+log_info "Current hostname: $CURRENT_HOST"
+log_info "Expected standby hostname: $STANDBY_HOSTNAME"
+
+if [[ "$CURRENT_HOST" != "$STANDBY_HOSTNAME" ]]; then
+    log_warn "Current hostname does not match expected standby hostname"
+    if ! confirm_proceed "Continue anyway?"; then
+        exit 1
+    fi
+fi
+
+# Check Oracle environment
+if [[ -z "$ORACLE_HOME" ]]; then
+    # Try to set from config
+    export ORACLE_HOME="$STANDBY_ORACLE_HOME"
+fi
+
+if [[ -z "$ORACLE_SID" ]]; then
+    export ORACLE_SID="$STANDBY_ORACLE_SID"
+fi
+
+check_oracle_env || exit 1
+
+# ============================================================
+# Create Directory Structure
+# ============================================================
+
+log_section "Creating Directory Structure"
+
+# Admin directories
+DIRS_TO_CREATE=(
+    "${STANDBY_ADMIN_DIR}/adump"
+    "${STANDBY_ADMIN_DIR}/bdump"
+    "${STANDBY_ADMIN_DIR}/cdump"
+    "${STANDBY_ADMIN_DIR}/udump"
+    "${STANDBY_ADMIN_DIR}/pfile"
+    "${STANDBY_DATA_PATH}"
+    "${STANDBY_REDO_PATH}"
+    "${STANDBY_ARCHIVE_DEST}"
+)
+
+# Add FRA if configured
+if [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
+    STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+    DIRS_TO_CREATE+=("$STANDBY_FRA")
+fi
+
+for dir in "${DIRS_TO_CREATE[@]}"; do
+    if [[ ! -d "$dir" ]]; then
+        log_info "Creating directory: $dir"
+        mkdir -p "$dir"
+    else
+        log_info "Directory exists: $dir"
+    fi
+done
+
+log_info "Directory structure created successfully"
+
+# ============================================================
+# Copy Password File
+# ============================================================
+
+log_section "Copying Password File"
+
+SOURCE_PWD_FILE="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
+DEST_PWD_FILE="${ORACLE_HOME}/dbs/orapw${STANDBY_ORACLE_SID}"
+
+if [[ ! -f "$SOURCE_PWD_FILE" ]]; then
+    log_error "Password file not found on NFS: $SOURCE_PWD_FILE"
+    log_error "Please ensure 01_gather_primary_info.sh copied the password file"
+    exit 1
+fi
+
+if [[ -f "$DEST_PWD_FILE" ]]; then
+    backup_file "$DEST_PWD_FILE"
+fi
+
+cp "$SOURCE_PWD_FILE" "$DEST_PWD_FILE"
+chmod 640 "$DEST_PWD_FILE"
+log_info "Password file copied to: $DEST_PWD_FILE"
+
+# ============================================================
+# Copy Standby Init File
+# ============================================================
+
+log_section "Setting Up Parameter File"
+
+SOURCE_PFILE="${NFS_SHARE}/init${STANDBY_ORACLE_SID}.ora"
+DEST_PFILE="${ORACLE_HOME}/dbs/init${STANDBY_ORACLE_SID}.ora"
+
+if [[ ! -f "$SOURCE_PFILE" ]]; then
+    log_error "Standby pfile not found on NFS: $SOURCE_PFILE"
+    log_error "Please ensure 02_generate_standby_config.sh generated the pfile"
+    exit 1
+fi
+
+if [[ -f "$DEST_PFILE" ]]; then
+    backup_file "$DEST_PFILE"
+fi
+
+cp "$SOURCE_PFILE" "$DEST_PFILE"
+chmod 640 "$DEST_PFILE"
+log_info "Parameter file copied to: $DEST_PFILE"
+
+# ============================================================
+# Configure Listener
+# ============================================================
+
+log_section "Configuring Listener"
+
+LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
+LISTENER_ENTRY_FILE="${NFS_SHARE}/listener_standby.ora"
+
+if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
+    log_error "Listener entry file not found: $LISTENER_ENTRY_FILE"
+    exit 1
+fi
+
+# Check if listener.ora exists
+if [[ -f "$LISTENER_ORA" ]]; then
+    backup_file "$LISTENER_ORA"
+
+    # Check if SID_LIST already contains our entry
+    if grep -q "SID_NAME = ${STANDBY_ORACLE_SID}" "$LISTENER_ORA"; then
+        log_warn "Listener entry for $STANDBY_ORACLE_SID already exists"
+        log_info "Please verify listener.ora manually if needed"
+    else
+        # Check if SID_LIST_LISTENER exists
+        if grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
+            log_warn "SID_LIST_LISTENER already exists in listener.ora"
+            log_warn "Please manually merge the following entry:"
+            echo ""
+            echo "    (SID_DESC ="
+            echo "      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})"
+            echo "      (ORACLE_HOME = ${ORACLE_HOME})"
+            echo "      (SID_NAME = ${STANDBY_ORACLE_SID})"
+            echo "    )"
+            echo ""
+        else
+            # Append our listener entry
+            log_info "Adding SID_LIST_LISTENER to listener.ora"
+            cat >> "$LISTENER_ORA" <<EOF
+
+# Data Guard standby static registration - Added $(date)
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${STANDBY_ORACLE_SID})
+    )
+  )
+EOF
+            log_info "Listener entry added successfully"
+        fi
+    fi
+else
+    # Create new listener.ora
+    log_info "Creating new listener.ora"
+    cat > "$LISTENER_ORA" <<EOF
+# Listener configuration for Data Guard standby
+# Created: $(date)
+
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${STANDBY_LISTENER_PORT}))
+    )
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${STANDBY_ORACLE_SID})
+    )
+  )
+EOF
+    log_info "listener.ora created successfully"
+fi
+
+# ============================================================
+# Configure TNS Names
+# ============================================================
+
+log_section "Configuring TNS Names"
+
+TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
+TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries.ora"
+
+if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
+    log_error "TNS entries file not found: $TNSNAMES_ENTRY_FILE"
+    exit 1
+fi
+
+# Check if tnsnames.ora exists
+if [[ -f "$TNSNAMES_ORA" ]]; then
+    backup_file "$TNSNAMES_ORA"
+
+    # Check if entries already exist
+    if grep -q "$PRIMARY_TNS_ALIAS" "$TNSNAMES_ORA" && grep -q "$STANDBY_TNS_ALIAS" "$TNSNAMES_ORA"; then
+        log_warn "TNS entries already exist for both primary and standby"
+        log_info "Please verify tnsnames.ora manually if needed"
+    else
+        # Append entries
+        log_info "Adding TNS entries to tnsnames.ora"
+        echo "" >> "$TNSNAMES_ORA"
+        echo "# Data Guard TNS entries - Added $(date)" >> "$TNSNAMES_ORA"
+        cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
+        log_info "TNS entries added successfully"
+    fi
+else
+    # Create new tnsnames.ora
+    log_info "Creating new tnsnames.ora"
+    echo "# TNS Names for Data Guard" > "$TNSNAMES_ORA"
+    echo "# Created: $(date)" >> "$TNSNAMES_ORA"
+    echo "" >> "$TNSNAMES_ORA"
+    cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
+    log_info "tnsnames.ora created successfully"
+fi
+
+# ============================================================
+# Update oratab
+# ============================================================
+
+log_section "Updating oratab"
+
+ORATAB="/etc/oratab"
+if [[ -f "$ORATAB" ]]; then
+    if grep -q "^${STANDBY_ORACLE_SID}:" "$ORATAB"; then
+        log_info "Entry for $STANDBY_ORACLE_SID already exists in oratab"
+    else
+        log_info "Adding $STANDBY_ORACLE_SID to oratab"
+        echo "${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N" >> "$ORATAB"
+    fi
+else
+    log_warn "oratab not found at $ORATAB"
+fi
+
+# ============================================================
+# Start/Reload Listener
+# ============================================================
+
+log_section "Starting Listener"
+
+# Check if listener is running
+if "$ORACLE_HOME/bin/lsnrctl" status > /dev/null 2>&1; then
+    log_info "Listener is running, reloading..."
+    "$ORACLE_HOME/bin/lsnrctl" reload
+else
+    log_info "Starting listener..."
+    "$ORACLE_HOME/bin/lsnrctl" start
+fi
+
+# Show listener status
+echo ""
+"$ORACLE_HOME/bin/lsnrctl" status
+
+# ============================================================
+# Verify Static Registration
+# ============================================================
+
+log_section "Verifying Configuration"
+
+echo ""
+log_info "Checking listener services..."
+"$ORACLE_HOME/bin/lsnrctl" services
+
+# Look for our service
+if "$ORACLE_HOME/bin/lsnrctl" status 2>&1 | grep -q "$STANDBY_DB_UNIQUE_NAME"; then
+    log_info "Static registration verified for $STANDBY_DB_UNIQUE_NAME"
+else
+    log_warn "Could not verify static registration - please check listener status"
+fi
+
+# ============================================================
+# Summary
+# ============================================================
+
+print_summary "SUCCESS" "Standby environment setup complete"
+
+echo ""
+echo "COMPLETED ACTIONS:"
+echo "=================="
+echo "  - Created directory structure"
+echo "  - Copied password file"
+echo "  - Installed parameter file"
+echo "  - Configured listener with static registration"
+echo "  - Configured tnsnames.ora"
+echo "  - Updated oratab"
+echo "  - Started/reloaded listener"
+echo ""
+echo "NEXT STEPS:"
+echo "==========="
+echo ""
+echo "1. On PRIMARY server:"
+echo "   Run: ./04_prepare_primary_dg.sh"
+echo ""
+echo "2. Then return to STANDBY and run:"
+echo "   ./05_clone_standby.sh"
+echo ""

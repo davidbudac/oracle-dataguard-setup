@@ -1,0 +1,25 @@
+# Logs
+*.log
+logs/
+
+# Generated configuration files (contain environment-specific data)
+primary_info.env
+standby_config.env
+
+# Oracle password files
+orapw*
+
+# Backup files
+*.bak
+*.bak.*
+
+# Editor files
+*.swp
+*.swo
+*~
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.sublime-*
