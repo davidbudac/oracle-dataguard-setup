@@ -28,9 +28,11 @@ templates/     - Reference templates
 
 - **Data Guard Broker (DGMGRL)** manages DG parameters instead of manual ALTER SYSTEM commands
 - **NFS share** at `/OINSTALL/_dataguard_setup` for file exchange between servers
-- **Single source of truth**: `standby_config.env` contains all configuration
+- **Single source of truth**: `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` contains all configuration
+- **Concurrent builds**: All generated files include DB_UNIQUE_NAME to support multiple DG setups
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)
+- **AIX 7.2 compatible**: Uses printf instead of echo -e, sed instead of grep -P
 
 ## Common Functions
 

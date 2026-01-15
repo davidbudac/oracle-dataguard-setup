@@ -21,7 +21,7 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 4: Prepare Primary for DG"
 
-# Initialize logging
+# Initialize logging (will reinitialize with DB name later)
 init_log "04_prepare_primary_dg"
 
 # ============================================================
@@ -34,15 +34,34 @@ check_oracle_env || exit 1
 check_nfs_mount || exit 1
 check_db_connection || exit 1
 
-# Load standby configuration
-STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
-if [[ ! -f "$STANDBY_CONFIG_FILE" ]]; then
-    log_error "Standby config file not found: $STANDBY_CONFIG_FILE"
+# Check for standby config files - support unique naming
+STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
+
+if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
+    log_error "No standby config files found in $NFS_SHARE"
+    log_error "Please run 02_generate_standby_config.sh first"
     exit 1
+elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
+    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
+    log_info "Found standby config file: $STANDBY_CONFIG_FILE"
+else
+    # Multiple standby config files exist - let user choose
+    echo ""
+    echo "Multiple standby configurations found:"
+    echo ""
+    PS3="Select the standby configuration to use: "
+    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
+        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
+            break
+        fi
+    done
 fi
 
 log_info "Loading standby configuration..."
 source "$STANDBY_CONFIG_FILE"
+
+# Reinitialize log with standby DB name
+init_log "04_prepare_primary_dg_${STANDBY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Configure TNS Names on Primary
@@ -51,7 +70,7 @@ source "$STANDBY_CONFIG_FILE"
 log_section "Configuring TNS Names on Primary"
 
 TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
-TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries.ora"
+TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
     log_error "TNS entries file not found: $TNSNAMES_ENTRY_FILE"
@@ -204,7 +223,7 @@ log_info "Testing basic port connectivity to ${STANDBY_HOSTNAME}:${STANDBY_PORT}
 log_info "(Port ${STANDBY_PORT} taken from primary listener configuration)"
 
 PORT_CHECK_RESULT=0
-if command -v nc &> /dev/null; then
+if command -v nc >/dev/null 2>&1; then
     # Use netcat if available
     if nc -z -w 5 "$STANDBY_HOSTNAME" "$STANDBY_PORT" 2>/dev/null; then
         log_info "PASS: Port ${STANDBY_PORT} is reachable on ${STANDBY_HOSTNAME}"
@@ -216,7 +235,7 @@ if command -v nc &> /dev/null; then
         log_error "  3. Hostname '${STANDBY_HOSTNAME}' resolves correctly"
         PORT_CHECK_RESULT=1
     fi
-elif command -v timeout &> /dev/null; then
+elif command -v timeout >/dev/null 2>&1; then
     # Use bash /dev/tcp with timeout
     if timeout 5 bash -c "echo > /dev/tcp/${STANDBY_HOSTNAME}/${STANDBY_PORT}" 2>/dev/null; then
         log_info "PASS: Port ${STANDBY_PORT} is reachable on ${STANDBY_HOSTNAME}"

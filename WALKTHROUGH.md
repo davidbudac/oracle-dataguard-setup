@@ -114,7 +114,7 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 ```
 
 **Output files (on NFS):**
-- `primary_info.env` - Database configuration
+- `primary_info_<DB_UNIQUE_NAME>.env` - Database configuration
 - `orapw<SID>` - Password file copy
 
 ---
@@ -135,10 +135,11 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 **Review the configuration summary and confirm.**
 
 **Output files (on NFS):**
-- `standby_config.env` - Master configuration (single source of truth)
-- `init<SID>.ora` - Standby parameter file
-- `tnsnames_entries.ora` - Network entries
-- `listener_standby.ora` - Listener configuration
+- `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` - Master configuration (single source of truth)
+- `init<SID>_<STANDBY_DB_UNIQUE_NAME>.ora` - Standby parameter file
+- `tnsnames_entries_<STANDBY_DB_UNIQUE_NAME>.ora` - Network entries
+- `listener_<STANDBY_DB_UNIQUE_NAME>.ora` - Listener configuration
+- `configure_broker_<STANDBY_DB_UNIQUE_NAME>.dgmgrl` - Broker configuration script
 
 ---
 
@@ -302,9 +303,9 @@ ALTER SYSTEM SWITCH LOGFILE;
 │  dgmgrl / "show database 'PRODSTBY'"                                    │
 │  dgmgrl / "switchover to 'PRODSTBY'"                                    │
 │                                                                         │
-│  CONFIG FILES:                                                          │
+│  CONFIG FILES (include DB_UNIQUE_NAME for concurrent builds):           │
 │  ═════════════                                                          │
-│  /OINSTALL/_dataguard_setup/standby_config.env                          │
-│  /OINSTALL/_dataguard_setup/primary_info.env                            │
+│  /OINSTALL/_dataguard_setup/standby_config_<STBY_NAME>.env              │
+│  /OINSTALL/_dataguard_setup/primary_info_<PRI_NAME>.env                 │
 └─────────────────────────────────────────────────────────────────────────┘
 ```

@@ -21,7 +21,7 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 3: Setup Standby Environment"
 
-# Initialize logging
+# Initialize logging (will reinitialize with DB name later)
 init_log "03_setup_standby_env"
 
 # ============================================================
@@ -32,19 +32,38 @@ log_section "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
-# Check standby config file exists
-STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
-if [[ ! -f "$STANDBY_CONFIG_FILE" ]]; then
-    log_error "Standby config file not found: $STANDBY_CONFIG_FILE"
+# Check for standby config files - support unique naming
+STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
+
+if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
+    log_error "No standby config files found in $NFS_SHARE"
     log_error "Please run 02_generate_standby_config.sh first"
     exit 1
+elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
+    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
+    log_info "Found standby config file: $STANDBY_CONFIG_FILE"
+else
+    # Multiple standby config files exist - let user choose
+    echo ""
+    echo "Multiple standby configurations found:"
+    echo ""
+    PS3="Select the standby configuration to use: "
+    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
+        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
+            break
+        fi
+    done
 fi
 
 log_info "Loading standby configuration..."
 source "$STANDBY_CONFIG_FILE"
 
+# Reinitialize log with standby DB name
+init_log "03_setup_standby_env_${STANDBY_DB_UNIQUE_NAME}"
+
 # Verify we're on the correct host
-CURRENT_HOST=$(hostname -f 2>/dev/null || hostname)
+# AIX-compatible hostname detection
+CURRENT_HOST=$(hostname 2>/dev/null)
 log_info "Current hostname: $CURRENT_HOST"
 log_info "Expected standby hostname: $STANDBY_HOSTNAME"
 
@@ -195,7 +214,7 @@ log_info "Password file copied to: $DEST_PWD_FILE"
 
 log_section "Setting Up Parameter File"
 
-SOURCE_PFILE="${NFS_SHARE}/init${STANDBY_ORACLE_SID}.ora"
+SOURCE_PFILE="${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora"
 DEST_PFILE="${ORACLE_HOME}/dbs/init${STANDBY_ORACLE_SID}.ora"
 
 if [[ ! -f "$SOURCE_PFILE" ]]; then
@@ -219,7 +238,7 @@ log_info "Parameter file copied to: $DEST_PFILE"
 log_section "Configuring Listener"
 
 LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
-LISTENER_ENTRY_FILE="${NFS_SHARE}/listener_standby.ora"
+LISTENER_ENTRY_FILE="${NFS_SHARE}/listener_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
     log_error "Listener entry file not found: $LISTENER_ENTRY_FILE"
@@ -339,7 +358,7 @@ fi
 log_section "Configuring TNS Names"
 
 TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
-TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries.ora"
+TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
     log_error "TNS entries file not found: $TNSNAMES_ENTRY_FILE"

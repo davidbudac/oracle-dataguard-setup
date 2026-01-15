@@ -21,7 +21,7 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 5: Clone Standby Database"
 
-# Initialize logging
+# Initialize logging (will reinitialize with DB name later)
 init_log "05_clone_standby"
 
 # ============================================================
@@ -32,15 +32,34 @@ log_section "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
-# Load standby configuration
-STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
-if [[ ! -f "$STANDBY_CONFIG_FILE" ]]; then
-    log_error "Standby config file not found: $STANDBY_CONFIG_FILE"
+# Check for standby config files - support unique naming
+STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
+
+if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
+    log_error "No standby config files found in $NFS_SHARE"
+    log_error "Please run 02_generate_standby_config.sh first"
     exit 1
+elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
+    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
+    log_info "Found standby config file: $STANDBY_CONFIG_FILE"
+else
+    # Multiple standby config files exist - let user choose
+    echo ""
+    echo "Multiple standby configurations found:"
+    echo ""
+    PS3="Select the standby configuration to use: "
+    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
+        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
+            break
+        fi
+    done
 fi
 
 log_info "Loading standby configuration..."
 source "$STANDBY_CONFIG_FILE"
+
+# Reinitialize log with standby DB name
+init_log "05_clone_standby_${STANDBY_DB_UNIQUE_NAME}"
 
 # Set Oracle environment
 export ORACLE_HOME="$STANDBY_ORACLE_HOME"

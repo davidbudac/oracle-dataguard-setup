@@ -3,8 +3,12 @@
 logs/
 
 # Generated configuration files (contain environment-specific data)
-primary_info.env
-standby_config.env
+primary_info_*.env
+standby_config_*.env
+init*_*.ora
+tnsnames_entries_*.ora
+listener_*.ora
+configure_broker_*.dgmgrl
 
 # Oracle password files
 orapw*

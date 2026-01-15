@@ -21,8 +21,8 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 1: Gather Primary Info"
 
-# Initialize logging
-init_log "01_gather_primary_info"
+# Initialize temporary logging (will reinitialize with DB_UNIQUE_NAME later)
+init_log "01_gather_primary_info_${ORACLE_SID}"
 
 # ============================================================
 # Pre-flight Checks
@@ -42,6 +42,9 @@ log_section "Gathering Database Identity Information"
 
 DB_NAME=$(get_db_parameter "db_name")
 DB_UNIQUE_NAME=$(get_db_parameter "db_unique_name")
+
+# Reinitialize log with DB_UNIQUE_NAME for proper identification
+init_log "01_gather_primary_info_${DB_UNIQUE_NAME}"
 DB_DOMAIN=$(get_db_parameter "db_domain")
 INSTANCE_NAME=$(run_sql "SELECT INSTANCE_NAME FROM V\$INSTANCE;")
 INSTANCE_NAME=$(echo "$INSTANCE_NAME" | tr -d ' \n\r')
@@ -62,7 +65,13 @@ log_info "DBID: $DBID"
 
 log_section "Gathering Oracle Environment Info"
 
-PRIMARY_HOSTNAME=$(hostname -f 2>/dev/null || hostname)
+# AIX-compatible hostname detection
+PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
+# Try to get FQDN if possible
+if command -v host >/dev/null 2>&1; then
+    FQDN=$(host "$PRIMARY_HOSTNAME" 2>/dev/null | awk '/has address/{print $1; exit}')
+    [[ -n "$FQDN" ]] && PRIMARY_HOSTNAME="$FQDN"
+fi
 PRIMARY_ORACLE_HOME="$ORACLE_HOME"
 PRIMARY_ORACLE_BASE="${ORACLE_BASE:-$(dirname $(dirname $ORACLE_HOME))}"
 PRIMARY_ORACLE_SID="$ORACLE_SID"
@@ -255,7 +264,8 @@ log_info "Detecting listener port from running listener..."
 LSNRCTL_OUTPUT=$("$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null || true)
 if [[ -n "$LSNRCTL_OUTPUT" ]]; then
     # Extract PORT from listener output (e.g., "(PORT = 1521)")
-    LISTENER_PORT=$(echo "$LSNRCTL_OUTPUT" | grep -oP 'PORT\s*=\s*\K\d+' | head -1)
+    # AIX-compatible: use sed instead of grep -P
+    LISTENER_PORT=$(echo "$LSNRCTL_OUTPUT" | sed -n 's/.*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
     if [[ -n "$LISTENER_PORT" ]]; then
         log_info "Listener port detected from lsnrctl: $LISTENER_PORT"
     fi
@@ -274,7 +284,12 @@ fi
 if [[ -z "$LISTENER_PORT" ]]; then
     LOCAL_LISTENER=$(get_db_parameter "local_listener")
     if [[ -n "$LOCAL_LISTENER" ]]; then
-        LISTENER_PORT=$(echo "$LOCAL_LISTENER" | grep -oP '\d{4,5}' | head -1)
+        # AIX-compatible: use sed to extract 4-5 digit port numbers
+        LISTENER_PORT=$(echo "$LOCAL_LISTENER" | sed -n 's/.*[^0-9]\([0-9]\{4,5\}\)[^0-9].*/\1/p' | head -1)
+        # If sed didn't match, try a simpler pattern
+        if [[ -z "$LISTENER_PORT" ]]; then
+            LISTENER_PORT=$(echo "$LOCAL_LISTENER" | tr -cs '0-9\n' '\n' | awk 'length>=4 && length<=5 {print; exit}')
+        fi
         if [[ -n "$LISTENER_PORT" ]]; then
             log_info "Listener port from local_listener parameter: $LISTENER_PORT"
         fi
@@ -356,7 +371,8 @@ fi
 
 log_section "Writing Primary Information to NFS"
 
-OUTPUT_FILE="${NFS_SHARE}/primary_info.env"
+# Use DB_UNIQUE_NAME in filename to support concurrent builds
+OUTPUT_FILE="${NFS_SHARE}/primary_info_${DB_UNIQUE_NAME}.env"
 
 cat > "$OUTPUT_FILE" <<EOF
 # ============================================================

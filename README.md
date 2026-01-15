@@ -9,7 +9,8 @@ These scripts automate the process of creating a physical standby database from 
 ## Features
 
 - **Automated Information Gathering** - Collects all required parameters from the primary database
-- **Single Source of Truth** - Generates a master configuration file (`standby_config.env`) for consistent setup
+- **Single Source of Truth** - Generates a master configuration file (`standby_config_<name>.env`) for consistent setup
+- **Concurrent Build Support** - All generated files include DB_UNIQUE_NAME, allowing multiple DG setups simultaneously
 - **Data Guard Broker (DGMGRL)** - Centralized management of Data Guard configuration
 - **Prerequisite Validation** - Checks archivelog mode, force logging, password files, etc.
 - **NFS-Based File Sharing** - Uses shared storage for configuration and file transfer
@@ -108,7 +109,7 @@ Step 6: Configure Broker ◄─────────────────�
 
 ### Key Configuration File
 
-After running Step 2, review `/OINSTALL/_dataguard_setup/standby_config.env`:
+After running Step 2, review `/OINSTALL/_dataguard_setup/standby_config_<STANDBY_DB_UNIQUE_NAME>.env`:
 
 ```bash
 # Primary Database Info

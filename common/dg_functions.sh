@@ -18,25 +18,25 @@ NFS_SHARE="/OINSTALL/_dataguard_setup"
 # ============================================================
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    printf "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
     echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    printf "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
     echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - $1"
+    printf "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
     echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
 }
 
 log_section() {
     echo ""
-    echo -e "${BLUE}============================================================${NC}"
-    echo -e "${BLUE}$1${NC}"
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${BLUE}%s${NC}\n" "$1"
+    printf "${BLUE}============================================================${NC}\n"
     echo ""
     echo "" >> "$LOG_FILE" 2>/dev/null
     echo "============================================================" >> "$LOG_FILE" 2>/dev/null
@@ -182,7 +182,7 @@ prompt_password() {
     local password
 
     # Output prompt to stderr so it doesn't get captured by $()
-    echo -n -e "${YELLOW}${prompt_text}${NC}: " >&2
+    printf "${YELLOW}%s${NC}: " "$prompt_text" >&2
     read -s password
     echo "" >&2
 
@@ -264,8 +264,8 @@ confirm_proceed() {
     local response
 
     echo ""
-    echo -e "${YELLOW}$message${NC}"
-    echo -n "Do you want to proceed? [y/N]: "
+    printf "${YELLOW}%s${NC}\n" "$message"
+    printf "Do you want to proceed? [y/N]: "
     read response
 
     case "$response" in
@@ -286,9 +286,9 @@ display_config() {
     local config_file="$1"
 
     echo ""
-    echo -e "${BLUE}============================================================${NC}"
-    echo -e "${BLUE}Configuration Review${NC}"
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${BLUE}Configuration Review${NC}\n"
+    printf "${BLUE}============================================================${NC}\n"
     echo ""
 
     while IFS='=' read -r key value; do
@@ -306,15 +306,15 @@ display_config() {
     done < "$config_file"
 
     echo ""
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
 }
 
 print_banner() {
     local title="$1"
     echo ""
-    echo -e "${BLUE}============================================================${NC}"
-    echo -e "${BLUE}     Oracle Data Guard Setup - $title${NC}"
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${BLUE}     Oracle Data Guard Setup - %s${NC}\n" "$title"
+    printf "${BLUE}============================================================${NC}\n"
     echo ""
 }
 
@@ -323,12 +323,12 @@ print_summary() {
     local message="$2"
 
     echo ""
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
     if [[ "$status" == "SUCCESS" ]]; then
-        echo -e "${GREEN}     $status: $message${NC}"
+        printf "${GREEN}     %s: %s${NC}\n" "$status" "$message"
     else
-        echo -e "${RED}     $status: $message${NC}"
+        printf "${RED}     %s: %s${NC}\n" "$status" "$message"
     fi
-    echo -e "${BLUE}============================================================${NC}"
+    printf "${BLUE}============================================================${NC}\n"
     echo ""
 }

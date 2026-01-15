@@ -21,7 +21,7 @@ source "${SCRIPT_DIR}/dg_functions.sh"
 
 print_banner "Step 2: Generate Standby Config"
 
-# Initialize logging
+# Initialize logging (will reinitialize with DB names later)
 init_log "02_generate_standby_config"
 
 # ============================================================
@@ -32,12 +32,27 @@ log_section "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
-# Check primary info file exists
-PRIMARY_INFO_FILE="${NFS_SHARE}/primary_info.env"
-if [[ ! -f "$PRIMARY_INFO_FILE" ]]; then
-    log_error "Primary info file not found: $PRIMARY_INFO_FILE"
+# Check for primary info files - support unique naming
+PRIMARY_INFO_FILES=(${NFS_SHARE}/primary_info_*.env)
+
+if [[ ${#PRIMARY_INFO_FILES[@]} -eq 0 || ! -f "${PRIMARY_INFO_FILES[0]}" ]]; then
+    log_error "No primary info files found in $NFS_SHARE"
     log_error "Please run 01_gather_primary_info.sh on the primary server first"
     exit 1
+elif [[ ${#PRIMARY_INFO_FILES[@]} -eq 1 ]]; then
+    PRIMARY_INFO_FILE="${PRIMARY_INFO_FILES[0]}"
+    log_info "Found primary info file: $PRIMARY_INFO_FILE"
+else
+    # Multiple primary info files exist - let user choose
+    echo ""
+    echo "Multiple primary databases found:"
+    echo ""
+    PS3="Select the primary database to use: "
+    select PRIMARY_INFO_FILE in "${PRIMARY_INFO_FILES[@]}"; do
+        if [[ -n "$PRIMARY_INFO_FILE" ]]; then
+            break
+        fi
+    done
 fi
 
 log_info "Loading primary info from: $PRIMARY_INFO_FILE"
@@ -46,6 +61,9 @@ log_info "Loading primary info from: $PRIMARY_INFO_FILE"
 source "$PRIMARY_INFO_FILE"
 
 log_info "Primary database: $DB_UNIQUE_NAME on $PRIMARY_HOSTNAME"
+
+# Reinitialize log with primary DB name
+init_log "02_generate_standby_config_${DB_UNIQUE_NAME}"
 
 # ============================================================
 # Prompt for Standby Information
@@ -151,7 +169,8 @@ log_info "Recommended standby redo groups: $RECOMMENDED_STBY_GROUPS"
 
 log_section "Writing Standby Configuration"
 
-STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
+# Use STANDBY_DB_UNIQUE_NAME in filename to support concurrent builds
+STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config_${STANDBY_DB_UNIQUE_NAME}.env"
 
 cat > "$STANDBY_CONFIG_FILE" <<EOF
 # ============================================================
@@ -226,7 +245,8 @@ log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
 
 log_section "Generating Standby Init Parameter File"
 
-STANDBY_PFILE="${NFS_SHARE}/init${STANDBY_ORACLE_SID}.ora"
+# Include DB_UNIQUE_NAME in filename to support concurrent builds
+STANDBY_PFILE="${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 cat > "$STANDBY_PFILE" <<EOF
 # ============================================================
@@ -291,7 +311,8 @@ log_info "Standby pfile written to: $STANDBY_PFILE"
 
 log_section "Generating TNS Entries"
 
-TNSNAMES_FILE="${NFS_SHARE}/tnsnames_entries.ora"
+# Include standby name in filename to support concurrent builds
+TNSNAMES_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 cat > "$TNSNAMES_FILE" <<EOF
 # ============================================================
@@ -327,7 +348,8 @@ log_info "TNS entries written to: $TNSNAMES_FILE"
 
 log_section "Generating Listener Configuration for Standby"
 
-LISTENER_FILE="${NFS_SHARE}/listener_standby.ora"
+# Include standby name in filename to support concurrent builds
+LISTENER_FILE="${NFS_SHARE}/listener_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 cat > "$LISTENER_FILE" <<EOF
 # ============================================================
@@ -365,7 +387,8 @@ log_info "Listener entries written to: $LISTENER_FILE"
 log_section "Generating Data Guard Broker Configuration Script"
 
 DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
-DGMGRL_SCRIPT="${NFS_SHARE}/configure_broker.dgmgrl"
+# Include standby name in filename to support concurrent builds
+DGMGRL_SCRIPT="${NFS_SHARE}/configure_broker_${STANDBY_DB_UNIQUE_NAME}.dgmgrl"
 
 cat > "$DGMGRL_SCRIPT" <<EOF
 # ============================================================

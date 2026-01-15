@@ -21,7 +21,7 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 7: Verify Data Guard"
 
-# Initialize logging
+# Initialize logging (will reinitialize with DB name later)
 init_log "07_verify_dataguard"
 
 # ============================================================
@@ -32,15 +32,34 @@ log_section "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
-# Load standby configuration
-STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config.env"
-if [[ ! -f "$STANDBY_CONFIG_FILE" ]]; then
-    log_error "Standby config file not found: $STANDBY_CONFIG_FILE"
+# Check for standby config files - support unique naming
+STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
+
+if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
+    log_error "No standby config files found in $NFS_SHARE"
+    log_error "Please run 02_generate_standby_config.sh first"
     exit 1
+elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
+    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
+    log_info "Found standby config file: $STANDBY_CONFIG_FILE"
+else
+    # Multiple standby config files exist - let user choose
+    echo ""
+    echo "Multiple standby configurations found:"
+    echo ""
+    PS3="Select the standby configuration to use: "
+    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
+        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
+            break
+        fi
+    done
 fi
 
 log_info "Loading standby configuration..."
 source "$STANDBY_CONFIG_FILE"
+
+# Reinitialize log with standby DB name
+init_log "07_verify_dataguard_${STANDBY_DB_UNIQUE_NAME}"
 
 # Set Oracle environment
 export ORACLE_HOME="$STANDBY_ORACLE_HOME"
@@ -73,7 +92,11 @@ EOF
 )
 DB_INFO=$(echo "$DB_INFO" | tr -d ' \n\r')
 
-IFS='|' read -r DB_ROLE OPEN_MODE PROTECTION_MODE SWITCHOVER_STATUS <<< "$DB_INFO"
+# AIX-compatible: use awk instead of here-strings
+DB_ROLE=$(echo "$DB_INFO" | awk -F'|' '{print $1}')
+OPEN_MODE=$(echo "$DB_INFO" | awk -F'|' '{print $2}')
+PROTECTION_MODE=$(echo "$DB_INFO" | awk -F'|' '{print $3}')
+SWITCHOVER_STATUS=$(echo "$DB_INFO" | awk -F'|' '{print $4}')
 
 echo ""
 echo "Database Configuration:"
@@ -121,7 +144,11 @@ if [[ -z "$MRP_INFO" || "$MRP_INFO" == *"no rows"* ]]; then
     OVERALL_STATUS="ERROR"
     ((ERRORS++))
 else
-    IFS='|' read -r MRP_PROCESS MRP_STATUS MRP_SEQUENCE <<< "$(echo "$MRP_INFO" | tr -d ' \n\r')"
+    # AIX-compatible: use awk instead of here-strings
+    MRP_INFO_CLEAN=$(echo "$MRP_INFO" | tr -d ' \n\r')
+    MRP_PROCESS=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $1}')
+    MRP_STATUS=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $2}')
+    MRP_SEQUENCE=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $3}')
     echo ""
     echo "MRP Status:"
     echo "  Process:   $MRP_PROCESS"
@@ -200,7 +227,10 @@ EXIT;
 EOF
 )
 
-IFS='|' read -r LAST_APPLIED LAST_RECEIVED <<< "$(echo "$APPLY_INFO" | tr -d ' \n\r')"
+# AIX-compatible: use awk instead of here-strings
+APPLY_INFO_CLEAN=$(echo "$APPLY_INFO" | tr -d ' \n\r')
+LAST_APPLIED=$(echo "$APPLY_INFO_CLEAN" | awk -F'|' '{print $1}')
+LAST_RECEIVED=$(echo "$APPLY_INFO_CLEAN" | awk -F'|' '{print $2}')
 
 echo ""
 echo "Archive Log Sequences:"
@@ -373,13 +403,13 @@ echo "  Warnings:             $WARNINGS"
 echo ""
 
 if [[ "$OVERALL_STATUS" == "HEALTHY" && "$ERRORS" -eq 0 ]]; then
-    echo -e "  ${GREEN}OVERALL STATUS: HEALTHY${NC}"
+    printf "  ${GREEN}OVERALL STATUS: HEALTHY${NC}\n"
     print_summary "SUCCESS" "Data Guard configuration is healthy"
 elif [[ "$ERRORS" -gt 0 ]]; then
-    echo -e "  ${RED}OVERALL STATUS: ERROR${NC}"
+    printf "  ${RED}OVERALL STATUS: ERROR${NC}\n"
     print_summary "ERROR" "Data Guard configuration has $ERRORS error(s)"
 else
-    echo -e "  ${YELLOW}OVERALL STATUS: WARNING${NC}"
+    printf "  ${YELLOW}OVERALL STATUS: WARNING${NC}\n"
     print_summary "WARNING" "Data Guard configuration has $WARNINGS warning(s)"
 fi
 
