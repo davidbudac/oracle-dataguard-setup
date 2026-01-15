@@ -108,15 +108,49 @@ STANDBY_ORACLE_SID=${STANDBY_ORACLE_SID:-$PRIMARY_ORACLE_SID}
 
 log_section "Generating Path Conversions"
 
-# Replace primary DB_UNIQUE_NAME with standby DB_UNIQUE_NAME in paths
-STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
-STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+# Detect the actual directory name used in paths (may differ in case from DB_UNIQUE_NAME)
+# DB_UNIQUE_NAME might be 'testcdb' but directory might be 'TESTCDB'
+PRIMARY_DIR_NAME=""
+DB_UNIQUE_NAME_UPPER=$(echo "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+DB_UNIQUE_NAME_LOWER=$(echo "$DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+
+# Check for uppercase version in path
+if echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_UPPER}"; then
+    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_UPPER"
+# Check for lowercase version in path
+elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_LOWER}"; then
+    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_LOWER"
+# Check for exact match (mixed case)
+elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME}/"; then
+    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
+fi
+
+# Generate the standby directory name (preserve case pattern from primary)
+if [[ -n "$PRIMARY_DIR_NAME" ]]; then
+    # Match the case pattern of the primary
+    if [[ "$PRIMARY_DIR_NAME" == "$DB_UNIQUE_NAME_UPPER" ]]; then
+        STANDBY_DIR_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+    else
+        STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
+    fi
+    log_info "Primary directory name in path: $PRIMARY_DIR_NAME"
+    log_info "Standby directory name for path: $STANDBY_DIR_NAME"
+else
+    # Fallback: use DB_UNIQUE_NAME as-is
+    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
+    STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
+    log_warn "Could not detect directory name case in path, using DB_UNIQUE_NAME directly"
+fi
+
+# Replace primary directory name with standby directory name in paths
+STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
 
 # Handle archive destination - may use FRA
 if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
     # Use FRA for archiving on standby
     if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-        STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+        STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
         STANDBY_ARCHIVE_DEST=""  # Will use USE_DB_RECOVERY_FILE_DEST
         USE_FRA_FOR_STANDBY="YES"
         log_info "Standby will use FRA for archive logs: $STANDBY_FRA"
@@ -126,7 +160,7 @@ if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
         exit 1
     fi
 else
-    STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+    STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
     USE_FRA_FOR_STANDBY="NO"
 fi
 
