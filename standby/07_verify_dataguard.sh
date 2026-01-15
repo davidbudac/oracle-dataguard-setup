@@ -455,6 +455,50 @@ echo "ALTER DATABASE OPEN READ ONLY;"
 echo "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;"
 echo ""
 
+# ============================================================
+# Security Hardening - Lock SYS Account
+# ============================================================
+
+# Only perform security hardening if verification passed without errors
+if [[ "$ERRORS" -eq 0 ]]; then
+    log_section "Security Hardening"
+
+    log_info "Randomizing SYS password and locking account on STANDBY..."
+
+    # Generate a random password (not displayed or logged anywhere)
+    # Using /dev/urandom for randomness, base64 for encoding, remove special chars
+    RANDOM_PWD=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | base64 | tr -dc 'A-Za-z0-9' | head -c 32)
+
+    # Change SYS password and lock the account on standby (current connection)
+    SECURE_RESULT=$(sqlplus -s / as sysdba <<EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+ALTER USER SYS IDENTIFIED BY "${RANDOM_PWD}";
+ALTER USER SYS ACCOUNT LOCK;
+SELECT 'SUCCESS' FROM DUAL;
+EXIT;
+EOF
+)
+
+    if echo "$SECURE_RESULT" | grep -q "SUCCESS"; then
+        log_info "SYS account secured on standby database"
+    else
+        log_warn "Could not secure SYS account on standby - please do this manually"
+    fi
+
+    # Clear the password variable
+    RANDOM_PWD=""
+    unset RANDOM_PWD
+
+    log_info "Security hardening complete on standby"
+    echo ""
+    log_warn "IMPORTANT: You should also secure SYS on the PRIMARY database:"
+    log_warn "  sqlplus / as sysdba"
+    log_warn "  ALTER USER SYS IDENTIFIED BY VALUES 'impossible_password_hash';"
+    log_warn "  ALTER USER SYS ACCOUNT LOCK;"
+    echo ""
+    log_info "Use OS authentication '/ as sysdba' for future DBA connections"
+fi
+
 # Return appropriate exit code
 if [[ "$ERRORS" -gt 0 ]]; then
     exit 1
