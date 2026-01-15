@@ -108,11 +108,17 @@ log_section "Configuring Listener on Primary"
 LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
 LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${PRIMARY_DB_UNIQUE_NAME}.ora"
 
-# New SID_DESC entry to add - write to temp file for AIX compatibility
+# New SID_DESC entries to add - write to temp file for AIX compatibility
+# Includes _DGMGRL service for Data Guard Broker switchover
 TEMP_SID_DESC=$(mktemp)
 cat > "$TEMP_SID_DESC" <<EOF
     (SID_DESC =
       (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${PRIMARY_ORACLE_SID})
     )
@@ -145,10 +151,16 @@ if [[ -f "$LISTENER_ORA" ]]; then
         cat >> "$LISTENER_ORA" <<EOF
 
 # Data Guard primary static registration - Added $(date)
+# Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
       (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${PRIMARY_ORACLE_SID})
     )
@@ -170,10 +182,16 @@ LISTENER =
     )
   )
 
+# Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
       (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${PRIMARY_ORACLE_SID})
     )

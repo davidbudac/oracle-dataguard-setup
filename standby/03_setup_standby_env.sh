@@ -251,11 +251,17 @@ if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
     exit 1
 fi
 
-# New SID_DESC entry to add - write to temp file for AIX compatibility
+# New SID_DESC entries to add - write to temp file for AIX compatibility
+# Includes _DGMGRL service for Data Guard Broker switchover
 TEMP_SID_DESC=$(mktemp)
 cat > "$TEMP_SID_DESC" <<EOF
     (SID_DESC =
       (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${STANDBY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${STANDBY_ORACLE_SID})
     )
@@ -288,10 +294,16 @@ if [[ -f "$LISTENER_ORA" ]]; then
         cat >> "$LISTENER_ORA" <<EOF
 
 # Data Guard standby static registration - Added $(date)
+# Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
       (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${STANDBY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${STANDBY_ORACLE_SID})
     )
@@ -313,10 +325,16 @@ LISTENER =
     )
   )
 
+# Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
       (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${STANDBY_ORACLE_SID})
+    )
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
       (ORACLE_HOME = ${ORACLE_HOME})
       (SID_NAME = ${STANDBY_ORACLE_SID})
     )
