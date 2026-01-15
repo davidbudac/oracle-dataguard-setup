@@ -384,6 +384,22 @@ EXIT;
 EOF
 
 # ============================================================
+# Configure RMAN Archivelog Deletion Policy
+# ============================================================
+
+log_section "Configuring RMAN Archivelog Deletion Policy"
+
+log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
+log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
+
+"$ORACLE_HOME/bin/rman" target / <<EOF
+CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
+EXIT;
+EOF
+
+log_info "RMAN archivelog deletion policy configured"
+
+# ============================================================
 # Summary
 # ============================================================
 
@@ -396,6 +412,7 @@ echo "  - Started instance in NOMOUNT"
 echo "  - Executed RMAN DUPLICATE FOR STANDBY FROM ACTIVE DATABASE"
 echo "  - Created SPFILE with DG_BROKER_START=TRUE"
 echo "  - Started Managed Recovery Process (MRP)"
+echo "  - Configured RMAN archivelog deletion policy (SHIPPED TO ALL STANDBY)"
 echo ""
 echo "RMAN LOG: $RMAN_LOG"
 echo ""

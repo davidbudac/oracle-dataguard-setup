@@ -316,6 +316,22 @@ log_info "Data Guard Broker enabled successfully"
 log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
 
 # ============================================================
+# Configure RMAN Archivelog Deletion Policy
+# ============================================================
+
+log_section "Configuring RMAN Archivelog Deletion Policy"
+
+log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
+log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
+
+"$ORACLE_HOME/bin/rman" target / <<EOF
+CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
+EXIT;
+EOF
+
+log_info "RMAN archivelog deletion policy configured"
+
+# ============================================================
 # Verify Network Connectivity to Standby
 # ============================================================
 
