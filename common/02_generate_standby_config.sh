@@ -381,6 +381,36 @@ EOF
 log_info "Listener entries written to: $LISTENER_FILE"
 
 # ============================================================
+# Generate Listener Entry for Primary
+# ============================================================
+
+log_section "Generating Listener Configuration for Primary"
+
+# Include primary DB_UNIQUE_NAME in filename
+LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${DB_UNIQUE_NAME}.ora"
+
+cat > "$LISTENER_PRIMARY_FILE" <<EOF
+# ============================================================
+# Oracle Data Guard Listener Entry for Primary
+# Generated: $(date)
+# Add this SID_LIST entry to listener.ora on PRIMARY server
+# Static registration ensures connectivity during switchover
+# ============================================================
+
+# Add this to your existing SID_LIST_LISTENER or create new:
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${PRIMARY_ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+  )
+EOF
+
+log_info "Primary listener entries written to: $LISTENER_PRIMARY_FILE"
+
+# ============================================================
 # Generate Data Guard Broker Configuration Script
 # ============================================================
 
@@ -457,11 +487,12 @@ echo ""
 echo "================================================================"
 echo ""
 echo "Generated Files:"
-echo "  - Standby config:    $STANDBY_CONFIG_FILE"
-echo "  - Standby pfile:     $STANDBY_PFILE"
-echo "  - TNS entries:       $TNSNAMES_FILE"
-echo "  - Listener config:   $LISTENER_FILE"
-echo "  - DGMGRL script:     $DGMGRL_SCRIPT"
+echo "  - Standby config:      $STANDBY_CONFIG_FILE"
+echo "  - Standby pfile:       $STANDBY_PFILE"
+echo "  - TNS entries:         $TNSNAMES_FILE"
+echo "  - Standby listener:    $LISTENER_FILE"
+echo "  - Primary listener:    $LISTENER_PRIMARY_FILE"
+echo "  - DGMGRL script:       $DGMGRL_SCRIPT"
 echo ""
 echo "================================================================"
 

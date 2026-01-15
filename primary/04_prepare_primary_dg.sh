@@ -100,6 +100,94 @@ else
 fi
 
 # ============================================================
+# Configure Listener on Primary
+# ============================================================
+
+log_section "Configuring Listener on Primary"
+
+LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
+LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${PRIMARY_DB_UNIQUE_NAME}.ora"
+
+# New SID_DESC entry to add - write to temp file for AIX compatibility
+TEMP_SID_DESC=$(mktemp)
+cat > "$TEMP_SID_DESC" <<EOF
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+EOF
+
+# Check if listener.ora exists
+if [[ -f "$LISTENER_ORA" ]]; then
+    backup_file "$LISTENER_ORA"
+
+    # Check if SID_LIST already contains our entry
+    if grep -q "SID_NAME.*=.*${PRIMARY_ORACLE_SID}[^A-Za-z0-9_]" "$LISTENER_ORA" || \
+       grep -q "SID_NAME.*=.*${PRIMARY_ORACLE_SID}$" "$LISTENER_ORA"; then
+        log_info "Listener entry for $PRIMARY_ORACLE_SID already exists"
+        log_info "Skipping listener configuration"
+    elif grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
+        # Use the add_sid_to_listener function from dg_functions.sh
+        log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
+        if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
+            log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
+        else
+            log_warn "Could not auto-insert SID_DESC entry"
+            log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
+            echo ""
+            cat "$TEMP_SID_DESC"
+            echo ""
+        fi
+    else
+        # Append new SID_LIST_LISTENER section
+        log_info "Adding SID_LIST_LISTENER to listener.ora"
+        cat >> "$LISTENER_ORA" <<EOF
+
+# Data Guard primary static registration - Added $(date)
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+  )
+EOF
+        log_info "Listener entry added successfully"
+    fi
+else
+    # Create new listener.ora
+    log_info "Creating new listener.ora"
+    cat > "$LISTENER_ORA" <<EOF
+# Listener configuration for Data Guard primary
+# Created: $(date)
+
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = ${PRIMARY_HOSTNAME})(PORT = ${PRIMARY_LISTENER_PORT}))
+    )
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
+      (ORACLE_HOME = ${ORACLE_HOME})
+      (SID_NAME = ${PRIMARY_ORACLE_SID})
+    )
+  )
+EOF
+    log_info "listener.ora created successfully"
+fi
+
+rm -f "$TEMP_SID_DESC"
+
+log_info "Listener configuration updated (changes will take effect on next listener reload)"
+log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl reload"
+
+# ============================================================
 # Check/Enable Force Logging
 # ============================================================
 
@@ -318,6 +406,7 @@ echo ""
 echo "COMPLETED ACTIONS:"
 echo "=================="
 echo "  - Configured tnsnames.ora with standby entry"
+echo "  - Configured listener.ora with static registration (NOT restarted)"
 echo "  - Enabled FORCE LOGGING (if needed)"
 echo "  - Created standby redo logs (if needed)"
 echo "  - Enabled DG_BROKER_START=TRUE"
