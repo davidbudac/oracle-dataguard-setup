@@ -100,6 +100,7 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 | 5 | STANDBY | `./standby/05_clone_standby.sh` |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
+| 8 | PRIMARY | `./primary/08_security_hardening.sh` (Optional) |
 
 ---
 
@@ -232,6 +233,26 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 - MRP status: APPLYING_LOG
 - Archive gaps: 0
 - Broker status: SUCCESS
+
+---
+
+## Step 8: Security Hardening (Optional)
+
+**Server:** PRIMARY
+
+```bash
+./primary/08_security_hardening.sh
+```
+
+**Actions:**
+- Changes SYS password to a random value (not stored anywhere)
+- Locks the SYS account
+
+**After running this script:**
+- Use OS authentication `/ as sysdba` for all DBA connections
+- Data Guard redo transport continues to work (uses password file)
+
+**Note:** This step is optional but recommended for production environments.
 
 ---
 
