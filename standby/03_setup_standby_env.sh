@@ -245,7 +245,7 @@ if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
     exit 1
 fi
 
-# New SID_DESC entry to add - write to temp file for AIX awk compatibility
+# New SID_DESC entry to add - write to temp file for AIX compatibility
 TEMP_SID_DESC=$(mktemp)
 cat > "$TEMP_SID_DESC" <<EOF
     (SID_DESC =
@@ -264,65 +264,22 @@ if [[ -f "$LISTENER_ORA" ]]; then
        grep -q "SID_NAME.*=.*${STANDBY_ORACLE_SID}$" "$LISTENER_ORA"; then
         log_warn "Listener entry for $STANDBY_ORACLE_SID already exists"
         log_info "Skipping listener configuration"
-        rm -f "$TEMP_SID_DESC"
-    else
-        # Check if SID_LIST_LISTENER exists
-        if grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
-            log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
-
-            # Create a temporary file with the new entry inserted
-            TEMP_LISTENER=$(mktemp)
-
-            # AIX-compatible: use awk to find insertion point, then use sed/cat
-            # Find the line number of the last closing paren of SID_LIST_LISTENER
-            INSERT_LINE=$(awk '
-            BEGIN { in_sid_list = 0; paren_count = 0; insert_line = 0 }
-            /SID_LIST_LISTENER/ { in_sid_list = 1 }
-            {
-                if (in_sid_list) {
-                    for (i = 1; i <= length($0); i++) {
-                        c = substr($0, i, 1)
-                        if (c == "(") paren_count++
-                        if (c == ")") paren_count--
-                    }
-                    if (paren_count == 0 && in_sid_list) {
-                        insert_line = NR
-                        in_sid_list = 0
-                    }
-                }
-            }
-            END { print insert_line }
-            ' "$LISTENER_ORA")
-
-            if [[ "$INSERT_LINE" -gt 0 ]]; then
-                # Insert the new SID_DESC before the closing line
-                head -n $((INSERT_LINE - 1)) "$LISTENER_ORA" > "$TEMP_LISTENER"
-                cat "$TEMP_SID_DESC" >> "$TEMP_LISTENER"
-                tail -n +${INSERT_LINE} "$LISTENER_ORA" >> "$TEMP_LISTENER"
-
-                # Verify the insertion worked
-                if grep -q "SID_NAME.*=.*${STANDBY_ORACLE_SID}" "$TEMP_LISTENER"; then
-                    mv "$TEMP_LISTENER" "$LISTENER_ORA"
-                    log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
-                else
-                    rm -f "$TEMP_LISTENER"
-                    log_warn "Could not auto-insert SID_DESC entry"
-                    log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
-                    echo ""
-                    cat "$TEMP_SID_DESC"
-                    echo ""
-                fi
-            else
-                log_warn "Could not find SID_LIST_LISTENER closing bracket"
-                log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
-                echo ""
-                cat "$TEMP_SID_DESC"
-                echo ""
-            fi
+    elif grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
+        # Use the add_sid_to_listener function from dg_functions.sh
+        log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
+        if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
+            log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
         else
-            # Append new SID_LIST_LISTENER section
-            log_info "Adding SID_LIST_LISTENER to listener.ora"
-            cat >> "$LISTENER_ORA" <<EOF
+            log_warn "Could not auto-insert SID_DESC entry"
+            log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
+            echo ""
+            cat "$TEMP_SID_DESC"
+            echo ""
+        fi
+    else
+        # Append new SID_LIST_LISTENER section
+        log_info "Adding SID_LIST_LISTENER to listener.ora"
+        cat >> "$LISTENER_ORA" <<EOF
 
 # Data Guard standby static registration - Added $(date)
 SID_LIST_LISTENER =
@@ -334,9 +291,7 @@ SID_LIST_LISTENER =
     )
   )
 EOF
-            log_info "Listener entry added successfully"
-        fi
-        rm -f "$TEMP_SID_DESC"
+        log_info "Listener entry added successfully"
     fi
 else
     # Create new listener.ora
@@ -362,8 +317,9 @@ SID_LIST_LISTENER =
   )
 EOF
     log_info "listener.ora created successfully"
-    rm -f "$TEMP_SID_DESC"
 fi
+
+rm -f "$TEMP_SID_DESC"
 
 # ============================================================
 # Configure TNS Names

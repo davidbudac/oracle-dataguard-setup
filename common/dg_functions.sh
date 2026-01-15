@@ -256,6 +256,102 @@ tnsping_test() {
 }
 
 # ============================================================
+# Listener Configuration Functions
+# ============================================================
+
+# Add a SID_DESC entry to an existing SID_LIST_LISTENER block
+# Usage: add_sid_to_listener <listener.ora> <sid_desc_file>
+# Returns: 0 on success, 1 on failure
+# Output: Modified listener.ora (original backed up)
+#
+# Example sid_desc_file contents:
+#     (SID_DESC =
+#       (GLOBAL_DBNAME = MYDB)
+#       (ORACLE_HOME = /u01/app/oracle/product/19.0.0/dbhome_1)
+#       (SID_NAME = MYDB)
+#     )
+#
+add_sid_to_listener() {
+    local listener_file="$1"
+    local sid_desc_file="$2"
+
+    if [[ ! -f "$listener_file" ]]; then
+        echo "ERROR: Listener file not found: $listener_file" >&2
+        return 1
+    fi
+
+    if [[ ! -f "$sid_desc_file" ]]; then
+        echo "ERROR: SID_DESC file not found: $sid_desc_file" >&2
+        return 1
+    fi
+
+    if ! grep -q "SID_LIST_LISTENER" "$listener_file"; then
+        echo "ERROR: SID_LIST_LISTENER not found in $listener_file" >&2
+        return 1
+    fi
+
+    # Find the insertion point: the line where SID_LIST closes
+    # Structure (typical):
+    #   SID_LIST_LISTENER =
+    #     (SID_LIST =           <- paren_count becomes 1 after (
+    #       (SID_DESC = ...)    <- paren_count goes to 2, back to 1
+    #     )                     <- INSERT BEFORE THIS (paren_count goes from 1 to 0)
+    #
+    # We want to insert BEFORE the line where paren_count drops to 0
+
+    local insert_line
+    insert_line=$(awk '
+    BEGIN {
+        in_sid_list_listener = 0
+        paren_count = 0
+        found_line = 0
+    }
+    /SID_LIST_LISTENER/ {
+        in_sid_list_listener = 1
+    }
+    in_sid_list_listener && !found_line {
+        # Count parens on this line
+        line = $0
+        for (i = 1; i <= length(line); i++) {
+            c = substr(line, i, 1)
+            if (c == "(") {
+                paren_count++
+            }
+            if (c == ")") {
+                paren_count--
+                # When paren_count drops to 0, this line closes SID_LIST
+                # We want to insert BEFORE this line
+                if (paren_count == 0) {
+                    found_line = NR
+                }
+            }
+        }
+    }
+    END {
+        print found_line
+    }
+    ' "$listener_file")
+
+    if [[ -z "$insert_line" || "$insert_line" -eq 0 ]]; then
+        echo "ERROR: Could not find SID_LIST closing bracket" >&2
+        return 1
+    fi
+
+    # Create the new file by inserting sid_desc before the insert_line
+    local temp_file
+    temp_file=$(mktemp)
+
+    head -n $((insert_line - 1)) "$listener_file" > "$temp_file"
+    cat "$sid_desc_file" >> "$temp_file"
+    tail -n "+${insert_line}" "$listener_file" >> "$temp_file"
+
+    # Replace original
+    mv "$temp_file" "$listener_file"
+
+    return 0
+}
+
+# ============================================================
 # User Confirmation
 # ============================================================
 
