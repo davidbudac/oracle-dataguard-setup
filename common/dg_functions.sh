@@ -72,6 +72,17 @@ init_log() {
 }
 
 # ============================================================
+# String Utility Functions
+# ============================================================
+
+# Strip all whitespace (spaces, tabs, newlines) from a string
+# AIX compatible - uses tr with explicit character list
+# Usage: VALUE=$(strip_whitespace "$VALUE")
+strip_whitespace() {
+    echo "$1" | tr -d ' \t\n\r'
+}
+
+# ============================================================
 # Validation Functions
 # ============================================================
 
