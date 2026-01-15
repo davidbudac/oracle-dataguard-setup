@@ -106,8 +106,8 @@ echo "  Protection Mode:    $PROTECTION_MODE"
 echo "  Switchover Status:  $SWITCHOVER_STATUS"
 echo ""
 
-# Validate role
-if [[ "$DB_ROLE" != "PHYSICAL STANDBY" ]]; then
+# Validate role (handle both "PHYSICAL STANDBY" and "PHYSICALSTANDBY" after space removal)
+if [[ "$DB_ROLE" != "PHYSICALSTANDBY" && "$DB_ROLE" != "PHYSICAL STANDBY" ]]; then
     log_error "Database role is not PHYSICAL STANDBY (current: $DB_ROLE)"
     OVERALL_STATUS="ERROR"
     ((ERRORS++))
@@ -115,8 +115,8 @@ else
     log_info "PASS: Database role is PHYSICAL STANDBY"
 fi
 
-# Validate open mode
-if [[ "$OPEN_MODE" != "MOUNTED" && "$OPEN_MODE" != *"READ ONLY"* ]]; then
+# Validate open mode (handle space removal: "READONLY" or "READ ONLY")
+if [[ "$OPEN_MODE" != "MOUNTED" && "$OPEN_MODE" != *"READONLY"* && "$OPEN_MODE" != *"READ ONLY"* ]]; then
     log_warn "Unexpected open mode: $OPEN_MODE"
     ((WARNINGS++))
 else
