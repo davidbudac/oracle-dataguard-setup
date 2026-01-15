@@ -137,8 +137,14 @@ DIRS_TO_CREATE=(
     "${STANDBY_ADMIN_DIR}/pfile"
     "${STANDBY_DATA_PATH}"
     "${STANDBY_REDO_PATH}"
-    "${STANDBY_ARCHIVE_DEST}"
 )
+
+# Add archive destination if configured (may be empty if using FRA)
+if [[ -n "$STANDBY_ARCHIVE_DEST" ]]; then
+    DIRS_TO_CREATE+=("$STANDBY_ARCHIVE_DEST")
+else
+    log_info "STANDBY_ARCHIVE_DEST not set - assuming FRA is used for archive logs"
+fi
 
 # Add FRA if configured
 if [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
@@ -147,6 +153,9 @@ if [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVER
 fi
 
 for dir in "${DIRS_TO_CREATE[@]}"; do
+    # Skip empty entries
+    [[ -z "$dir" ]] && continue
+
     if [[ ! -d "$dir" ]]; then
         log_info "Creating directory: $dir"
         mkdir -p "$dir"
