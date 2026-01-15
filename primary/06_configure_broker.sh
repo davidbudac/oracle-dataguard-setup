@@ -135,6 +135,7 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
     fi
 
     log_info "Removing existing configuration..."
+    log_cmd "dgmgrl /:" "REMOVE CONFIGURATION"
     "$ORACLE_HOME/bin/dgmgrl" -silent / "remove configuration" || true
     log_info "Existing configuration removed"
 fi
@@ -153,6 +154,7 @@ log_info "Standby database: $STANDBY_DB_UNIQUE_NAME"
 
 # Create configuration
 log_info "Creating broker configuration..."
+log_cmd "dgmgrl /:" "CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}'"
 "$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
 CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}';
 EXIT;
@@ -166,6 +168,7 @@ log_info "Configuration created successfully"
 
 # Add standby database
 log_info "Adding standby database to configuration..."
+log_cmd "dgmgrl /:" "ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL"
 "$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
 ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL;
 EXIT;
@@ -184,6 +187,7 @@ log_info "Standby database added successfully"
 log_section "Enabling Data Guard Broker Configuration"
 
 log_info "Enabling configuration..."
+log_cmd "dgmgrl /:" "ENABLE CONFIGURATION"
 "$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
 ENABLE CONFIGURATION;
 EXIT;
@@ -251,6 +255,7 @@ fi
 log_section "Testing Log Shipping"
 
 log_info "Forcing log switch to test redo transport..."
+log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SWITCH LOGFILE"
 run_sql "ALTER SYSTEM SWITCH LOGFILE;"
 
 sleep 5

@@ -198,6 +198,7 @@ FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
 
 if [[ "$FORCE_LOGGING" != "YES" ]]; then
     log_info "Enabling FORCE LOGGING..."
+    log_cmd "sqlplus / as sysdba:" "ALTER DATABASE FORCE LOGGING"
     run_sql "ALTER DATABASE FORCE LOGGING;"
     log_info "FORCE LOGGING enabled"
 else
@@ -240,6 +241,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         STBY_LOG_FILE="${REDO_PATH}standby_redo${NEW_GROUP}.log"
 
         log_info "Creating standby redo log group $NEW_GROUP: $STBY_LOG_FILE"
+        log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
 
         run_sql "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M;"
     done
@@ -266,6 +268,7 @@ log_info "Current DG_BROKER_START: $DG_BROKER_START"
 
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     log_info "Enabling DG_BROKER_START..."
+    log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH"
     run_sql "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;"
     log_info "DG_BROKER_START enabled"
 
@@ -288,6 +291,7 @@ fi
 
 # Set STANDBY_FILE_MANAGEMENT (still needed for automatic file creation)
 log_info "Setting STANDBY_FILE_MANAGEMENT=AUTO..."
+log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH"
 run_sql "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH;"
 
 log_info "Data Guard Broker enabled successfully"

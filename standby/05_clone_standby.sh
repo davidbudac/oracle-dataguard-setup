@@ -164,6 +164,7 @@ EOF
 if echo "$INSTANCE_STATUS" | grep -qE "STARTED|MOUNTED|OPEN"; then
     log_warn "Instance is already running"
     log_info "Shutting down existing instance..."
+    log_cmd "sqlplus / as sysdba:" "SHUTDOWN ABORT"
     sqlplus -s / as sysdba <<EOF
 SHUTDOWN ABORT;
 EXIT;
@@ -171,6 +172,7 @@ EOF
 fi
 
 log_info "Starting instance in NOMOUNT mode..."
+log_cmd "sqlplus / as sysdba:" "STARTUP NOMOUNT PFILE='${PFILE}'"
 sqlplus -s / as sysdba <<EOF
 STARTUP NOMOUNT PFILE='${PFILE}';
 EXIT;
@@ -232,11 +234,18 @@ DUPLICATE TARGET DATABASE
 EOF
 
 log_info "RMAN script created: $RMAN_SCRIPT"
+echo ""
+echo "RMAN Script Contents:"
+echo "---------------------"
+cat "$RMAN_SCRIPT"
+echo "---------------------"
+echo ""
 
 # Execute RMAN
 RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').log"
 
 log_info "Starting RMAN duplicate (logging to: $RMAN_LOG)..."
+log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
 echo ""
 
 "$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
@@ -283,6 +292,7 @@ if [[ -f "$SPFILE" ]]; then
     log_info "SPFILE exists: $SPFILE"
 else
     log_info "Creating SPFILE from PFILE..."
+    log_cmd "sqlplus / as sysdba:" "CREATE SPFILE FROM PFILE='${PFILE}'"
     sqlplus -s / as sysdba <<EOF
 CREATE SPFILE FROM PFILE='${PFILE}';
 EXIT;
@@ -296,6 +306,8 @@ fi
 log_section "Starting Managed Recovery"
 
 log_info "Starting managed recovery process (MRP)..."
+log_cmd "sqlplus / as sysdba:" "ALTER DATABASE MOUNT STANDBY DATABASE"
+log_cmd "sqlplus / as sysdba:" "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION"
 
 sqlplus -s / as sysdba <<EOF
 -- Ensure database is mounted

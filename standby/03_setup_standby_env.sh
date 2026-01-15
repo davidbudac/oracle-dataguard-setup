@@ -204,6 +204,7 @@ if [[ -f "$DEST_PWD_FILE" ]]; then
     backup_file "$DEST_PWD_FILE"
 fi
 
+log_cmd "COMMAND:" "cp $SOURCE_PWD_FILE $DEST_PWD_FILE"
 cp "$SOURCE_PWD_FILE" "$DEST_PWD_FILE"
 chmod 640 "$DEST_PWD_FILE"
 log_info "Password file copied to: $DEST_PWD_FILE"
@@ -227,6 +228,7 @@ if [[ -f "$DEST_PFILE" ]]; then
     backup_file "$DEST_PFILE"
 fi
 
+log_cmd "COMMAND:" "cp $SOURCE_PFILE $DEST_PFILE"
 cp "$SOURCE_PFILE" "$DEST_PFILE"
 chmod 640 "$DEST_PFILE"
 log_info "Parameter file copied to: $DEST_PFILE"
@@ -388,9 +390,11 @@ log_section "Starting Listener"
 # Check if listener is running
 if "$ORACLE_HOME/bin/lsnrctl" status > /dev/null 2>&1; then
     log_info "Listener is running, reloading..."
+    log_cmd "COMMAND:" "lsnrctl reload"
     "$ORACLE_HOME/bin/lsnrctl" reload
 else
     log_info "Starting listener..."
+    log_cmd "COMMAND:" "lsnrctl start"
     "$ORACLE_HOME/bin/lsnrctl" start
 fi
 

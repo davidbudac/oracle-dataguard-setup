@@ -44,6 +44,16 @@ log_section() {
     echo "============================================================" >> "$LOG_FILE" 2>/dev/null
 }
 
+# Log a command that is about to be executed
+# Usage: log_cmd "sqlplus / as sysdba" "STARTUP NOMOUNT PFILE='...'"
+# Or:    log_cmd "COMMAND:" "lsnrctl reload"
+log_cmd() {
+    local prefix="$1"
+    local cmd="$2"
+    printf "${YELLOW}>>> %s${NC} %s\n" "$prefix" "$cmd"
+    echo ">>> $prefix $cmd" >> "$LOG_FILE" 2>/dev/null
+}
+
 # Initialize log file
 init_log() {
     local script_name="$1"
