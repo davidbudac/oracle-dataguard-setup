@@ -181,10 +181,12 @@ prompt_password() {
     local prompt_text="$1"
     local password
 
-    echo -n -e "${YELLOW}${prompt_text}${NC}: "
+    # Output prompt to stderr so it doesn't get captured by $()
+    echo -n -e "${YELLOW}${prompt_text}${NC}: " >&2
     read -s password
-    echo ""
+    echo "" >&2
 
+    # Only the password goes to stdout (gets captured)
     echo "$password"
 }
 
