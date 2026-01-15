@@ -23,6 +23,7 @@ templates/     - Reference templates
 7. `standby/05_clone_standby.sh` - RMAN duplicate (prompts for SYS password)
 8. `primary/06_configure_broker.sh` - Configure DGMGRL
 9. `standby/07_verify_dataguard.sh` - Verify setup
+10. `primary/08_security_hardening.sh` - Lock SYS account (optional)
 
 ## Key Design Decisions
 
