@@ -76,10 +76,10 @@ init_log() {
 # ============================================================
 
 # Strip all whitespace (spaces, tabs, newlines) from a string
-# AIX compatible - uses tr with explicit character list
+# AIX compatible - uses POSIX character class [:space:]
 # Usage: VALUE=$(strip_whitespace "$VALUE")
 strip_whitespace() {
-    echo "$1" | tr -d ' \t\n\r'
+    echo "$1" | tr -d '[:space:]'
 }
 
 # ============================================================
