@@ -253,7 +253,8 @@ fi
 
 # New SID_DESC entries to add - write to temp file for AIX compatibility
 # Includes _DGMGRL service for Data Guard Broker switchover
-TEMP_SID_DESC=$(mktemp)
+# AIX compatible: use $$ (PID) instead of mktemp
+TEMP_SID_DESC="/tmp/dg_sid_desc_standby_$$.tmp"
 cat > "$TEMP_SID_DESC" <<EOF
     (SID_DESC =
       (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})

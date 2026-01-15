@@ -348,8 +348,9 @@ add_sid_to_listener() {
     fi
 
     # Create the new file by inserting sid_desc before the insert_line
+    # AIX compatible: use $$ (PID) instead of mktemp
     local temp_file
-    temp_file=$(mktemp)
+    temp_file="/tmp/dg_listener_edit_$$.tmp"
 
     head -n $((insert_line - 1)) "$listener_file" > "$temp_file"
     cat "$sid_desc_file" >> "$temp_file"
