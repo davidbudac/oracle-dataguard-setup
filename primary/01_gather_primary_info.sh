@@ -216,13 +216,30 @@ log_info "Log mode: $LOG_MODE"
 
 # Get archive destination
 ARCHIVE_DEST=$(get_db_parameter "log_archive_dest_1")
+ARCHIVE_DEST_PATH=""
+USE_FRA_FOR_ARCHIVE="NO"
+
 # Extract just the location part
 if [[ "$ARCHIVE_DEST" == *"LOCATION="* ]]; then
     ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST" | sed 's/.*LOCATION=\([^ ]*\).*/\1/')
-else
-    ARCHIVE_DEST_PATH="$ARCHIVE_DEST"
 fi
-log_info "Archive destination: $ARCHIVE_DEST_PATH"
+
+# If no explicit LOCATION, check if using FRA
+if [[ -z "$ARCHIVE_DEST_PATH" || "$ARCHIVE_DEST" == *"USE_DB_RECOVERY_FILE_DEST"* ]]; then
+    log_info "Archive destination uses Fast Recovery Area (FRA)"
+    USE_FRA_FOR_ARCHIVE="YES"
+    # Get actual FRA path for reference
+    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
+        ARCHIVE_DEST_PATH="${DB_RECOVERY_FILE_DEST}/${DB_UNIQUE_NAME}/archivelog"
+        log_info "FRA archive path: $ARCHIVE_DEST_PATH"
+    fi
+fi
+
+if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
+    log_warn "Could not determine archive destination path"
+    log_warn "Archive logs may be using FRA or a non-standard configuration"
+fi
+log_info "Archive destination: ${ARCHIVE_DEST_PATH:-'(FRA-managed)'}"
 
 # Check Data Guard Broker status
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
@@ -408,6 +425,7 @@ CONTROL_FILES="$CONTROL_FILES"
 # --- Recovery Configuration ---
 DB_RECOVERY_FILE_DEST="$DB_RECOVERY_FILE_DEST"
 DB_RECOVERY_FILE_DEST_SIZE="$DB_RECOVERY_FILE_DEST_SIZE"
+USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"
 
 # --- Redo Log Configuration ---
 REDO_LOG_SIZE_MB="$REDO_LOG_SIZE_MB"

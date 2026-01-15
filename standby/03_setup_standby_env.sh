@@ -165,10 +165,14 @@ else
     log_info "STANDBY_ARCHIVE_DEST not set - assuming FRA is used for archive logs"
 fi
 
-# Add FRA if configured
-if [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
-    STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+# Add FRA if configured (STANDBY_FRA is set in the config when using FRA)
+if [[ -n "$STANDBY_FRA" ]]; then
     DIRS_TO_CREATE+=("$STANDBY_FRA")
+    log_info "Using Fast Recovery Area: $STANDBY_FRA"
+elif [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
+    # Fallback: calculate from DB_RECOVERY_FILE_DEST if STANDBY_FRA not set
+    STANDBY_FRA_CALC=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+    DIRS_TO_CREATE+=("$STANDBY_FRA_CALC")
 fi
 
 for dir in "${DIRS_TO_CREATE[@]}"; do

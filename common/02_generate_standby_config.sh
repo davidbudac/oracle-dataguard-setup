@@ -111,7 +111,24 @@ log_section "Generating Path Conversions"
 # Replace primary DB_UNIQUE_NAME with standby DB_UNIQUE_NAME in paths
 STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
 STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
-STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+
+# Handle archive destination - may use FRA
+if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
+    # Use FRA for archiving on standby
+    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
+        STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+        STANDBY_ARCHIVE_DEST=""  # Will use USE_DB_RECOVERY_FILE_DEST
+        USE_FRA_FOR_STANDBY="YES"
+        log_info "Standby will use FRA for archive logs: $STANDBY_FRA"
+    else
+        log_error "FRA is used for archiving but DB_RECOVERY_FILE_DEST is not set"
+        log_error "Please configure archive destination manually"
+        exit 1
+    fi
+else
+    STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+    USE_FRA_FOR_STANDBY="NO"
+fi
 
 # Generate FILE_NAME_CONVERT parameters
 DB_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}'"
@@ -221,6 +238,9 @@ STANDBY_ARCHIVE_DEST="$STANDBY_ARCHIVE_DEST"
 # --- Recovery Area ---
 DB_RECOVERY_FILE_DEST="$DB_RECOVERY_FILE_DEST"
 DB_RECOVERY_FILE_DEST_SIZE="$DB_RECOVERY_FILE_DEST_SIZE"
+USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"
+USE_FRA_FOR_STANDBY="$USE_FRA_FOR_STANDBY"
+STANDBY_FRA="$STANDBY_FRA"
 
 # --- Redo Log Configuration ---
 REDO_LOG_SIZE_MB="$REDO_LOG_SIZE_MB"
@@ -273,7 +293,13 @@ $(if [[ -n "$DB_DOMAIN" ]]; then echo "*.db_domain='${DB_DOMAIN}'"; fi)
 *.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'
 
 # --- Archive Log Destination (local only) ---
-*.log_archive_dest_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'
+$(if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
+echo "*.log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
+echo "*.db_recovery_file_dest='${STANDBY_FRA}'"
+echo "*.db_recovery_file_dest_size=${DB_RECOVERY_FILE_DEST_SIZE}"
+else
+echo "*.log_archive_dest_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
+fi)
 *.log_archive_dest_state_1=ENABLE
 *.log_archive_format='%t_%s_%r.arc'
 
