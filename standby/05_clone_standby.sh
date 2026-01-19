@@ -243,14 +243,15 @@ log_info "Starting RMAN duplicate (logging to: $RMAN_LOG)..."
 log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
 echo ""
 
+# Use tee to display output on screen AND write to log file
+# PIPESTATUS[0] captures RMAN's exit code (not tee's)
 "$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
-    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" \
-    LOG "$RMAN_LOG" <<EOF
+    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" <<EOF 2>&1 | tee "$RMAN_LOG"
 @${RMAN_SCRIPT}
 EXIT;
 EOF
 
-RMAN_EXIT_CODE=$?
+RMAN_EXIT_CODE=${PIPESTATUS[0]}
 
 # Clear password from memory
 SYS_PASSWORD=""
