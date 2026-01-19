@@ -48,6 +48,7 @@ dataguard_setup/
 │   └── 02_mount_nfs_client.sh         # Mount NFS share on client
 ├── primary/
 │   ├── 01_gather_primary_info.sh      # Collect DB info from primary
+│   ├── 02_generate_standby_config.sh  # Generate standby configuration
 │   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
 │   └── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
 ├── standby/
@@ -55,7 +56,6 @@ dataguard_setup/
 │   ├── 05_clone_standby.sh            # RMAN duplicate execution
 │   └── 07_verify_dataguard.sh         # Validation and health check
 ├── common/
-│   ├── 02_generate_standby_config.sh  # Generate standby configuration
 │   └── dg_functions.sh                # Shared utility functions
 └── templates/
     ├── init_standby.ora.template      # Reference template
@@ -67,15 +67,17 @@ dataguard_setup/
 
 ### Execution Order
 
-| Step | Server | Command |
-|------|--------|---------|
-| 1 | PRIMARY | `./primary/01_gather_primary_info.sh` |
-| 2 | PRIMARY | `./common/02_generate_standby_config.sh` |
-| 3 | STANDBY | `./standby/03_setup_standby_env.sh` |
-| 4 | PRIMARY | `./primary/04_prepare_primary_dg.sh` |
-| 5 | STANDBY | `./standby/05_clone_standby.sh` |
-| 6 | PRIMARY | `./primary/06_configure_broker.sh` |
-| 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
+| Step | Server | Command | Restartable |
+|------|--------|---------|-------------|
+| 1 | PRIMARY | `./primary/01_gather_primary_info.sh` | Yes |
+| 2 | PRIMARY | `./primary/02_generate_standby_config.sh` | Yes |
+| 3 | STANDBY | `./standby/03_setup_standby_env.sh` | Yes |
+| 4 | PRIMARY | `./primary/04_prepare_primary_dg.sh` | Yes |
+| 5 | STANDBY | `./standby/05_clone_standby.sh` | No* |
+| 6 | PRIMARY | `./primary/06_configure_broker.sh` | Yes |
+| 7 | STANDBY | `./standby/07_verify_dataguard.sh` | Yes |
+
+**\*** Step 5 requires cleanup before restart (see [Restartability](#restartability)).
 
 ### Workflow Diagram
 
@@ -97,6 +99,17 @@ Step 6: Configure Broker ◄─────────────────�
     │
     └────────────────────────────────────► Step 7: Verify Setup
 ```
+
+### Restartability
+
+**Steps 1-4 are fully restartable** - these scripts are idempotent and can be re-run from step 1 if needed.
+
+**Step 5 is NOT directly restartable** - once RMAN duplicate starts, cleanup is required:
+1. Shut down standby instance: `SHUTDOWN ABORT`
+2. Remove standby data files, control files, and redo logs
+3. Re-run step 5
+
+**Steps 6-7 are restartable** - broker config can be removed with `REMOVE CONFIGURATION` in DGMGRL.
 
 ## Configuration
 
