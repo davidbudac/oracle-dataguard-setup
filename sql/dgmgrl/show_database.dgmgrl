@@ -1,0 +1,4 @@
+-- Show database details in broker configuration
+-- Usage: dgmgrl @show_database.dgmgrl db_unique_name
+SHOW DATABASE '&1';
+EXIT;

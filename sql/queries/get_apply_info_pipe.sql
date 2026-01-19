@@ -1,0 +1,8 @@
+-- Get apply info as pipe-delimited string (for parsing)
+SET HEADING OFF FEEDBACK OFF LINESIZE 200
+SELECT
+    NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END), 0) || '|' ||
+    NVL(MAX(SEQUENCE#), 0)
+FROM V$ARCHIVED_LOG
+WHERE THREAD# = 1;
+EXIT;

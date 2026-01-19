@@ -1,0 +1,6 @@
+-- Get archive destination 1 status (with headers for display)
+SET LINESIZE 200 PAGESIZE 100
+SELECT DEST_ID, STATUS, DESTINATION
+FROM V$ARCHIVE_DEST
+WHERE DEST_ID = 1;
+EXIT;

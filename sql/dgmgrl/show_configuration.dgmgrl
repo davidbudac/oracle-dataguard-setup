@@ -1,0 +1,3 @@
+-- Show Data Guard Broker configuration
+SHOW CONFIGURATION;
+EXIT;

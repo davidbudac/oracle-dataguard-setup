@@ -1,0 +1,5 @@
+-- Get standby redo log information (with headers for display)
+SET LINESIZE 200 PAGESIZE 100
+SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS
+FROM V$STANDBY_LOG ORDER BY GROUP#;
+EXIT;

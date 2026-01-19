@@ -212,13 +212,13 @@ log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl r
 
 log_section "Checking Force Logging"
 
-FORCE_LOGGING=$(run_sql "SELECT FORCE_LOGGING FROM V\$DATABASE;")
+FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
 FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
 
 if [[ "$FORCE_LOGGING" != "YES" ]]; then
     log_info "Enabling FORCE LOGGING..."
     log_cmd "sqlplus / as sysdba:" "ALTER DATABASE FORCE LOGGING"
-    run_sql "ALTER DATABASE FORCE LOGGING;"
+    run_sql_command "enable_force_logging.sql"
     log_info "FORCE LOGGING enabled"
 else
     log_info "FORCE LOGGING is already enabled"
@@ -231,7 +231,7 @@ fi
 log_section "Checking Standby Redo Logs"
 
 # Get current standby redo log count
-CURRENT_STBY_GROUPS=$(run_sql "SELECT COUNT(DISTINCT GROUP#) FROM V\$STANDBY_LOG;")
+CURRENT_STBY_GROUPS=$(run_sql_query "get_standby_redo_count.sql")
 CURRENT_STBY_GROUPS=$(echo "$CURRENT_STBY_GROUPS" | tr -d ' \n\r')
 
 REQUIRED_STBY_GROUPS=$STANDBY_REDO_GROUPS
@@ -243,11 +243,11 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     log_info "Creating standby redo logs..."
 
     # Get the max group number
-    MAX_GROUP=$(run_sql "SELECT NVL(MAX(GROUP#), 0) FROM (SELECT GROUP# FROM V\$LOG UNION SELECT GROUP# FROM V\$STANDBY_LOG);")
+    MAX_GROUP=$(run_sql_query "get_max_redo_group.sql")
     MAX_GROUP=$(echo "$MAX_GROUP" | tr -d ' \n\r')
 
     # Get redo log path for standby redo logs
-    REDO_PATH=$(run_sql "SELECT SUBSTR(MEMBER, 1, INSTR(MEMBER, '/', -1)) FROM V\$LOGFILE WHERE ROWNUM=1;")
+    REDO_PATH=$(run_sql_query "get_redo_member_path.sql")
     REDO_PATH=$(echo "$REDO_PATH" | tr -d ' \n\r')
 
     # Calculate how many to create
@@ -262,7 +262,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         log_info "Creating standby redo log group $NEW_GROUP: $STBY_LOG_FILE"
         log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
 
-        run_sql "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M;"
+        run_sql_command "add_standby_logfile.sql" "$NEW_GROUP" "$STBY_LOG_FILE" "$REDO_LOG_SIZE_MB"
     done
 
     log_info "Standby redo logs created successfully"
@@ -270,7 +270,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     # Verify
     echo ""
     log_info "Standby redo log configuration:"
-    run_sql_with_header "SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS FROM V\$STANDBY_LOG ORDER BY GROUP#;"
+    run_sql_display "get_standby_redo_info.sql"
 else
     log_info "Sufficient standby redo logs already exist"
 fi
@@ -288,7 +288,7 @@ log_info "Current DG_BROKER_START: $DG_BROKER_START"
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     log_info "Enabling DG_BROKER_START..."
     log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH"
-    run_sql "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH;"
+    run_sql_command "set_dg_broker_start.sql"
     log_info "DG_BROKER_START enabled"
 
     # Wait for broker processes to start
@@ -299,7 +299,7 @@ else
 fi
 
 # Verify broker processes are running
-DMON_COUNT=$(run_sql "SELECT COUNT(*) FROM V\$PROCESS WHERE PNAME LIKE 'DMON%';")
+DMON_COUNT=$(run_sql_query "get_dmon_count.sql")
 DMON_COUNT=$(echo "$DMON_COUNT" | tr -d ' \n\r')
 
 if [[ "$DMON_COUNT" -gt 0 ]]; then
@@ -311,7 +311,7 @@ fi
 # Set STANDBY_FILE_MANAGEMENT (still needed for automatic file creation)
 log_info "Setting STANDBY_FILE_MANAGEMENT=AUTO..."
 log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH"
-run_sql "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH;"
+run_sql_command "set_standby_file_mgmt.sql"
 
 log_info "Data Guard Broker enabled successfully"
 log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
@@ -325,10 +325,7 @@ log_section "Configuring RMAN Archivelog Deletion Policy"
 log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
 log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
 
-"$ORACLE_HOME/bin/rman" target / <<EOF
-CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
-EXIT;
-EOF
+run_rman "configure_archivelog_deletion.rman"
 
 log_info "RMAN archivelog deletion policy configured"
 
@@ -403,33 +400,15 @@ log_section "Current Data Guard Configuration"
 
 echo ""
 echo "Data Guard Broker Status:"
-run_sql_with_header "
-SELECT NAME, VALUE
-FROM V\$PARAMETER
-WHERE NAME IN (
-    'dg_broker_start',
-    'dg_broker_config_file1',
-    'dg_broker_config_file2',
-    'standby_file_management'
-)
-ORDER BY NAME;
-"
+run_sql_display "get_dg_params.sql"
 
 echo ""
 echo "Archive Destination 1 (Local):"
-run_sql_with_header "
-SELECT DEST_ID, STATUS, DESTINATION
-FROM V\$ARCHIVE_DEST
-WHERE DEST_ID = 1;
-"
+run_sql_display "get_archive_dest_1_status.sql"
 
 echo ""
 echo "Standby Redo Logs:"
-run_sql_with_header "
-SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS
-FROM V\$STANDBY_LOG
-ORDER BY GROUP#;
-"
+run_sql_display "get_standby_redo_info.sql"
 
 echo ""
 echo "Note: LOG_ARCHIVE_DEST_2 and other DG parameters will be"

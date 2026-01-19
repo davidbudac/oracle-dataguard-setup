@@ -13,6 +13,12 @@ NC='\033[0m' # No Color
 # NFS share path for file exchange
 NFS_SHARE="/OINSTALL/_dataguard_setup"
 
+# Get the directory where this script is located
+DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# SQL scripts directory (relative to project root)
+SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
+
 # ============================================================
 # Logging Functions
 # ============================================================
@@ -141,12 +147,7 @@ check_db_connection() {
     log_info "Checking database connection..."
 
     local result
-    result=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
-SELECT 'CONNECTED' FROM DUAL;
-EXIT;
-EOF
-)
+    result=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/check_connection.sql")
 
     if echo "$result" | grep -q "CONNECTED"; then
         log_info "Successfully connected to database"
@@ -162,36 +163,104 @@ EOF
 # SQL Execution Functions
 # ============================================================
 
-run_sql() {
-    local sql="$1"
-    sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
-$sql
-EXIT;
-EOF
+# Run a SQL script file
+# Usage: run_sql_script <script_path> [arg1] [arg2] ...
+run_sql_script() {
+    local script="$1"
+    shift
+    sqlplus -s / as sysdba @"$script" "$@"
 }
 
-run_sql_with_header() {
-    local sql="$1"
-    sqlplus -s / as sysdba <<EOF
-SET LINESIZE 200 PAGESIZE 100
-$sql
-EXIT;
-EOF
+# Run a SQL query script and return clean output
+# Usage: run_sql_query <script_name> [arg1] [arg2] ...
+# Note: script_name is relative to $SQL_DIR/queries/
+run_sql_query() {
+    local script_name="$1"
+    shift
+    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@"
 }
 
+# Run a SQL command script
+# Usage: run_sql_command <script_name> [arg1] [arg2] ...
+# Note: script_name is relative to $SQL_DIR/commands/
+run_sql_command() {
+    local script_name="$1"
+    shift
+    sqlplus -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@"
+}
+
+# Run a SQL query script with headers (for display)
+# Usage: run_sql_display <script_name> [arg1] [arg2] ...
+run_sql_display() {
+    local script_name="$1"
+    shift
+    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@"
+}
+
+# Get a database parameter value
+# Usage: get_db_parameter <param_name>
 get_db_parameter() {
     local param_name="$1"
     local value
-    value=$(run_sql "SELECT VALUE FROM V\$PARAMETER WHERE NAME='${param_name}';")
+    value=$(run_sql_query "get_db_parameter.sql" "$param_name")
     echo "$value" | tr -d ' \n\r'
 }
 
+# Get a database property value
+# Usage: get_db_property <property_name>
 get_db_property() {
     local prop_name="$1"
     local value
-    value=$(run_sql "SELECT PROPERTY_VALUE FROM DATABASE_PROPERTIES WHERE PROPERTY_NAME='${prop_name}';")
+    value=$(run_sql_query "get_db_property.sql" "$prop_name")
     echo "$value" | tr -d ' \n\r'
+}
+
+# ============================================================
+# RMAN Execution Functions
+# ============================================================
+
+# Run an RMAN script file
+# Usage: run_rman_script <script_path>
+run_rman_script() {
+    local script="$1"
+    "$ORACLE_HOME/bin/rman" target / @"$script"
+}
+
+# Run an RMAN script from the sql/rman directory
+# Usage: run_rman <script_name>
+run_rman() {
+    local script_name="$1"
+    "$ORACLE_HOME/bin/rman" target / @"${SQL_DIR}/rman/${script_name}"
+}
+
+# ============================================================
+# DGMGRL Execution Functions
+# ============================================================
+
+# Run a DGMGRL script file with OS authentication
+# Usage: run_dgmgrl_script <script_path> [arg1] [arg2] ...
+run_dgmgrl_script() {
+    local script="$1"
+    shift
+    "$ORACLE_HOME/bin/dgmgrl" -silent / @"$script" "$@"
+}
+
+# Run a DGMGRL script from the sql/dgmgrl directory
+# Usage: run_dgmgrl <script_name> [arg1] [arg2] ...
+run_dgmgrl() {
+    local script_name="$1"
+    shift
+    "$ORACLE_HOME/bin/dgmgrl" -silent / @"${SQL_DIR}/dgmgrl/${script_name}" "$@"
+}
+
+# Run a DGMGRL script with password authentication
+# Usage: run_dgmgrl_with_password <password> <tns_alias> <script_name> [arg1] [arg2] ...
+run_dgmgrl_with_password() {
+    local password="$1"
+    local tns_alias="$2"
+    local script_name="$3"
+    shift 3
+    "$ORACLE_HOME/bin/dgmgrl" -silent "sys/${password}@${tns_alias}" @"${SQL_DIR}/dgmgrl/${script_name}" "$@"
 }
 
 # ============================================================
@@ -216,12 +285,7 @@ verify_sys_password() {
     local tns_alias="$2"
 
     local result
-    result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" <<EOF 2>&1
-SET HEADING OFF FEEDBACK OFF
-SELECT 'CONNECTED' FROM DUAL;
-EXIT;
-EOF
-)
+    result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" @"${SQL_DIR}/queries/check_connection.sql" 2>&1)
 
     if echo "$result" | grep -q "CONNECTED"; then
         return 0

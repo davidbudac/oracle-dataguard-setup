@@ -154,37 +154,21 @@ log_info "Password verified successfully"
 log_section "Starting Standby Instance"
 
 # Check if instance is already running
-INSTANCE_STATUS=$(sqlplus -s / as sysdba <<EOF 2>&1
-SET HEADING OFF FEEDBACK OFF
-SELECT STATUS FROM V\$INSTANCE;
-EXIT;
-EOF
-)
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>&1)
 
 if echo "$INSTANCE_STATUS" | grep -qE "STARTED|MOUNTED|OPEN"; then
     log_warn "Instance is already running"
     log_info "Shutting down existing instance..."
     log_cmd "sqlplus / as sysdba:" "SHUTDOWN ABORT"
-    sqlplus -s / as sysdba <<EOF
-SHUTDOWN ABORT;
-EXIT;
-EOF
+    run_sql_command "shutdown_abort.sql"
 fi
 
 log_info "Starting instance in NOMOUNT mode..."
 log_cmd "sqlplus / as sysdba:" "STARTUP NOMOUNT PFILE='${PFILE}'"
-sqlplus -s / as sysdba <<EOF
-STARTUP NOMOUNT PFILE='${PFILE}';
-EXIT;
-EOF
+run_sql_command "startup_nomount.sql" "$PFILE"
 
 # Verify NOMOUNT state
-INSTANCE_STATUS=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT STATUS FROM V\$INSTANCE;
-EXIT;
-EOF
-)
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
 INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
 
 if [[ "$INSTANCE_STATUS" != "STARTED" ]]; then
@@ -286,12 +270,7 @@ log_info "RMAN duplicate completed successfully"
 log_section "Finalizing Instance Configuration"
 
 # Check if we're mounted
-INSTANCE_STATUS=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT STATUS FROM V\$INSTANCE;
-EXIT;
-EOF
-)
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
 INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
 
 log_info "Current instance status: $INSTANCE_STATUS"
@@ -304,10 +283,7 @@ if [[ -f "$SPFILE" ]]; then
 else
     log_info "Creating SPFILE from PFILE..."
     log_cmd "sqlplus / as sysdba:" "CREATE SPFILE FROM PFILE='${PFILE}'"
-    sqlplus -s / as sysdba <<EOF
-CREATE SPFILE FROM PFILE='${PFILE}';
-EXIT;
-EOF
+    run_sql_command "create_spfile.sql" "$PFILE"
 fi
 
 # ============================================================
@@ -320,24 +296,13 @@ log_info "Starting managed recovery process (MRP)..."
 log_cmd "sqlplus / as sysdba:" "ALTER DATABASE MOUNT STANDBY DATABASE"
 log_cmd "sqlplus / as sysdba:" "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION"
 
-sqlplus -s / as sysdba <<EOF
--- Ensure database is mounted
-ALTER DATABASE MOUNT STANDBY DATABASE;
-
--- Start managed recovery with real-time apply
-ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;
-EXIT;
-EOF
+run_sql_command "mount_standby.sql"
+run_sql_command "start_mrp.sql"
 
 # Verify MRP is running
 sleep 5
 
-MRP_STATUS=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT PROCESS || ':' || STATUS FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
-EXIT;
-EOF
-)
+MRP_STATUS=$(run_sql_query "get_mrp_status.sql")
 
 if echo "$MRP_STATUS" | grep -q "MRP0"; then
     log_info "Managed Recovery Process (MRP) is running"
@@ -355,33 +320,15 @@ log_section "Standby Database Status"
 
 echo ""
 echo "Database Role and Status:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-SELECT DATABASE_ROLE, OPEN_MODE, PROTECTION_MODE, SWITCHOVER_STATUS
-FROM V\$DATABASE;
-EXIT;
-EOF
+run_sql_display "get_db_status.sql"
 
 echo ""
 echo "Managed Standby Processes:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-SELECT PROCESS, STATUS, THREAD#, SEQUENCE#, BLOCK#
-FROM V\$MANAGED_STANDBY
-ORDER BY PROCESS;
-EXIT;
-EOF
+run_sql_display "get_managed_standby_procs.sql"
 
 echo ""
 echo "Archive Log Apply Status:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-SELECT THREAD#, MAX(SEQUENCE#) AS LAST_APPLIED
-FROM V\$ARCHIVED_LOG
-WHERE APPLIED = 'YES'
-GROUP BY THREAD#;
-EXIT;
-EOF
+run_sql_display "get_archive_apply_status.sql"
 
 # ============================================================
 # Configure RMAN Archivelog Deletion Policy
@@ -392,10 +339,7 @@ log_section "Configuring RMAN Archivelog Deletion Policy"
 log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
 log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
 
-"$ORACLE_HOME/bin/rman" target / <<EOF
-CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
-EXIT;
-EOF
+run_rman "configure_archivelog_deletion.rman"
 
 log_info "RMAN archivelog deletion policy configured"
 

@@ -1,0 +1,4 @@
+-- Create Data Guard Broker configuration
+-- Usage: dgmgrl @create_configuration.dgmgrl config_name primary_db primary_tns
+CREATE CONFIGURATION '&1' AS PRIMARY DATABASE IS '&2' CONNECT IDENTIFIER IS '&3';
+EXIT;

@@ -98,13 +98,7 @@ ERRORS=0
 
 log_section "Database Role and Status"
 
-DB_INFO=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF LINESIZE 200
-SELECT DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS
-FROM V\$DATABASE;
-EXIT;
-EOF
-)
+DB_INFO=$(run_sql_query "get_db_status_pipe.sql")
 DB_INFO=$(echo "$DB_INFO" | tr -d ' \n\r')
 
 # AIX-compatible: use awk instead of here-strings
@@ -144,14 +138,7 @@ fi
 
 log_section "Managed Recovery Process (MRP)"
 
-MRP_INFO=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF LINESIZE 200
-SELECT PROCESS || '|' || STATUS || '|' || NVL(TO_CHAR(SEQUENCE#), 'N/A')
-FROM V\$MANAGED_STANDBY
-WHERE PROCESS = 'MRP0';
-EXIT;
-EOF
-)
+MRP_INFO=$(run_sql_query "get_mrp_info_pipe.sql")
 
 if [[ -z "$MRP_INFO" || "$MRP_INFO" == *"no rows"* ]]; then
     log_error "Managed Recovery Process (MRP0) is NOT running"
@@ -182,17 +169,7 @@ fi
 # Show all managed standby processes
 echo ""
 echo "All Managed Standby Processes:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-COLUMN PROCESS FORMAT A10
-COLUMN STATUS FORMAT A15
-COLUMN SEQUENCE# FORMAT 999999
-COLUMN BLOCK# FORMAT 9999999
-SELECT PROCESS, STATUS, THREAD#, SEQUENCE#, BLOCK#
-FROM V\$MANAGED_STANDBY
-ORDER BY PROCESS;
-EXIT;
-EOF
+run_sql_display "get_managed_standby_procs.sql"
 
 # ============================================================
 # Check Archive Log Gap
@@ -200,24 +177,14 @@ EOF
 
 log_section "Archive Log Gap Analysis"
 
-GAP_INFO=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT COUNT(*) FROM V\$ARCHIVE_GAP;
-EXIT;
-EOF
-)
+GAP_INFO=$(run_sql_query "get_archive_gap_count.sql")
 GAP_COUNT=$(echo "$GAP_INFO" | tr -d ' \n\r')
 
 if [[ "$GAP_COUNT" -gt 0 ]]; then
     log_error "ARCHIVE GAP DETECTED: $GAP_COUNT gap(s) found"
     echo ""
     echo "Gap Details:"
-    sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-SELECT THREAD#, LOW_SEQUENCE#, HIGH_SEQUENCE#
-FROM V\$ARCHIVE_GAP;
-EXIT;
-EOF
+    run_sql_display "get_archive_gap_details.sql"
     OVERALL_STATUS="ERROR"
     ((ERRORS++))
 else
@@ -231,16 +198,7 @@ fi
 log_section "Archive Log Apply Status"
 
 # Get last received and applied sequence
-APPLY_INFO=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF LINESIZE 200
-SELECT
-    NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END), 0) || '|' ||
-    NVL(MAX(SEQUENCE#), 0)
-FROM V\$ARCHIVED_LOG
-WHERE THREAD# = 1;
-EXIT;
-EOF
-)
+APPLY_INFO=$(run_sql_query "get_apply_info_pipe.sql")
 
 # AIX-compatible: use awk instead of here-strings
 APPLY_INFO_CLEAN=$(echo "$APPLY_INFO" | tr -d ' \n\r')
@@ -278,29 +236,20 @@ log_section "Data Guard Broker Configuration"
 
 echo ""
 echo "Broker Configuration Status:"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
-SHOW CONFIGURATION;
-EOF
+run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true
 
 echo ""
 echo "Primary Database Status:"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
-SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}';
-EOF
+run_dgmgrl "show_database.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" 2>&1 || true
 
 echo ""
 echo "Standby Database Status:"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
-SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
-EOF
+run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" 2>&1 || true
 
 echo ""
 echo "Network Configuration Validation:"
 if [[ -n "$SYS_PASSWORD" ]]; then
-    "$ORACLE_HOME/bin/dgmgrl" -silent <<EOF 2>&1 || true
-CONNECT sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS};
-VALIDATE NETWORK CONFIGURATION FOR ALL;
-EOF
+    run_dgmgrl_with_password "$SYS_PASSWORD" "$STANDBY_TNS_ALIAS" "validate_network.dgmgrl" 2>&1 || true
 else
     log_warn "Skipping network validation (no SYS password provided)"
 fi
@@ -313,23 +262,7 @@ log_section "Data Guard Parameters"
 
 echo ""
 echo "Key Data Guard Parameters:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 200 PAGESIZE 50
-COLUMN NAME FORMAT A30
-COLUMN VALUE FORMAT A100
-SELECT NAME, VALUE
-FROM V\$PARAMETER
-WHERE NAME IN (
-    'db_name',
-    'db_unique_name',
-    'dg_broker_start',
-    'log_archive_dest_1',
-    'log_archive_dest_2',
-    'standby_file_management'
-)
-ORDER BY NAME;
-EXIT;
-EOF
+run_sql_display "get_dg_params_full.sql"
 
 # ============================================================
 # Check Archive Destination Status
@@ -339,33 +272,15 @@ log_section "Archive Destination Status"
 
 echo ""
 echo "Archive Destination Configuration:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 200 PAGESIZE 50
-COLUMN DEST_NAME FORMAT A20
-COLUMN STATUS FORMAT A10
-COLUMN DESTINATION FORMAT A60
-SELECT DEST_ID, DEST_NAME, STATUS, TARGET, DESTINATION
-FROM V\$ARCHIVE_DEST
-WHERE DEST_ID IN (1, 2);
-EXIT;
-EOF
+run_sql_display "get_archive_dest_config.sql"
 
 # Check for errors in archive destinations
-DEST_ERRORS=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT COUNT(*) FROM V\$ARCHIVE_DEST WHERE STATUS = 'ERROR' AND DEST_ID IN (1,2);
-EXIT;
-EOF
-)
+DEST_ERRORS=$(run_sql_query "get_archive_dest_error_count.sql")
 DEST_ERROR_COUNT=$(echo "$DEST_ERRORS" | tr -d ' \n\r')
 
 if [[ "$DEST_ERROR_COUNT" -gt 0 ]]; then
     log_error "Archive destination error detected"
-    sqlplus -s / as sysdba <<EOF
-SET LINESIZE 200 PAGESIZE 50
-SELECT DEST_ID, ERROR FROM V\$ARCHIVE_DEST WHERE STATUS = 'ERROR';
-EXIT;
-EOF
+    run_sql_display "get_archive_dest_errors.sql"
     OVERALL_STATUS="ERROR"
     ((ERRORS++))
 fi
@@ -378,13 +293,7 @@ log_section "Redo Log Configuration"
 
 echo ""
 echo "Standby Redo Logs:"
-sqlplus -s / as sysdba <<EOF
-SET LINESIZE 150 PAGESIZE 50
-SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS, ARCHIVED
-FROM V\$STANDBY_LOG
-ORDER BY GROUP#;
-EXIT;
-EOF
+run_sql_display "get_standby_redo_full.sql"
 
 # ============================================================
 # Network Connectivity Check

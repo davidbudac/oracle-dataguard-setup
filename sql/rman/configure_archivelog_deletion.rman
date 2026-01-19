@@ -1,0 +1,4 @@
+# Configure RMAN archivelog deletion policy
+# This ensures archive logs are not deleted until shipped to all standby databases
+CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
+EXIT;

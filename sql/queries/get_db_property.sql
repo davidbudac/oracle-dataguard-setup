@@ -1,0 +1,5 @@
+-- Get database property value by name
+-- Usage: sqlplus @get_db_property.sql property_name
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT PROPERTY_VALUE FROM DATABASE_PROPERTIES WHERE PROPERTY_NAME = '&1';
+EXIT;

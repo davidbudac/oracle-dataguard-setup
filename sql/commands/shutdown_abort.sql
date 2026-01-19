@@ -1,0 +1,4 @@
+-- Shutdown database with abort
+SET HEADING OFF FEEDBACK ON VERIFY OFF
+SHUTDOWN ABORT;
+EXIT;

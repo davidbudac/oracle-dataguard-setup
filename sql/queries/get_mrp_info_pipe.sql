@@ -1,0 +1,6 @@
+-- Get MRP info as pipe-delimited string (for parsing)
+SET HEADING OFF FEEDBACK OFF LINESIZE 200
+SELECT PROCESS || '|' || STATUS || '|' || NVL(TO_CHAR(SEQUENCE#), 'N/A')
+FROM V$MANAGED_STANDBY
+WHERE PROCESS = 'MRP0';
+EXIT;

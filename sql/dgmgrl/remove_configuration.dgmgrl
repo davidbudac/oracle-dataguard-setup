@@ -1,0 +1,3 @@
+-- Remove Data Guard Broker configuration
+REMOVE CONFIGURATION;
+EXIT;

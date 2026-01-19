@@ -1,0 +1,4 @@
+-- Add standby database to broker configuration
+-- Usage: dgmgrl @add_database.dgmgrl standby_db standby_tns
+ADD DATABASE '&1' AS CONNECT IDENTIFIER IS '&2' MAINTAINED AS PHYSICAL;
+EXIT;

@@ -1,0 +1,5 @@
+-- Show log transport status for database
+-- Usage: dgmgrl @show_log_status.dgmgrl db_unique_name
+SHOW DATABASE '&1' 'InconsistentProperties';
+SHOW DATABASE '&1' 'LogXptStatus';
+EXIT;

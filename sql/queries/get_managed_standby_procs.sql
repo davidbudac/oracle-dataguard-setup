@@ -1,0 +1,6 @@
+-- Get all managed standby processes (with headers for display)
+SET LINESIZE 150 PAGESIZE 50
+SELECT PROCESS, STATUS, THREAD#, SEQUENCE#, BLOCK#
+FROM V$MANAGED_STANDBY
+ORDER BY PROCESS;
+EXIT;

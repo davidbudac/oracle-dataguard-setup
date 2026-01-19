@@ -1,0 +1,5 @@
+-- Get datafile information (with headers for display)
+SET LINESIZE 200 PAGESIZE 100
+SELECT FILE#, BYTES/1024/1024 AS SIZE_MB, NAME
+FROM V$DATAFILE ORDER BY FILE#;
+EXIT;

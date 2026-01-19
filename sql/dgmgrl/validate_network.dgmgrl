@@ -1,0 +1,4 @@
+-- Validate network configuration for all databases
+-- Note: Requires connection with SYS password
+VALIDATE NETWORK CONFIGURATION FOR ALL;
+EXIT;

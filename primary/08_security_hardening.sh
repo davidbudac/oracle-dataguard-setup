@@ -35,7 +35,7 @@ check_oracle_env || exit 1
 check_db_connection || exit 1
 
 # Verify this is the primary database
-DB_ROLE=$(run_sql "SELECT DATABASE_ROLE FROM V\$DATABASE;")
+DB_ROLE=$(run_sql_query "get_db_role.sql")
 DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
@@ -57,7 +57,7 @@ init_log "08_security_hardening_${DB_UNIQUE_NAME}"
 log_section "Verifying Data Guard Configuration"
 
 # Check if broker configuration exists and is healthy
-CONFIG_STATUS=$("$ORACLE_HOME/bin/dgmgrl" -silent / "show configuration" 2>&1 || true)
+CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
 if echo "$CONFIG_STATUS" | grep -q "ORA-16532"; then
     log_error "No Data Guard Broker configuration found"
@@ -116,14 +116,7 @@ log_cmd "sqlplus / as sysdba:" "ALTER USER SYS IDENTIFIED BY '********'"
 log_cmd "sqlplus / as sysdba:" "ALTER USER SYS ACCOUNT LOCK"
 
 # Change SYS password and lock the account
-SECURE_RESULT=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
-ALTER USER SYS IDENTIFIED BY "${RANDOM_PWD}";
-ALTER USER SYS ACCOUNT LOCK;
-SELECT 'SUCCESS' FROM DUAL;
-EXIT;
-EOF
-)
+SECURE_RESULT=$(run_sql_command "secure_sys_account.sql" "$RANDOM_PWD")
 
 # Clear the password variable immediately
 RANDOM_PWD=""
@@ -146,7 +139,7 @@ fi
 log_section "Verifying Security Changes"
 
 # Check account status
-ACCOUNT_STATUS=$(run_sql "SELECT ACCOUNT_STATUS FROM DBA_USERS WHERE USERNAME='SYS';")
+ACCOUNT_STATUS=$(run_sql_query "get_sys_account_status.sql")
 ACCOUNT_STATUS=$(echo "$ACCOUNT_STATUS" | tr -d ' \n\r')
 
 if [[ "$ACCOUNT_STATUS" == *"LOCKED"* ]]; then
@@ -157,12 +150,7 @@ fi
 
 # Verify OS authentication still works
 log_info "Verifying OS authentication..."
-TEST_RESULT=$(sqlplus -s / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF
-SELECT 'OS_AUTH_OK' FROM DUAL;
-EXIT;
-EOF
-)
+TEST_RESULT=$(run_sql_query "check_os_auth.sql")
 
 if echo "$TEST_RESULT" | grep -q "OS_AUTH_OK"; then
     log_info "PASS: OS authentication '/ as sysdba' is working"

@@ -1,0 +1,3 @@
+-- Enable Data Guard Broker configuration
+ENABLE CONFIGURATION;
+EXIT;

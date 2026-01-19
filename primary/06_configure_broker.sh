@@ -81,7 +81,7 @@ if [[ "$DG_BROKER_START" != "TRUE" ]]; then
 fi
 
 # Check DMON process is running
-DMON_COUNT=$(run_sql "SELECT COUNT(*) FROM V\$PROCESS WHERE PNAME LIKE 'DMON%';")
+DMON_COUNT=$(run_sql_query "get_dmon_count.sql")
 DMON_COUNT=$(echo "$DMON_COUNT" | tr -d ' \n\r')
 
 if [[ "$DMON_COUNT" -eq 0 ]]; then
@@ -120,7 +120,7 @@ log_info "tnsping to standby successful"
 log_section "Checking for Existing Broker Configuration"
 
 # Try to connect and check for existing config
-EXISTING_CONFIG=$("$ORACLE_HOME/bin/dgmgrl" -silent / "show configuration" 2>&1 || true)
+EXISTING_CONFIG=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
 if echo "$EXISTING_CONFIG" | grep -q "ORA-16532"; then
     log_info "No existing broker configuration found - proceeding with creation"
@@ -136,7 +136,7 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
 
     log_info "Removing existing configuration..."
     log_cmd "dgmgrl /:" "REMOVE CONFIGURATION"
-    "$ORACLE_HOME/bin/dgmgrl" -silent / "remove configuration" || true
+    run_dgmgrl "remove_configuration.dgmgrl" || true
     log_info "Existing configuration removed"
 fi
 
@@ -155,10 +155,7 @@ log_info "Standby database: $STANDBY_DB_UNIQUE_NAME"
 # Create configuration
 log_info "Creating broker configuration..."
 log_cmd "dgmgrl /:" "CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}'"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}';
-EXIT;
-EOF
+run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"
 
 if [[ $? -ne 0 ]]; then
     log_error "Failed to create broker configuration"
@@ -169,10 +166,7 @@ log_info "Configuration created successfully"
 # Add standby database
 log_info "Adding standby database to configuration..."
 log_cmd "dgmgrl /:" "ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL;
-EXIT;
-EOF
+run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"
 
 if [[ $? -ne 0 ]]; then
     log_error "Failed to add standby database"
@@ -188,10 +182,7 @@ log_section "Enabling Data Guard Broker Configuration"
 
 log_info "Enabling configuration..."
 log_cmd "dgmgrl /:" "ENABLE CONFIGURATION"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-ENABLE CONFIGURATION;
-EXIT;
-EOF
+run_dgmgrl "enable_configuration.dgmgrl"
 
 # Wait for configuration to stabilize
 log_info "Waiting for configuration to stabilize..."
@@ -206,26 +197,17 @@ log_section "Verifying Broker Configuration"
 echo ""
 echo "Data Guard Broker Configuration:"
 echo "================================="
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-SHOW CONFIGURATION;
-EXIT;
-EOF
+run_dgmgrl "show_configuration.dgmgrl"
 
 echo ""
 echo "Primary Database Details:"
 echo "========================="
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}';
-EXIT;
-EOF
+run_dgmgrl "show_database.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME"
 
 echo ""
 echo "Standby Database Details:"
 echo "========================="
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
-EXIT;
-EOF
+run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
 
 # ============================================================
 # Check Configuration Status
@@ -233,7 +215,7 @@ EOF
 
 log_section "Configuration Status Check"
 
-CONFIG_STATUS=$("$ORACLE_HOME/bin/dgmgrl" -silent / "show configuration" 2>&1)
+CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1)
 
 if echo "$CONFIG_STATUS" | grep -q "SUCCESS"; then
     log_info "Configuration status: SUCCESS"
@@ -256,16 +238,12 @@ log_section "Testing Log Shipping"
 
 log_info "Forcing log switch to test redo transport..."
 log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SWITCH LOGFILE"
-run_sql "ALTER SYSTEM SWITCH LOGFILE;"
+run_sql_command "switch_logfile.sql"
 
 sleep 5
 
 log_info "Checking log shipping status..."
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF
-SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}' 'InconsistentProperties';
-SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}' 'LogXptStatus';
-EXIT;
-EOF
+run_dgmgrl "show_log_status.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
 
 # ============================================================
 # Summary

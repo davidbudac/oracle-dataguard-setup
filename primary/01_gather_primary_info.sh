@@ -46,11 +46,11 @@ DB_UNIQUE_NAME=$(get_db_parameter "db_unique_name")
 # Reinitialize log with DB_UNIQUE_NAME for proper identification
 init_log "01_gather_primary_info_${DB_UNIQUE_NAME}"
 DB_DOMAIN=$(get_db_parameter "db_domain")
-INSTANCE_NAME=$(run_sql "SELECT INSTANCE_NAME FROM V\$INSTANCE;")
+INSTANCE_NAME=$(run_sql_query "get_instance_name.sql")
 INSTANCE_NAME=$(echo "$INSTANCE_NAME" | tr -d ' \n\r')
 
 # Get DBID
-DBID=$(run_sql "SELECT DBID FROM V\$DATABASE;")
+DBID=$(run_sql_query "get_dbid.sql")
 DBID=$(echo "$DBID" | tr -d ' \n\r')
 
 log_info "DB_NAME: $DB_NAME"
@@ -106,24 +106,21 @@ log_info "COMPATIBLE: $COMPATIBLE"
 log_section "Gathering Redo Log Configuration"
 
 # Online redo log info
-ONLINE_REDO_INFO=$(run_sql_with_header "
-SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS
-FROM V\$LOG ORDER BY GROUP#;
-")
+ONLINE_REDO_INFO=$(run_sql_display "get_online_redo_info.sql")
 echo "$ONLINE_REDO_INFO"
 
 # Get redo log size (in MB) and count
-REDO_LOG_SIZE_MB=$(run_sql "SELECT DISTINCT BYTES/1024/1024 FROM V\$LOG WHERE ROWNUM=1;")
+REDO_LOG_SIZE_MB=$(run_sql_query "get_redo_log_size.sql")
 REDO_LOG_SIZE_MB=$(echo "$REDO_LOG_SIZE_MB" | tr -d ' \n\r')
 
-ONLINE_REDO_GROUPS=$(run_sql "SELECT COUNT(DISTINCT GROUP#) FROM V\$LOG;")
+ONLINE_REDO_GROUPS=$(run_sql_query "get_online_redo_count.sql")
 ONLINE_REDO_GROUPS=$(echo "$ONLINE_REDO_GROUPS" | tr -d ' \n\r')
 
 log_info "Redo log size: ${REDO_LOG_SIZE_MB}MB"
 log_info "Online redo groups: $ONLINE_REDO_GROUPS"
 
 # Redo log members/paths
-REDO_LOG_PATHS=$(run_sql "SELECT DISTINCT SUBSTR(MEMBER, 1, INSTR(MEMBER, '/', -1)) AS PATH FROM V\$LOGFILE;")
+REDO_LOG_PATHS=$(run_sql_query "get_redo_log_paths.sql")
 REDO_LOG_PATH=$(echo "$REDO_LOG_PATHS" | head -1 | tr -d ' \n\r')
 log_info "Redo log path: $REDO_LOG_PATH"
 
@@ -133,17 +130,14 @@ log_info "Redo log path: $REDO_LOG_PATH"
 
 log_section "Checking Standby Redo Logs"
 
-STANDBY_REDO_COUNT=$(run_sql "SELECT COUNT(DISTINCT GROUP#) FROM V\$STANDBY_LOG;")
+STANDBY_REDO_COUNT=$(run_sql_query "get_standby_redo_count.sql")
 STANDBY_REDO_COUNT=$(echo "$STANDBY_REDO_COUNT" | tr -d ' \n\r')
 
 if [[ "$STANDBY_REDO_COUNT" -gt 0 ]]; then
     log_info "Standby redo logs exist: $STANDBY_REDO_COUNT groups"
     STANDBY_REDO_EXISTS="YES"
 
-    run_sql_with_header "
-SELECT GROUP#, THREAD#, BYTES/1024/1024 AS SIZE_MB, STATUS
-FROM V\$STANDBY_LOG ORDER BY GROUP#;
-"
+    run_sql_display "get_standby_redo_info.sql"
 else
     log_warn "No standby redo logs found - they will need to be created"
     STANDBY_REDO_EXISTS="NO"
@@ -156,31 +150,25 @@ fi
 log_section "Gathering Data File Locations"
 
 # Get unique data file directories
-DATAFILE_DIRS=$(run_sql "
-SELECT DISTINCT SUBSTR(NAME, 1, INSTR(NAME, '/', -1)-1)
-FROM V\$DATAFILE;
-")
+DATAFILE_DIRS=$(run_sql_query "get_datafile_dirs.sql")
 
 PRIMARY_DATA_PATH=$(echo "$DATAFILE_DIRS" | head -1 | tr -d ' \n\r')
 log_info "Primary data path: $PRIMARY_DATA_PATH"
 
 # Show all data files
 echo "Data files:"
-run_sql_with_header "
-SELECT FILE#, BYTES/1024/1024 AS SIZE_MB, NAME
-FROM V\$DATAFILE ORDER BY FILE#;
-"
+run_sql_display "get_datafile_info.sql"
 
 # Calculate total database size (datafiles + tempfiles + redo logs)
 log_info "Calculating total database size..."
 
-DATAFILE_SIZE_MB=$(run_sql "SELECT ROUND(SUM(BYTES)/1024/1024) FROM V\$DATAFILE;")
+DATAFILE_SIZE_MB=$(run_sql_query "get_datafile_size.sql")
 DATAFILE_SIZE_MB=$(echo "$DATAFILE_SIZE_MB" | tr -d ' \n\r')
 
-TEMPFILE_SIZE_MB=$(run_sql "SELECT NVL(ROUND(SUM(BYTES)/1024/1024), 0) FROM V\$TEMPFILE;")
+TEMPFILE_SIZE_MB=$(run_sql_query "get_tempfile_size.sql")
 TEMPFILE_SIZE_MB=$(echo "$TEMPFILE_SIZE_MB" | tr -d ' \n\r')
 
-REDOLOG_SIZE_MB=$(run_sql "SELECT ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;")
+REDOLOG_SIZE_MB=$(run_sql_query "get_redolog_total_size.sql")
 REDOLOG_SIZE_MB=$(echo "$REDOLOG_SIZE_MB" | tr -d ' \n\r')
 
 # Total size with 20% buffer for growth and standby redo logs
@@ -210,7 +198,7 @@ log_info "Control files: $CONTROL_FILES"
 log_section "Gathering Archive Log Configuration"
 
 # Check archive log mode
-LOG_MODE=$(run_sql "SELECT LOG_MODE FROM V\$DATABASE;")
+LOG_MODE=$(run_sql_query "get_log_mode.sql")
 LOG_MODE=$(echo "$LOG_MODE" | tr -d ' \n\r')
 log_info "Log mode: $LOG_MODE"
 
@@ -219,10 +207,7 @@ ARCHIVE_DEST_PATH=""
 USE_FRA_FOR_ARCHIVE="NO"
 
 # First try V$ARCHIVE_DEST which shows the actual resolved destination
-ARCHIVE_DEST_PATH=$(run_sql "
-SELECT DESTINATION FROM V\$ARCHIVE_DEST
-WHERE DEST_ID=1 AND STATUS='VALID' AND DESTINATION IS NOT NULL;
-")
+ARCHIVE_DEST_PATH=$(run_sql_query "get_archive_dest.sql")
 ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
 
 # If V$ARCHIVE_DEST didn't return a path, try the parameter
@@ -249,10 +234,7 @@ if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
         log_info "Archive destination (derived from FRA): $ARCHIVE_DEST_PATH"
     else
         # Last resort: query V$ARCHIVED_LOG for an existing archive location
-        ARCHIVE_DEST_PATH=$(run_sql "
-SELECT DISTINCT SUBSTR(NAME, 1, INSTR(NAME, '/', -1)-1)
-FROM V\$ARCHIVED_LOG WHERE NAME IS NOT NULL AND ROWNUM=1;
-")
+        ARCHIVE_DEST_PATH=$(run_sql_query "get_archive_dest_from_logs.sql")
         ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
         if [[ -n "$ARCHIVE_DEST_PATH" ]]; then
             log_info "Archive destination (from archived logs): $ARCHIVE_DEST_PATH"
@@ -271,7 +253,7 @@ log_info "DG_BROKER_START: $DG_BROKER_START"
 # Check for existing DG Broker configuration
 if [[ "$DG_BROKER_START" == "TRUE" ]]; then
     log_info "Data Guard Broker is enabled on primary"
-    BROKER_CONFIG=$(run_sql "SELECT NAME FROM V\$DG_BROKER_CONFIG WHERE ROWNUM=1;")
+    BROKER_CONFIG=$(run_sql_query "get_broker_config_name.sql")
     if [[ -n "$BROKER_CONFIG" ]]; then
         log_warn "Existing Broker configuration found: $BROKER_CONFIG"
         log_warn "This setup will create a new configuration"
@@ -313,7 +295,7 @@ fi
 
 # Method 2: Try V$LISTENER_NETWORK view
 if [[ -z "$LISTENER_PORT" ]]; then
-    LISTENER_PORT=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;")
+    LISTENER_PORT=$(run_sql_query "get_listener_port.sql")
     LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d ' \n\r')
     if [[ -n "$LISTENER_PORT" ]]; then
         log_info "Listener port from V\$LISTENER_NETWORK: $LISTENER_PORT"
@@ -366,7 +348,7 @@ else
 fi
 
 # Check FORCE LOGGING
-FORCE_LOGGING=$(run_sql "SELECT FORCE_LOGGING FROM V\$DATABASE;")
+FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
 FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
 
 if [[ "$FORCE_LOGGING" != "YES" ]]; then

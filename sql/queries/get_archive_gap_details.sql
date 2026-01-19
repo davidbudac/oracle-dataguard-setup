@@ -1,0 +1,5 @@
+-- Get archive gap details (with headers for display)
+SET LINESIZE 150 PAGESIZE 50
+SELECT THREAD#, LOW_SEQUENCE#, HIGH_SEQUENCE#
+FROM V$ARCHIVE_GAP;
+EXIT;
