@@ -214,32 +214,55 @@ LOG_MODE=$(run_sql "SELECT LOG_MODE FROM V\$DATABASE;")
 LOG_MODE=$(echo "$LOG_MODE" | tr -d ' \n\r')
 log_info "Log mode: $LOG_MODE"
 
-# Get archive destination
-ARCHIVE_DEST=$(get_db_parameter "log_archive_dest_1")
+# Get archive destination - query V$ARCHIVE_DEST for the resolved path
 ARCHIVE_DEST_PATH=""
 USE_FRA_FOR_ARCHIVE="NO"
 
-# Extract just the location part
-if [[ "$ARCHIVE_DEST" == *"LOCATION="* ]]; then
-    ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST" | sed 's/.*LOCATION=\([^ ]*\).*/\1/')
-fi
+# First try V$ARCHIVE_DEST which shows the actual resolved destination
+ARCHIVE_DEST_PATH=$(run_sql "
+SELECT DESTINATION FROM V\$ARCHIVE_DEST
+WHERE DEST_ID=1 AND STATUS='VALID' AND DESTINATION IS NOT NULL;
+")
+ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
 
-# If no explicit LOCATION, check if using FRA
-if [[ -z "$ARCHIVE_DEST_PATH" || "$ARCHIVE_DEST" == *"USE_DB_RECOVERY_FILE_DEST"* ]]; then
-    log_info "Archive destination uses Fast Recovery Area (FRA)"
-    USE_FRA_FOR_ARCHIVE="YES"
-    # Get actual FRA path for reference
-    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-        ARCHIVE_DEST_PATH="${DB_RECOVERY_FILE_DEST}/${DB_UNIQUE_NAME}/archivelog"
-        log_info "FRA archive path: $ARCHIVE_DEST_PATH"
+# If V$ARCHIVE_DEST didn't return a path, try the parameter
+if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
+    ARCHIVE_DEST=$(get_db_parameter "log_archive_dest_1")
+    # Check if using FRA
+    if [[ "$ARCHIVE_DEST" == *"USE_DB_RECOVERY_FILE_DEST"* ]]; then
+        USE_FRA_FOR_ARCHIVE="YES"
+        log_info "Archive destination uses Fast Recovery Area (FRA)"
+    # Extract just the location part if it contains LOCATION=
+    elif [[ "$ARCHIVE_DEST" == *"LOCATION="* ]]; then
+        ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST" | sed 's/.*LOCATION=\([^ ]*\).*/\1/')
+    elif [[ -n "$ARCHIVE_DEST" ]]; then
+        ARCHIVE_DEST_PATH="$ARCHIVE_DEST"
     fi
 fi
 
+# If still empty, try to derive from FRA or existing archives
 if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
-    log_warn "Could not determine archive destination path"
-    log_warn "Archive logs may be using FRA or a non-standard configuration"
+    FRA_DEST=$(get_db_parameter "db_recovery_file_dest")
+    if [[ -n "$FRA_DEST" ]]; then
+        USE_FRA_FOR_ARCHIVE="YES"
+        ARCHIVE_DEST_PATH="${FRA_DEST}/${DB_UNIQUE_NAME}/archivelog"
+        log_info "Archive destination (derived from FRA): $ARCHIVE_DEST_PATH"
+    else
+        # Last resort: query V$ARCHIVED_LOG for an existing archive location
+        ARCHIVE_DEST_PATH=$(run_sql "
+SELECT DISTINCT SUBSTR(NAME, 1, INSTR(NAME, '/', -1)-1)
+FROM V\$ARCHIVED_LOG WHERE NAME IS NOT NULL AND ROWNUM=1;
+")
+        ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
+        if [[ -n "$ARCHIVE_DEST_PATH" ]]; then
+            log_info "Archive destination (from archived logs): $ARCHIVE_DEST_PATH"
+        else
+            log_warn "Could not determine archive destination path"
+        fi
+    fi
+else
+    log_info "Archive destination: $ARCHIVE_DEST_PATH"
 fi
-log_info "Archive destination: ${ARCHIVE_DEST_PATH:-'(FRA-managed)'}"
 
 # Check Data Guard Broker status
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
