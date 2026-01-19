@@ -70,6 +70,21 @@ check_oracle_env || exit 1
 check_db_connection || exit 1
 
 # ============================================================
+# Prompt for SYS Password (needed for DGMGRL network validation)
+# ============================================================
+
+log_section "Authentication"
+
+echo ""
+echo "SYS password is required for DGMGRL network validation."
+read -s -p "Enter SYS password: " SYS_PASSWORD
+echo ""
+
+if [[ -z "$SYS_PASSWORD" ]]; then
+    log_warn "No SYS password provided - DGMGRL network validation will be skipped"
+fi
+
+# ============================================================
 # Initialize Status Tracking
 # ============================================================
 
@@ -281,9 +296,14 @@ EOF
 
 echo ""
 echo "Network Configuration Validation:"
-"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
+if [[ -n "$SYS_PASSWORD" ]]; then
+    "$ORACLE_HOME/bin/dgmgrl" -silent <<EOF 2>&1 || true
+CONNECT sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS};
 VALIDATE NETWORK CONFIGURATION FOR ALL;
 EOF
+else
+    log_warn "Skipping network validation (no SYS password provided)"
+fi
 
 # ============================================================
 # Check Data Guard Parameters
