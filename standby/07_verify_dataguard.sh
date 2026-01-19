@@ -279,6 +279,12 @@ echo "Standby Database Status:"
 SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
 EOF
 
+echo ""
+echo "Network Configuration Validation:"
+"$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1 || true
+VALIDATE NETWORK CONFIGURATION FOR ALL;
+EOF
+
 # ============================================================
 # Check Data Guard Parameters
 # ============================================================
