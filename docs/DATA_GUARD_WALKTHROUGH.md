@@ -7,13 +7,14 @@ This document describes what each automation script does and shows the equivalen
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
-2. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
-3. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
-4. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
-5. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
-6. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
-7. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
-8. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
+2. [Restartability](#restartability)
+3. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
+4. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
+5. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
+6. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
+7. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
+8. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
+9. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
 
 ---
 
@@ -26,6 +27,27 @@ Before beginning Data Guard setup, ensure:
 - Network connectivity between primary and standby servers
 - Sufficient disk space on standby for database files
 - NFS share mounted at `/OINSTALL/_dataguard_setup` on both servers
+
+---
+
+## Restartability
+
+| Steps | Restartable | Notes |
+|-------|-------------|-------|
+| 1-4 | **Yes** | Fully idempotent. Can restart from step 1 at any point. |
+| 5 | **No** | Once RMAN duplicate begins, cleanup required before restart. |
+| 6-7 | **Yes** | Broker config can be removed and recreated. Step 7 is read-only. |
+
+**To restart from Step 5 after a failure:**
+1. Shut down the standby instance: `SHUTDOWN ABORT`
+2. Remove standby data files: `rm -rf /path/to/standby/oradata/*`
+3. Remove standby control files and redo logs
+4. Re-run step 5
+
+**To restart from Step 6 after a failure:**
+1. Connect to DGMGRL: `dgmgrl /`
+2. Remove existing config: `REMOVE CONFIGURATION`
+3. Re-run step 6
 
 ---
 
@@ -118,7 +140,7 @@ cp $ORACLE_HOME/dbs/orapw$ORACLE_SID /OINSTALL/_dataguard_setup/
 
 ## Step 2: Generate Standby Configuration
 
-**Script:** `common/02_generate_standby_config.sh`
+**Script:** `primary/02_generate_standby_config.sh`
 
 ### What the Script Does
 

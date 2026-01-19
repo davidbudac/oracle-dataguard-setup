@@ -17,13 +17,24 @@ templates/     - Reference templates
 1. `nfs/01_setup_nfs_server.sh` - Setup NFS (on NFS server, requires sudo)
 2. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo)
 3. `primary/01_gather_primary_info.sh` - Collect primary DB info
-4. `common/02_generate_standby_config.sh` - Generate standby config (user reviews)
+4. `primary/02_generate_standby_config.sh` - Generate standby config (user reviews)
 5. `standby/03_setup_standby_env.sh` - Prepare standby environment
 6. `primary/04_prepare_primary_dg.sh` - Configure primary for DG
 7. `standby/05_clone_standby.sh` - RMAN duplicate (prompts for SYS password)
 8. `primary/06_configure_broker.sh` - Configure DGMGRL
 9. `standby/07_verify_dataguard.sh` - Verify setup
 10. `primary/08_security_hardening.sh` - Lock SYS account (optional)
+
+## Restartability
+
+**Steps 1-4 are fully restartable** - these scripts are idempotent and can be re-run from step 1 if needed. They gather information, generate configs, and apply settings that can be safely overwritten.
+
+**Step 5 (Clone Standby) is NOT directly restartable** - once RMAN duplicate starts, you cannot simply re-run the script. To restart from step 5:
+1. Shut down the standby instance
+2. Remove all standby data files, control files, and redo logs
+3. Re-run step 5
+
+**Steps 6-7 are restartable** - the broker configuration can be removed with `REMOVE CONFIGURATION` in DGMGRL and recreated. Step 7 is read-only verification.
 
 ## Key Design Decisions
 
