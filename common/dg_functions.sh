@@ -237,12 +237,29 @@ run_rman() {
 # DGMGRL Execution Functions
 # ============================================================
 
+# Substitute &1, &2, etc. in dgmgrl script content with provided arguments
+# Unlike SQLPlus, dgmgrl does not support passing positional arguments after @script
+# Usage: substitute_dgmgrl_args <script_content> [arg1] [arg2] ...
+substitute_dgmgrl_args() {
+    local content="$1"
+    shift
+    local i=1
+    for arg in "$@"; do
+        content=$(printf '%s' "$content" | sed "s|&${i}|${arg}|g")
+        i=$((i + 1))
+    done
+    printf '%s' "$content"
+}
+
 # Run a DGMGRL script file with OS authentication
 # Usage: run_dgmgrl_script <script_path> [arg1] [arg2] ...
 run_dgmgrl_script() {
     local script="$1"
     shift
-    "$ORACLE_HOME/bin/dgmgrl" -silent / @"$script" "$@"
+    local content
+    content=$(cat "$script")
+    content=$(substitute_dgmgrl_args "$content" "$@")
+    printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /
 }
 
 # Run a DGMGRL script from the sql/dgmgrl directory
@@ -250,7 +267,11 @@ run_dgmgrl_script() {
 run_dgmgrl() {
     local script_name="$1"
     shift
-    "$ORACLE_HOME/bin/dgmgrl" -silent / @"${SQL_DIR}/dgmgrl/${script_name}" "$@"
+    local script_path="${SQL_DIR}/dgmgrl/${script_name}"
+    local content
+    content=$(cat "$script_path")
+    content=$(substitute_dgmgrl_args "$content" "$@")
+    printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /
 }
 
 # Run a DGMGRL script with password authentication
@@ -260,7 +281,11 @@ run_dgmgrl_with_password() {
     local tns_alias="$2"
     local script_name="$3"
     shift 3
-    "$ORACLE_HOME/bin/dgmgrl" -silent "sys/${password}@${tns_alias}" @"${SQL_DIR}/dgmgrl/${script_name}" "$@"
+    local script_path="${SQL_DIR}/dgmgrl/${script_name}"
+    local content
+    content=$(cat "$script_path")
+    content=$(substitute_dgmgrl_args "$content" "$@")
+    printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent "sys/${password}@${tns_alias}"
 }
 
 # ============================================================
