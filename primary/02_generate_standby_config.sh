@@ -11,9 +11,10 @@ set -e
 
 # Get script directory
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
-source "${SCRIPT_DIR}/dg_functions.sh"
+source "${COMMON_DIR}/dg_functions.sh"
 
 # ============================================================
 # Main Script
