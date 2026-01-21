@@ -42,7 +42,9 @@ These scripts automate the process of creating a physical standby database from 
 ```
 dataguard_setup/
 ├── README.md                          # This file
-├── WALKTHROUGH.md                     # Detailed step-by-step guide
+├── CLAUDE.md                          # Project instructions for AI assistants
+├── docs/
+│   └── DATA_GUARD_WALKTHROUGH.md      # Detailed step-by-step guide
 ├── nfs/
 │   ├── 01_setup_nfs_server.sh         # Setup NFS server and export share
 │   └── 02_mount_nfs_client.sh         # Mount NFS share on client
@@ -50,17 +52,20 @@ dataguard_setup/
 │   ├── 01_gather_primary_info.sh      # Collect DB info from primary
 │   ├── 02_generate_standby_config.sh  # Generate standby configuration
 │   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
-│   └── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
+│   ├── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
+│   └── 08_security_hardening.sh       # Lock SYS account (optional)
 ├── standby/
 │   ├── 03_setup_standby_env.sh        # Prepare standby environment
 │   ├── 05_clone_standby.sh            # RMAN duplicate execution
 │   └── 07_verify_dataguard.sh         # Validation and health check
 ├── common/
 │   └── dg_functions.sh                # Shared utility functions
-└── templates/
-    ├── init_standby.ora.template      # Reference template
-    ├── listener.ora.template          # Reference template
-    └── tnsnames.ora.template          # Reference template
+├── templates/
+│   ├── init_standby.ora.template      # Reference template
+│   ├── listener.ora.template          # Reference template
+│   └── tnsnames.ora.template          # Reference template
+└── tests/
+    └── test_add_sid_to_listener.sh    # Test script for listener functions
 ```
 
 ## Quick Start
@@ -76,8 +81,11 @@ dataguard_setup/
 | 5 | STANDBY | `./standby/05_clone_standby.sh` | No* |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` | Yes |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` | Yes |
+| 8 | PRIMARY | `./primary/08_security_hardening.sh` | Yes** |
 
 **\*** Step 5 requires cleanup before restart (see [Restartability](#restartability)).
+
+**\*\*** Step 8 is optional. Locks SYS account after setup is verified.
 
 ### Workflow Diagram
 
@@ -98,6 +106,8 @@ Step 4: Prepare Primary ◄─────────────────�
 Step 6: Configure Broker ◄────────────────────────────┘
     │
     └────────────────────────────────────► Step 7: Verify Setup
+
+Step 8: Security Hardening (optional)
 ```
 
 ### Restartability
@@ -141,7 +151,7 @@ DB_FILE_NAME_CONVERT="'/u01/oradata/PROD','/u01/oradata/PRODSTBY'"
 
 For a detailed walkthrough with explanations, diagrams, and troubleshooting:
 
-**See [WALKTHROUGH.md](WALKTHROUGH.md)**
+**See [docs/DATA_GUARD_WALKTHROUGH.md](docs/DATA_GUARD_WALKTHROUGH.md)**
 
 ## Post-Setup Monitoring
 
@@ -179,7 +189,7 @@ ALTER SYSTEM SWITCH LOGFILE;
 
 ## Troubleshooting
 
-Common issues are documented in [WALKTHROUGH.md](WALKTHROUGH.md#7-troubleshooting-guide), including:
+Common issues are documented in [docs/DATA_GUARD_WALKTHROUGH.md](docs/DATA_GUARD_WALKTHROUGH.md), including:
 
 - TNS connectivity failures
 - RMAN duplicate errors

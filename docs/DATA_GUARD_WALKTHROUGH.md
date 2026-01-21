@@ -15,6 +15,7 @@ This document describes what each automation script does and shows the equivalen
 7. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
 8. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
 9. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
+10. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
 
 ---
 
@@ -36,7 +37,7 @@ Before beginning Data Guard setup, ensure:
 |-------|-------------|-------|
 | 1-4 | **Yes** | Fully idempotent. Can restart from step 1 at any point. |
 | 5 | **No** | Once RMAN duplicate begins, cleanup required before restart. |
-| 6-7 | **Yes** | Broker config can be removed and recreated. Step 7 is read-only. |
+| 6-8 | **Yes** | Broker config can be removed and recreated. Steps 7-8 are safe to re-run. |
 
 **To restart from Step 5 after a failure:**
 1. Shut down the standby instance: `SHUTDOWN ABORT`
@@ -611,6 +612,66 @@ EXIT;
 
 ---
 
+## Step 8: Security Hardening (Optional)
+
+**Script:** `primary/08_security_hardening.sh`
+
+### What the Script Does
+
+1. Verifies this is the primary database
+2. Checks that Data Guard Broker configuration is healthy
+3. Prompts for confirmation before proceeding
+4. Generates a random 32-character password for SYS
+5. Changes SYS password to the random value (not stored anywhere)
+6. Locks the SYS account
+7. Verifies OS authentication still works
+8. Clears the password from memory
+
+### Why Lock the SYS Account?
+
+After Data Guard is configured:
+- The password file is used for redo transport authentication
+- DBAs should use OS authentication (`/ as sysdba`) for local connections
+- Locking SYS prevents password-based attacks while maintaining functionality
+
+### Manual Equivalent
+
+```sql
+-- As oracle user on PRIMARY server
+sqlplus / as sysdba
+
+-- Generate a random password (use your preferred method)
+-- Then change SYS password and lock the account
+ALTER USER SYS IDENTIFIED BY '<random_32_char_password>';
+ALTER USER SYS ACCOUNT LOCK;
+
+-- Verify the change
+SELECT username, account_status FROM dba_users WHERE username = 'SYS';
+
+EXIT;
+```
+
+### Important Notes
+
+- **After running this script:**
+  - Use `sqlplus / as sysdba` for all DBA connections
+  - Password-based SYS connections will not work
+  - Data Guard redo transport continues to work (uses password file)
+
+- **To unlock SYS if needed:**
+  ```sql
+  sqlplus / as sysdba
+  ALTER USER SYS ACCOUNT UNLOCK;
+  ALTER USER SYS IDENTIFIED BY '<new_password>';
+  ```
+
+- **Consider also locking:**
+  ```sql
+  ALTER USER SYSTEM ACCOUNT LOCK;
+  ```
+
+---
+
 ## Summary: What Would Be Done Manually Without Scripts
 
 | Step | Script | Manual Effort |
@@ -622,6 +683,7 @@ EXIT;
 | 5 | Clone Standby | Start NOMOUNT, run RMAN duplicate, create SPFILE, start MRP |
 | 6 | Configure Broker | Run DGMGRL commands to create config, add database, enable |
 | 7 | Verify | Run multiple SQL queries and DGMGRL commands to check health |
+| 8 | Security Hardening | Change SYS password to random value, lock account (optional) |
 
 **Total Manual Steps:** ~80+ individual commands, queries, and file edits
 

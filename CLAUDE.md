@@ -10,6 +10,8 @@ primary/       - Scripts to run on PRIMARY server
 standby/       - Scripts to run on STANDBY server
 common/        - Shared scripts and functions
 templates/     - Reference templates
+docs/          - Detailed walkthrough documentation
+tests/         - Test scripts
 ```
 
 ## Execution Order

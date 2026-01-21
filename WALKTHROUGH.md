@@ -100,7 +100,6 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 | 5 | STANDBY | `./standby/05_clone_standby.sh` |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
-| 8 | PRIMARY | `./primary/08_security_hardening.sh` (Optional) |
 
 ---
 
@@ -236,26 +235,6 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 
 ---
 
-## Step 8: Security Hardening (Optional)
-
-**Server:** PRIMARY
-
-```bash
-./primary/08_security_hardening.sh
-```
-
-**Actions:**
-- Changes SYS password to a random value (not stored anywhere)
-- Locks the SYS account
-
-**After running this script:**
-- Use OS authentication `/ as sysdba` for all DBA connections
-- Data Guard redo transport continues to work (uses password file)
-
-**Note:** This step is optional but recommended for production environments.
-
----
-
 ## Post-Setup Commands
 
 ### DGMGRL (Recommended)
@@ -296,10 +275,10 @@ ALTER SYSTEM SWITCH LOGFILE;
 
 | Issue | Solution |
 |-------|----------|
-| tnsping fails | Check listener, hostname, firewall (port 1521) |
+| tnsping fails | Check listener, hostname, firewall |
 | ORA-01017 during RMAN | Verify password file copied correctly |
-| MRP not running | `ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;` |
-| Archive gaps | Check FAL_SERVER, network connectivity; broker should auto-resolve |
+| MRP not running | Try restarting MRP: `dgmgrl / "edit database XXX set state=apply-off /on "` |
+| Archive gaps | Try restarting log shipping: `dgmgrl / "edit database XXX set state=transport-off / on"` |
 | Broker shows WARNING | `dgmgrl / "show database 'PRODSTBY' 'StatusReport'"` |
 
 ---
