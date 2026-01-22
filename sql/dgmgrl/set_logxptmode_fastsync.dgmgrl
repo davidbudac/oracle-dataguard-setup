@@ -1,0 +1,6 @@
+-- ============================================================
+-- Set LogXptMode to FASTSYNC for specified database
+-- Usage: Pass standby_db_unique_name as &1
+-- ============================================================
+EDIT DATABASE '&1' SET PROPERTY LogXptMode='FASTSYNC';
+EXIT;

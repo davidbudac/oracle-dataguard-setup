@@ -1,0 +1,6 @@
+-- ============================================================
+-- Set protection mode to MAXIMUM AVAILABILITY
+-- Requires standby to be synchronized before execution
+-- ============================================================
+EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY;
+EXIT;

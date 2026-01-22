@@ -16,6 +16,7 @@ This document describes what each automation script does and shows the equivalen
 8. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
 9. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
 10. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
+11. [Fast-Start Failover (Optional)](#fast-start-failover-optional)
 
 ---
 
@@ -734,3 +735,80 @@ ALTER DATABASE OPEN READ ONLY;
 -- Restart MRP after read-only access
 ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;
 ```
+
+---
+
+## Fast-Start Failover (Optional)
+
+After Data Guard setup is complete and verified, you can optionally configure Fast-Start Failover (FSFO) for automatic failover.
+
+**Scripts:** `fsfo/configure_fsfo.sh` and `fsfo/observer.sh`
+
+### What FSFO Provides
+
+- **Automatic failover** when primary becomes unavailable
+- **Observer process** monitors both databases continuously
+- **Protection mode** upgraded to MAXIMUM AVAILABILITY (synchronous redo)
+
+### Configuration
+
+Run on the **STANDBY** server after Step 7 verification passes:
+
+```bash
+./fsfo/configure_fsfo.sh
+```
+
+This configures:
+- Protection mode: MAXIMUM AVAILABILITY
+- LogXptMode: FASTSYNC (synchronous with fast acknowledgment)
+- FSFO threshold: 30 seconds (configurable via FSFO_THRESHOLD environment variable)
+- FSFO target: standby database
+
+### Observer Management
+
+The observer must be running for automatic failover to occur:
+
+```bash
+# Start observer in background
+./fsfo/observer.sh start
+
+# Check observer status
+./fsfo/observer.sh status
+
+# Stop observer (before maintenance)
+./fsfo/observer.sh stop
+
+# Restart observer
+./fsfo/observer.sh restart
+```
+
+### Manual DGMGRL Commands
+
+```
+-- Show FSFO status
+dgmgrl / "SHOW FAST_START FAILOVER"
+
+-- Disable FSFO
+dgmgrl / "DISABLE FAST_START FAILOVER"
+
+-- Re-enable FSFO
+dgmgrl / "ENABLE FAST_START FAILOVER"
+
+-- Stop observer from DGMGRL
+dgmgrl / "STOP OBSERVER"
+```
+
+### Important Notes
+
+1. **Observer location**: The observer runs on the standby server so it remains available if the primary fails
+
+2. **Protection mode impact**: MAXIMUM AVAILABILITY provides zero data loss but may slightly impact primary performance
+
+3. **Network requirements**: Observer must have network connectivity to both primary and standby databases
+
+4. **Maintenance considerations**: Stop the observer before performing database maintenance to prevent unexpected failovers
+
+5. **Threshold tuning**: The default 30-second threshold can be adjusted:
+   ```bash
+   FSFO_THRESHOLD=60 ./fsfo/configure_fsfo.sh
+   ```

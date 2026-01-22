@@ -8,6 +8,7 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 nfs/           - NFS setup scripts (run before Data Guard setup)
 primary/       - Scripts to run on PRIMARY server
 standby/       - Scripts to run on STANDBY server
+fsfo/          - Fast-Start Failover scripts (optional, run on STANDBY)
 common/        - Shared scripts and functions
 templates/     - Reference templates
 docs/          - Detailed walkthrough documentation
@@ -68,3 +69,27 @@ Built-in validations:
 ## Testing
 
 Scripts are designed for Oracle 19c on Linux with filesystem storage. Test in non-production first.
+
+## Fast-Start Failover (Optional)
+
+After Data Guard setup is complete, you can optionally configure Fast-Start Failover (FSFO) for automatic failover:
+
+```
+fsfo/configure_fsfo.sh  - Configure FSFO (run once on STANDBY)
+fsfo/observer.sh        - Observer lifecycle: start/stop/status/restart
+```
+
+**FSFO Configuration:**
+- Sets protection mode to MAXIMUM AVAILABILITY
+- Sets LogXptMode to FASTSYNC
+- Enables Fast-Start Failover with 30-second threshold
+
+**Observer Management:**
+```bash
+./fsfo/observer.sh start    # Start observer in background
+./fsfo/observer.sh status   # Check observer status
+./fsfo/observer.sh stop     # Stop observer
+./fsfo/observer.sh restart  # Restart observer
+```
+
+The observer must be running for automatic failover to occur.

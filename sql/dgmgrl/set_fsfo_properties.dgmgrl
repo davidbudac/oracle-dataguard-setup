@@ -1,0 +1,7 @@
+-- ============================================================
+-- Set Fast-Start Failover properties
+-- Usage: Pass standby_db_unique_name as &1, threshold (seconds) as &2
+-- ============================================================
+EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=&2;
+EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='&1';
+EXIT;

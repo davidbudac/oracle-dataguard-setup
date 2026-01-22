@@ -58,6 +58,9 @@ dataguard_setup/
 │   ├── 03_setup_standby_env.sh        # Prepare standby environment
 │   ├── 05_clone_standby.sh            # RMAN duplicate execution
 │   └── 07_verify_dataguard.sh         # Validation and health check
+├── fsfo/
+│   ├── configure_fsfo.sh              # Configure Fast-Start Failover (optional)
+│   └── observer.sh                    # Observer lifecycle management
 ├── common/
 │   └── dg_functions.sh                # Shared utility functions
 ├── templates/
@@ -185,6 +188,55 @@ SELECT NAME, VALUE FROM V$DATAGUARD_STATS WHERE NAME LIKE '%lag%';
 
 -- Force log switch for testing (on primary)
 ALTER SYSTEM SWITCH LOGFILE;
+```
+
+## Fast-Start Failover (Optional)
+
+After Data Guard setup is complete and verified, you can optionally configure Fast-Start Failover (FSFO) for automatic failover capability.
+
+### Configuration
+
+Run on the **STANDBY** server after Step 7 verification passes:
+
+```bash
+# Configure FSFO (one-time)
+./fsfo/configure_fsfo.sh
+```
+
+This configures:
+- Protection mode: MAXIMUM AVAILABILITY
+- LogXptMode: FASTSYNC
+- FSFO threshold: 30 seconds
+
+### Observer Management
+
+The observer must be running for automatic failover to occur:
+
+```bash
+# Start the observer
+./fsfo/observer.sh start
+
+# Check observer status
+./fsfo/observer.sh status
+
+# Stop the observer (before maintenance)
+./fsfo/observer.sh stop
+
+# Restart the observer
+./fsfo/observer.sh restart
+```
+
+### FSFO Commands (DGMGRL)
+
+```bash
+# Show FSFO status
+dgmgrl / "show fast_start failover"
+
+# Disable FSFO (if needed)
+dgmgrl / "disable fast_start failover"
+
+# Re-enable FSFO
+dgmgrl / "enable fast_start failover"
 ```
 
 ## Troubleshooting
