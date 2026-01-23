@@ -160,7 +160,7 @@ log_info "Minor lag is acceptable; FSFO will wait for sync before failover"
 
 log_section "Checking Current Protection Mode"
 
-CURRENT_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \n\r')
+CURRENT_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d '\n\r' | sed 's/^ *//;s/ *$//')
 log_info "Current protection mode: $CURRENT_MODE"
 
 # ============================================================
@@ -340,20 +340,37 @@ log_info "LogXptMode set to FASTSYNC for ${STANDBY_DB_UNIQUE_NAME}"
 
 log_section "Setting Protection Mode to MAXIMUM AVAILABILITY"
 
-if [[ "$CURRENT_MODE" == "MAXIMUM AVAILABILITY" ]]; then
+# Normalize protection mode for comparison (remove spaces)
+CURRENT_MODE_NORMALIZED=$(echo "$CURRENT_MODE" | tr -d ' ')
+
+if [[ "$CURRENT_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then
     log_info "Protection mode is already MAXIMUM AVAILABILITY"
 else
     log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY"
-    run_dgmgrl "set_maxavailability.dgmgrl"
+    DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl" 2>&1)
+    DGMGRL_RC=$?
+
+    if [[ $DGMGRL_RC -ne 0 ]] || echo "$DGMGRL_OUTPUT" | grep -qi "error\|ORA-"; then
+        log_error "DGMGRL command failed:"
+        echo ""
+        echo "$DGMGRL_OUTPUT"
+        echo ""
+        exit 1
+    fi
 
     # Verify change
     sleep 3
     NEW_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \n\r')
+    NEW_MODE_NORMALIZED=$(echo "$NEW_MODE" | tr -d ' ')
 
-    if [[ "$NEW_MODE" == "MAXIMUM AVAILABILITY" ]]; then
+    if [[ "$NEW_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then
         log_info "Protection mode set to MAXIMUM AVAILABILITY"
     else
         log_error "Failed to set protection mode (current: $NEW_MODE)"
+        log_error "DGMGRL output was:"
+        echo ""
+        echo "$DGMGRL_OUTPUT"
+        echo ""
         exit 1
     fi
 fi
