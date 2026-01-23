@@ -213,7 +213,7 @@ Run on the **PRIMARY** server after Step 7 verification passes:
 ```
 
 This configures:
-- Creates SYSDG user for observer authentication
+- Creates observer user with SYSDG privilege (username is configurable)
 - Protection mode: MAXIMUM AVAILABILITY
 - LogXptMode: FASTSYNC
 - FSFO threshold: 30 seconds (configurable via FSFO_THRESHOLD)
@@ -240,7 +240,7 @@ The observer can run on the **standby server** or a **dedicated 3rd server**. On
 ./fsfo/observer.sh restart
 ```
 
-The wallet provides secure authentication without storing passwords. When running `setup`, you will be prompted for the SYSDG password created in Step 9.
+The wallet provides secure authentication without storing passwords. When running `setup`, you will be prompted for the observer user password created in Step 9.
 
 ### FSFO Commands (DGMGRL)
 

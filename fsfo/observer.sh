@@ -221,21 +221,30 @@ EOF
     # Add Credentials
     # ============================================================
 
-    log_section "Adding SYSDG Credentials"
+    log_section "Adding Observer Credentials"
 
+    # Get observer username from config or prompt
+    if [[ -z "$OBSERVER_USER" ]]; then
+        echo ""
+        echo "No observer username found in configuration."
+        read -p "Enter observer username: " OBSERVER_USER
+        OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
+    fi
+
+    log_info "Observer username: $OBSERVER_USER"
     log_info "Adding credentials for: $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS"
     log_info "These entries must match your tnsnames.ora entries"
 
-    SYSDG_PASSWORD=$(prompt_password "Enter SYSDG user password")
+    OBSERVER_PASSWORD=$(prompt_password "Enter password for $OBSERVER_USER")
 
-    if [[ -z "$SYSDG_PASSWORD" ]]; then
-        log_error "SYSDG password cannot be empty"
+    if [[ -z "$OBSERVER_PASSWORD" ]]; then
+        log_error "Password cannot be empty"
         exit 1
     fi
 
     # Add credential for primary
     log_info "Adding credential for $PRIMARY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" sysdg "$SYSDG_PASSWORD" << EOF
+    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
 
@@ -246,7 +255,7 @@ EOF
 
     # Add credential for standby
     log_info "Adding credential for $STANDBY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" sysdg "$SYSDG_PASSWORD" << EOF
+    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
 
@@ -258,7 +267,7 @@ EOF
     # Clear passwords from memory
     unset WALLET_PASSWORD
     unset WALLET_PASSWORD_CONFIRM
-    unset SYSDG_PASSWORD
+    unset OBSERVER_PASSWORD
 
     log_info "Credentials added successfully"
 
@@ -316,8 +325,9 @@ SQLNET.WALLET_OVERRIDE = TRUE
     echo "====================="
     echo ""
     echo "  Wallet Location: $WALLET_DIR"
-    echo "  Credentials:     sysdg@$PRIMARY_TNS_ALIAS"
-    echo "                   sysdg@$STANDBY_TNS_ALIAS"
+    echo "  Observer User:   $OBSERVER_USER"
+    echo "  Credentials:     ${OBSERVER_USER}@$PRIMARY_TNS_ALIAS"
+    echo "                   ${OBSERVER_USER}@$STANDBY_TNS_ALIAS"
     echo "  Auto-login:      Enabled"
     echo ""
     echo "NEXT STEPS"

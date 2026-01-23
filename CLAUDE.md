@@ -81,7 +81,7 @@ After Data Guard setup is complete, you can optionally configure Fast-Start Fail
 ```bash
 ./primary/09_configure_fsfo.sh
 ```
-This creates a SYSDG user, sets MAXIMUM AVAILABILITY mode, enables FSFO.
+This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mode, enables FSFO.
 
 **Step 10: Observer Setup (on OBSERVER server - can be standby or 3rd server)**
 ```bash
@@ -94,7 +94,7 @@ This creates a SYSDG user, sets MAXIMUM AVAILABILITY mode, enables FSFO.
 
 **Authentication:**
 - Uses Oracle Wallet for secure authentication (no stored passwords)
-- SYSDG user with SYSDG privilege for observer connections
+- User-specified username with SYSDG privilege for observer connections
 - Observer connects via: `dgmgrl /@PRIMARY_TNS_ALIAS`
 
 **FSFO Configuration:**

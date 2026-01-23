@@ -746,13 +746,14 @@ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT
 ### What the Script Does
 
 1. Verifies Data Guard Broker configuration is healthy
-2. Prompts for and creates SYSDG user for observer authentication
-3. Sets protection mode to MAXIMUM AVAILABILITY
-4. Sets LogXptMode to FASTSYNC
-5. Configures FSFO properties (threshold, target)
-6. Enables Fast-Start Failover
-7. Copies password file to NFS for observer server
-8. Outputs wallet setup instructions
+2. Prompts for observer username (default: dg_observer)
+3. Creates observer user with SYSDG privilege
+4. Sets protection mode to MAXIMUM AVAILABILITY
+5. Sets LogXptMode to FASTSYNC
+6. Configures FSFO properties (threshold, target)
+7. Enables Fast-Start Failover
+8. Copies password file to NFS for observer server
+9. Outputs wallet setup instructions
 
 ### Manual Equivalent
 
@@ -760,10 +761,10 @@ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT
 -- As oracle user on PRIMARY server
 sqlplus / as sysdba
 
--- Create SYSDG user for observer
-CREATE USER sysdg IDENTIFIED BY <password>;
-GRANT SYSDG TO sysdg;
-GRANT CREATE SESSION TO sysdg;
+-- Create observer user (any name) with SYSDG privilege
+CREATE USER dg_observer IDENTIFIED BY <password>;
+GRANT SYSDG TO dg_observer;
+GRANT CREATE SESSION TO dg_observer;
 
 EXIT;
 ```
@@ -802,7 +803,7 @@ The observer can run on the **standby server** or a **dedicated 3rd server**.
 **Setup command (`./observer.sh setup`):**
 1. Creates Oracle Wallet directory
 2. Creates auto-login wallet
-3. Adds SYSDG credentials for primary and standby TNS aliases
+3. Adds observer user credentials for primary and standby TNS aliases
 4. Configures sqlnet.ora with wallet location
 5. Tests wallet connectivity
 
@@ -829,9 +830,9 @@ mkstore -wrl $ORACLE_HOME/network/admin/wallet -create
 mkstore -wrl $ORACLE_HOME/network/admin/wallet -createSSO
 # Enter wallet password when prompted
 
-# Add credentials
-mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential PRIMARY_TNS sysdg <password>
-mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential STANDBY_TNS sysdg <password>
+# Add credentials (use the observer username from Step 9)
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential PRIMARY_TNS dg_observer <password>
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential STANDBY_TNS dg_observer <password>
 ```
 
 ```bash

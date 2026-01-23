@@ -6,7 +6,7 @@
 # Data Guard setup is complete (Step 7 verification passes).
 #
 # This script:
-# - Creates SYSDG user for observer authentication
+# - Creates a user with SYSDG privilege for observer authentication
 # - Sets protection mode to MAXIMUM AVAILABILITY
 # - Sets LogXptMode to FASTSYNC
 # - Enables Fast-Start Failover
@@ -169,10 +169,32 @@ log_info "Current protection mode: $CURRENT_MODE"
 
 log_section "FSFO Configuration Summary"
 
+# ============================================================
+# Prompt for Observer Username
+# ============================================================
+
+log_section "Observer User Configuration"
+
+echo ""
+echo "The observer requires a database user with SYSDG privilege."
+echo "You can use any username (e.g., dg_observer, fsfo_user, etc.)"
+echo ""
+
+# Default username suggestion
+DEFAULT_OBSERVER_USER="dg_observer"
+
+read -p "Enter username for observer [$DEFAULT_OBSERVER_USER]: " OBSERVER_USER
+OBSERVER_USER="${OBSERVER_USER:-$DEFAULT_OBSERVER_USER}"
+
+# Convert to uppercase for Oracle
+OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
+
+log_info "Observer username: $OBSERVER_USER"
+
 echo ""
 echo "The following changes will be made:"
 echo ""
-echo "  1. Create SYSDG user    : For observer wallet authentication"
+echo "  1. Create user          : $OBSERVER_USER (with SYSDG privilege)"
 echo "  2. Protection Mode      : $CURRENT_MODE -> MAXIMUM AVAILABILITY"
 echo "  3. LogXptMode           : FASTSYNC (for ${STANDBY_DB_UNIQUE_NAME})"
 echo "  4. FSFO Threshold       : ${FSFO_THRESHOLD} seconds"
@@ -186,104 +208,115 @@ if ! confirm_proceed "Proceed with FSFO configuration?"; then
 fi
 
 # ============================================================
-# Create SYSDG User
+# Create Observer User with SYSDG Privilege
 # ============================================================
 
-log_section "Creating SYSDG User for Observer Authentication"
+log_section "Creating Observer User with SYSDG Privilege"
 
-# Check if SYSDG user already exists
-SYSDG_EXISTS=$(sqlplus -s / as sysdba << 'EOF'
+# Check if user already exists
+USER_EXISTS=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
-SELECT COUNT(*) FROM dba_users WHERE username = 'SYSDG';
+SELECT COUNT(*) FROM dba_users WHERE username = '${OBSERVER_USER}';
 EXIT;
 EOF
 )
-SYSDG_EXISTS=$(echo "$SYSDG_EXISTS" | tr -d ' \n\r')
+USER_EXISTS=$(echo "$USER_EXISTS" | tr -d ' \n\r')
 
-if [[ "$SYSDG_EXISTS" == "1" ]]; then
-    log_info "SYSDG user already exists"
+if [[ "$USER_EXISTS" == "1" ]]; then
+    log_info "User $OBSERVER_USER already exists"
 
-    if ! confirm_proceed "Do you want to recreate the SYSDG user with a new password?"; then
-        log_info "Keeping existing SYSDG user"
+    # Check if user has SYSDG privilege
+    HAS_SYSDG=$(sqlplus -s / as sysdba << EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+SELECT COUNT(*) FROM dba_role_privs WHERE grantee = '${OBSERVER_USER}' AND granted_role = 'SYSDG';
+EXIT;
+EOF
+)
+    HAS_SYSDG=$(echo "$HAS_SYSDG" | tr -d ' \n\r')
+
+    if [[ "$HAS_SYSDG" == "1" ]]; then
+        log_info "User $OBSERVER_USER already has SYSDG privilege"
     else
-        # Prompt for SYSDG password
-        SYSDG_PASSWORD=$(prompt_password "Enter password for SYSDG user")
+        log_info "Granting SYSDG privilege to $OBSERVER_USER..."
+        sqlplus -s / as sysdba << EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+GRANT SYSDG TO ${OBSERVER_USER};
+GRANT CREATE SESSION TO ${OBSERVER_USER};
+EXIT;
+EOF
+        log_info "SYSDG privilege granted"
+    fi
 
-        if [[ -z "$SYSDG_PASSWORD" ]]; then
+    if ! confirm_proceed "Do you want to reset the password for $OBSERVER_USER?"; then
+        log_info "Keeping existing password for $OBSERVER_USER"
+    else
+        OBSERVER_PASSWORD=$(prompt_password "Enter new password for $OBSERVER_USER")
+
+        if [[ -z "$OBSERVER_PASSWORD" ]]; then
             log_error "Password cannot be empty"
             exit 1
         fi
 
-        # Drop and recreate
-        log_info "Dropping existing SYSDG user..."
-        sqlplus -s / as sysdba << EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
-DROP USER sysdg CASCADE;
-EXIT;
-EOF
-
-        log_info "Creating SYSDG user..."
-        log_cmd "sqlplus / as sysdba:" "CREATE USER sysdg IDENTIFIED BY ***"
+        log_info "Updating password for $OBSERVER_USER..."
+        log_cmd "sqlplus / as sysdba:" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***"
         RESULT=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
-CREATE USER sysdg IDENTIFIED BY "${SYSDG_PASSWORD}";
-GRANT SYSDG TO sysdg;
-GRANT CREATE SESSION TO sysdg;
+ALTER USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
 SELECT 'SUCCESS' FROM DUAL;
 EXIT;
 EOF
 )
 
         if ! echo "$RESULT" | grep -q "SUCCESS"; then
-            log_error "Failed to create SYSDG user"
+            log_error "Failed to update password for $OBSERVER_USER"
             echo "$RESULT"
             exit 1
         fi
 
-        log_info "SYSDG user created successfully"
+        log_info "Password updated for $OBSERVER_USER"
     fi
 else
-    # Prompt for SYSDG password
-    SYSDG_PASSWORD=$(prompt_password "Enter password for new SYSDG user")
+    # Prompt for password
+    OBSERVER_PASSWORD=$(prompt_password "Enter password for new user $OBSERVER_USER")
 
-    if [[ -z "$SYSDG_PASSWORD" ]]; then
+    if [[ -z "$OBSERVER_PASSWORD" ]]; then
         log_error "Password cannot be empty"
         exit 1
     fi
 
     # Confirm password
-    SYSDG_PASSWORD_CONFIRM=$(prompt_password "Confirm SYSDG password")
+    OBSERVER_PASSWORD_CONFIRM=$(prompt_password "Confirm password")
 
-    if [[ "$SYSDG_PASSWORD" != "$SYSDG_PASSWORD_CONFIRM" ]]; then
+    if [[ "$OBSERVER_PASSWORD" != "$OBSERVER_PASSWORD_CONFIRM" ]]; then
         log_error "Passwords do not match"
         exit 1
     fi
 
-    log_info "Creating SYSDG user..."
-    log_cmd "sqlplus / as sysdba:" "CREATE USER sysdg IDENTIFIED BY ***"
+    log_info "Creating user $OBSERVER_USER with SYSDG privilege..."
+    log_cmd "sqlplus / as sysdba:" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***"
     RESULT=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
-CREATE USER sysdg IDENTIFIED BY "${SYSDG_PASSWORD}";
-GRANT SYSDG TO sysdg;
-GRANT CREATE SESSION TO sysdg;
+CREATE USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
+GRANT SYSDG TO ${OBSERVER_USER};
+GRANT CREATE SESSION TO ${OBSERVER_USER};
 SELECT 'SUCCESS' FROM DUAL;
 EXIT;
 EOF
 )
 
     if ! echo "$RESULT" | grep -q "SUCCESS"; then
-        log_error "Failed to create SYSDG user"
+        log_error "Failed to create user $OBSERVER_USER"
         echo "$RESULT"
         exit 1
     fi
 
-    log_info "SYSDG user created successfully"
+    log_info "User $OBSERVER_USER created successfully"
     log_info "Note: User will be replicated to standby via redo transport"
 fi
 
 # Clear password from memory
-unset SYSDG_PASSWORD
-unset SYSDG_PASSWORD_CONFIRM
+unset OBSERVER_PASSWORD
+unset OBSERVER_PASSWORD_CONFIRM
 
 # ============================================================
 # Configure Protection Mode
@@ -390,11 +423,18 @@ if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
 # ============================================================
 FSFO_ENABLED="YES"
 FSFO_THRESHOLD="${FSFO_THRESHOLD}"
+OBSERVER_USER="${OBSERVER_USER}"
 OBSERVER_WALLET_DIR="\${ORACLE_HOME}/network/admin/wallet"
 EOF
     log_info "Added FSFO settings to configuration file"
 else
-    log_info "FSFO settings already exist in configuration file"
+    # Update OBSERVER_USER if it changed
+    if grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+        sed -i.bak "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" "$STANDBY_CONFIG_FILE"
+    else
+        echo "OBSERVER_USER=\"${OBSERVER_USER}\"" >> "$STANDBY_CONFIG_FILE"
+    fi
+    log_info "FSFO settings updated in configuration file"
 fi
 
 # ============================================================
@@ -422,7 +462,7 @@ echo "  LogXptMode      : FASTSYNC"
 echo "  FSFO Threshold  : ${FSFO_THRESHOLD} seconds"
 echo "  FSFO Target     : ${STANDBY_DB_UNIQUE_NAME}"
 echo "  FSFO Status     : ENABLED (observer not yet started)"
-echo "  SYSDG User      : Created for observer authentication"
+echo "  Observer User   : ${OBSERVER_USER} (with SYSDG privilege)"
 echo ""
 echo "NEXT STEPS - Observer Setup"
 echo "==========================="
@@ -449,7 +489,7 @@ echo "====================="
 echo ""
 echo "The wallet provides secure authentication without storing passwords."
 echo "When running './fsfo/observer.sh setup', you will be prompted for the"
-echo "SYSDG password you just created."
+echo "password for user ${OBSERVER_USER}."
 echo ""
 echo "The observer connects using: dgmgrl /@${PRIMARY_TNS_ALIAS}"
 echo ""
