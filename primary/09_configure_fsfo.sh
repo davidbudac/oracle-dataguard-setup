@@ -195,8 +195,8 @@ echo ""
 echo "The following changes will be made:"
 echo ""
 echo "  1. Create user          : $OBSERVER_USER (with SYSDG privilege)"
-echo "  2. Protection Mode      : $CURRENT_MODE -> MAXIMUM AVAILABILITY"
-echo "  3. LogXptMode           : FASTSYNC (for ${STANDBY_DB_UNIQUE_NAME})"
+echo "  2. LogXptMode           : FASTSYNC (for both ${PRIMARY_DB_UNIQUE_NAME} and ${STANDBY_DB_UNIQUE_NAME})"
+echo "  3. Protection Mode      : $CURRENT_MODE -> MAXIMUM AVAILABILITY"
 echo "  4. FSFO Threshold       : ${FSFO_THRESHOLD} seconds"
 echo "  5. FSFO Target          : ${STANDBY_DB_UNIQUE_NAME}"
 echo "  6. Fast-Start Failover  : ENABLED"
@@ -319,6 +319,22 @@ unset OBSERVER_PASSWORD
 unset OBSERVER_PASSWORD_CONFIRM
 
 # ============================================================
+# Configure LogXptMode (must be done before changing protection mode)
+# ============================================================
+
+log_section "Setting LogXptMode to FASTSYNC"
+
+log_info "Setting LogXptMode to FASTSYNC for both databases..."
+
+log_cmd "dgmgrl / :" "EDIT DATABASE '${PRIMARY_DB_UNIQUE_NAME}' SET PROPERTY LogXptMode='FASTSYNC'"
+run_dgmgrl "set_logxptmode_fastsync.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME"
+log_info "LogXptMode set to FASTSYNC for ${PRIMARY_DB_UNIQUE_NAME}"
+
+log_cmd "dgmgrl / :" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY LogXptMode='FASTSYNC'"
+run_dgmgrl "set_logxptmode_fastsync.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
+log_info "LogXptMode set to FASTSYNC for ${STANDBY_DB_UNIQUE_NAME}"
+
+# ============================================================
 # Configure Protection Mode
 # ============================================================
 
@@ -341,17 +357,6 @@ else
         exit 1
     fi
 fi
-
-# ============================================================
-# Configure LogXptMode
-# ============================================================
-
-log_section "Setting LogXptMode to FASTSYNC"
-
-log_cmd "dgmgrl / :" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY LogXptMode='FASTSYNC'"
-run_dgmgrl "set_logxptmode_fastsync.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
-
-log_info "LogXptMode set to FASTSYNC for ${STANDBY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Configure FSFO Properties

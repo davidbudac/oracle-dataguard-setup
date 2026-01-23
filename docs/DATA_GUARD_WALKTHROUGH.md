@@ -748,8 +748,8 @@ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT
 1. Verifies Data Guard Broker configuration is healthy
 2. Prompts for observer username (default: dg_observer)
 3. Creates observer user with SYSDG privilege
-4. Sets protection mode to MAXIMUM AVAILABILITY
-5. Sets LogXptMode to FASTSYNC
+4. Sets LogXptMode to FASTSYNC for both databases
+5. Sets protection mode to MAXIMUM AVAILABILITY
 6. Configures FSFO properties (threshold, target)
 7. Enables Fast-Start Failover
 8. Copies password file to NFS for observer server
@@ -773,11 +773,12 @@ EXIT;
 -- Configure FSFO in DGMGRL
 dgmgrl /
 
+-- Set LogXptMode for both databases (must be done before changing protection mode)
+EDIT DATABASE 'PRIMARY_DB' SET PROPERTY LogXptMode='FASTSYNC';
+EDIT DATABASE 'STANDBY_DB' SET PROPERTY LogXptMode='FASTSYNC';
+
 -- Set protection mode
 EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY;
-
--- Set LogXptMode for standby
-EDIT DATABASE 'STANDBY_DB' SET PROPERTY LogXptMode='FASTSYNC';
 
 -- Configure FSFO properties
 EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=30;
