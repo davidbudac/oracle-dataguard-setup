@@ -1,17 +1,21 @@
 #!/bin/bash
 # ============================================================
-# Oracle Data Guard - Configure Fast-Start Failover (FSFO)
+# Oracle Data Guard Setup - Step 9: Configure Fast-Start Failover
 # ============================================================
-# Run this script on the STANDBY database server after
+# Run this script on the PRIMARY database server after
 # Data Guard setup is complete (Step 7 verification passes).
 #
-# This script configures:
-# - Protection mode: MAXIMUM AVAILABILITY
-# - LogXptMode: FASTSYNC
-# - Fast-Start Failover with observer support
+# This script:
+# - Creates SYSDG user for observer authentication
+# - Sets protection mode to MAXIMUM AVAILABILITY
+# - Sets LogXptMode to FASTSYNC
+# - Enables Fast-Start Failover
+# - Copies password file to NFS for observer server
+# - Outputs wallet setup instructions for observer
 #
-# After running this script, start the observer with:
-#   ./fsfo/observer.sh start
+# After running this script, set up the observer:
+#   1. On the observer server, run: ./fsfo/observer.sh setup
+#   2. Then start the observer: ./fsfo/observer.sh start
 # ============================================================
 
 set -e
@@ -30,10 +34,10 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # Main Script
 # ============================================================
 
-print_banner "Configure Fast-Start Failover"
+print_banner "Step 9: Configure Fast-Start Failover"
 
 # Initialize logging
-init_log "configure_fsfo"
+init_log "09_configure_fsfo"
 
 # ============================================================
 # Pre-flight Checks
@@ -74,7 +78,7 @@ fi
 source "$STANDBY_CONFIG_FILE"
 
 # Re-initialize log with DB name
-init_log "configure_fsfo_${STANDBY_DB_UNIQUE_NAME}"
+init_log "09_configure_fsfo_${STANDBY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Verify Database Role
@@ -85,13 +89,13 @@ log_section "Verifying Database Role"
 DB_ROLE=$(run_sql_query "get_db_role.sql")
 DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
 
-if [[ "$DB_ROLE" != "PHYSICAL STANDBY" ]]; then
-    log_error "This script must be run on the STANDBY database"
+if [[ "$DB_ROLE" != "PRIMARY" ]]; then
+    log_error "This script must be run on the PRIMARY database"
     log_error "Current database role: $DB_ROLE"
     exit 1
 fi
 
-log_info "Confirmed: Running on PHYSICAL STANDBY database"
+log_info "Confirmed: Running on PRIMARY database"
 
 # ============================================================
 # Verify Data Guard Broker Configuration
@@ -103,7 +107,7 @@ CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
 if echo "$CONFIG_STATUS" | grep -q "ORA-16532"; then
     log_error "No Data Guard Broker configuration found"
-    log_error "Please complete Data Guard setup (Steps 1-7) before configuring FSFO"
+    log_error "Please complete Data Guard setup (Steps 1-8) before configuring FSFO"
     exit 1
 fi
 
@@ -168,17 +172,118 @@ log_section "FSFO Configuration Summary"
 echo ""
 echo "The following changes will be made:"
 echo ""
-echo "  1. Protection Mode    : $CURRENT_MODE -> MAXIMUM AVAILABILITY"
-echo "  2. LogXptMode         : FASTSYNC (for ${STANDBY_DB_UNIQUE_NAME})"
-echo "  3. FSFO Threshold     : ${FSFO_THRESHOLD} seconds"
-echo "  4. FSFO Target        : ${STANDBY_DB_UNIQUE_NAME}"
-echo "  5. Fast-Start Failover: ENABLED"
+echo "  1. Create SYSDG user    : For observer wallet authentication"
+echo "  2. Protection Mode      : $CURRENT_MODE -> MAXIMUM AVAILABILITY"
+echo "  3. LogXptMode           : FASTSYNC (for ${STANDBY_DB_UNIQUE_NAME})"
+echo "  4. FSFO Threshold       : ${FSFO_THRESHOLD} seconds"
+echo "  5. FSFO Target          : ${STANDBY_DB_UNIQUE_NAME}"
+echo "  6. Fast-Start Failover  : ENABLED"
 echo ""
 
 if ! confirm_proceed "Proceed with FSFO configuration?"; then
     log_info "FSFO configuration cancelled by user"
     exit 0
 fi
+
+# ============================================================
+# Create SYSDG User
+# ============================================================
+
+log_section "Creating SYSDG User for Observer Authentication"
+
+# Check if SYSDG user already exists
+SYSDG_EXISTS=$(sqlplus -s / as sysdba << 'EOF'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+SELECT COUNT(*) FROM dba_users WHERE username = 'SYSDG';
+EXIT;
+EOF
+)
+SYSDG_EXISTS=$(echo "$SYSDG_EXISTS" | tr -d ' \n\r')
+
+if [[ "$SYSDG_EXISTS" == "1" ]]; then
+    log_info "SYSDG user already exists"
+
+    if ! confirm_proceed "Do you want to recreate the SYSDG user with a new password?"; then
+        log_info "Keeping existing SYSDG user"
+    else
+        # Prompt for SYSDG password
+        SYSDG_PASSWORD=$(prompt_password "Enter password for SYSDG user")
+
+        if [[ -z "$SYSDG_PASSWORD" ]]; then
+            log_error "Password cannot be empty"
+            exit 1
+        fi
+
+        # Drop and recreate
+        log_info "Dropping existing SYSDG user..."
+        sqlplus -s / as sysdba << EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+DROP USER sysdg CASCADE;
+EXIT;
+EOF
+
+        log_info "Creating SYSDG user..."
+        log_cmd "sqlplus / as sysdba:" "CREATE USER sysdg IDENTIFIED BY ***"
+        RESULT=$(sqlplus -s / as sysdba << EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+CREATE USER sysdg IDENTIFIED BY "${SYSDG_PASSWORD}";
+GRANT SYSDG TO sysdg;
+GRANT CREATE SESSION TO sysdg;
+SELECT 'SUCCESS' FROM DUAL;
+EXIT;
+EOF
+)
+
+        if ! echo "$RESULT" | grep -q "SUCCESS"; then
+            log_error "Failed to create SYSDG user"
+            echo "$RESULT"
+            exit 1
+        fi
+
+        log_info "SYSDG user created successfully"
+    fi
+else
+    # Prompt for SYSDG password
+    SYSDG_PASSWORD=$(prompt_password "Enter password for new SYSDG user")
+
+    if [[ -z "$SYSDG_PASSWORD" ]]; then
+        log_error "Password cannot be empty"
+        exit 1
+    fi
+
+    # Confirm password
+    SYSDG_PASSWORD_CONFIRM=$(prompt_password "Confirm SYSDG password")
+
+    if [[ "$SYSDG_PASSWORD" != "$SYSDG_PASSWORD_CONFIRM" ]]; then
+        log_error "Passwords do not match"
+        exit 1
+    fi
+
+    log_info "Creating SYSDG user..."
+    log_cmd "sqlplus / as sysdba:" "CREATE USER sysdg IDENTIFIED BY ***"
+    RESULT=$(sqlplus -s / as sysdba << EOF
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+CREATE USER sysdg IDENTIFIED BY "${SYSDG_PASSWORD}";
+GRANT SYSDG TO sysdg;
+GRANT CREATE SESSION TO sysdg;
+SELECT 'SUCCESS' FROM DUAL;
+EXIT;
+EOF
+)
+
+    if ! echo "$RESULT" | grep -q "SUCCESS"; then
+        log_error "Failed to create SYSDG user"
+        echo "$RESULT"
+        exit 1
+    fi
+
+    log_info "SYSDG user created successfully"
+    log_info "Note: User will be replicated to standby via redo transport"
+fi
+
+# Clear password from memory
+unset SYSDG_PASSWORD
+unset SYSDG_PASSWORD_CONFIRM
 
 # ============================================================
 # Configure Protection Mode
@@ -247,6 +352,52 @@ fi
 log_info "Fast-Start Failover enabled"
 
 # ============================================================
+# Copy Password File for Observer Server
+# ============================================================
+
+log_section "Preparing Files for Observer Server"
+
+# Check if password file already exists on NFS
+ORAPW_FILE="$ORACLE_HOME/dbs/orapw${ORACLE_SID}"
+NFS_ORAPW_FILE="${NFS_SHARE}/orapw${PRIMARY_DB_NAME}"
+
+if [[ -f "$NFS_ORAPW_FILE" ]]; then
+    log_info "Password file already exists on NFS share"
+else
+    if [[ -f "$ORAPW_FILE" ]]; then
+        log_info "Copying password file to NFS share..."
+        cp "$ORAPW_FILE" "$NFS_ORAPW_FILE"
+        chmod 640 "$NFS_ORAPW_FILE"
+        log_info "Password file copied to: $NFS_ORAPW_FILE"
+    else
+        log_warn "Password file not found: $ORAPW_FILE"
+        log_warn "Observer server may need manual password file configuration"
+    fi
+fi
+
+# ============================================================
+# Update Configuration File with FSFO Settings
+# ============================================================
+
+log_section "Updating Configuration File"
+
+# Add FSFO settings to config file if not present
+if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+    cat >> "$STANDBY_CONFIG_FILE" << EOF
+
+# ============================================================
+# FSFO Configuration (added by Step 9)
+# ============================================================
+FSFO_ENABLED="YES"
+FSFO_THRESHOLD="${FSFO_THRESHOLD}"
+OBSERVER_WALLET_DIR="\${ORACLE_HOME}/network/admin/wallet"
+EOF
+    log_info "Added FSFO settings to configuration file"
+else
+    log_info "FSFO settings already exist in configuration file"
+fi
+
+# ============================================================
 # Display Final Configuration
 # ============================================================
 
@@ -271,18 +422,36 @@ echo "  LogXptMode      : FASTSYNC"
 echo "  FSFO Threshold  : ${FSFO_THRESHOLD} seconds"
 echo "  FSFO Target     : ${STANDBY_DB_UNIQUE_NAME}"
 echo "  FSFO Status     : ENABLED (observer not yet started)"
+echo "  SYSDG User      : Created for observer authentication"
 echo ""
-echo "NEXT STEPS"
-echo "=========="
+echo "NEXT STEPS - Observer Setup"
+echo "==========================="
 echo ""
-echo "  1. Start the observer process:"
+echo "The observer can run on the standby server or a 3rd dedicated server."
+echo "On the observer server:"
+echo ""
+echo "  1. Ensure Oracle client is installed"
+echo "  2. Configure tnsnames.ora with entries for:"
+echo "     - ${PRIMARY_TNS_ALIAS}"
+echo "     - ${STANDBY_TNS_ALIAS}"
+echo ""
+echo "  3. Set up the observer wallet:"
+echo "     ./fsfo/observer.sh setup"
+echo ""
+echo "  4. Start the observer:"
 echo "     ./fsfo/observer.sh start"
 echo ""
-echo "  2. Verify observer is running:"
+echo "  5. Verify observer status:"
 echo "     ./fsfo/observer.sh status"
 echo ""
-echo "  3. Monitor FSFO status:"
-echo "     dgmgrl / \"show fast_start failover\""
+echo "OBSERVER WALLET SETUP"
+echo "====================="
+echo ""
+echo "The wallet provides secure authentication without storing passwords."
+echo "When running './fsfo/observer.sh setup', you will be prompted for the"
+echo "SYSDG password you just created."
+echo ""
+echo "The observer connects using: dgmgrl /@${PRIMARY_TNS_ALIAS}"
 echo ""
 echo "NOTE: The observer must be running for automatic failover to occur."
 echo ""

@@ -53,14 +53,14 @@ dataguard_setup/
 │   ├── 02_generate_standby_config.sh  # Generate standby configuration
 │   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
 │   ├── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
-│   └── 08_security_hardening.sh       # Lock SYS account (optional)
+│   ├── 08_security_hardening.sh       # Lock SYS account (optional)
+│   └── 09_configure_fsfo.sh           # Configure Fast-Start Failover (optional)
 ├── standby/
 │   ├── 03_setup_standby_env.sh        # Prepare standby environment
 │   ├── 05_clone_standby.sh            # RMAN duplicate execution
 │   └── 07_verify_dataguard.sh         # Validation and health check
 ├── fsfo/
-│   ├── configure_fsfo.sh              # Configure Fast-Start Failover (optional)
-│   └── observer.sh                    # Observer lifecycle management
+│   └── observer.sh                    # Observer setup and lifecycle (setup/start/stop/status)
 ├── common/
 │   └── dg_functions.sh                # Shared utility functions
 ├── templates/
@@ -85,10 +85,14 @@ dataguard_setup/
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` | Yes |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` | Yes |
 | 8 | PRIMARY | `./primary/08_security_hardening.sh` | Yes** |
+| 9 | PRIMARY | `./primary/09_configure_fsfo.sh` | Yes*** |
+| 10 | OBSERVER | `./fsfo/observer.sh setup` then `start` | Yes*** |
 
 **\*** Step 5 requires cleanup before restart (see [Restartability](#restartability)).
 
 **\*\*** Step 8 is optional. Locks SYS account after setup is verified.
+
+**\*\*\*** Steps 9-10 are optional. Configures Fast-Start Failover for automatic failover.
 
 ### Workflow Diagram
 
@@ -111,6 +115,12 @@ Step 6: Configure Broker ◄─────────────────�
     └────────────────────────────────────► Step 7: Verify Setup
 
 Step 8: Security Hardening (optional)
+
+                        OBSERVER SERVER (optional - can be standby or 3rd server)
+                        ══════════════════════════════════════════════════════
+Step 9: Configure FSFO ─────────────────► Step 10: Observer Setup & Start
+    (creates SYSDG user,                    (wallet setup, start observer)
+     enables FSFO)
 ```
 
 ### Restartability
@@ -192,27 +202,31 @@ ALTER SYSTEM SWITCH LOGFILE;
 
 ## Fast-Start Failover (Optional)
 
-After Data Guard setup is complete and verified, you can optionally configure Fast-Start Failover (FSFO) for automatic failover capability.
+After Data Guard setup is complete and verified (Steps 1-8), you can optionally configure Fast-Start Failover (FSFO) for automatic failover capability.
 
-### Configuration
+### Step 9: Configure FSFO
 
-Run on the **STANDBY** server after Step 7 verification passes:
+Run on the **PRIMARY** server after Step 7 verification passes:
 
 ```bash
-# Configure FSFO (one-time)
-./fsfo/configure_fsfo.sh
+./primary/09_configure_fsfo.sh
 ```
 
 This configures:
+- Creates SYSDG user for observer authentication
 - Protection mode: MAXIMUM AVAILABILITY
 - LogXptMode: FASTSYNC
-- FSFO threshold: 30 seconds
+- FSFO threshold: 30 seconds (configurable via FSFO_THRESHOLD)
+- Enables Fast-Start Failover
 
-### Observer Management
+### Step 10: Observer Setup
 
-The observer must be running for automatic failover to occur:
+The observer can run on the **standby server** or a **dedicated 3rd server**. On the observer server:
 
 ```bash
+# Set up Oracle Wallet for secure authentication
+./fsfo/observer.sh setup
+
 # Start the observer
 ./fsfo/observer.sh start
 
@@ -225,6 +239,8 @@ The observer must be running for automatic failover to occur:
 # Restart the observer
 ./fsfo/observer.sh restart
 ```
+
+The wallet provides secure authentication without storing passwords. When running `setup`, you will be prompted for the SYSDG password created in Step 9.
 
 ### FSFO Commands (DGMGRL)
 

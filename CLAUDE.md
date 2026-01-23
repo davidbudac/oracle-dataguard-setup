@@ -6,9 +6,9 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 
 ```
 nfs/           - NFS setup scripts (run before Data Guard setup)
-primary/       - Scripts to run on PRIMARY server
-standby/       - Scripts to run on STANDBY server
-fsfo/          - Fast-Start Failover scripts (optional, run on STANDBY)
+primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
+standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
+fsfo/          - Observer scripts (run on observer server - standby or 3rd server)
 common/        - Shared scripts and functions
 templates/     - Reference templates
 docs/          - Detailed walkthrough documentation
@@ -27,6 +27,9 @@ tests/         - Test scripts
 8. `primary/06_configure_broker.sh` - Configure DGMGRL
 9. `standby/07_verify_dataguard.sh` - Verify setup
 10. `primary/08_security_hardening.sh` - Lock SYS account (optional)
+11. `primary/09_configure_fsfo.sh` - Configure Fast-Start Failover (optional)
+12. `fsfo/observer.sh setup` - Set up observer wallet (on observer server)
+13. `fsfo/observer.sh start` - Start observer (on observer server)
 
 ## Restartability
 
@@ -74,22 +77,29 @@ Scripts are designed for Oracle 19c on Linux with filesystem storage. Test in no
 
 After Data Guard setup is complete, you can optionally configure Fast-Start Failover (FSFO) for automatic failover:
 
+**Step 9: Configure FSFO (on PRIMARY)**
+```bash
+./primary/09_configure_fsfo.sh
 ```
-fsfo/configure_fsfo.sh  - Configure FSFO (run once on STANDBY)
-fsfo/observer.sh        - Observer lifecycle: start/stop/status/restart
+This creates a SYSDG user, sets MAXIMUM AVAILABILITY mode, enables FSFO.
+
+**Step 10: Observer Setup (on OBSERVER server - can be standby or 3rd server)**
+```bash
+./fsfo/observer.sh setup   # Create Oracle Wallet with SYSDG credentials
+./fsfo/observer.sh start   # Start observer in background
+./fsfo/observer.sh status  # Check observer status
+./fsfo/observer.sh stop    # Stop observer
+./fsfo/observer.sh restart # Restart observer
 ```
+
+**Authentication:**
+- Uses Oracle Wallet for secure authentication (no stored passwords)
+- SYSDG user with SYSDG privilege for observer connections
+- Observer connects via: `dgmgrl /@PRIMARY_TNS_ALIAS`
 
 **FSFO Configuration:**
-- Sets protection mode to MAXIMUM AVAILABILITY
-- Sets LogXptMode to FASTSYNC
-- Enables Fast-Start Failover with 30-second threshold
-
-**Observer Management:**
-```bash
-./fsfo/observer.sh start    # Start observer in background
-./fsfo/observer.sh status   # Check observer status
-./fsfo/observer.sh stop     # Stop observer
-./fsfo/observer.sh restart  # Restart observer
-```
+- Protection mode: MAXIMUM AVAILABILITY
+- LogXptMode: FASTSYNC
+- Default threshold: 30 seconds (configurable via FSFO_THRESHOLD)
 
 The observer must be running for automatic failover to occur.

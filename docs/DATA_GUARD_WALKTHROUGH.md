@@ -16,7 +16,8 @@ This document describes what each automation script does and shows the equivalen
 8. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
 9. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
 10. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
-11. [Fast-Start Failover (Optional)](#fast-start-failover-optional)
+11. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
+12. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
 
 ---
 
@@ -738,37 +739,120 @@ ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT
 
 ---
 
-## Fast-Start Failover (Optional)
+## Step 9: Configure Fast-Start Failover (Optional)
 
-After Data Guard setup is complete and verified, you can optionally configure Fast-Start Failover (FSFO) for automatic failover.
+**Script:** `primary/09_configure_fsfo.sh`
 
-**Scripts:** `fsfo/configure_fsfo.sh` and `fsfo/observer.sh`
+### What the Script Does
 
-### What FSFO Provides
+1. Verifies Data Guard Broker configuration is healthy
+2. Prompts for and creates SYSDG user for observer authentication
+3. Sets protection mode to MAXIMUM AVAILABILITY
+4. Sets LogXptMode to FASTSYNC
+5. Configures FSFO properties (threshold, target)
+6. Enables Fast-Start Failover
+7. Copies password file to NFS for observer server
+8. Outputs wallet setup instructions
 
-- **Automatic failover** when primary becomes unavailable
-- **Observer process** monitors both databases continuously
-- **Protection mode** upgraded to MAXIMUM AVAILABILITY (synchronous redo)
+### Manual Equivalent
 
-### Configuration
+```sql
+-- As oracle user on PRIMARY server
+sqlplus / as sysdba
 
-Run on the **STANDBY** server after Step 7 verification passes:
+-- Create SYSDG user for observer
+CREATE USER sysdg IDENTIFIED BY <password>;
+GRANT SYSDG TO sysdg;
+GRANT CREATE SESSION TO sysdg;
 
-```bash
-./fsfo/configure_fsfo.sh
+EXIT;
 ```
 
-This configures:
-- Protection mode: MAXIMUM AVAILABILITY
-- LogXptMode: FASTSYNC (synchronous with fast acknowledgment)
-- FSFO threshold: 30 seconds (configurable via FSFO_THRESHOLD environment variable)
-- FSFO target: standby database
+```
+-- Configure FSFO in DGMGRL
+dgmgrl /
 
-### Observer Management
+-- Set protection mode
+EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY;
 
-The observer must be running for automatic failover to occur:
+-- Set LogXptMode for standby
+EDIT DATABASE 'STANDBY_DB' SET PROPERTY LogXptMode='FASTSYNC';
+
+-- Configure FSFO properties
+EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=30;
+EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='STANDBY_DB';
+
+-- Enable FSFO
+ENABLE FAST_START FAILOVER;
+
+SHOW FAST_START FAILOVER;
+EXIT;
+```
+
+---
+
+## Step 10: Observer Setup (Optional)
+
+**Script:** `fsfo/observer.sh`
+
+### What the Script Does
+
+The observer can run on the **standby server** or a **dedicated 3rd server**.
+
+**Setup command (`./observer.sh setup`):**
+1. Creates Oracle Wallet directory
+2. Creates auto-login wallet
+3. Adds SYSDG credentials for primary and standby TNS aliases
+4. Configures sqlnet.ora with wallet location
+5. Tests wallet connectivity
+
+**Start command (`./observer.sh start`):**
+1. Verifies wallet exists
+2. Verifies FSFO is enabled
+3. Starts observer in background using wallet authentication
+4. Saves PID for lifecycle management
+
+### Manual Equivalent
 
 ```bash
+# As oracle user on OBSERVER server
+
+# Create wallet directory
+mkdir -p $ORACLE_HOME/network/admin/wallet
+chmod 700 $ORACLE_HOME/network/admin/wallet
+
+# Create wallet
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -create
+# Enter wallet password when prompted
+
+# Enable auto-login
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -createSSO
+# Enter wallet password when prompted
+
+# Add credentials
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential PRIMARY_TNS sysdg <password>
+mkstore -wrl $ORACLE_HOME/network/admin/wallet -createCredential STANDBY_TNS sysdg <password>
+```
+
+```bash
+# Add to sqlnet.ora
+cat >> $ORACLE_HOME/network/admin/sqlnet.ora << 'EOF'
+WALLET_LOCATION = (SOURCE = (METHOD = FILE) (METHOD_DATA = (DIRECTORY = /path/to/wallet)))
+SQLNET.WALLET_OVERRIDE = TRUE
+EOF
+```
+
+```bash
+# Start observer using wallet
+nohup dgmgrl /@PRIMARY_TNS "START OBSERVER" > observer.log 2>&1 &
+```
+
+### Observer Commands
+
+```bash
+# Set up wallet (one-time)
+./fsfo/observer.sh setup
+
 # Start observer in background
 ./fsfo/observer.sh start
 
@@ -800,15 +884,17 @@ dgmgrl / "STOP OBSERVER"
 
 ### Important Notes
 
-1. **Observer location**: The observer runs on the standby server so it remains available if the primary fails
+1. **Observer location**: The observer can run on the standby server or a dedicated 3rd server. A 3rd server is recommended for production as it remains available regardless of which database fails.
 
-2. **Protection mode impact**: MAXIMUM AVAILABILITY provides zero data loss but may slightly impact primary performance
+2. **Authentication**: Uses Oracle Wallet with SYSDG user for secure authentication. No passwords are stored in scripts.
 
-3. **Network requirements**: Observer must have network connectivity to both primary and standby databases
+3. **Protection mode impact**: MAXIMUM AVAILABILITY provides zero data loss but may slightly impact primary performance.
 
-4. **Maintenance considerations**: Stop the observer before performing database maintenance to prevent unexpected failovers
+4. **Network requirements**: Observer must have network connectivity to both primary and standby databases.
 
-5. **Threshold tuning**: The default 30-second threshold can be adjusted:
+5. **Maintenance considerations**: Stop the observer before performing database maintenance to prevent unexpected failovers.
+
+6. **Threshold tuning**: The default 30-second threshold can be adjusted:
    ```bash
-   FSFO_THRESHOLD=60 ./fsfo/configure_fsfo.sh
+   FSFO_THRESHOLD=60 ./primary/09_configure_fsfo.sh
    ```
