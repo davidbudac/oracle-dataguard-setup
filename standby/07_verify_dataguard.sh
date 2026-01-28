@@ -77,10 +77,14 @@ log_section "Authentication"
 
 echo ""
 echo "SYS password is required for DGMGRL network validation."
-read -s -p "Enter SYS password: " SYS_PASSWORD
+printf "Enter SYS password: "
+# AIX compatible: use stty instead of read -s
+stty -echo
+read SYS_PASSWORD
+stty echo
 echo ""
 
-if [[ -z "$SYS_PASSWORD" ]]; then
+if [ -z "$SYS_PASSWORD" ]; then
     log_warn "No SYS password provided - DGMGRL network validation will be skipped"
 fi
 

@@ -77,8 +77,9 @@ echo "Please provide the following information for the standby database:"
 echo ""
 
 # Standby hostname
-read -p "Standby server hostname: " STANDBY_HOSTNAME
-if [[ -z "$STANDBY_HOSTNAME" ]]; then
+printf "Standby server hostname: "
+read STANDBY_HOSTNAME
+if [ -z "$STANDBY_HOSTNAME" ]; then
     log_error "Standby hostname cannot be empty"
     exit 1
 fi
@@ -86,8 +87,9 @@ fi
 # Standby DB_UNIQUE_NAME
 echo ""
 echo "The standby DB_UNIQUE_NAME must be different from primary ($DB_UNIQUE_NAME)"
-read -p "Standby DB_UNIQUE_NAME: " STANDBY_DB_UNIQUE_NAME
-if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
+printf "Standby DB_UNIQUE_NAME: "
+read STANDBY_DB_UNIQUE_NAME
+if [ -z "$STANDBY_DB_UNIQUE_NAME" ]; then
     log_error "Standby DB_UNIQUE_NAME cannot be empty"
     exit 1
 fi
@@ -100,7 +102,8 @@ fi
 # Standby Oracle SID (default same as primary)
 echo ""
 echo "The standby ORACLE_SID (default: $PRIMARY_ORACLE_SID)"
-read -p "Standby ORACLE_SID [$PRIMARY_ORACLE_SID]: " STANDBY_ORACLE_SID
+printf "Standby ORACLE_SID [$PRIMARY_ORACLE_SID]: "
+read STANDBY_ORACLE_SID
 STANDBY_ORACLE_SID=${STANDBY_ORACLE_SID:-$PRIMARY_ORACLE_SID}
 
 # ============================================================

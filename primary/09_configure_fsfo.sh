@@ -183,7 +183,8 @@ echo ""
 # Default username suggestion
 DEFAULT_OBSERVER_USER="dg_observer"
 
-read -p "Enter username for observer [$DEFAULT_OBSERVER_USER]: " OBSERVER_USER
+printf "Enter username for observer [$DEFAULT_OBSERVER_USER]: "
+read OBSERVER_USER
 OBSERVER_USER="${OBSERVER_USER:-$DEFAULT_OBSERVER_USER}"
 
 # Convert to uppercase for Oracle
@@ -451,8 +452,10 @@ EOF
     log_info "Added FSFO settings to configuration file"
 else
     # Update OBSERVER_USER if it changed
+    # AIX compatible: use temp file instead of sed -i
     if grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
-        sed -i.bak "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" "$STANDBY_CONFIG_FILE"
+        sed "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" "$STANDBY_CONFIG_FILE" > "${STANDBY_CONFIG_FILE}.tmp"
+        mv "${STANDBY_CONFIG_FILE}.tmp" "$STANDBY_CONFIG_FILE"
     else
         echo "OBSERVER_USER=\"${OBSERVER_USER}\"" >> "$STANDBY_CONFIG_FILE"
     fi

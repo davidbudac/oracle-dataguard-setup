@@ -244,14 +244,19 @@ log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_
 echo ""
 
 # Use tee to display output on screen AND write to log file
-# PIPESTATUS[0] captures RMAN's exit code (not tee's)
+# AIX compatible: use temp file to capture exit code instead of PIPESTATUS
+RMAN_EXIT_FILE="/tmp/rman_exit_$$"
+(
 "$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
-    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" <<EOF 2>&1 | tee "$RMAN_LOG"
+    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" <<EOF
 @${RMAN_SCRIPT}
 EXIT;
 EOF
+echo $? > "$RMAN_EXIT_FILE"
+) 2>&1 | tee "$RMAN_LOG"
 
-RMAN_EXIT_CODE=${PIPESTATUS[0]}
+RMAN_EXIT_CODE=$(cat "$RMAN_EXIT_FILE" 2>/dev/null || echo "1")
+rm -f "$RMAN_EXIT_FILE"
 
 # Clear password from memory
 SYS_PASSWORD=""

@@ -255,7 +255,8 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
 
     log_info "Creating $GROUPS_TO_CREATE standby redo log groups..."
 
-    for ((i=1; i<=GROUPS_TO_CREATE; i++)); do
+    i=1
+    while [ "$i" -le "$GROUPS_TO_CREATE" ]; do
         NEW_GROUP=$((MAX_GROUP + i))
         STBY_LOG_FILE="${REDO_PATH}standby_redo${NEW_GROUP}.log"
 
@@ -263,6 +264,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
 
         run_sql_command "add_standby_logfile.sql" "$NEW_GROUP" "$STBY_LOG_FILE" "$REDO_LOG_SIZE_MB"
+        i=$((i + 1))
     done
 
     log_info "Standby redo logs created successfully"

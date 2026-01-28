@@ -329,7 +329,10 @@ prompt_password() {
 
     # Output prompt to stderr so it doesn't get captured by $()
     printf "${YELLOW}%s${NC}: " "$prompt_text" >&2
-    read -s password
+    # AIX compatible: use stty instead of read -s
+    stty -echo
+    read password
+    stty echo
     echo "" >&2
 
     # Only the password goes to stdout (gets captured)

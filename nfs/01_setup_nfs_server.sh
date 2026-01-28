@@ -19,22 +19,22 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    printf "${GREEN}[INFO]${NC} %s\n" "$1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    printf "${YELLOW}[WARN]${NC} %s\n" "$1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf "${RED}[ERROR]${NC} %s\n" "$1"
 }
 
 # ============================================================
 # Check root privileges
 # ============================================================
 
-if [[ $EUID -ne 0 ]]; then
+if [ "$EUID" -ne 0 ]; then
     log_error "This script must be run as root (use sudo)"
     exit 1
 fi
@@ -52,10 +52,12 @@ echo "Enter the hostnames or IP addresses that need access to this NFS share."
 echo "These are typically your primary and standby database servers."
 echo ""
 
-read -p "Primary server hostname/IP: " PRIMARY_HOST
-read -p "Standby server hostname/IP: " STANDBY_HOST
+printf "Primary server hostname/IP: "
+read PRIMARY_HOST
+printf "Standby server hostname/IP: "
+read STANDBY_HOST
 
-if [[ -z "$PRIMARY_HOST" || -z "$STANDBY_HOST" ]]; then
+if [ -z "$PRIMARY_HOST" ] || [ -z "$STANDBY_HOST" ]; then
     log_error "Both hostnames are required"
     exit 1
 fi

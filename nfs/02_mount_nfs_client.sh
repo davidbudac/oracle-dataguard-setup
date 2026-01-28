@@ -19,22 +19,22 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    printf "${GREEN}[INFO]${NC} %s\n" "$1"
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    printf "${YELLOW}[WARN]${NC} %s\n" "$1"
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    printf "${RED}[ERROR]${NC} %s\n" "$1"
 }
 
 # ============================================================
 # Check root privileges
 # ============================================================
 
-if [[ $EUID -ne 0 ]]; then
+if [ "$EUID" -ne 0 ]; then
     log_error "This script must be run as root (use sudo)"
     exit 1
 fi
@@ -76,9 +76,10 @@ echo "Enter the hostname or IP address of the NFS server."
 echo "(This is the server where you ran 01_setup_nfs_server.sh)"
 echo ""
 
-read -p "NFS server hostname/IP: " NFS_SERVER
+printf "NFS server hostname/IP: "
+read NFS_SERVER
 
-if [[ -z "$NFS_SERVER" ]]; then
+if [ -z "$NFS_SERVER" ]; then
     log_error "NFS server hostname is required"
     exit 1
 fi
@@ -223,7 +224,7 @@ log_info "Setting permissions for oracle user..."
 # Try to find oracle user UID
 ORACLE_UID=$(id -u oracle 2>/dev/null || echo "")
 
-if [[ -n "$ORACLE_UID" ]]; then
+if [ -n "$ORACLE_UID" ]; then
     chown oracle:oinstall "$NFS_MOUNT_PATH" 2>/dev/null || chown oracle:dba "$NFS_MOUNT_PATH" 2>/dev/null || true
     chmod 775 "$NFS_MOUNT_PATH"
     log_info "Permissions set for oracle user"

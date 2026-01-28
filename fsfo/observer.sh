@@ -227,7 +227,8 @@ EOF
     if [[ -z "$OBSERVER_USER" ]]; then
         echo ""
         echo "No observer username found in configuration."
-        read -p "Enter observer username: " OBSERVER_USER
+        printf "Enter observer username: "
+        read OBSERVER_USER
         OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
     fi
 
