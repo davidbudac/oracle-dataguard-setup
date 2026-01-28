@@ -10,8 +10,8 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# NFS share path for file exchange
-NFS_SHARE="/OINSTALL/_dataguard_setup"
+# NFS share path for file exchange (default, can be overridden by confirm_nfs_share)
+NFS_SHARE="${NFS_SHARE:-/OINSTALL/_dataguard_setup}"
 
 # Get the directory where this script is located
 DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -141,6 +141,37 @@ check_nfs_mount() {
 
     log_info "NFS share is accessible and writable"
     return 0
+}
+
+# Prompt user to confirm or provide NFS share location
+# Usage: confirm_nfs_share
+# Sets: NFS_SHARE global variable
+confirm_nfs_share() {
+    local default_path="$NFS_SHARE"
+    local user_input
+
+    echo ""
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${BLUE}NFS Share Location Configuration${NC}\n"
+    printf "${BLUE}============================================================${NC}\n"
+    echo ""
+    printf "The NFS share is used to exchange files between primary and standby servers.\n"
+    echo ""
+    printf "Current NFS share path: ${GREEN}%s${NC}\n" "$default_path"
+    echo ""
+    printf "Press Enter to use this path, or type a different path: "
+    read user_input
+
+    if [[ -n "$user_input" ]]; then
+        # User provided a different path - strip trailing slash
+        NFS_SHARE="${user_input%/}"
+        log_info "NFS share path set to: $NFS_SHARE"
+    else
+        log_info "Using default NFS share path: $NFS_SHARE"
+    fi
+
+    # Export so child processes can access it
+    export NFS_SHARE
 }
 
 check_db_connection() {

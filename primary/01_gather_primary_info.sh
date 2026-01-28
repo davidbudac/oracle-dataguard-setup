@@ -21,6 +21,13 @@ source "${COMMON_DIR}/dg_functions.sh"
 
 print_banner "Step 1: Gather Primary Info"
 
+# ============================================================
+# NFS Share Configuration
+# ============================================================
+
+# Ask user to confirm or provide NFS share location
+confirm_nfs_share
+
 # Initialize temporary logging (will reinitialize with DB_UNIQUE_NAME later)
 init_log "01_gather_primary_info_${ORACLE_SID}"
 
