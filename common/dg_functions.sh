@@ -25,17 +25,17 @@ SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 
 log_info() {
     printf "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
-    echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+    [ -n "$LOG_FILE" ] && echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
 log_warn() {
     printf "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
-    echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+    [ -n "$LOG_FILE" ] && echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
 log_error() {
     printf "${RED}[ERROR]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
-    echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" 2>/dev/null
+    [ -n "$LOG_FILE" ] && echo "[ERROR] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE"
 }
 
 log_section() {
@@ -44,10 +44,12 @@ log_section() {
     printf "${BLUE}%s${NC}\n" "$1"
     printf "${BLUE}============================================================${NC}\n"
     echo ""
-    echo "" >> "$LOG_FILE" 2>/dev/null
-    echo "============================================================" >> "$LOG_FILE" 2>/dev/null
-    echo "$1" >> "$LOG_FILE" 2>/dev/null
-    echo "============================================================" >> "$LOG_FILE" 2>/dev/null
+    if [ -n "$LOG_FILE" ]; then
+        echo "" >> "$LOG_FILE"
+        echo "============================================================" >> "$LOG_FILE"
+        echo "$1" >> "$LOG_FILE"
+        echo "============================================================" >> "$LOG_FILE"
+    fi
 }
 
 # Log a command that is about to be executed
@@ -57,7 +59,7 @@ log_cmd() {
     local prefix="$1"
     local cmd="$2"
     printf "${YELLOW}>>> %s${NC} %s\n" "$prefix" "$cmd"
-    echo ">>> $prefix $cmd" >> "$LOG_FILE" 2>/dev/null
+    [ -n "$LOG_FILE" ] && echo ">>> $prefix $cmd" >> "$LOG_FILE"
 }
 
 # Initialize log file
