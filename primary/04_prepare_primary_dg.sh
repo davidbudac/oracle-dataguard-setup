@@ -253,11 +253,14 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     # Calculate how many to create
     GROUPS_TO_CREATE=$((REQUIRED_STBY_GROUPS - CURRENT_STBY_GROUPS))
 
-    log_info "Creating $GROUPS_TO_CREATE standby redo log groups..."
+    # Standby redo log groups start at group 11
+    STANDBY_REDO_START_GROUP=11
 
-    i=1
-    while [ "$i" -le "$GROUPS_TO_CREATE" ]; do
-        NEW_GROUP=$((MAX_GROUP + i))
+    log_info "Creating $GROUPS_TO_CREATE standby redo log groups starting at group $STANDBY_REDO_START_GROUP..."
+
+    i=0
+    while [ "$i" -lt "$GROUPS_TO_CREATE" ]; do
+        NEW_GROUP=$((STANDBY_REDO_START_GROUP + i))
         STBY_LOG_FILE="${REDO_PATH}standby_redo${NEW_GROUP}.log"
 
         log_info "Creating standby redo log group $NEW_GROUP: $STBY_LOG_FILE"
