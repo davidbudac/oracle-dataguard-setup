@@ -499,6 +499,88 @@ add_sid_to_listener() {
 }
 
 # ============================================================
+# File Selection Functions
+# ============================================================
+
+# Select a config file from a list, sorted by modification time
+# Usage: select_config_file <result_var> <file_type> <glob_pattern>
+# Example: select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"
+# Returns: Sets the result variable to the selected file path
+#          Returns 0 on success, 1 if no files found or user cancelled
+select_config_file() {
+    local result_var="$1"
+    local file_type="$2"
+    local glob_pattern="$3"
+
+    # Get files sorted by modification time (oldest first, newest last)
+    # AIX compatible: use ls -t (newest first) then reverse with tail -r or tac
+    local files_array=()
+    local file
+
+    # First check if any files match the pattern
+    local matching_files
+    matching_files=$(ls -1t $glob_pattern 2>/dev/null) || true
+
+    if [[ -z "$matching_files" ]]; then
+        log_error "No ${file_type} files found matching: $glob_pattern"
+        return 1
+    fi
+
+    # Reverse the order (oldest first, newest last) - AIX compatible
+    # Using a while loop to reverse since tac may not exist on AIX
+    local reversed_files=()
+    while IFS= read -r file; do
+        reversed_files=("$file" "${reversed_files[@]}")
+    done <<< "$matching_files"
+    files_array=("${reversed_files[@]}")
+
+    local file_count=${#files_array[@]}
+
+    if [[ $file_count -eq 1 ]]; then
+        eval "$result_var=\"${files_array[0]}\""
+        log_info "Found ${file_type} file: ${files_array[0]}"
+        return 0
+    fi
+
+    # Multiple files - show selection menu
+    echo ""
+    echo "Multiple ${file_type} files found (sorted by date, newest last):"
+    echo ""
+
+    local i=1
+    for file in "${files_array[@]}"; do
+        local basename_file=$(basename "$file")
+        local mtime=$(ls -l "$file" 2>/dev/null | awk '{print $6, $7, $8}')
+        if [[ $i -eq $file_count ]]; then
+            printf "  ${GREEN}%d) %s  [%s] (newest - default)${NC}\n" "$i" "$basename_file" "$mtime"
+        else
+            printf "  %d) %s  [%s]\n" "$i" "$basename_file" "$mtime"
+        fi
+        i=$((i + 1))
+    done
+
+    echo ""
+    printf "Select ${file_type} [1-%d, default=%d]: " "$file_count" "$file_count"
+    read selection
+
+    # Default to newest (last in list) if empty
+    if [[ -z "$selection" ]]; then
+        selection=$file_count
+    fi
+
+    # Validate selection
+    if ! [[ "$selection" =~ ^[0-9]+$ ]] || [[ "$selection" -lt 1 ]] || [[ "$selection" -gt $file_count ]]; then
+        log_error "Invalid selection: $selection"
+        return 1
+    fi
+
+    local selected_file="${files_array[$((selection - 1))]}"
+    eval "$result_var=\"$selected_file\""
+    log_info "Selected: $selected_file"
+    return 0
+}
+
+# ============================================================
 # User Confirmation
 # ============================================================
 

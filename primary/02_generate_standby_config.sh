@@ -34,26 +34,9 @@ log_section "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for primary info files - support unique naming
-PRIMARY_INFO_FILES=(${NFS_SHARE}/primary_info_*.env)
-
-if [[ ${#PRIMARY_INFO_FILES[@]} -eq 0 || ! -f "${PRIMARY_INFO_FILES[0]}" ]]; then
-    log_error "No primary info files found in $NFS_SHARE"
+if ! select_config_file PRIMARY_INFO_FILE "primary database info" "${NFS_SHARE}/primary_info_*.env"; then
     log_error "Please run 01_gather_primary_info.sh on the primary server first"
     exit 1
-elif [[ ${#PRIMARY_INFO_FILES[@]} -eq 1 ]]; then
-    PRIMARY_INFO_FILE="${PRIMARY_INFO_FILES[0]}"
-    log_info "Found primary info file: $PRIMARY_INFO_FILE"
-else
-    # Multiple primary info files exist - let user choose
-    echo ""
-    echo "Multiple primary databases found:"
-    echo ""
-    PS3="Select the primary database to use: "
-    select PRIMARY_INFO_FILE in "${PRIMARY_INFO_FILES[@]}"; do
-        if [[ -n "$PRIMARY_INFO_FILE" ]]; then
-            break
-        fi
-    done
 fi
 
 log_info "Loading primary info from: $PRIMARY_INFO_FILE"

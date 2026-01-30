@@ -56,23 +56,9 @@ check_db_connection || exit 1
 log_section "Loading Configuration"
 
 # Find standby config file
-STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
-
-if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
-    log_error "No standby configuration file found in ${NFS_SHARE}"
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run the Data Guard setup scripts first (Steps 1-7)"
     exit 1
-elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
-    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
-    log_info "Using configuration: $(basename "$STANDBY_CONFIG_FILE")"
-else
-    log_info "Multiple configuration files found:"
-    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
-        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
-            log_info "Selected: $(basename "$STANDBY_CONFIG_FILE")"
-            break
-        fi
-    done
 fi
 
 source "$STANDBY_CONFIG_FILE"

@@ -35,26 +35,9 @@ check_nfs_mount || exit 1
 check_db_connection || exit 1
 
 # Check for standby config files - support unique naming
-STANDBY_CONFIG_FILES=(${NFS_SHARE}/standby_config_*.env)
-
-if [[ ${#STANDBY_CONFIG_FILES[@]} -eq 0 || ! -f "${STANDBY_CONFIG_FILES[0]}" ]]; then
-    log_error "No standby config files found in $NFS_SHARE"
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run 02_generate_standby_config.sh first"
     exit 1
-elif [[ ${#STANDBY_CONFIG_FILES[@]} -eq 1 ]]; then
-    STANDBY_CONFIG_FILE="${STANDBY_CONFIG_FILES[0]}"
-    log_info "Found standby config file: $STANDBY_CONFIG_FILE"
-else
-    # Multiple standby config files exist - let user choose
-    echo ""
-    echo "Multiple standby configurations found:"
-    echo ""
-    PS3="Select the standby configuration to use: "
-    select STANDBY_CONFIG_FILE in "${STANDBY_CONFIG_FILES[@]}"; do
-        if [[ -n "$STANDBY_CONFIG_FILE" ]]; then
-            break
-        fi
-    done
 fi
 
 log_info "Loading standby configuration..."
