@@ -189,8 +189,16 @@ log_info "Standby redo path: $STANDBY_REDO_PATH"
 
 log_section "Generating TNS Configuration"
 
-PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}"
-STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}"
+# Use domain-qualified aliases if DB_DOMAIN is set
+# This handles NAMES.DEFAULT_DOMAIN in sqlnet.ora
+if [[ -n "$DB_DOMAIN" ]]; then
+    PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}.${DB_DOMAIN}"
+    STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
+    log_info "Using domain-qualified TNS aliases (DB_DOMAIN: $DB_DOMAIN)"
+else
+    PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}"
+    STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}"
+fi
 
 log_info "Primary TNS alias: $PRIMARY_TNS_ALIAS"
 log_info "Standby TNS alias: $STANDBY_TNS_ALIAS"
@@ -378,11 +386,24 @@ log_section "Generating TNS Entries"
 # Include standby name in filename to support concurrent builds
 TNSNAMES_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
+# Generate service names (with domain if set)
+if [[ -n "$DB_DOMAIN" ]]; then
+    PRIMARY_SERVICE_NAME="${DB_UNIQUE_NAME}.${DB_DOMAIN}"
+    STANDBY_SERVICE_NAME="${STANDBY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
+else
+    PRIMARY_SERVICE_NAME="${DB_UNIQUE_NAME}"
+    STANDBY_SERVICE_NAME="${STANDBY_DB_UNIQUE_NAME}"
+fi
+
 cat > "$TNSNAMES_FILE" <<EOF
 # ============================================================
 # Oracle Data Guard TNS Entries
 # Generated: $(date)
 # Add these entries to tnsnames.ora on BOTH primary and standby
+# ============================================================
+# Note: If NAMES.DEFAULT_DOMAIN is set in sqlnet.ora, Oracle appends
+# that domain to any alias without a domain. These entries include
+# the domain suffix to ensure consistent resolution.
 # ============================================================
 
 ${PRIMARY_TNS_ALIAS} =
@@ -390,7 +411,7 @@ ${PRIMARY_TNS_ALIAS} =
     (ADDRESS = (PROTOCOL = TCP)(HOST = ${PRIMARY_HOSTNAME})(PORT = ${LISTENER_PORT}))
     (CONNECT_DATA =
       (SERVER = DEDICATED)
-      (SERVICE_NAME = ${DB_UNIQUE_NAME})
+      (SERVICE_NAME = ${PRIMARY_SERVICE_NAME})
     )
   )
 
@@ -399,7 +420,7 @@ ${STANDBY_TNS_ALIAS} =
     (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${LISTENER_PORT}))
     (CONNECT_DATA =
       (SERVER = DEDICATED)
-      (SERVICE_NAME = ${STANDBY_DB_UNIQUE_NAME})
+      (SERVICE_NAME = ${STANDBY_SERVICE_NAME})
     )
   )
 EOF
@@ -427,12 +448,12 @@ cat > "$LISTENER_FILE" <<EOF
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
+      (GLOBAL_DBNAME = ${STANDBY_SERVICE_NAME})
       (ORACLE_HOME = ${STANDBY_ORACLE_HOME})
       (SID_NAME = ${STANDBY_ORACLE_SID})
     )
     (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
+      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}})
       (ORACLE_HOME = ${STANDBY_ORACLE_HOME})
       (SID_NAME = ${STANDBY_ORACLE_SID})
     )
@@ -470,12 +491,12 @@ cat > "$LISTENER_PRIMARY_FILE" <<EOF
 SID_LIST_LISTENER =
   (SID_LIST =
     (SID_DESC =
-      (GLOBAL_DBNAME = ${DB_UNIQUE_NAME})
+      (GLOBAL_DBNAME = ${PRIMARY_SERVICE_NAME})
       (ORACLE_HOME = ${PRIMARY_ORACLE_HOME})
       (SID_NAME = ${PRIMARY_ORACLE_SID})
     )
     (SID_DESC =
-      (GLOBAL_DBNAME = ${DB_UNIQUE_NAME}_DGMGRL)
+      (GLOBAL_DBNAME = ${DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}})
       (ORACLE_HOME = ${PRIMARY_ORACLE_HOME})
       (SID_NAME = ${PRIMARY_ORACLE_SID})
     )
