@@ -9,6 +9,7 @@ nfs/           - NFS setup scripts (run before Data Guard setup)
 primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
 standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
 fsfo/          - Observer scripts (run on observer server - standby or 3rd server)
+trigger/       - Role-aware service trigger (run on PRIMARY)
 common/        - Shared scripts and functions
 templates/     - Reference templates
 docs/          - Detailed walkthrough documentation
@@ -30,6 +31,7 @@ tests/         - Test scripts
 11. `primary/09_configure_fsfo.sh` - Configure Fast-Start Failover (optional)
 12. `fsfo/observer.sh setup` - Set up observer wallet (on observer server)
 13. `fsfo/observer.sh start` - Start observer (on observer server)
+14. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
 
 ## Restartability
 
@@ -103,3 +105,20 @@ This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mo
 - Default threshold: 30 seconds (configurable via FSFO_THRESHOLD)
 
 The observer must be running for automatic failover to occur.
+
+## Role-Aware Service Trigger (Optional)
+
+After Data Guard setup is complete, you can deploy triggers that automatically start/stop services based on database role:
+
+**Step 14: Deploy Service Trigger (on PRIMARY)**
+```bash
+./trigger/create_role_trigger.sh
+```
+This discovers running user services, creates PL/SQL package `SYS.DG_SERVICE_MGR` and two database triggers. Services are started on PRIMARY and stopped on STANDBY, triggered on both role change (switchover/failover) and database startup.
+
+**Objects created:**
+- `SYS.DG_SERVICE_MGR` - PL/SQL package with `MANAGE_SERVICES` procedure
+- `SYS.TRG_MANAGE_SERVICES_ROLE_CHG` - Fires `AFTER DB_ROLE_CHANGE`
+- `SYS.TRG_MANAGE_SERVICES_STARTUP` - Fires `AFTER STARTUP`
+
+Objects replicate to standby automatically via redo apply. The script is restartable - re-running replaces existing objects with the updated service list.

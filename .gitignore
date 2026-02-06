@@ -9,6 +9,7 @@ init*_*.ora
 tnsnames_entries_*.ora
 listener_*.ora
 configure_broker_*.dgmgrl
+dg_service_mgr_*.sql
 
 # Oracle password files
 orapw*
