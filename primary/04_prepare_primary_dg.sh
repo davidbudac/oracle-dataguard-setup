@@ -14,12 +14,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 4: Prepare Primary for DG"
+init_progress 6
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "04_prepare_primary_dg"
@@ -28,7 +30,7 @@ init_log "04_prepare_primary_dg"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_oracle_env || exit 1
 check_nfs_mount || exit 1
@@ -50,7 +52,7 @@ init_log "04_prepare_primary_dg_${STANDBY_DB_UNIQUE_NAME}"
 # Configure TNS Names on Primary
 # ============================================================
 
-log_section "Configuring TNS Names on Primary"
+progress_step "Configuring TNS Names on Primary"
 
 TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
 TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
@@ -68,6 +70,7 @@ if [[ -f "$TNSNAMES_ORA" ]]; then
         log_info "TNS entry for standby already exists"
     else
         log_info "Adding TNS entries to tnsnames.ora"
+        confirm_approval_action "Append standby TNS entry on primary" "append Data Guard entries to $TNSNAMES_ORA" || exit 1
         echo "" >> "$TNSNAMES_ORA"
         echo "# Data Guard TNS entries - Added $(date)" >> "$TNSNAMES_ORA"
         cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
@@ -75,6 +78,7 @@ if [[ -f "$TNSNAMES_ORA" ]]; then
     fi
 else
     log_info "Creating new tnsnames.ora"
+    confirm_approval_action "Create primary tnsnames.ora" "write $TNSNAMES_ORA" || exit 1
     echo "# TNS Names for Data Guard" > "$TNSNAMES_ORA"
     echo "# Created: $(date)" >> "$TNSNAMES_ORA"
     echo "" >> "$TNSNAMES_ORA"
@@ -86,7 +90,7 @@ fi
 # Configure Listener on Primary
 # ============================================================
 
-log_section "Configuring Listener on Primary"
+progress_step "Configuring Listener on Primary"
 
 LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
 LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${PRIMARY_DB_UNIQUE_NAME}.ora"
@@ -120,6 +124,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
     elif grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
         # Use the add_sid_to_listener function from dg_functions.sh
         log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
+        confirm_approval_action "Update primary listener.ora" "Insert primary SID_DESC entries into $LISTENER_ORA" || exit 1
         if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
             log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
         else
@@ -132,6 +137,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
     else
         # Append new SID_LIST_LISTENER section
         log_info "Adding SID_LIST_LISTENER to listener.ora"
+        confirm_approval_action "Append primary SID_LIST_LISTENER to listener.ora" "append Data Guard primary listener block to $LISTENER_ORA" || exit 1
         cat >> "$LISTENER_ORA" <<EOF
 
 # Data Guard primary static registration - Added $(date)
@@ -155,6 +161,7 @@ EOF
 else
     # Create new listener.ora
     log_info "Creating new listener.ora"
+    confirm_approval_action "Create primary listener.ora" "write $LISTENER_ORA" || exit 1
     cat > "$LISTENER_ORA" <<EOF
 # Listener configuration for Data Guard primary
 # Created: $(date)
@@ -193,7 +200,7 @@ log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl r
 # Check/Enable Force Logging
 # ============================================================
 
-log_section "Checking Force Logging"
+progress_step "Checking Force Logging"
 
 FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
 FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
@@ -211,7 +218,7 @@ fi
 # Check/Create Standby Redo Logs
 # ============================================================
 
-log_section "Checking Standby Redo Logs"
+progress_step "Checking Standby Redo Logs"
 
 # Get current standby redo log count
 CURRENT_STBY_GROUPS=$(run_sql_query "get_standby_redo_count.sql")
@@ -267,7 +274,7 @@ fi
 # Enable Data Guard Broker
 # ============================================================
 
-log_section "Enabling Data Guard Broker"
+progress_step "Enabling Data Guard Broker"
 
 # Check current DG_BROKER_START setting
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
@@ -301,7 +308,7 @@ log_info "Setting STANDBY_FILE_MANAGEMENT=AUTO..."
 log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO SCOPE=BOTH"
 run_sql_command "set_standby_file_mgmt.sql"
 
-log_info "Data Guard Broker enabled successfully"
+log_success "Data Guard Broker enabled successfully"
 log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
 
 # ============================================================
@@ -315,7 +322,7 @@ log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL 
 
 run_rman "configure_archivelog_deletion.rman"
 
-log_info "RMAN archivelog deletion policy configured"
+log_success "RMAN archivelog deletion policy configured"
 
 # ============================================================
 # Verify Network Connectivity to Standby
@@ -384,7 +391,7 @@ fi
 # Display Current Configuration
 # ============================================================
 
-log_section "Current Data Guard Configuration"
+progress_step "Reviewing Current Data Guard Configuration"
 
 echo ""
 echo "Data Guard Broker Status:"
@@ -407,26 +414,21 @@ echo "      configured automatically when the broker is enabled."
 # ============================================================
 
 print_summary "SUCCESS" "Primary configured for Data Guard"
+print_status_block "Primary Data Guard Readiness" \
+    "Primary DB" "$PRIMARY_DB_UNIQUE_NAME" \
+    "Standby DB" "$STANDBY_DB_UNIQUE_NAME" \
+    "FORCE_LOGGING" "$FORCE_LOGGING" \
+    "DG_BROKER_START" "$DG_BROKER_START" \
+    "Standby Redo Groups" "$REQUIRED_STBY_GROUPS"
 
-echo ""
-echo "COMPLETED ACTIONS:"
-echo "=================="
-echo "  - Configured tnsnames.ora with standby entry"
-echo "  - Configured listener.ora with static registration (NOT restarted)"
-echo "  - Enabled FORCE LOGGING (if needed)"
-echo "  - Created standby redo logs (if needed)"
-echo "  - Enabled DG_BROKER_START=TRUE"
-echo "  - Set STANDBY_FILE_MANAGEMENT=AUTO"
-echo ""
-echo "NEXT STEPS:"
-echo "==========="
-echo ""
-echo "On STANDBY server:"
-echo "   Run: ./standby/05_clone_standby.sh"
-echo ""
-echo "IMPORTANT: Ensure the standby listener is running with"
-echo "static registration before running the clone script."
-echo ""
-echo "After cloning, run the broker configuration:"
-echo "   ./primary/06_configure_broker.sh"
-echo ""
+print_list_block "Completed Actions" \
+    "Configured tnsnames.ora with the standby entry." \
+    "Configured listener.ora static registration on primary." \
+    "Enabled FORCE LOGGING when required." \
+    "Created missing standby redo logs." \
+    "Enabled DG_BROKER_START and STANDBY_FILE_MANAGEMENT=AUTO."
+
+print_list_block "Next Steps" \
+    "On STANDBY, run ./standby/05_clone_standby.sh." \
+    "Make sure the standby listener is running with static registration first." \
+    "After the clone completes, run ./primary/06_configure_broker.sh."

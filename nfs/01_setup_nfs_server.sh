@@ -8,6 +8,16 @@
 
 set -e
 
+for arg in "$@"; do
+    case "$arg" in
+        -v|--verbose)
+            export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+            set -x
+            break
+            ;;
+    esac
+done
+
 # Configuration
 NFS_SHARE_PATH="/OINSTALL/_dataguard_setup"
 NFS_EXPORT_OPTIONS="rw,sync,no_subtree_check,no_root_squash"

@@ -14,12 +14,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 7: Verify Data Guard"
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "07_verify_dataguard"
@@ -28,7 +30,7 @@ init_log "07_verify_dataguard"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
@@ -56,16 +58,11 @@ check_db_connection || exit 1
 # Prompt for SYS Password (needed for DGMGRL network validation)
 # ============================================================
 
-log_section "Authentication"
+progress_step "Authentication"
 
 echo ""
 echo "SYS password is required for DGMGRL network validation."
-printf "Enter SYS password: "
-# AIX compatible: use stty instead of read -s
-stty -echo
-read SYS_PASSWORD
-stty echo
-echo ""
+SYS_PASSWORD=$(prompt_password "Enter SYS password")
 
 if [ -z "$SYS_PASSWORD" ]; then
     log_warn "No SYS password provided - DGMGRL network validation will be skipped"
@@ -83,7 +80,7 @@ ERRORS=0
 # Check Database Role and Status
 # ============================================================
 
-log_section "Database Role and Status"
+progress_step "Checking Database Role and Status"
 
 DB_INFO=$(run_sql_query "get_db_status_pipe.sql")
 DB_INFO=$(echo "$DB_INFO" | tr -d ' \n\r')
@@ -123,7 +120,7 @@ fi
 # Check Managed Recovery Process
 # ============================================================
 
-log_section "Managed Recovery Process (MRP)"
+progress_step "Checking Managed Recovery Process"
 
 MRP_INFO=$(run_sql_query "get_mrp_info_pipe.sql")
 
@@ -162,7 +159,7 @@ run_sql_display "get_managed_standby_procs.sql"
 # Check Archive Log Gap
 # ============================================================
 
-log_section "Archive Log Gap Analysis"
+progress_step "Checking Archive Log Gaps"
 
 GAP_INFO=$(run_sql_query "get_archive_gap_count.sql")
 GAP_COUNT=$(echo "$GAP_INFO" | tr -d ' \n\r')
@@ -182,7 +179,7 @@ fi
 # Check Archive Log Apply Status
 # ============================================================
 
-log_section "Archive Log Apply Status"
+progress_step "Checking Archive Log Apply Status"
 
 # Get last received and applied sequence
 APPLY_INFO=$(run_sql_query "get_apply_info_pipe.sql")
@@ -219,7 +216,7 @@ fi
 # Check Data Guard Broker Configuration
 # ============================================================
 
-log_section "Data Guard Broker Configuration"
+progress_step "Checking Data Guard Broker Configuration"
 
 echo ""
 echo "Broker Configuration Status:"
@@ -245,7 +242,7 @@ fi
 # Check Data Guard Parameters
 # ============================================================
 
-log_section "Data Guard Parameters"
+progress_step "Reviewing Data Guard Parameters"
 
 echo ""
 echo "Key Data Guard Parameters:"
@@ -255,7 +252,7 @@ run_sql_display "get_dg_params_full.sql"
 # Check Archive Destination Status
 # ============================================================
 
-log_section "Archive Destination Status"
+progress_step "Checking Archive Destination Status"
 
 echo ""
 echo "Archive Destination Configuration:"
@@ -309,19 +306,19 @@ echo "================================================================"
 echo "                 DATA GUARD HEALTH REPORT"
 echo "================================================================"
 echo ""
-echo "  Primary Database:     $PRIMARY_DB_UNIQUE_NAME @ $PRIMARY_HOSTNAME"
-echo "  Standby Database:     $STANDBY_DB_UNIQUE_NAME @ $STANDBY_HOSTNAME"
+print_status_row "Primary Database" "$PRIMARY_DB_UNIQUE_NAME @ $PRIMARY_HOSTNAME"
+print_status_row "Standby Database" "$STANDBY_DB_UNIQUE_NAME @ $STANDBY_HOSTNAME"
 echo ""
-echo "  Database Role:        $DB_ROLE"
-echo "  Open Mode:            $OPEN_MODE"
-echo "  Protection Mode:      $PROTECTION_MODE"
+print_status_row "Database Role" "$DB_ROLE"
+print_status_row "Open Mode" "$OPEN_MODE"
+print_status_row "Protection Mode" "$PROTECTION_MODE"
 echo ""
-echo "  MRP Status:           ${MRP_STATUS:-NOT RUNNING}"
-echo "  Last Applied Seq:     $LAST_APPLIED"
-echo "  Archive Gaps:         ${GAP_COUNT:-0}"
-echo ""
-echo "  Errors:               $ERRORS"
-echo "  Warnings:             $WARNINGS"
+print_status_row "MRP Status" "${MRP_STATUS:-NOT RUNNING}"
+print_status_row "Last Applied Seq" "${LAST_APPLIED:-N/A}"
+print_status_row "Last Received Seq" "${LAST_RECEIVED:-N/A}"
+print_status_row "Archive Gaps" "${GAP_COUNT:-0}"
+print_status_row "Errors" "$ERRORS"
+print_status_row "Warnings" "$WARNINGS"
 echo ""
 
 if [[ "$OVERALL_STATUS" == "HEALTHY" && "$ERRORS" -eq 0 ]]; then
@@ -343,52 +340,25 @@ echo ""
 # Useful Commands
 # ============================================================
 
-echo "USEFUL MONITORING COMMANDS:"
-echo "==========================="
-echo ""
-echo "# DGMGRL - Show configuration status:"
-echo "dgmgrl / \"show configuration\""
-echo ""
-echo "# DGMGRL - Show database details:"
-echo "dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\""
-echo "dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "# DGMGRL - Validate configuration:"
-echo "dgmgrl / \"validate database '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "# SQL - Check apply lag in real-time:"
-echo "SELECT NAME, VALUE, TIME_COMPUTED FROM V\$DATAGUARD_STATS WHERE NAME LIKE '%lag%';"
-echo ""
-echo "# SQL - Monitor log apply:"
-echo "SELECT PROCESS, STATUS, SEQUENCE# FROM V\$MANAGED_STANDBY;"
-echo ""
-echo "# SQL - Check for gaps:"
-echo "SELECT * FROM V\$ARCHIVE_GAP;"
-echo ""
-echo "# Force log switch on primary (for testing):"
-echo "ALTER SYSTEM SWITCH LOGFILE;"
-echo ""
-echo "# DGMGRL - Switchover to standby:"
-echo "dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "# Open standby in read-only mode (Active Data Guard):"
-echo "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;"
-echo "ALTER DATABASE OPEN READ ONLY;"
-echo "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;"
-echo ""
+print_list_block "Useful Monitoring Commands" \
+    "dgmgrl / \"show configuration\"" \
+    "dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\"" \
+    "dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\"" \
+    "dgmgrl / \"validate database '$STANDBY_DB_UNIQUE_NAME'\"" \
+    "SELECT NAME, VALUE, TIME_COMPUTED FROM V\\$DATAGUARD_STATS WHERE NAME LIKE '%lag%';" \
+    "SELECT PROCESS, STATUS, SEQUENCE# FROM V\\$MANAGED_STANDBY;" \
+    "SELECT * FROM V\\$ARCHIVE_GAP;" \
+    "ALTER SYSTEM SWITCH LOGFILE;" \
+    "dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\"" \
+    "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL; ALTER DATABASE OPEN READ ONLY; ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;"
 
 # ============================================================
 # Next Steps
 # ============================================================
 
 if [[ "$ERRORS" -eq 0 ]]; then
-    echo ""
-    echo "NEXT STEP (Optional but Recommended):"
-    echo "======================================"
-    echo ""
-    echo "Run security hardening on PRIMARY to lock SYS account:"
-    echo "   ./primary/08_security_hardening.sh"
-    echo ""
+    print_list_block "Next Step" \
+        "Run ./primary/08_security_hardening.sh on PRIMARY to lock down the SYS account."
 fi
 
 # Return appropriate exit code

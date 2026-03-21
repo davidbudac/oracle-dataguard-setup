@@ -15,12 +15,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 8: Security Hardening"
+init_progress 4
 
 # Initialize logging
 init_log "08_security_hardening"
@@ -29,7 +31,7 @@ init_log "08_security_hardening"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_oracle_env || exit 1
 check_db_connection || exit 1
@@ -54,7 +56,7 @@ init_log "08_security_hardening_${DB_UNIQUE_NAME}"
 # Verify Data Guard Configuration
 # ============================================================
 
-log_section "Verifying Data Guard Configuration"
+progress_step "Verifying Data Guard Configuration"
 
 # Check if broker configuration exists and is healthy
 CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
@@ -81,7 +83,7 @@ fi
 # Confirmation
 # ============================================================
 
-log_section "Security Hardening Confirmation"
+progress_step "Reviewing Security Hardening Impact"
 
 echo ""
 echo "WARNING: This script will:"
@@ -103,7 +105,7 @@ fi
 # Security Hardening
 # ============================================================
 
-log_section "Applying Security Hardening"
+progress_step "Applying Security Hardening"
 
 log_info "Generating random password..."
 
@@ -123,7 +125,7 @@ RANDOM_PWD=""
 unset RANDOM_PWD
 
 if echo "$SECURE_RESULT" | grep -q "SUCCESS"; then
-    log_info "SYS account secured successfully"
+log_success "SYS account secured successfully"
 else
     log_error "Failed to secure SYS account"
     log_error "Please secure manually:"
@@ -136,7 +138,7 @@ fi
 # Verify Changes
 # ============================================================
 
-log_section "Verifying Security Changes"
+progress_step "Verifying Security Changes"
 
 # Check account status
 ACCOUNT_STATUS=$(run_sql_query "get_sys_account_status.sql")
@@ -163,26 +165,18 @@ fi
 # ============================================================
 
 print_summary "SUCCESS" "Security hardening complete"
+print_status_block "Security State" \
+    "Database" "$DB_UNIQUE_NAME" \
+    "Database Role" "$DB_ROLE" \
+    "SYS Account Status" "$ACCOUNT_STATUS" \
+    "OS Authentication" "$(if echo "$TEST_RESULT" | grep -q "OS_AUTH_OK"; then echo OK; else echo CHECK_MANUALLY; fi)"
 
-echo ""
-echo "COMPLETED ACTIONS:"
-echo "=================="
-echo "  - Changed SYS password to random value (not stored)"
-echo "  - Locked SYS account"
-echo ""
-echo "IMPORTANT NOTES:"
-echo "================"
-echo ""
-echo "  1. Use OS authentication for all future DBA connections:"
-echo "     sqlplus / as sysdba"
-echo ""
-echo "  2. Data Guard redo transport will continue to work"
-echo "     (uses password file, not account password)"
-echo ""
-echo "  3. To unlock SYS if needed (requires OS authentication):"
-echo "     ALTER USER SYS ACCOUNT UNLOCK;"
-echo "     ALTER USER SYS IDENTIFIED BY '<new_password>';"
-echo ""
-echo "  4. Consider also locking other privileged accounts:"
-echo "     ALTER USER SYSTEM ACCOUNT LOCK;"
-echo ""
+print_list_block "Completed Actions" \
+    "Changed the SYS password to a random value that is not stored." \
+    "Locked the SYS account."
+
+print_list_block "Important Notes" \
+    "Use OS authentication for future DBA access: sqlplus / as sysdba" \
+    "Data Guard redo transport still works through the password file." \
+    "To unlock SYS later: ALTER USER SYS ACCOUNT UNLOCK; ALTER USER SYS IDENTIFIED BY '<new_password>';" \
+    "Consider locking other privileged accounts such as SYSTEM."

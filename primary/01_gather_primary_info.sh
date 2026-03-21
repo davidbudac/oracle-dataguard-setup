@@ -14,12 +14,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 1: Gather Primary Info"
+init_progress 10
 
 # ============================================================
 # NFS Share Configuration
@@ -35,7 +37,7 @@ init_log "01_gather_primary_info_${ORACLE_SID}"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_oracle_env || exit 1
 check_nfs_mount || exit 1
@@ -45,7 +47,7 @@ check_db_connection || exit 1
 # Gather Database Identity Information
 # ============================================================
 
-log_section "Gathering Database Identity Information"
+progress_step "Gathering Database Identity Information"
 
 DB_NAME=$(get_db_parameter "db_name")
 DB_UNIQUE_NAME=$(get_db_parameter "db_unique_name")
@@ -70,7 +72,7 @@ log_info "DBID: $DBID"
 # Gather Oracle Environment Info
 # ============================================================
 
-log_section "Gathering Oracle Environment Info"
+progress_step "Gathering Oracle Environment Information"
 
 # AIX-compatible hostname detection
 PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
@@ -92,7 +94,7 @@ log_info "ORACLE_SID: $PRIMARY_ORACLE_SID"
 # Gather Database Configuration
 # ============================================================
 
-log_section "Gathering Database Configuration"
+progress_step "Gathering Database Configuration"
 
 # Character set
 NLS_CHARACTERSET=$(get_db_property "NLS_CHARACTERSET")
@@ -110,7 +112,7 @@ log_info "COMPATIBLE: $COMPATIBLE"
 # Gather Redo Log Configuration
 # ============================================================
 
-log_section "Gathering Redo Log Configuration"
+progress_step "Gathering Redo Log Configuration"
 
 # Online redo log info
 ONLINE_REDO_INFO=$(run_sql_display "get_online_redo_info.sql")
@@ -135,7 +137,7 @@ log_info "Redo log path: $REDO_LOG_PATH"
 # Check Standby Redo Logs
 # ============================================================
 
-log_section "Checking Standby Redo Logs"
+progress_step "Checking Standby Redo Logs"
 
 STANDBY_REDO_COUNT=$(run_sql_query "get_standby_redo_count.sql")
 STANDBY_REDO_COUNT=$(echo "$STANDBY_REDO_COUNT" | tr -d ' \n\r')
@@ -154,7 +156,7 @@ fi
 # Gather Data File Locations
 # ============================================================
 
-log_section "Gathering Data File Locations"
+progress_step "Gathering Data File Locations"
 
 # Get unique data file directories
 DATAFILE_DIRS=$(run_sql_query "get_datafile_dirs.sql")
@@ -193,7 +195,7 @@ log_info "  Required (with 20% buffer): ${REQUIRED_SPACE_MB} MB"
 # Gather Control File Locations
 # ============================================================
 
-log_section "Gathering Control File Locations"
+progress_step "Gathering Control File Locations"
 
 CONTROL_FILES=$(get_db_parameter "control_files")
 log_info "Control files: $CONTROL_FILES"
@@ -202,7 +204,7 @@ log_info "Control files: $CONTROL_FILES"
 # Gather Archive Log Configuration
 # ============================================================
 
-log_section "Gathering Archive Log Configuration"
+progress_step "Gathering Archive Log Configuration"
 
 # Check archive log mode
 LOG_MODE=$(run_sql_query "get_log_mode.sql")
@@ -341,7 +343,7 @@ log_info "Service names: $SERVICE_NAMES"
 # Prerequisite Checks
 # ============================================================
 
-log_section "Data Guard Prerequisites Check"
+progress_step "Running Data Guard Prerequisite Checks"
 
 PREREQ_PASS=true
 
@@ -398,7 +400,7 @@ fi
 # Write Output File
 # ============================================================
 
-log_section "Writing Primary Information to NFS"
+progress_step "Writing Primary Information to NFS"
 
 # Use DB_UNIQUE_NAME in filename to support concurrent builds
 OUTPUT_FILE="${NFS_SHARE}/primary_info_${DB_UNIQUE_NAME}.env"
@@ -470,9 +472,10 @@ log_info "Primary info written to: $OUTPUT_FILE"
 # Copy password file to NFS share
 PWD_DEST="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
 if [[ -f "$PWD_FILE" ]]; then
+    confirm_approval_action "Copy primary password file to NFS share" "cp $PWD_FILE $PWD_DEST && chmod 640 $PWD_DEST" || exit 1
     cp "$PWD_FILE" "$PWD_DEST"
     chmod 640 "$PWD_DEST"
-    log_info "Password file copied to: $PWD_DEST"
+    log_success "Password file copied to: $PWD_DEST"
 fi
 
 # ============================================================
@@ -481,16 +484,28 @@ fi
 
 if [[ "$PREREQ_PASS" == "true" ]]; then
     print_summary "SUCCESS" "Primary information gathered successfully"
-    echo "Output files:"
-    echo "  - Primary info: $OUTPUT_FILE"
-    echo "  - Password file: $PWD_DEST"
-    echo ""
-    echo "Next step: Run 02_generate_standby_config.sh to generate standby configuration"
+    print_status_block "Primary Snapshot" \
+        "Primary Host" "$PRIMARY_HOSTNAME" \
+        "DB_UNIQUE_NAME" "$DB_UNIQUE_NAME" \
+        "Instance" "$INSTANCE_NAME" \
+        "Redo Size" "${REDO_LOG_SIZE_MB} MB" \
+        "Required Space" "${REQUIRED_SPACE_MB} MB"
+    print_list_block "Generated Files" \
+        "Primary info: $OUTPUT_FILE" \
+        "Password file: $PWD_DEST"
+    print_list_block "Next Step" \
+        "Run ./primary/02_generate_standby_config.sh to build the standby configuration."
 else
     print_summary "WARNING" "Primary information gathered with prerequisite issues"
+    print_status_block "Review Required" \
+        "Primary Host" "$PRIMARY_HOSTNAME" \
+        "DB_UNIQUE_NAME" "$DB_UNIQUE_NAME" \
+        "ARCHIVELOG Mode" "$LOG_MODE" \
+        "FORCE_LOGGING" "$FORCE_LOGGING" \
+        "REMOTE_LOGIN_PASSWORDFILE" "$REMOTE_LOGIN_PWFILE"
+    print_list_block "Generated Files" \
+        "Primary info: $OUTPUT_FILE"
     echo ""
     echo "Please resolve the prerequisite issues before proceeding."
-    echo "Output files have been created for review:"
-    echo "  - Primary info: $OUTPUT_FILE"
     exit 1
 fi

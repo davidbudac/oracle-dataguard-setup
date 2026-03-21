@@ -24,6 +24,7 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
@@ -343,6 +344,7 @@ log_section "Deploying PL/SQL Objects"
 
 log_info "Creating package SYS.DG_SERVICE_MGR..."
 log_cmd "sqlplus / as sysdba:" "CREATE OR REPLACE PACKAGE SYS.DG_SERVICE_MGR ..."
+confirm_approval_action "Deploy DG_SERVICE_MGR package and role-change triggers" "sqlplus -s / as sysdba <deploy DG_SERVICE_MGR package and triggers>" || exit 1
 
 DEPLOY_RESULT=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON

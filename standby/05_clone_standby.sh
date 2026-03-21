@@ -14,12 +14,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 5: Clone Standby Database"
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "05_clone_standby"
@@ -28,7 +30,7 @@ init_log "05_clone_standby"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
@@ -71,7 +73,7 @@ fi
 # Verify Listener Status
 # ============================================================
 
-log_section "Verifying Listener"
+progress_step "Verifying Listener"
 
 log_info "Checking listener status..."
 if ! "$ORACLE_HOME/bin/lsnrctl" status > /dev/null 2>&1; then
@@ -93,7 +95,7 @@ log_info "Listener is running with static registration"
 # Test TNS Connectivity
 # ============================================================
 
-log_section "Testing Network Connectivity"
+progress_step "Testing Network Connectivity"
 
 # Test tnsping to primary
 log_info "Testing tnsping to primary ($PRIMARY_TNS_ALIAS)..."
@@ -117,7 +119,7 @@ log_info "tnsping to standby successful"
 # Prompt for SYS Password
 # ============================================================
 
-log_section "Authentication"
+progress_step "Authenticating to Primary"
 
 echo ""
 SYS_PASSWORD=$(prompt_password "Enter SYS password for primary database")
@@ -134,7 +136,7 @@ log_info "Password verified successfully"
 # Start Instance in NOMOUNT
 # ============================================================
 
-log_section "Starting Standby Instance"
+progress_step "Starting Standby Instance"
 
 # Check if instance is already running
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>&1)
@@ -166,12 +168,13 @@ log_info "Instance started in NOMOUNT mode"
 # Execute RMAN Duplicate
 # ============================================================
 
-log_section "Executing RMAN Duplicate"
+progress_step "Executing RMAN Duplicate"
 
 echo ""
 echo "================================================================"
 echo "Starting RMAN duplicate from active database..."
 echo "This process may take a while depending on database size."
+echo "Watch the RMAN output below for channel allocation, restore, and recovery progress."
 echo "================================================================"
 echo ""
 
@@ -225,6 +228,7 @@ RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').log"
 log_info "Starting RMAN duplicate (logging to: $RMAN_LOG)..."
 log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
 echo ""
+confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOME/bin/rman\" TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS} @${RMAN_SCRIPT}" || exit 1
 
 # Use tee to display output on screen AND write to log file
 # AIX compatible: use temp file to capture exit code instead of PIPESTATUS
@@ -250,13 +254,13 @@ if [[ $RMAN_EXIT_CODE -ne 0 ]]; then
     exit 1
 fi
 
-log_info "RMAN duplicate completed successfully"
+log_success "RMAN duplicate completed successfully"
 
 # ============================================================
 # Create SPFILE and Restart
 # ============================================================
 
-log_section "Finalizing Instance Configuration"
+progress_step "Finalizing Instance Configuration"
 
 # Check if we're mounted
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
@@ -279,7 +283,7 @@ fi
 # Start Managed Recovery
 # ============================================================
 
-log_section "Starting Managed Recovery"
+progress_step "Starting Managed Recovery"
 
 log_info "Starting managed recovery process (MRP)..."
 log_cmd "sqlplus / as sysdba:" "ALTER DATABASE MOUNT STANDBY DATABASE"
@@ -330,35 +334,29 @@ log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL 
 
 run_rman "configure_archivelog_deletion.rman"
 
-log_info "RMAN archivelog deletion policy configured"
+log_success "RMAN archivelog deletion policy configured"
 
 # ============================================================
 # Summary
 # ============================================================
 
 print_summary "SUCCESS" "Standby database created successfully"
+print_status_block "Standby Clone Result" \
+    "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+    "Instance Status" "$INSTANCE_STATUS" \
+    "MRP Verification" "${MRP_STATUS:-Unavailable}" \
+    "RMAN Log" "$RMAN_LOG"
+
+print_list_block "Completed Actions" \
+    "Started the standby instance in NOMOUNT." \
+    "Ran RMAN DUPLICATE FROM ACTIVE DATABASE." \
+    "Verified or created the SPFILE." \
+    "Started Managed Recovery Process (MRP)." \
+    "Configured RMAN archivelog deletion policy."
+
+print_list_block "Next Steps" \
+    "On PRIMARY, run ./primary/06_configure_broker.sh to enable broker-managed log shipping." \
+    "Then run ./standby/07_verify_dataguard.sh to validate the full setup."
 
 echo ""
-echo "COMPLETED ACTIONS:"
-echo "=================="
-echo "  - Started instance in NOMOUNT"
-echo "  - Executed RMAN DUPLICATE FOR STANDBY FROM ACTIVE DATABASE"
-echo "  - Created SPFILE with DG_BROKER_START=TRUE"
-echo "  - Started Managed Recovery Process (MRP)"
-echo "  - Configured RMAN archivelog deletion policy (SHIPPED TO ALL STANDBY)"
-echo ""
-echo "RMAN LOG: $RMAN_LOG"
-echo ""
-echo "NEXT STEPS:"
-echo "==========="
-echo ""
-echo "IMPORTANT: Configure Data Guard Broker to enable log shipping:"
-echo ""
-echo "On PRIMARY server:"
-echo "   Run: ./primary/06_configure_broker.sh"
-echo ""
-echo "After broker configuration, verify the setup:"
-echo "   Run: ./standby/07_verify_dataguard.sh"
-echo ""
-echo "Note: Log shipping will not work until the broker is configured!"
-echo ""
+echo "Note: Log shipping will not be fully managed until broker configuration is complete."

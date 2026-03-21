@@ -11,11 +11,14 @@ These scripts automate the process of creating a physical standby database from 
 - **Automated Information Gathering** - Collects all required parameters from the primary database
 - **Single Source of Truth** - Generates a master configuration file (`standby_config_<name>.env`) for consistent setup
 - **Concurrent Build Support** - All generated files include DB_UNIQUE_NAME, allowing multiple DG setups simultaneously
+- **Clear Operator Feedback** - Numbered progress sections, compact summaries, and clearer next-step guidance
 - **Data Guard Broker (DGMGRL)** - Centralized management of Data Guard configuration
 - **Prerequisite Validation** - Checks archivelog mode, force logging, password files, etc.
 - **NFS-Based File Sharing** - Uses shared storage for configuration and file transfer
 - **Secure Password Handling** - Passwords prompted at runtime, never stored
 - **Comprehensive Logging** - All operations logged with timestamps
+- **Verbose Tracing** - Optional shell tracing for exact command visibility
+- **Approval Mode** - Optional confirmation before mutating actions
 - **Health Verification** - Post-setup validation with detailed status reporting
 
 ## Prerequisites
@@ -134,6 +137,23 @@ Step 9: Configure FSFO ─────────────────► St
 
 **Steps 6-7 are restartable** - broker config can be removed with `REMOVE CONFIGURATION` in DGMGRL.
 
+## Runtime Modes
+
+All common-based workflow scripts support the following optional flags:
+
+```bash
+./primary/06_configure_broker.sh --verbose
+./standby/05_clone_standby.sh --approval-mode
+APPROVAL_MODE=1 VERBOSE=1 ./primary/09_configure_fsfo.sh
+```
+
+- `--verbose` or `VERBOSE=1`
+  Prints the exact shell commands being executed, with tracing temporarily suppressed around password entry and password-based connections.
+- `--approval-mode` or `APPROVAL_MODE=1`
+  Pauses before mutating actions, shows a structured approval block with the action, impact, log file, and command preview, and asks for confirmation.
+- `--suspicious` and `SUSPICIOUS=1`
+  Still work as backward-compatible aliases for `approval mode`.
+
 ## Configuration
 
 ### Environment Assumptions
@@ -210,6 +230,8 @@ Run on the **PRIMARY** server after Step 7 verification passes:
 
 ```bash
 ./primary/09_configure_fsfo.sh
+# Optional runtime modes:
+./primary/09_configure_fsfo.sh --verbose --approval-mode
 ```
 
 This configures:

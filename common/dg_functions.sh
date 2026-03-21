@@ -8,10 +8,14 @@ RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+CYAN='\033[0;36m'
 NC='\033[0m' # No Color
 
 # NFS share path for file exchange (default, can be overridden by confirm_nfs_share)
 NFS_SHARE="${NFS_SHARE:-/OINSTALL/_dataguard_setup}"
+VERBOSE="${VERBOSE:-0}"
+APPROVAL_MODE="${APPROVAL_MODE:-${SUSPICIOUS:-0}}"
+VERBOSE_TRACE_PAUSED=0
 
 # Get the directory where this script is located
 DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,6 +27,57 @@ SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 # Logging Functions
 # ============================================================
 
+enable_verbose_mode() {
+    local arg
+
+    for arg in "$@"; do
+        case "$arg" in
+            -v|--verbose)
+                VERBOSE=1
+                ;;
+            -a|--approval-mode|-s|--suspicious)
+                APPROVAL_MODE=1
+                ;;
+            --no-verbose)
+                VERBOSE=0
+                ;;
+            --no-approval-mode|--no-suspicious)
+                APPROVAL_MODE=0
+                ;;
+        esac
+    done
+
+    export VERBOSE
+    export APPROVAL_MODE
+    export SUSPICIOUS="$APPROVAL_MODE"
+
+    if [[ "$VERBOSE" == "1" ]]; then
+        export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
+        set -x
+        log_info "Verbose mode enabled. Shell command tracing is active."
+    fi
+
+    if [[ "$APPROVAL_MODE" == "1" ]]; then
+        log_info "Approval mode enabled. Mutating actions require approval."
+    fi
+}
+
+pause_verbose_trace() {
+    if [[ "$VERBOSE" == "1" && "$-" == *x* ]]; then
+        VERBOSE_TRACE_PAUSED=1
+        set +x
+    else
+        VERBOSE_TRACE_PAUSED=0
+    fi
+}
+
+resume_verbose_trace() {
+    if [[ "$VERBOSE_TRACE_PAUSED" == "1" ]]; then
+        VERBOSE_TRACE_PAUSED=0
+        set -x
+    fi
+}
+
 log_info() {
     printf "${GREEN}[INFO]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
     [ -n "$LOG_FILE" ] && echo "[INFO] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" || :
@@ -31,6 +86,11 @@ log_info() {
 log_warn() {
     printf "${YELLOW}[WARN]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
     [ -n "$LOG_FILE" ] && echo "[WARN] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" || :
+}
+
+log_success() {
+    printf "${CYAN}[OK]${NC} $(date '+%Y-%m-%d %H:%M:%S') - %s\n" "$1"
+    [ -n "$LOG_FILE" ] && echo "[OK] $(date '+%Y-%m-%d %H:%M:%S') - $1" >> "$LOG_FILE" || :
 }
 
 log_error() {
@@ -60,6 +120,91 @@ log_cmd() {
     local cmd="$2"
     printf "${YELLOW}>>> %s${NC} %s\n" "$prefix" "$cmd"
     [ -n "$LOG_FILE" ] && echo ">>> $prefix $cmd" >> "$LOG_FILE" || :
+}
+
+shell_join() {
+    local arg
+    local output=""
+    local quoted
+
+    for arg in "$@"; do
+        printf -v quoted '%q' "$arg"
+        output="${output:+${output} }${quoted}"
+    done
+
+    printf '%s' "$output"
+}
+
+confirm_approval_action() {
+    local action_title="$1"
+    local action_cmd="$2"
+    local response
+    local impact_scope
+
+    if [[ "$APPROVAL_MODE" != "1" ]]; then
+        return 0
+    fi
+
+    case "$action_cmd" in
+        *sqlplus* )
+            impact_scope="Database change"
+            ;;
+        *rman* )
+            impact_scope="RMAN / database storage change"
+            ;;
+        *dgmgrl* )
+            impact_scope="Data Guard Broker change"
+            ;;
+        *listener.ora*|*tnsnames.ora*|*/etc/oratab* )
+            impact_scope="Oracle host configuration change"
+            ;;
+        *mkdir*|*cp*|*chmod*|*mv*|*append*|*write* )
+            impact_scope="Filesystem change"
+            ;;
+        * )
+            impact_scope="Mutating external action"
+            ;;
+    esac
+
+    echo ""
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${YELLOW}Approval Mode Check${NC}\n"
+    printf "${BLUE}============================================================${NC}\n"
+    print_status_row "Action" "$action_title"
+    print_status_row "Impact" "$impact_scope"
+    if [[ -n "$LOG_FILE" ]]; then
+        print_status_row "Log File" "$LOG_FILE"
+    fi
+    echo ""
+    printf "${BLUE}Command Preview${NC}\n"
+    printf "${BLUE}%s${NC}\n" "------------------------------------------------------------"
+    printf "  %s\n" "$action_cmd"
+    echo ""
+    printf "${YELLOW}Approve this action? [y/N]: ${NC}"
+    read response
+
+    case "$response" in
+        [yY][eE][sS]|[yY])
+            return 0
+            ;;
+    esac
+
+    log_warn "Action cancelled by user: $action_title"
+    return 1
+}
+
+confirm_suspicious_action() {
+    confirm_approval_action "$@"
+}
+
+run_mutating_command() {
+    local action_title="$1"
+    shift
+    local action_cmd
+
+    action_cmd=$(shell_join "$@")
+    confirm_approval_action "$action_title" "$action_cmd" || return 1
+    "$@"
 }
 
 # Initialize log file
@@ -201,6 +346,7 @@ check_db_connection() {
 run_sql_script() {
     local script="$1"
     shift
+    confirm_approval_action "Run SQL script" "sqlplus -s / as sysdba @$script $(shell_join "$@")" || return 1
     sqlplus -s / as sysdba @"$script" "$@"
 }
 
@@ -219,6 +365,7 @@ run_sql_query() {
 run_sql_command() {
     local script_name="$1"
     shift
+    confirm_approval_action "Run SQL command script" "sqlplus -s / as sysdba @${SQL_DIR}/commands/${script_name} $(shell_join "$@")" || return 1
     sqlplus -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@"
 }
 
@@ -256,6 +403,7 @@ get_db_property() {
 # Usage: run_rman_script <script_path>
 run_rman_script() {
     local script="$1"
+    confirm_approval_action "Run RMAN script" "\"$ORACLE_HOME/bin/rman\" target / @$script" || return 1
     "$ORACLE_HOME/bin/rman" target / @"$script"
 }
 
@@ -263,7 +411,19 @@ run_rman_script() {
 # Usage: run_rman <script_name>
 run_rman() {
     local script_name="$1"
+    confirm_approval_action "Run RMAN command script" "\"$ORACLE_HOME/bin/rman\" target / @${SQL_DIR}/rman/${script_name}" || return 1
     "$ORACLE_HOME/bin/rman" target / @"${SQL_DIR}/rman/${script_name}"
+}
+
+is_mutating_dgmgrl_script() {
+    case "$(basename "$1")" in
+        show_*|validate_*)
+            return 1
+            ;;
+        *)
+            return 0
+            ;;
+    esac
 }
 
 # ============================================================
@@ -292,6 +452,9 @@ run_dgmgrl_script() {
     local content
     content=$(cat "$script")
     content=$(substitute_dgmgrl_args "$content" "$@")
+    if is_mutating_dgmgrl_script "$script"; then
+        confirm_approval_action "Run DGMGRL script" "printf '<script>' | \"$ORACLE_HOME/bin/dgmgrl\" -silent /  # $(basename "$script") $(shell_join "$@")" || return 1
+    fi
     printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /
 }
 
@@ -304,6 +467,9 @@ run_dgmgrl() {
     local content
     content=$(cat "$script_path")
     content=$(substitute_dgmgrl_args "$content" "$@")
+    if is_mutating_dgmgrl_script "$script_name"; then
+        confirm_approval_action "Run DGMGRL script" "printf '<script>' | \"$ORACLE_HOME/bin/dgmgrl\" -silent /  # ${script_name} $(shell_join "$@")" || return 1
+    fi
     printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /
 }
 
@@ -318,7 +484,11 @@ run_dgmgrl_with_password() {
     local content
     content=$(cat "$script_path")
     content=$(substitute_dgmgrl_args "$content" "$@")
+    pause_verbose_trace
     printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent "sys/${password}@${tns_alias}"
+    local rc=$?
+    resume_verbose_trace
+    return $rc
 }
 
 # ============================================================
@@ -332,13 +502,36 @@ prompt_password() {
     # Output prompt to stderr so it doesn't get captured by $()
     printf "${YELLOW}%s${NC}: " "$prompt_text" >&2
     # AIX compatible: use stty instead of read -s
+    pause_verbose_trace
     stty -echo
     read password
     stty echo
+    resume_verbose_trace
     echo "" >&2
 
     # Only the password goes to stdout (gets captured)
     echo "$password"
+}
+
+prompt_with_default() {
+    local prompt_text="$1"
+    local default_value="$2"
+    local result_var="$3"
+    local user_input
+
+    if [[ -n "$default_value" ]]; then
+        printf "%s [%s]: " "$prompt_text" "$default_value"
+    else
+        printf "%s: " "$prompt_text"
+    fi
+
+    read user_input
+
+    if [[ -z "$user_input" ]]; then
+        user_input="$default_value"
+    fi
+
+    printf -v "$result_var" '%s' "$user_input"
 }
 
 verify_sys_password() {
@@ -346,7 +539,14 @@ verify_sys_password() {
     local tns_alias="$2"
 
     local result
+    pause_verbose_trace
     result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" @"${SQL_DIR}/queries/check_connection.sql" 2>&1)
+    local rc=$?
+    resume_verbose_trace
+
+    if [[ $rc -ne 0 ]]; then
+        return 1
+    fi
 
     if echo "$result" | grep -q "CONNECTED"; then
         return 0
@@ -363,7 +563,7 @@ backup_file() {
     local file="$1"
     if [[ -f "$file" ]]; then
         local backup="${file}.bak.$(date '+%Y%m%d_%H%M%S')"
-        cp "$file" "$backup"
+        run_mutating_command "Create backup file" cp "$file" "$backup" || return 1
         log_info "Backed up $file to $backup"
     fi
 }
@@ -379,6 +579,7 @@ append_to_file() {
         return 1
     fi
 
+    confirm_approval_action "Append content to file" "append content to $file" || return 1
     echo "" >> "$file"
     echo "$content" >> "$file"
     log_info "Appended content to $file"
@@ -493,6 +694,7 @@ add_sid_to_listener() {
     tail -n "+${insert_line}" "$listener_file" >> "$temp_file"
 
     # Replace original
+    confirm_approval_action "Update listener file" "mv $temp_file $listener_file" || return 1
     mv "$temp_file" "$listener_file"
 
     return 0
@@ -607,6 +809,60 @@ confirm_proceed() {
 # Display Functions
 # ============================================================
 
+TOTAL_PROGRESS_STEPS=0
+CURRENT_PROGRESS_STEP=0
+
+init_progress() {
+    TOTAL_PROGRESS_STEPS="${1:-0}"
+    CURRENT_PROGRESS_STEP=0
+}
+
+progress_step() {
+    local title="$1"
+
+    if [[ "$TOTAL_PROGRESS_STEPS" -gt 0 ]]; then
+        CURRENT_PROGRESS_STEP=$((CURRENT_PROGRESS_STEP + 1))
+        log_section "[$CURRENT_PROGRESS_STEP/$TOTAL_PROGRESS_STEPS] $title"
+    else
+        log_section "$title"
+    fi
+}
+
+print_status_row() {
+    local label="$1"
+    local value="$2"
+    printf "  %-24s %s\n" "${label}:" "${value}"
+}
+
+print_status_block() {
+    local title="$1"
+    shift
+
+    echo ""
+    printf "${BLUE}%s${NC}\n" "$title"
+    printf "${BLUE}%s${NC}\n" "------------------------------------------------------------"
+
+    while [[ $# -gt 1 ]]; do
+        print_status_row "$1" "$2"
+        shift 2
+    done
+}
+
+print_list_block() {
+    local title="$1"
+    shift
+    local i=1
+
+    echo ""
+    printf "${BLUE}%s${NC}\n" "$title"
+    printf "${BLUE}%s${NC}\n" "------------------------------------------------------------"
+
+    for item in "$@"; do
+        printf "  %d. %s\n" "$i" "$item"
+        i=$((i + 1))
+    done
+}
+
 display_config() {
     local config_file="$1"
 
@@ -651,6 +907,8 @@ print_summary() {
     printf "${BLUE}============================================================${NC}\n"
     if [[ "$status" == "SUCCESS" ]]; then
         printf "${GREEN}     %s: %s${NC}\n" "$status" "$message"
+    elif [[ "$status" == "WARNING" ]]; then
+        printf "${YELLOW}     %s: %s${NC}\n" "$status" "$message"
     else
         printf "${RED}     %s: %s${NC}\n" "$status" "$message"
     fi

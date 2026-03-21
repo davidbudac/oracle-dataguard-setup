@@ -15,12 +15,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 2: Generate Standby Config"
+init_progress 7
 
 # Initialize logging (will reinitialize with DB names later)
 init_log "02_generate_standby_config"
@@ -29,7 +31,7 @@ init_log "02_generate_standby_config"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_nfs_mount || exit 1
 
@@ -53,15 +55,14 @@ init_log "02_generate_standby_config_${DB_UNIQUE_NAME}"
 # Prompt for Standby Information
 # ============================================================
 
-log_section "Standby Server Configuration"
+progress_step "Collecting Standby Server Configuration"
 
 echo ""
 echo "Please provide the following information for the standby database:"
 echo ""
 
 # Standby hostname
-printf "Standby server hostname: "
-read STANDBY_HOSTNAME
+prompt_with_default "Standby server hostname" "" STANDBY_HOSTNAME
 if [ -z "$STANDBY_HOSTNAME" ]; then
     log_error "Standby hostname cannot be empty"
     exit 1
@@ -84,16 +85,14 @@ fi
 
 # Standby Oracle SID (default same as primary)
 echo ""
-echo "The standby ORACLE_SID (default: $PRIMARY_ORACLE_SID)"
-printf "Standby ORACLE_SID [$PRIMARY_ORACLE_SID]: "
-read STANDBY_ORACLE_SID
-STANDBY_ORACLE_SID=${STANDBY_ORACLE_SID:-$PRIMARY_ORACLE_SID}
+echo "The standby ORACLE_SID usually matches the primary unless you have a naming reason to change it."
+prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
 
 # ============================================================
 # Generate Path Conversions
 # ============================================================
 
-log_section "Generating Path Conversions"
+progress_step "Generating Path Conversions"
 
 # Detect the actual directory name used in paths (may differ in case from DB_UNIQUE_NAME)
 # DB_UNIQUE_NAME might be 'testcdb' but directory might be 'TESTCDB'
@@ -170,7 +169,7 @@ log_info "Standby redo path: $STANDBY_REDO_PATH"
 # Generate TNS Aliases
 # ============================================================
 
-log_section "Generating TNS Configuration"
+progress_step "Generating TNS Configuration"
 
 # Use domain-qualified aliases if DB_DOMAIN is set
 # This handles NAMES.DEFAULT_DOMAIN in sqlnet.ora
@@ -190,7 +189,7 @@ log_info "Standby TNS alias: $STANDBY_TNS_ALIAS"
 # Generate Admin Directories
 # ============================================================
 
-log_section "Generating Admin Directories"
+progress_step "Generating Admin Directories"
 
 # Assume same ORACLE_BASE structure on standby
 STANDBY_ORACLE_BASE="$PRIMARY_ORACLE_BASE"
@@ -213,7 +212,7 @@ log_info "Recommended standby redo groups: $RECOMMENDED_STBY_GROUPS"
 # Write Standby Configuration File
 # ============================================================
 
-log_section "Writing Standby Configuration"
+progress_step "Writing Standby Configuration Files"
 
 # Use STANDBY_DB_UNIQUE_NAME in filename to support concurrent builds
 STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config_${STANDBY_DB_UNIQUE_NAME}.env"
@@ -292,6 +291,7 @@ log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
 # Generate Standby Init Parameter File
 # ============================================================
 
+log_success "Standby configuration written to: $STANDBY_CONFIG_FILE"
 log_section "Generating Standby Init Parameter File"
 
 # Include DB_UNIQUE_NAME in filename to support concurrent builds
@@ -359,6 +359,7 @@ fi)
 EOF
 
 log_info "Standby pfile written to: $STANDBY_PFILE"
+log_success "Standby pfile written to: $STANDBY_PFILE"
 
 # ============================================================
 # Generate TNS Entries
@@ -409,6 +410,7 @@ ${STANDBY_TNS_ALIAS} =
 EOF
 
 log_info "TNS entries written to: $TNSNAMES_FILE"
+log_success "TNS entries written to: $TNSNAMES_FILE"
 
 # ============================================================
 # Generate Listener Entry for Standby
@@ -452,6 +454,7 @@ LISTENER =
 EOF
 
 log_info "Listener entries written to: $LISTENER_FILE"
+log_success "Standby listener snippet written to: $LISTENER_FILE"
 
 # ============================================================
 # Generate Listener Entry for Primary
@@ -487,12 +490,13 @@ SID_LIST_LISTENER =
 EOF
 
 log_info "Primary listener entries written to: $LISTENER_PRIMARY_FILE"
+log_success "Primary listener snippet written to: $LISTENER_PRIMARY_FILE"
 
 # ============================================================
 # Generate Data Guard Broker Configuration Script
 # ============================================================
 
-log_section "Generating Data Guard Broker Configuration Script"
+progress_step "Generating Broker Bootstrap Script"
 
 DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
 # Include standby name in filename to support concurrent builds
@@ -523,56 +527,42 @@ SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
 EOF
 
 log_info "DGMGRL script written to: $DGMGRL_SCRIPT"
+log_success "DGMGRL script written to: $DGMGRL_SCRIPT"
 
 # ============================================================
 # Display Configuration for Review
 # ============================================================
 
-log_section "Configuration Review"
+progress_step "Reviewing Generated Configuration"
 
-echo ""
-echo "================================================================"
-echo "                 STANDBY CONFIGURATION SUMMARY"
-echo "================================================================"
-echo ""
-echo "PRIMARY DATABASE:"
-echo "  Hostname:        $PRIMARY_HOSTNAME"
-echo "  DB_UNIQUE_NAME:  $DB_UNIQUE_NAME"
-echo "  ORACLE_SID:      $PRIMARY_ORACLE_SID"
-echo "  TNS Alias:       $PRIMARY_TNS_ALIAS"
-echo "  Data Path:       $PRIMARY_DATA_PATH"
-echo ""
-echo "STANDBY DATABASE:"
-echo "  Hostname:        $STANDBY_HOSTNAME"
-echo "  DB_UNIQUE_NAME:  $STANDBY_DB_UNIQUE_NAME"
-echo "  ORACLE_SID:      $STANDBY_ORACLE_SID"
-echo "  TNS Alias:       $STANDBY_TNS_ALIAS"
-echo "  Data Path:       $STANDBY_DATA_PATH"
-echo ""
-echo "PATH CONVERSIONS:"
-echo "  DB_FILE_NAME_CONVERT:  $DB_FILE_NAME_CONVERT"
-echo "  LOG_FILE_NAME_CONVERT: $LOG_FILE_NAME_CONVERT"
-echo ""
-echo "REDO LOG CONFIGURATION:"
-echo "  Online Redo Groups:  $ONLINE_REDO_GROUPS"
-echo "  Standby Redo Groups: $RECOMMENDED_STBY_GROUPS"
-echo "  Redo Log Size:       ${REDO_LOG_SIZE_MB}MB"
-echo ""
-echo "DATA GUARD BROKER:"
-echo "  Configuration Name:  $DG_BROKER_CONFIG_NAME"
-echo "  (Parameters will be managed automatically by DGMGRL)"
-echo ""
-echo "================================================================"
-echo ""
-echo "Generated Files:"
-echo "  - Standby config:      $STANDBY_CONFIG_FILE"
-echo "  - Standby pfile:       $STANDBY_PFILE"
-echo "  - TNS entries:         $TNSNAMES_FILE"
-echo "  - Standby listener:    $LISTENER_FILE"
-echo "  - Primary listener:    $LISTENER_PRIMARY_FILE"
-echo "  - DGMGRL script:       $DGMGRL_SCRIPT"
-echo ""
-echo "================================================================"
+print_status_block "Primary Database" \
+    "Hostname" "$PRIMARY_HOSTNAME" \
+    "DB_UNIQUE_NAME" "$DB_UNIQUE_NAME" \
+    "ORACLE_SID" "$PRIMARY_ORACLE_SID" \
+    "TNS Alias" "$PRIMARY_TNS_ALIAS" \
+    "Data Path" "$PRIMARY_DATA_PATH"
+
+print_status_block "Standby Database" \
+    "Hostname" "$STANDBY_HOSTNAME" \
+    "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+    "ORACLE_SID" "$STANDBY_ORACLE_SID" \
+    "TNS Alias" "$STANDBY_TNS_ALIAS" \
+    "Data Path" "$STANDBY_DATA_PATH"
+
+print_status_block "Key Conversions" \
+    "DB_FILE_NAME_CONVERT" "$DB_FILE_NAME_CONVERT" \
+    "LOG_FILE_NAME_CONVERT" "$LOG_FILE_NAME_CONVERT" \
+    "Redo Log Size" "${REDO_LOG_SIZE_MB} MB" \
+    "Standby Redo Groups" "$RECOMMENDED_STBY_GROUPS" \
+    "Broker Config" "$DG_BROKER_CONFIG_NAME"
+
+print_list_block "Generated Files" \
+    "Standby config: $STANDBY_CONFIG_FILE" \
+    "Standby pfile: $STANDBY_PFILE" \
+    "TNS entries: $TNSNAMES_FILE" \
+    "Standby listener: $LISTENER_FILE" \
+    "Primary listener: $LISTENER_PRIMARY_FILE" \
+    "DGMGRL script: $DGMGRL_SCRIPT"
 
 # ============================================================
 # User Confirmation
@@ -588,23 +578,9 @@ if ! confirm_proceed "Please review the configuration above."; then
 fi
 
 print_summary "SUCCESS" "Standby configuration generated successfully"
-
-echo ""
-echo "NEXT STEPS:"
-echo "==========="
-echo ""
-echo "1. On STANDBY server:"
-echo "   Run: ./standby/03_setup_standby_env.sh"
-echo ""
-echo "2. On PRIMARY server:"
-echo "   Run: ./primary/04_prepare_primary_dg.sh"
-echo ""
-echo "3. On STANDBY server:"
-echo "   Run: ./standby/05_clone_standby.sh"
-echo ""
-echo "4. On PRIMARY server:"
-echo "   Run: ./primary/06_configure_broker.sh"
-echo ""
-echo "5. On either server:"
-echo "   Run: ./standby/07_verify_dataguard.sh"
-echo ""
+print_list_block "Next Steps" \
+    "On STANDBY, run ./standby/03_setup_standby_env.sh." \
+    "On PRIMARY, run ./primary/04_prepare_primary_dg.sh." \
+    "Back on STANDBY, run ./standby/05_clone_standby.sh." \
+    "On PRIMARY, run ./primary/06_configure_broker.sh." \
+    "On either server, run ./standby/07_verify_dataguard.sh."

@@ -26,6 +26,7 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # Default FSFO threshold (seconds)
 FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
@@ -35,6 +36,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
+init_progress 13
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -43,7 +45,7 @@ init_log "09_configure_fsfo"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_oracle_env || exit 1
 check_nfs_mount || exit 1
@@ -53,7 +55,7 @@ check_db_connection || exit 1
 # Load Configuration
 # ============================================================
 
-log_section "Loading Configuration"
+progress_step "Loading Configuration"
 
 # Find standby config file
 if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
@@ -70,7 +72,7 @@ init_log "09_configure_fsfo_${STANDBY_DB_UNIQUE_NAME}"
 # Verify Database Role
 # ============================================================
 
-log_section "Verifying Database Role"
+progress_step "Verifying Database Role"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
 DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
@@ -87,7 +89,7 @@ log_info "Confirmed: Running on PRIMARY database"
 # Verify Data Guard Broker Configuration
 # ============================================================
 
-log_section "Verifying Data Guard Broker"
+progress_step "Verifying Data Guard Broker"
 
 CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
@@ -119,7 +121,7 @@ fi
 # Check Synchronization Status
 # ============================================================
 
-log_section "Checking Synchronization Status"
+progress_step "Checking Synchronization Status"
 
 log_info "Querying transport and apply lag..."
 
@@ -144,7 +146,7 @@ log_info "Minor lag is acceptable; FSFO will wait for sync before failover"
 # Check Current Protection Mode
 # ============================================================
 
-log_section "Checking Current Protection Mode"
+progress_step "Checking Current Protection Mode"
 
 CURRENT_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d '\n\r' | sed 's/^ *//;s/ *$//')
 log_info "Current protection mode: $CURRENT_MODE"
@@ -153,7 +155,7 @@ log_info "Current protection mode: $CURRENT_MODE"
 # Configuration Summary
 # ============================================================
 
-log_section "FSFO Configuration Summary"
+progress_step "Reviewing FSFO Configuration Summary"
 
 # ============================================================
 # Prompt for Observer Username
@@ -169,9 +171,7 @@ echo ""
 # Default username suggestion
 DEFAULT_OBSERVER_USER="dg_observer"
 
-printf "Enter username for observer [$DEFAULT_OBSERVER_USER]: "
-read OBSERVER_USER
-OBSERVER_USER="${OBSERVER_USER:-$DEFAULT_OBSERVER_USER}"
+prompt_with_default "Enter username for observer" "$DEFAULT_OBSERVER_USER" OBSERVER_USER
 
 # Convert to uppercase for Oracle
 OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
@@ -198,7 +198,7 @@ fi
 # Create Observer User with SYSDG Privilege
 # ============================================================
 
-log_section "Creating Observer User with SYSDG Privilege"
+progress_step "Creating Observer User"
 
 # Check if user already exists
 USER_EXISTS=$(sqlplus -s / as sysdba << EOF
@@ -225,6 +225,7 @@ EOF
         log_info "User $OBSERVER_USER already has SYSDG privilege"
     else
         log_info "Granting SYSDG privilege to $OBSERVER_USER..."
+        confirm_approval_action "Grant SYSDG and CREATE SESSION to observer user" "GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
         sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
 GRANT SYSDG TO ${OBSERVER_USER};
@@ -246,6 +247,7 @@ EOF
 
         log_info "Updating password for $OBSERVER_USER..."
         log_cmd "sqlplus / as sysdba:" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***"
+        confirm_approval_action "Update observer user password" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***" || exit 1
         RESULT=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
 ALTER USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
@@ -281,6 +283,7 @@ else
 
     log_info "Creating user $OBSERVER_USER with SYSDG privilege..."
     log_cmd "sqlplus / as sysdba:" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***"
+    confirm_approval_action "Create observer user with SYSDG privilege" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***; GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
     RESULT=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
 CREATE USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
@@ -309,7 +312,7 @@ unset OBSERVER_PASSWORD_CONFIRM
 # Configure LogXptMode (must be done before changing protection mode)
 # ============================================================
 
-log_section "Setting LogXptMode to FASTSYNC"
+progress_step "Setting LogXptMode to FASTSYNC"
 
 log_info "Setting LogXptMode to FASTSYNC for both databases..."
 
@@ -325,7 +328,7 @@ log_info "LogXptMode set to FASTSYNC for ${STANDBY_DB_UNIQUE_NAME}"
 # Configure Protection Mode
 # ============================================================
 
-log_section "Setting Protection Mode to MAXIMUM AVAILABILITY"
+progress_step "Setting Protection Mode to MAXIMUM AVAILABILITY"
 
 # Normalize protection mode for comparison (remove spaces)
 CURRENT_MODE_NORMALIZED=$(echo "$CURRENT_MODE" | tr -d ' ')
@@ -366,7 +369,7 @@ fi
 # Configure FSFO Properties
 # ============================================================
 
-log_section "Setting FSFO Properties"
+progress_step "Setting FSFO Properties"
 
 log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=${FSFO_THRESHOLD}"
 log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='${STANDBY_DB_UNIQUE_NAME}'"
@@ -379,7 +382,7 @@ log_info "FSFO target set to ${STANDBY_DB_UNIQUE_NAME}"
 # Enable Fast-Start Failover
 # ============================================================
 
-log_section "Enabling Fast-Start Failover"
+progress_step "Enabling Fast-Start Failover"
 
 log_cmd "dgmgrl / :" "ENABLE FAST_START FAILOVER"
 ENABLE_RESULT=$(run_dgmgrl "enable_fsfo.dgmgrl" 2>&1 || true)
@@ -408,6 +411,7 @@ if [[ -f "$NFS_ORAPW_FILE" ]]; then
 else
     if [[ -f "$ORAPW_FILE" ]]; then
         log_info "Copying password file to NFS share..."
+        confirm_approval_action "Copy primary password file for observer" "cp $ORAPW_FILE $NFS_ORAPW_FILE && chmod 640 $NFS_ORAPW_FILE" || exit 1
         cp "$ORAPW_FILE" "$NFS_ORAPW_FILE"
         chmod 640 "$NFS_ORAPW_FILE"
         log_info "Password file copied to: $NFS_ORAPW_FILE"
@@ -425,6 +429,7 @@ log_section "Updating Configuration File"
 
 # Add FSFO settings to config file if not present
 if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+    confirm_approval_action "Append FSFO settings to standby configuration" "append FSFO configuration to $STANDBY_CONFIG_FILE" || exit 1
     cat >> "$STANDBY_CONFIG_FILE" << EOF
 
 # ============================================================
@@ -440,9 +445,11 @@ else
     # Update OBSERVER_USER if it changed
     # AIX compatible: use temp file instead of sed -i
     if grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+        confirm_approval_action "Update OBSERVER_USER in standby configuration" "rewrite OBSERVER_USER in $STANDBY_CONFIG_FILE" || exit 1
         sed "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" "$STANDBY_CONFIG_FILE" > "${STANDBY_CONFIG_FILE}.tmp"
         mv "${STANDBY_CONFIG_FILE}.tmp" "$STANDBY_CONFIG_FILE"
     else
+        confirm_approval_action "Append OBSERVER_USER to standby configuration" "append OBSERVER_USER to $STANDBY_CONFIG_FILE" || exit 1
         echo "OBSERVER_USER=\"${OBSERVER_USER}\"" >> "$STANDBY_CONFIG_FILE"
     fi
     log_info "FSFO settings updated in configuration file"
@@ -452,7 +459,7 @@ fi
 # Display Final Configuration
 # ============================================================
 
-log_section "Final FSFO Configuration"
+progress_step "Reviewing Final FSFO Configuration"
 
 echo ""
 run_dgmgrl "show_fsfo_status.dgmgrl"
@@ -463,46 +470,22 @@ echo ""
 # ============================================================
 
 print_summary "SUCCESS" "Fast-Start Failover configured"
+print_status_block "FSFO Configuration" \
+    "Protection Mode" "MAXIMUM AVAILABILITY" \
+    "LogXptMode" "FASTSYNC" \
+    "FSFO Threshold" "${FSFO_THRESHOLD} seconds" \
+    "FSFO Target" "$STANDBY_DB_UNIQUE_NAME" \
+    "Observer User" "$OBSERVER_USER"
 
-echo ""
-echo "FSFO CONFIGURATION COMPLETE"
-echo "==========================="
-echo ""
-echo "  Protection Mode : MAXIMUM AVAILABILITY"
-echo "  LogXptMode      : FASTSYNC"
-echo "  FSFO Threshold  : ${FSFO_THRESHOLD} seconds"
-echo "  FSFO Target     : ${STANDBY_DB_UNIQUE_NAME}"
-echo "  FSFO Status     : ENABLED (observer not yet started)"
-echo "  Observer User   : ${OBSERVER_USER} (with SYSDG privilege)"
-echo ""
-echo "NEXT STEPS - Observer Setup"
-echo "==========================="
-echo ""
-echo "The observer can run on the standby server or a 3rd dedicated server."
-echo "On the observer server:"
-echo ""
-echo "  1. Ensure Oracle client is installed"
-echo "  2. Configure tnsnames.ora with entries for:"
-echo "     - ${PRIMARY_TNS_ALIAS}"
-echo "     - ${STANDBY_TNS_ALIAS}"
-echo ""
-echo "  3. Set up the observer wallet:"
-echo "     ./fsfo/observer.sh setup"
-echo ""
-echo "  4. Start the observer:"
-echo "     ./fsfo/observer.sh start"
-echo ""
-echo "  5. Verify observer status:"
-echo "     ./fsfo/observer.sh status"
-echo ""
-echo "OBSERVER WALLET SETUP"
-echo "====================="
-echo ""
-echo "The wallet provides secure authentication without storing passwords."
-echo "When running './fsfo/observer.sh setup', you will be prompted for the"
-echo "password for user ${OBSERVER_USER}."
-echo ""
-echo "The observer connects using: dgmgrl /@${PRIMARY_TNS_ALIAS}"
-echo ""
-echo "NOTE: The observer must be running for automatic failover to occur."
-echo ""
+print_list_block "Observer Setup" \
+    "Ensure Oracle client is installed on the observer host." \
+    "Configure tnsnames.ora with ${PRIMARY_TNS_ALIAS} and ${STANDBY_TNS_ALIAS}." \
+    "Run ./fsfo/observer.sh setup." \
+    "Run ./fsfo/observer.sh start." \
+    "Verify with ./fsfo/observer.sh status."
+
+print_list_block "Wallet Notes" \
+    "The wallet avoids storing passwords in scripts or process arguments." \
+    "observer.sh setup will prompt for the password of ${OBSERVER_USER}." \
+    "The observer connects using dgmgrl /@${PRIMARY_TNS_ALIAS}." \
+    "Automatic failover only works while the observer is running."

@@ -15,12 +15,14 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+enable_verbose_mode "$@"
 
 # ============================================================
 # Main Script
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
+init_progress 6
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -29,7 +31,7 @@ init_log "06_configure_broker"
 # Pre-flight Checks
 # ============================================================
 
-log_section "Pre-flight Checks"
+progress_step "Pre-flight Checks"
 
 check_oracle_env || exit 1
 check_nfs_mount || exit 1
@@ -51,7 +53,7 @@ init_log "06_configure_broker_${STANDBY_DB_UNIQUE_NAME}"
 # Verify DG Broker is Running
 # ============================================================
 
-log_section "Verifying Data Guard Broker Status"
+progress_step "Verifying Data Guard Broker Status"
 
 # Check DG_BROKER_START on primary
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
@@ -79,7 +81,7 @@ log_info "DMON process is running on primary"
 # Verify TNS Connectivity
 # ============================================================
 
-log_section "Verifying Network Connectivity"
+progress_step "Verifying Network Connectivity"
 
 log_info "Testing tnsping to primary ($PRIMARY_TNS_ALIAS)..."
 if ! "$ORACLE_HOME/bin/tnsping" "$PRIMARY_TNS_ALIAS" > /dev/null 2>&1; then
@@ -100,7 +102,7 @@ log_info "tnsping to standby successful"
 # Check for Existing Broker Configuration
 # ============================================================
 
-log_section "Checking for Existing Broker Configuration"
+progress_step "Checking for Existing Broker Configuration"
 
 # Try to connect and check for existing config
 EXISTING_CONFIG=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
@@ -127,7 +129,7 @@ fi
 # Create Broker Configuration
 # ============================================================
 
-log_section "Creating Data Guard Broker Configuration"
+progress_step "Creating Data Guard Broker Configuration"
 
 DG_BROKER_CONFIG_NAME="${DG_BROKER_CONFIG_NAME:-${PRIMARY_DB_NAME}_DG}"
 
@@ -161,7 +163,7 @@ log_info "Standby database added successfully"
 # Enable Configuration
 # ============================================================
 
-log_section "Enabling Data Guard Broker Configuration"
+progress_step "Enabling Data Guard Broker Configuration"
 
 log_info "Enabling configuration..."
 log_cmd "dgmgrl /:" "ENABLE CONFIGURATION"
@@ -175,7 +177,7 @@ sleep 10
 # Verify Configuration
 # ============================================================
 
-log_section "Verifying Broker Configuration"
+progress_step "Verifying Broker Configuration"
 
 echo ""
 echo "Data Guard Broker Configuration:"
@@ -239,35 +241,24 @@ elif [[ "$BROKER_STATUS" == "WARNING" ]]; then
 else
     print_summary "ERROR" "Data Guard Broker configuration has issues"
 fi
+print_status_block "Broker Configuration" \
+    "Configuration Name" "$DG_BROKER_CONFIG_NAME" \
+    "Primary Database" "$PRIMARY_DB_UNIQUE_NAME" \
+    "Standby Database" "$STANDBY_DB_UNIQUE_NAME" \
+    "Broker Status" "$BROKER_STATUS"
 
-echo ""
-echo "COMPLETED ACTIONS:"
-echo "=================="
-echo "  - Created broker configuration: $DG_BROKER_CONFIG_NAME"
-echo "  - Added primary database: $PRIMARY_DB_UNIQUE_NAME"
-echo "  - Added standby database: $STANDBY_DB_UNIQUE_NAME"
-echo "  - Enabled configuration"
-echo "  - Tested log shipping"
-echo ""
-echo "BROKER MANAGEMENT COMMANDS:"
-echo "==========================="
-echo ""
-echo "  # Show configuration status:"
-echo "  dgmgrl / \"show configuration\""
-echo ""
-echo "  # Show database details:"
-echo "  dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\""
-echo "  dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "  # Switchover to standby:"
-echo "  dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "  # Failover to standby (if primary is down):"
-echo "  dgmgrl / \"failover to '$STANDBY_DB_UNIQUE_NAME'\""
-echo ""
-echo "NEXT STEPS:"
-echo "==========="
-echo ""
-echo "Run verification script:"
-echo "   ./standby/07_verify_dataguard.sh"
-echo ""
+print_list_block "Completed Actions" \
+    "Created the broker configuration." \
+    "Added the primary and standby databases." \
+    "Enabled the configuration." \
+    "Forced a log switch to test redo transport."
+
+print_list_block "Broker Management Commands" \
+    "dgmgrl / \"show configuration\"" \
+    "dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\"" \
+    "dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\"" \
+    "dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\"" \
+    "dgmgrl / \"failover to '$STANDBY_DB_UNIQUE_NAME'\""
+
+print_list_block "Next Step" \
+    "Run ./standby/07_verify_dataguard.sh."

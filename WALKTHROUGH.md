@@ -94,12 +94,29 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 | Step | Server | Command |
 |------|--------|---------|
 | 1 | PRIMARY | `./primary/01_gather_primary_info.sh` |
-| 2 | PRIMARY | `./common/02_generate_standby_config.sh` |
+| 2 | PRIMARY | `./primary/02_generate_standby_config.sh` |
 | 3 | STANDBY | `./standby/03_setup_standby_env.sh` |
 | 4 | PRIMARY | `./primary/04_prepare_primary_dg.sh` |
 | 5 | STANDBY | `./standby/05_clone_standby.sh` |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
+
+### Optional Runtime Modes
+
+All workflow scripts that use `common/dg_functions.sh` support:
+
+```bash
+./primary/06_configure_broker.sh --verbose
+./standby/05_clone_standby.sh --approval-mode
+APPROVAL_MODE=1 VERBOSE=1 ./primary/09_configure_fsfo.sh
+```
+
+- `--verbose`
+  Prints exact shell command tracing.
+- `--approval-mode`
+  Pauses before mutating actions and shows an approval block with action, impact, log file, and command preview.
+- `--suspicious`
+  Backward-compatible alias for `--approval-mode`.
 
 ---
 
@@ -111,6 +128,8 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 export ORACLE_SID=PROD
 export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 ./primary/01_gather_primary_info.sh
+# Optional:
+./primary/01_gather_primary_info.sh --verbose --approval-mode
 ```
 
 **Output files (on NFS):**
@@ -124,7 +143,7 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 **Server:** PRIMARY
 
 ```bash
-./common/02_generate_standby_config.sh
+./primary/02_generate_standby_config.sh
 ```
 
 **Prompts:**
@@ -132,7 +151,7 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 - Standby DB_UNIQUE_NAME (e.g., `PRODSTBY`)
 - Standby ORACLE_SID (default: same as primary)
 
-**Review the configuration summary and confirm.**
+**Review the generated summary and file list before confirming.**
 
 **Output files (on NFS):**
 - `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` - Master configuration (single source of truth)
@@ -158,6 +177,8 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 - Copies password file
 - Configures listener (static registration)
 - Configures tnsnames.ora
+
+**Approval mode note:** with `--approval-mode`, filesystem and listener changes are shown for confirmation before they run.
 
 **Verify listener:**
 ```bash
@@ -193,6 +214,7 @@ lsnrctl status
 
 **Prompts:**
 - SYS password (used for RMAN connection, not stored)
+- If `--approval-mode` is enabled, approval before RMAN duplicate and other mutating actions
 
 **Duration:** Depends on database size (can take hours for large databases)
 
@@ -217,6 +239,8 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 - Enables configuration
 - Tests log shipping
 
+**Output:** numbered progress sections, broker summary, and next-step guidance.
+
 ---
 
 ## Step 7: Verify Data Guard
@@ -232,6 +256,7 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 - MRP status: APPLYING_LOG
 - Archive gaps: 0
 - Broker status: SUCCESS
+- Clear health summary with errors, warnings, and key sequence numbers
 
 ---
 
@@ -290,7 +315,7 @@ ALTER SYSTEM SWITCH LOGFILE;
 │  EXECUTION ORDER:                                                       │
 │  ════════════════                                                       │
 │  PRIMARY:  ./primary/01_gather_primary_info.sh                          │
-│  PRIMARY:  ./common/02_generate_standby_config.sh  ← REVIEW CONFIG      │
+│  PRIMARY:  ./primary/02_generate_standby_config.sh ← REVIEW CONFIG      │
 │  STANDBY:  ./standby/03_setup_standby_env.sh                            │
 │  PRIMARY:  ./primary/04_prepare_primary_dg.sh                           │
 │  STANDBY:  ./standby/05_clone_standby.sh           ← ENTER PASSWORD     │
