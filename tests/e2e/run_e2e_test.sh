@@ -688,7 +688,8 @@ phase_step1() {
     log_phase "STEP 1: Gather Primary Information"
 
     local result
-    # Prompts: NFS share path (Enter for default)
+    # Prompts: NFS share path confirmation (Enter for default)
+    # No config file selection needed for step 1
     result=$(ssh_piped "PRIMARY" \
         "./primary/01_gather_primary_info.sh" \
         "")
@@ -736,10 +737,11 @@ phase_step2() {
     log_phase "STEP 2: Generate Standby Configuration"
 
     local result
-    # Prompts: config selection, standby host, db_unique_name, SID (default), confirm
+    # Prompts: standby host, db_unique_name, SID (default), confirm
+    # Note: config file is auto-selected when only one exists (no menu prompt)
     result=$(ssh_piped "PRIMARY" \
         "./primary/02_generate_standby_config.sh" \
-        "1\n${STANDBY_HOST}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
+        "${STANDBY_HOST}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
 
     local exit_code=$?
     log_info "Step 2 output (last 10 lines):"
@@ -780,10 +782,10 @@ phase_step3() {
     log_phase "STEP 3: Setup Standby Environment"
 
     local result
-    # Prompts: config selection, NFS default, hostname mismatch confirm
+    # Prompts: hostname mismatch confirm (config auto-selected when only one)
     result=$(ssh_piped "STANDBY" \
         "./standby/03_setup_standby_env.sh" \
-        "1\n\ny")
+        "y\ny\ny\ny\ny")
 
     local exit_code=$?
     log_info "Step 3 output (last 10 lines):"
@@ -838,10 +840,10 @@ phase_step4() {
     log_phase "STEP 4: Prepare Primary for Data Guard"
 
     local result
-    # Prompts: config selection, NFS default
+    # Prompts: (config auto-selected when only one, no interactive prompts)
     result=$(ssh_piped "PRIMARY" \
         "./primary/04_prepare_primary_dg.sh" \
-        "1\n")
+        "")
 
     local exit_code=$?
     log_info "Step 4 output (last 10 lines):"
@@ -921,10 +923,10 @@ phase_step5() {
     log_info "This step takes a while (RMAN duplicate)..."
 
     local result
-    # Prompts: config selection, NFS default, SYS password, typed confirmation
+    # Prompts: SYS password, typed confirmation (config auto-selected)
     result=$(ssh_piped "STANDBY" \
         "./standby/05_clone_standby.sh" \
-        "1\n\n${TEST_SYS_PASSWORD}\n${TEST_STANDBY_DB_UNIQUE_NAME}")
+        "${TEST_SYS_PASSWORD}\n${TEST_STANDBY_DB_UNIQUE_NAME}")
 
     local exit_code=$?
     log_info "Step 5 output (last 15 lines):"
@@ -970,10 +972,10 @@ phase_step6() {
     log_phase "STEP 6: Configure Data Guard Broker"
 
     local result
-    # Prompts: config selection, NFS default, possible remove config confirm
+    # Prompts: possible remove config confirm (config auto-selected)
     result=$(ssh_piped "PRIMARY" \
         "./primary/06_configure_broker.sh" \
-        "1\n\ny")
+        "y\ny")
 
     local exit_code=$?
     log_info "Step 6 output (last 10 lines):"
@@ -1024,10 +1026,10 @@ phase_step7() {
     log_phase "STEP 7: Verify Data Guard"
 
     local result
-    # Prompts: config selection, NFS default, optional password (skip)
+    # Prompts: optional password/skip (config auto-selected)
     result=$(ssh_piped "STANDBY" \
         "./standby/07_verify_dataguard.sh" \
-        "1\n\n")
+        "\n")
 
     local exit_code=$?
     log_info "Step 7 output (last 15 lines):"
@@ -1092,10 +1094,10 @@ phase_step8() {
     log_phase "STEP 8: Security Hardening"
 
     local result
-    # Prompts: config selection, NFS default, typed confirmation
+    # Prompts: typed confirmation (config auto-selected)
     result=$(ssh_piped "PRIMARY" \
         "./primary/08_security_hardening.sh" \
-        "1\n\nSECURE ${TEST_DB_NAME}")
+        "SECURE ${TEST_DB_NAME}")
 
     local exit_code=$?
     log_info "Step 8 output (last 10 lines):"
@@ -1135,10 +1137,10 @@ phase_step9() {
     log_phase "STEP 9: Configure Fast-Start Failover"
 
     local result
-    # Prompts: config selection, NFS default, observer user, password, confirm
+    # Prompts: observer user, password, confirm (config auto-selected)
     result=$(ssh_piped "PRIMARY" \
         "FSFO_THRESHOLD=${FSFO_THRESHOLD} ./primary/09_configure_fsfo.sh" \
-        "1\n\n${TEST_OBSERVER_USER}\n${TEST_OBSERVER_PASSWORD}\ny")
+        "${TEST_OBSERVER_USER}\n${TEST_OBSERVER_PASSWORD}\ny")
 
     local exit_code=$?
     log_info "Step 9 output (last 10 lines):"
@@ -1191,10 +1193,10 @@ phase_step10() {
     # Setup wallet
     log_info "Setting up observer wallet..."
     local result
-    # Prompts: config selection, NFS default, wallet pwd, wallet pwd again, observer pwd
+    # Prompts: wallet pwd, wallet pwd again, observer pwd (config auto-selected)
     result=$(ssh_piped "STANDBY" \
         "./fsfo/observer.sh setup" \
-        "1\n\n${TEST_WALLET_PASSWORD}\n${TEST_WALLET_PASSWORD}\n${TEST_OBSERVER_PASSWORD}")
+        "${TEST_WALLET_PASSWORD}\n${TEST_WALLET_PASSWORD}\n${TEST_OBSERVER_PASSWORD}")
 
     local exit_code=$?
     log_info "Observer setup output (last 10 lines):"
@@ -1210,10 +1212,10 @@ phase_step10() {
 
     # Start observer
     log_info "Starting observer..."
-    # Prompts: config selection, NFS default
+    # No interactive prompts expected (config auto-selected)
     result=$(ssh_piped "STANDBY" \
         "./fsfo/observer.sh start" \
-        "1\n")
+        "")
 
     exit_code=$?
     log_info "Observer start output (last 5 lines):"
@@ -1260,10 +1262,10 @@ phase_step11() {
     log_phase "STEP 11: Role-Aware Service Trigger"
 
     local result
-    # Prompts: config selection, NFS default, accept services, confirm deploy
+    # Prompts: accept services, confirm deploy (config auto-selected)
     result=$(ssh_piped "PRIMARY" \
         "./trigger/create_role_trigger.sh" \
-        "1\n\na\ny")
+        "a\ny")
 
     local exit_code=$?
     log_info "Step 11 output (last 10 lines):"
