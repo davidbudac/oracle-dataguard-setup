@@ -1281,13 +1281,13 @@ phase_step11() {
     log_phase "STEP 11: Role-Aware Service Trigger"
 
     local result
-    # Prompts vary based on whether package already exists:
-    #   First run:  NFS confirm (Enter), accept services (Enter), deploy (y)
-    #   Re-run:     NFS confirm (Enter), accept services (Enter), replace (y), deploy (y)
-    # Extra y's are harmless - they go to EOF after the script finishes
+    # Prompts (config auto-selected, no NFS confirm in this script):
+    #   First run:  accept services (Enter), deploy (y)
+    #   Re-run:     accept services (Enter), replace existing (y), deploy (y)
+    # Extra y's after all prompts are harmless
     result=$(ssh_piped "PRIMARY" \
         "./trigger/create_role_trigger.sh" \
-        "\n\ny\ny\ny")
+        "\ny\ny\ny")
 
     local exit_code=$?
     log_info "Step 11 output (last 10 lines):"
