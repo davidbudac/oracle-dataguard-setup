@@ -24,8 +24,7 @@ orapw*
 *~
 .DS_Store
 
-# E2E test config (contains host IPs and passwords)
-tests/e2e/config.env
+# E2E test logs (generated at runtime)
 tests/e2e/logs/
 
 # IDE
