@@ -1281,11 +1281,10 @@ phase_step11() {
     log_phase "STEP 11: Role-Aware Service Trigger"
 
     local result
-    # Prompts: accept services (Enter), confirm deploy (y)
-    # The action menu uses Enter to accept, then y to confirm deployment
+    # Prompts: NFS confirm (Enter), accept services (Enter), replace existing (y), deploy (y)
     result=$(ssh_piped "PRIMARY" \
         "./trigger/create_role_trigger.sh" \
-        "\ny")
+        "\n\ny\ny")
 
     local exit_code=$?
     log_info "Step 11 output (last 10 lines):"
