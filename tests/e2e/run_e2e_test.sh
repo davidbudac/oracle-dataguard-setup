@@ -46,7 +46,7 @@ fi
 source "${SCRIPT_DIR}/config.env"
 
 # Validate required config
-for var in PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME ORACLE_BASE \
+for var in JUMP_HOST JUMP_USER PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME ORACLE_BASE \
            TEST_DB_NAME TEST_DB_UNIQUE_NAME TEST_STANDBY_DB_UNIQUE_NAME \
            TEST_SYS_PASSWORD NFS_SHARE REPO_URL REPO_DIR; do
     if [[ -z "${!var:-}" ]]; then
@@ -56,8 +56,13 @@ for var in PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME ORACLE_BASE \
 done
 
 # Derived values
-SSH_KEY_OPT=""
-[[ -n "${SSH_KEY:-}" ]] && SSH_KEY_OPT="-i ${SSH_KEY}"
+JUMP_KEY_OPT=""
+[[ -n "${JUMP_KEY:-}" ]] && JUMP_KEY_OPT="-i ${JUMP_KEY}"
+JUMP_SSH_PORT="${JUMP_SSH_PORT:-22}"
+PRIMARY_SSH_PORT="${PRIMARY_SSH_PORT:-22}"
+STANDBY_SSH_PORT="${STANDBY_SSH_PORT:-22}"
+DB_SSH_KEY_OPT=""
+[[ -n "${SSH_KEY:-}" ]] && DB_SSH_KEY_OPT="-i ${SSH_KEY}"
 
 # The standby ORACLE_SID is typically the same as the primary
 TEST_ORACLE_SID="${TEST_DB_NAME}"
@@ -136,27 +141,50 @@ EOF
 }
 
 # =============================================================================
-# SSH Helpers
+# SSH Helpers (all commands hop through the jump host)
 # =============================================================================
 
+# Build the SSH command prefix to reach a DB host via the jump host.
+# local machine -> jump host -> DB host (as oracle)
+_ssh_to_db_host() {
+    local db_host="$1"
+    local db_port="$2"
+
+    # Inner SSH: jump -> DB host
+    local inner_ssh="ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${db_port} ${SSH_USER}@${db_host}"
+
+    # Outer SSH: local -> jump, then run inner SSH
+    echo "ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p ${JUMP_SSH_PORT} ${JUMP_USER}@${JUMP_HOST} ${inner_ssh}"
+}
+
+# Run a command on a DB host (local -> jump -> DB host)
 ssh_cmd() {
     local host="$1"
     local cmd="$2"
     local timeout="${3:-300}"
 
-    ssh ${SSH_OPTS} ${SSH_KEY_OPT} "${SSH_USER}@${host}" \
-        "export ORACLE_HOME='${ORACLE_HOME}'; \
-         export ORACLE_BASE='${ORACLE_BASE}'; \
-         export ORACLE_SID='${TEST_ORACLE_SID}'; \
-         export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
-         export NFS_SHARE='${NFS_SHARE}'; \
-         ${cmd}" 2>&1
+    local port="${PRIMARY_SSH_PORT}"
+    [[ "$host" == "$STANDBY_HOST" ]] && port="${STANDBY_SSH_PORT}"
+
+    local env_setup="export ORACLE_HOME='${ORACLE_HOME}'; \
+export ORACLE_BASE='${ORACLE_BASE}'; \
+export ORACLE_SID='${TEST_ORACLE_SID}'; \
+export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
+export NFS_SHARE='${NFS_SHARE}'; "
+
+    # Escape the command for double-hop: the inner command is quoted for the
+    # jump host SSH, and the DB command is quoted inside that.
+    ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
+        "${JUMP_USER}@${JUMP_HOST}" \
+        "ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${port} ${SSH_USER}@${host} \
+            '${env_setup} ${cmd}'" 2>&1
 }
 
 ssh_primary() { ssh_cmd "$PRIMARY_HOST" "$1" "${2:-300}"; }
 ssh_standby() { ssh_cmd "$STANDBY_HOST" "$1" "${2:-300}"; }
 
-# Run a script with piped input on a remote host via expect
+# Run a script with automated interactive input on a remote host via expect.
+# Path: local -> jump -> DB host (expect runs on the DB host).
 # Usage: ssh_expect <host> <script_cmd> <expect_pairs...>
 #   expect_pairs are: "prompt_pattern" "response" "prompt_pattern" "response" ...
 ssh_expect() {
@@ -164,7 +192,10 @@ ssh_expect() {
     local script_cmd="$2"
     shift 2
 
-    # Build expect script
+    local port="${PRIMARY_SSH_PORT}"
+    [[ "$host" == "$STANDBY_HOST" ]] && port="${STANDBY_SSH_PORT}"
+
+    # Build expect script body
     local expect_body=""
     while [[ $# -ge 2 ]]; do
         local pattern="$1"
@@ -178,35 +209,48 @@ ssh_expect() {
     }"
     done
 
-    ssh ${SSH_OPTS} ${SSH_KEY_OPT} "${SSH_USER}@${host}" "
-        export ORACLE_HOME='${ORACLE_HOME}'
-        export ORACLE_BASE='${ORACLE_BASE}'
-        export ORACLE_SID='${TEST_ORACLE_SID}'
+    # SSH to jump, then SSH to DB host, then run expect there
+    ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
+        "${JUMP_USER}@${JUMP_HOST}" \
+        "ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${port} ${SSH_USER}@${host} '
+        export ORACLE_HOME='\"'\"'${ORACLE_HOME}'\"'\"'
+        export ORACLE_BASE='\"'\"'${ORACLE_BASE}'\"'\"'
+        export ORACLE_SID='\"'\"'${TEST_ORACLE_SID}'\"'\"'
         export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"
-        export NFS_SHARE='${NFS_SHARE}'
+        export NFS_SHARE='\"'\"'${NFS_SHARE}'\"'\"'
 
-        expect << 'EXPECT_SCRIPT'
+        expect << '\"'\"'EXPECT_SCRIPT'\"'\"'
 set timeout 600
 spawn bash -c \"cd ${REPO_DIR} && ${script_cmd}\"
 ${expect_body}
 expect eof
 catch wait result
-exit [lindex \$result 3]
+exit [lindex \\\$result 3]
 EXPECT_SCRIPT
-    " 2>&1
+    '" 2>&1
 }
 
 # =============================================================================
 # Assertion Helpers
 # =============================================================================
 
+assert_ssh_jump_ok() {
+    if ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
+        "${JUMP_USER}@${JUMP_HOST}" "echo ok" &>/dev/null; then
+        log_pass "SSH to jump host (${JUMP_HOST})"
+    else
+        log_fail "SSH to jump host (${JUMP_HOST})"
+        return 1
+    fi
+}
+
 assert_ssh_ok() {
     local host="$1"
     local label="$2"
-    if ssh ${SSH_OPTS} ${SSH_KEY_OPT} "${SSH_USER}@${host}" "echo ok" &>/dev/null; then
-        log_pass "SSH to ${label} (${host})"
+    if ssh_cmd "$host" "echo ok" 2>/dev/null | grep -q ok; then
+        log_pass "SSH to ${label} (${host}) via jump"
     else
-        log_fail "SSH to ${label} (${host})"
+        log_fail "SSH to ${label} (${host}) via jump"
         return 1
     fi
 }
@@ -282,6 +326,7 @@ assert_dgmgrl() {
 phase_preflight() {
     log_phase "PREFLIGHT: Validating environment"
 
+    assert_ssh_jump_ok || return 1
     assert_ssh_ok "$PRIMARY_HOST" "primary" || return 1
     assert_ssh_ok "$STANDBY_HOST" "standby" || return 1
 
@@ -1462,8 +1507,9 @@ EOF
 
     log "Oracle Data Guard E2E Test"
     log "Started: $(date)"
-    log "Primary: ${PRIMARY_HOST}"
-    log "Standby: ${STANDBY_HOST}"
+    log "Jump:    ${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}"
+    log "Primary: ${SSH_USER}@${PRIMARY_HOST}:${PRIMARY_SSH_PORT}"
+    log "Standby: ${SSH_USER}@${STANDBY_HOST}:${STANDBY_SSH_PORT}"
     log "Test DB: ${TEST_DB_NAME} / ${TEST_STANDBY_DB_UNIQUE_NAME}"
     log ""
 
