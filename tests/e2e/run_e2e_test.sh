@@ -744,9 +744,11 @@ phase_step2() {
     local result
     # Prompts: standby host, db_unique_name, SID (default), confirm
     # Note: config file is auto-selected when only one exists (no menu prompt)
+    # Use STANDBY_ORACLE_HOSTNAME (the real network hostname) not STANDBY_HOST (SSH target)
+    local standby_hn="${STANDBY_ORACLE_HOSTNAME:-${STANDBY_HOST}}"
     result=$(ssh_piped "PRIMARY" \
         "./primary/02_generate_standby_config.sh" \
-        "${STANDBY_HOST}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
+        "${standby_hn}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
 
     local exit_code=$?
     log_info "Step 2 output (last 10 lines):"
@@ -768,7 +770,8 @@ phase_step2() {
         "TNS entries on NFS" || return 1
 
     # Validate standby config has correct values
-    assert_remote_grep "PRIMARY" "STANDBY_HOSTNAME=.*${STANDBY_HOST}" \
+    local assert_hn="${STANDBY_ORACLE_HOSTNAME:-${STANDBY_HOST}}"
+    assert_remote_grep "PRIMARY" "STANDBY_HOSTNAME=.*${assert_hn}" \
         "${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env" \
         "Standby hostname in config" || return 1
 
