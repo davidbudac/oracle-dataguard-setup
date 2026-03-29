@@ -960,7 +960,7 @@ phase_step5() {
     # Validate: standby database role
     assert_sql "STANDBY" \
         "SELECT database_role FROM v\$database;" \
-        "PHYSICAL STANDBY" \
+        "PHYSICALSTANDBY" \
         "Database role is PHYSICAL STANDBY" || return 1
 
     # Validate: MRP is running
