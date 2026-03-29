@@ -644,9 +644,9 @@ prompt_password() {
     printf "${YELLOW}%s${NC}: " "$prompt_text" >&2
     # AIX compatible: use stty instead of read -s
     pause_verbose_trace
-    stty -echo
+    stty -echo 2>/dev/null || true
     read password
-    stty echo
+    stty echo 2>/dev/null || true
     resume_verbose_trace
     echo "" >&2
 
