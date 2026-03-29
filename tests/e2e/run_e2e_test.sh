@@ -1171,8 +1171,13 @@ phase_step9() {
 # =============================================================================
 
 phase_step10() {
+    if [[ "${SKIP_OBSERVER:-true}" == "true" ]]; then
+        log_skip "Step 10: Observer Setup (SKIP_OBSERVER=true)"
+        return 0
+    fi
+
     if [[ "${SKIP_FSFO}" == "true" ]]; then
-        log_skip "Step 10: Observer Setup (SKIP_FSFO=true)"
+        log_skip "Step 10: Observer Setup (SKIP_FSFO=true, FSFO not configured)"
         return 0
     fi
 
