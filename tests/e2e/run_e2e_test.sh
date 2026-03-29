@@ -16,10 +16,10 @@
 #
 # Prerequisites:
 #   - config.env filled in (copy from config.env.template)
-#   - SSH key access to both hosts as the oracle user
-#   - Oracle 19c installed on both hosts
-#   - NFS mounted on both hosts
-#   - 'expect' installed on both hosts
+#   - SSH key access to jump host, and from jump host to both DB hosts
+#   - Oracle 19c installed on both DB hosts
+#   - NFS mounted on both DB hosts
+#   - git installed on both DB hosts
 #
 # =============================================================================
 
@@ -142,92 +142,66 @@ EOF
 
 # =============================================================================
 # SSH Helpers (all commands hop through the jump host)
+#
+# Path: local machine -> jump host -> DB host (as oracle)
+# Uses ProxyJump (-J) for clean double-hop without nested quoting issues.
 # =============================================================================
 
-# Build the SSH command prefix to reach a DB host via the jump host.
-# local machine -> jump host -> DB host (as oracle)
-_ssh_to_db_host() {
-    local db_host="$1"
-    local db_port="$2"
-
-    # Inner SSH: jump -> DB host
-    local inner_ssh="ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${db_port} ${SSH_USER}@${db_host}"
-
-    # Outer SSH: local -> jump, then run inner SSH
-    echo "ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p ${JUMP_SSH_PORT} ${JUMP_USER}@${JUMP_HOST} ${inner_ssh}"
+# Get the SSH port for a given host
+_db_port() {
+    local host="$1"
+    if [[ "$host" == "$STANDBY_HOST" ]]; then
+        echo "${STANDBY_SSH_PORT}"
+    else
+        echo "${PRIMARY_SSH_PORT}"
+    fi
 }
 
-# Run a command on a DB host (local -> jump -> DB host)
+# Run a command on a DB host via ProxyJump
 ssh_cmd() {
     local host="$1"
     local cmd="$2"
     local timeout="${3:-300}"
 
-    local port="${PRIMARY_SSH_PORT}"
-    [[ "$host" == "$STANDBY_HOST" ]] && port="${STANDBY_SSH_PORT}"
+    local port
+    port=$(_db_port "$host")
 
-    local env_setup="export ORACLE_HOME='${ORACLE_HOME}'; \
-export ORACLE_BASE='${ORACLE_BASE}'; \
-export ORACLE_SID='${TEST_ORACLE_SID}'; \
-export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
-export NFS_SHARE='${NFS_SHARE}'; "
-
-    # Escape the command for double-hop: the inner command is quoted for the
-    # jump host SSH, and the DB command is quoted inside that.
-    ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
-        "${JUMP_USER}@${JUMP_HOST}" \
-        "ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${port} ${SSH_USER}@${host} \
-            '${env_setup} ${cmd}'" 2>&1
+    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
+        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        -p "${port}" "${SSH_USER}@${host}" \
+        "export ORACLE_HOME='${ORACLE_HOME}'; \
+         export ORACLE_BASE='${ORACLE_BASE}'; \
+         export ORACLE_SID='${TEST_ORACLE_SID}'; \
+         export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
+         export NFS_SHARE='${NFS_SHARE}'; \
+         ${cmd}" 2>&1
 }
 
 ssh_primary() { ssh_cmd "$PRIMARY_HOST" "$1" "${2:-300}"; }
 ssh_standby() { ssh_cmd "$STANDBY_HOST" "$1" "${2:-300}"; }
 
-# Run a script with automated interactive input on a remote host via expect.
-# Path: local -> jump -> DB host (expect runs on the DB host).
-# Usage: ssh_expect <host> <script_cmd> <expect_pairs...>
-#   expect_pairs are: "prompt_pattern" "response" "prompt_pattern" "response" ...
-ssh_expect() {
+# Run a script with piped stdin for interactive prompts.
+# Each line in the input string feeds one read/prompt in the script.
+# Usage: ssh_piped <host> <script_cmd> <stdin_lines>
+#   stdin_lines is a single string with \n-separated responses.
+ssh_piped() {
     local host="$1"
     local script_cmd="$2"
-    shift 2
+    local input="$3"
 
-    local port="${PRIMARY_SSH_PORT}"
-    [[ "$host" == "$STANDBY_HOST" ]] && port="${STANDBY_SSH_PORT}"
+    local port
+    port=$(_db_port "$host")
 
-    # Build expect script body
-    local expect_body=""
-    while [[ $# -ge 2 ]]; do
-        local pattern="$1"
-        local response="$2"
-        shift 2
-        expect_body+="
-    expect {
-        -re \"${pattern}\" { send \"${response}\\r\" }
-        timeout { puts \"EXPECT_TIMEOUT waiting for: ${pattern}\"; exit 1 }
-        eof { puts \"EXPECT_EOF before: ${pattern}\"; exit 1 }
-    }"
-    done
-
-    # SSH to jump, then SSH to DB host, then run expect there
-    ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
-        "${JUMP_USER}@${JUMP_HOST}" \
-        "ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} -p ${port} ${SSH_USER}@${host} '
-        export ORACLE_HOME='\"'\"'${ORACLE_HOME}'\"'\"'
-        export ORACLE_BASE='\"'\"'${ORACLE_BASE}'\"'\"'
-        export ORACLE_SID='\"'\"'${TEST_ORACLE_SID}'\"'\"'
-        export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"
-        export NFS_SHARE='\"'\"'${NFS_SHARE}'\"'\"'
-
-        expect << '\"'\"'EXPECT_SCRIPT'\"'\"'
-set timeout 600
-spawn bash -c \"cd ${REPO_DIR} && ${script_cmd}\"
-${expect_body}
-expect eof
-catch wait result
-exit [lindex \\\$result 3]
-EXPECT_SCRIPT
-    '" 2>&1
+    printf '%b\n' "${input}" | \
+    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
+        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        -p "${port}" "${SSH_USER}@${host}" \
+        "export ORACLE_HOME='${ORACLE_HOME}'; \
+         export ORACLE_BASE='${ORACLE_BASE}'; \
+         export ORACLE_SID='${TEST_ORACLE_SID}'; \
+         export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
+         export NFS_SHARE='${NFS_SHARE}'; \
+         cd '${REPO_DIR}' && ${script_cmd}" 2>&1
 }
 
 # =============================================================================
@@ -236,7 +210,7 @@ EXPECT_SCRIPT
 
 assert_ssh_jump_ok() {
     if ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
-        "${JUMP_USER}@${JUMP_HOST}" "echo ok" &>/dev/null; then
+        "${JUMP_USER}@${JUMP_HOST}" "echo ok" 2>/dev/null | grep -q ok; then
         log_pass "SSH to jump host (${JUMP_HOST})"
     else
         log_fail "SSH to jump host (${JUMP_HOST})"
@@ -247,10 +221,14 @@ assert_ssh_jump_ok() {
 assert_ssh_ok() {
     local host="$1"
     local label="$2"
-    if ssh_cmd "$host" "echo ok" 2>/dev/null | grep -q ok; then
-        log_pass "SSH to ${label} (${host}) via jump"
+    local port
+    port=$(_db_port "$host")
+    if ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
+        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        -p "${port}" "${SSH_USER}@${host}" "echo ok" 2>/dev/null | grep -q ok; then
+        log_pass "SSH to ${label} (${host}:${port}) via jump"
     else
-        log_fail "SSH to ${label} (${host}) via jump"
+        log_fail "SSH to ${label} (${host}:${port}) via jump"
         return 1
     fi
 }
@@ -342,11 +320,11 @@ phase_preflight() {
             return 1
         fi
 
-        # expect installed
-        if ssh_cmd "$host" "which expect >/dev/null 2>&1 && echo OK" | grep -q OK; then
-            log_pass "${label}: expect installed"
+        # git installed (needed for deploy)
+        if ssh_cmd "$host" "which git >/dev/null 2>&1 && echo OK" | grep -q OK; then
+            log_pass "${label}: git installed"
         else
-            log_fail "${label}: 'expect' not installed (required for automated input)"
+            log_fail "${label}: 'git' not installed (required for deploy)"
             return 1
         fi
 
@@ -707,10 +685,10 @@ phase_step1() {
     log_phase "STEP 1: Gather Primary Information"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: NFS share path (Enter for default)
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./primary/01_gather_primary_info.sh" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-    )
+        "")
 
     local exit_code=$?
     log_info "Step 1 output (last 10 lines):"
@@ -755,14 +733,10 @@ phase_step2() {
     log_phase "STEP 2: Generate Standby Configuration"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, standby host, db_unique_name, SID (default), confirm
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./primary/02_generate_standby_config.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "standby.*host|hostname" "${STANDBY_HOST}" \
-        "DB_UNIQUE_NAME|db_unique_name|unique.*name" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
-        "ORACLE_SID|oracle.*sid|SID" "" \
-        "proceed|continue|confirm|review|y/n|Y/n" "y" \
-    )
+        "1\n${STANDBY_HOST}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
 
     local exit_code=$?
     log_info "Step 2 output (last 10 lines):"
@@ -803,12 +777,10 @@ phase_step3() {
     log_phase "STEP 3: Setup Standby Environment"
 
     local result
-    result=$(ssh_expect "$STANDBY_HOST" \
+    # Prompts: config selection, NFS default, hostname mismatch confirm
+    result=$(ssh_piped "$STANDBY_HOST" \
         "./standby/03_setup_standby_env.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "proceed|continue|confirm|mismatch|y/n|Y/n" "y" \
-    )
+        "1\n\ny")
 
     local exit_code=$?
     log_info "Step 3 output (last 10 lines):"
@@ -863,12 +835,10 @@ phase_step4() {
     log_phase "STEP 4: Prepare Primary for Data Guard"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, NFS default
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./primary/04_prepare_primary_dg.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "proceed|continue|confirm|y/n|Y/n" "y" \
-    )
+        "1\n")
 
     local exit_code=$?
     log_info "Step 4 output (last 10 lines):"
@@ -948,13 +918,10 @@ phase_step5() {
     log_info "This step takes a while (RMAN duplicate)..."
 
     local result
-    result=$(ssh_expect "$STANDBY_HOST" \
+    # Prompts: config selection, NFS default, SYS password, typed confirmation
+    result=$(ssh_piped "$STANDBY_HOST" \
         "./standby/05_clone_standby.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "password|Password|SYS.*password" "${TEST_SYS_PASSWORD}" \
-        "type.*unique.*name|confirm.*proceed|type.*${TEST_STANDBY_DB_UNIQUE_NAME}|Type.*to confirm" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
-    )
+        "1\n\n${TEST_SYS_PASSWORD}\n${TEST_STANDBY_DB_UNIQUE_NAME}")
 
     local exit_code=$?
     log_info "Step 5 output (last 15 lines):"
@@ -1000,12 +967,10 @@ phase_step6() {
     log_phase "STEP 6: Configure Data Guard Broker"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, NFS default, possible remove config confirm
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./primary/06_configure_broker.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "proceed|continue|confirm|y/n|Y/n|remove.*config" "y" \
-    )
+        "1\n\ny")
 
     local exit_code=$?
     log_info "Step 6 output (last 10 lines):"
@@ -1056,12 +1021,10 @@ phase_step7() {
     log_phase "STEP 7: Verify Data Guard"
 
     local result
-    result=$(ssh_expect "$STANDBY_HOST" \
+    # Prompts: config selection, NFS default, optional password (skip)
+    result=$(ssh_piped "$STANDBY_HOST" \
         "./standby/07_verify_dataguard.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "password|Password|SYS.*password|skip|DGMGRL" "" \
-    )
+        "1\n\n")
 
     local exit_code=$?
     log_info "Step 7 output (last 15 lines):"
@@ -1126,12 +1089,10 @@ phase_step8() {
     log_phase "STEP 8: Security Hardening"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, NFS default, typed confirmation
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./primary/08_security_hardening.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "type.*SECURE|SECURE.*${TEST_DB_NAME}|confirm" "SECURE ${TEST_DB_NAME}" \
-    )
+        "1\n\nSECURE ${TEST_DB_NAME}")
 
     local exit_code=$?
     log_info "Step 8 output (last 10 lines):"
@@ -1171,14 +1132,10 @@ phase_step9() {
     log_phase "STEP 9: Configure Fast-Start Failover"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, NFS default, observer user, password, confirm
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "FSFO_THRESHOLD=${FSFO_THRESHOLD} ./primary/09_configure_fsfo.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "observer.*user|username|observer.*name" "${TEST_OBSERVER_USER}" \
-        "password|Password" "${TEST_OBSERVER_PASSWORD}" \
-        "proceed|continue|confirm|y/n|Y/n" "y" \
-    )
+        "1\n\n${TEST_OBSERVER_USER}\n${TEST_OBSERVER_PASSWORD}\ny")
 
     local exit_code=$?
     log_info "Step 9 output (last 10 lines):"
@@ -1231,14 +1188,10 @@ phase_step10() {
     # Setup wallet
     log_info "Setting up observer wallet..."
     local result
-    result=$(ssh_expect "$STANDBY_HOST" \
-        "cd ${REPO_DIR} && ./fsfo/observer.sh setup" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "wallet.*password|Wallet.*password|Enter.*password" "${TEST_WALLET_PASSWORD}" \
-        "password.*again|Re-enter|confirm.*password|Reenter" "${TEST_WALLET_PASSWORD}" \
-        "observer.*password|user.*password|Password.*observer" "${TEST_OBSERVER_PASSWORD}" \
-    )
+    # Prompts: config selection, NFS default, wallet pwd, wallet pwd again, observer pwd
+    result=$(ssh_piped "$STANDBY_HOST" \
+        "./fsfo/observer.sh setup" \
+        "1\n\n${TEST_WALLET_PASSWORD}\n${TEST_WALLET_PASSWORD}\n${TEST_OBSERVER_PASSWORD}")
 
     local exit_code=$?
     log_info "Observer setup output (last 10 lines):"
@@ -1254,11 +1207,10 @@ phase_step10() {
 
     # Start observer
     log_info "Starting observer..."
-    result=$(ssh_expect "$STANDBY_HOST" \
-        "cd ${REPO_DIR} && ./fsfo/observer.sh start" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-    )
+    # Prompts: config selection, NFS default
+    result=$(ssh_piped "$STANDBY_HOST" \
+        "./fsfo/observer.sh start" \
+        "1\n")
 
     exit_code=$?
     log_info "Observer start output (last 5 lines):"
@@ -1305,13 +1257,10 @@ phase_step11() {
     log_phase "STEP 11: Role-Aware Service Trigger"
 
     local result
-    result=$(ssh_expect "$PRIMARY_HOST" \
+    # Prompts: config selection, NFS default, accept services, confirm deploy
+    result=$(ssh_piped "$PRIMARY_HOST" \
         "./trigger/create_role_trigger.sh" \
-        "Select.*\\[|Choose.*:" "1" \
-        "NFS share|nfs.*share|NFS_SHARE|Enter.*NFS|confirm.*NFS|override" "" \
-        "accept|Accept|choice|select|action|option" "a" \
-        "proceed|continue|confirm|deploy|y/n|Y/n" "y" \
-    )
+        "1\n\na\ny")
 
     local exit_code=$?
     log_info "Step 11 output (last 10 lines):"
