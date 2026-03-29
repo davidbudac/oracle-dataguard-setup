@@ -418,6 +418,11 @@ cleanup_standby() {
     log_info "Cleaning up standby host..."
 
     ssh_cmd "STANDBY" "set +e;
+        # Comment out NAMES.DEFAULT_DOMAIN in sqlnet.ora if present
+        # (interferes with DG TNS aliases when db_domain is not set)
+        if grep -q 'NAMES.DEFAULT_DOMAIN' '${ORACLE_HOME}/network/admin/sqlnet.ora' 2>/dev/null; then
+            sed -i 's/^NAMES.DEFAULT_DOMAIN/#NAMES.DEFAULT_DOMAIN/' '${ORACLE_HOME}/network/admin/sqlnet.ora'
+        fi
         # Stop observer if running
         pkill -f 'dgmgrl.*observer' 2>/dev/null || true
 
