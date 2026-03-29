@@ -272,10 +272,8 @@ confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOM
 RMAN_EXIT_FILE="/tmp/rman_exit_$$"
 (
 "$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
-    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" <<EOF
-@${RMAN_SCRIPT}
-EXIT;
-EOF
+    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" \
+    cmdfile "${RMAN_SCRIPT}"
 echo $? > "$RMAN_EXIT_FILE"
 ) 2>&1 | tee "$RMAN_LOG"
 
