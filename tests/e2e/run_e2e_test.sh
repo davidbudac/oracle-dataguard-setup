@@ -145,26 +145,16 @@ EOF
 #
 # Path: local machine -> jump host -> DB host (as oracle)
 # Uses ProxyJump (-J) for clean double-hop without nested quoting issues.
+#
+# All functions take host AND port explicitly to support setups where both
+# DB hosts resolve to the same hostname (e.g. localhost with different ports).
 # =============================================================================
 
-# Get the SSH port for a given host
-_db_port() {
+# Core SSH: run command on a DB host via ProxyJump
+_ssh_hop() {
     local host="$1"
-    if [[ "$host" == "$STANDBY_HOST" ]]; then
-        echo "${STANDBY_SSH_PORT}"
-    else
-        echo "${PRIMARY_SSH_PORT}"
-    fi
-}
-
-# Run a command on a DB host via ProxyJump
-ssh_cmd() {
-    local host="$1"
-    local cmd="$2"
-    local timeout="${3:-300}"
-
-    local port
-    port=$(_db_port "$host")
+    local port="$2"
+    local cmd="$3"
 
     ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
         -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
@@ -177,20 +167,34 @@ ssh_cmd() {
          ${cmd}" 2>&1
 }
 
-ssh_primary() { ssh_cmd "$PRIMARY_HOST" "$1" "${2:-300}"; }
-ssh_standby() { ssh_cmd "$STANDBY_HOST" "$1" "${2:-300}"; }
+# Convenience wrappers that bind host+port using actual hostname variables
+ssh_primary() { _ssh_hop "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "$1"; }
+ssh_standby() { _ssh_hop "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$1"; }
+
+# Generic ssh_cmd - accepts "PRIMARY" or "STANDBY" as first arg
+ssh_cmd() {
+    local target="$1"
+    local cmd="$2"
+    if [[ "$target" == "PRIMARY" ]]; then
+        ssh_primary "$cmd"
+    else
+        ssh_standby "$cmd"
+    fi
+}
 
 # Run a script with piped stdin for interactive prompts.
-# Each line in the input string feeds one read/prompt in the script.
-# Usage: ssh_piped <host> <script_cmd> <stdin_lines>
-#   stdin_lines is a single string with \n-separated responses.
+# Usage: ssh_piped <"PRIMARY"|"STANDBY"> <script_cmd> <stdin_lines>
 ssh_piped() {
-    local host="$1"
+    local target="$1"
     local script_cmd="$2"
     local input="$3"
 
-    local port
-    port=$(_db_port "$host")
+    local host port
+    if [[ "$target" == "STANDBY" ]]; then
+        host="${STANDBY_HOST}"; port="${STANDBY_SSH_PORT}"
+    else
+        host="${PRIMARY_HOST}"; port="${PRIMARY_SSH_PORT}"
+    fi
 
     printf '%b\n' "${input}" | \
     ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
@@ -219,10 +223,14 @@ assert_ssh_jump_ok() {
 }
 
 assert_ssh_ok() {
-    local host="$1"
+    local target="$1"  # PRIMARY or STANDBY
     local label="$2"
-    local port
-    port=$(_db_port "$host")
+    local host port
+    if [[ "$target" == "STANDBY" ]]; then
+        host="${STANDBY_HOST}"; port="${STANDBY_SSH_PORT}"
+    else
+        host="${PRIMARY_HOST}"; port="${PRIMARY_SSH_PORT}"
+    fi
     if ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
         -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
         -p "${port}" "${SSH_USER}@${host}" "echo ok" 2>/dev/null | grep -q ok; then
@@ -305,15 +313,13 @@ phase_preflight() {
     log_phase "PREFLIGHT: Validating environment"
 
     assert_ssh_jump_ok || return 1
-    assert_ssh_ok "$PRIMARY_HOST" "primary" || return 1
-    assert_ssh_ok "$STANDBY_HOST" "standby" || return 1
+    assert_ssh_ok "PRIMARY" "primary" || return 1
+    assert_ssh_ok "STANDBY" "standby" || return 1
 
     # Oracle Home exists
-    for host_label in "PRIMARY:${PRIMARY_HOST}" "STANDBY:${STANDBY_HOST}"; do
-        local label="${host_label%%:*}"
-        local host="${host_label##*:}"
+    for label in PRIMARY STANDBY; do
 
-        if ssh_cmd "$host" "test -x '${ORACLE_HOME}/bin/sqlplus' && echo OK" | grep -q OK; then
+        if ssh_cmd "$label" "test -x '${ORACLE_HOME}/bin/sqlplus' && echo OK" | grep -q OK; then
             log_pass "${label}: Oracle Home valid"
         else
             log_fail "${label}: sqlplus not found at ${ORACLE_HOME}/bin/sqlplus"
@@ -321,7 +327,7 @@ phase_preflight() {
         fi
 
         # git installed (needed for deploy)
-        if ssh_cmd "$host" "which git >/dev/null 2>&1 && echo OK" | grep -q OK; then
+        if ssh_cmd "$label" "which git >/dev/null 2>&1 && echo OK" | grep -q OK; then
             log_pass "${label}: git installed"
         else
             log_fail "${label}: 'git' not installed (required for deploy)"
@@ -329,7 +335,7 @@ phase_preflight() {
         fi
 
         # NFS mounted and writable
-        if ssh_cmd "$host" "test -d '${NFS_SHARE}' && touch '${NFS_SHARE}/.e2e_test' && rm -f '${NFS_SHARE}/.e2e_test' && echo OK" | grep -q OK; then
+        if ssh_cmd "$label" "test -d '${NFS_SHARE}' && touch '${NFS_SHARE}/.e2e_test' && rm -f '${NFS_SHARE}/.e2e_test' && echo OK" | grep -q OK; then
             log_pass "${label}: NFS share writable at ${NFS_SHARE}"
         else
             log_fail "${label}: NFS share not writable at ${NFS_SHARE}"
@@ -339,7 +345,7 @@ phase_preflight() {
 
     # Check no existing test database on primary
     local db_check
-    db_check=$(ssh_cmd "$PRIMARY_HOST" "
+    db_check=$(ssh_cmd "PRIMARY" "
         ps -ef | grep -w 'ora_pmon_${TEST_ORACLE_SID}' | grep -v grep || true
     ")
     if [[ -n "$db_check" ]]; then
@@ -356,12 +362,10 @@ phase_preflight() {
 phase_deploy() {
     log_phase "DEPLOY: Deploying scripts to both hosts"
 
-    for host_label in "PRIMARY:${PRIMARY_HOST}" "STANDBY:${STANDBY_HOST}"; do
-        local label="${host_label%%:*}"
-        local host="${host_label##*:}"
+    for label in PRIMARY STANDBY; do
 
         local result
-        result=$(ssh_cmd "$host" "
+        result=$(ssh_cmd "$label" "
             if [[ -d '${REPO_DIR}/.git' ]]; then
                 cd '${REPO_DIR}'
                 git fetch origin '${REPO_BRANCH}' 2>&1
@@ -384,7 +388,7 @@ phase_deploy() {
         fi
 
         # Make scripts executable
-        ssh_cmd "$host" "chmod +x '${REPO_DIR}'/primary/*.sh '${REPO_DIR}'/standby/*.sh '${REPO_DIR}'/fsfo/*.sh '${REPO_DIR}'/trigger/*.sh '${REPO_DIR}'/common/*.sh 2>/dev/null || true"
+        ssh_cmd "$label" "chmod +x '${REPO_DIR}'/primary/*.sh '${REPO_DIR}'/standby/*.sh '${REPO_DIR}'/fsfo/*.sh '${REPO_DIR}'/trigger/*.sh '${REPO_DIR}'/common/*.sh 2>/dev/null || true"
     done
 
     log_pass "Deploy complete"
@@ -407,7 +411,7 @@ phase_cleanup() {
 cleanup_standby() {
     log_info "Cleaning up standby host..."
 
-    ssh_cmd "$STANDBY_HOST" "
+    ssh_cmd "STANDBY" "
         # Stop observer if running
         pkill -f 'dgmgrl.*observer' 2>/dev/null || true
 
@@ -467,7 +471,7 @@ SQLEOF
 cleanup_primary() {
     log_info "Cleaning up primary host..."
 
-    ssh_cmd "$PRIMARY_HOST" "
+    ssh_cmd "PRIMARY" "
         # Remove DG broker config first (if broker is running)
         dgmgrl -silent / 'REMOVE CONFIGURATION' 2>/dev/null || true
 
@@ -564,7 +568,7 @@ phase_create_db() {
     log_phase "CREATE DB: Creating test primary database (no OMF, no FRA)"
 
     local result
-    result=$(ssh_cmd "$PRIMARY_HOST" "
+    result=$(ssh_cmd "PRIMARY" "
         # Create archive log directory
         mkdir -p '${TEST_ARCHIVE_DIR}'
 
@@ -596,7 +600,7 @@ phase_create_db() {
     log_pass "DBCA database created"
 
     # Post-creation: disable OMF and FRA, enable archivelog with explicit dest
-    result=$(ssh_cmd "$PRIMARY_HOST" "
+    result=$(ssh_cmd "PRIMARY" "
         sqlplus -s / as sysdba << 'SQLEOF'
 SET HEADING OFF FEEDBACK ON
 
@@ -686,7 +690,7 @@ phase_step1() {
 
     local result
     # Prompts: NFS share path (Enter for default)
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./primary/01_gather_primary_info.sh" \
         "")
 
@@ -701,24 +705,24 @@ phase_step1() {
     fi
 
     # Validate outputs
-    assert_remote_file_exists "$PRIMARY_HOST" \
+    assert_remote_file_exists "PRIMARY" \
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "primary_info_${TEST_DB_UNIQUE_NAME}.env on NFS" || return 1
 
-    assert_remote_file_exists "$PRIMARY_HOST" \
+    assert_remote_file_exists "PRIMARY" \
         "${NFS_SHARE}/orapw${TEST_ORACLE_SID}" \
         "Password file on NFS" || return 1
 
     # Validate key variables in the primary info file
-    assert_remote_grep "$PRIMARY_HOST" "DB_NAME=" \
+    assert_remote_grep "PRIMARY" "DB_NAME=" \
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "DB_NAME in primary info" || return 1
 
-    assert_remote_grep "$PRIMARY_HOST" "DB_UNIQUE_NAME=" \
+    assert_remote_grep "PRIMARY" "DB_UNIQUE_NAME=" \
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "DB_UNIQUE_NAME in primary info" || return 1
 
-    assert_remote_grep "$PRIMARY_HOST" "ARCHIVELOG_MODE=.ARCHIVELOG" \
+    assert_remote_grep "PRIMARY" "ARCHIVELOG_MODE=.ARCHIVELOG" \
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "ARCHIVELOG mode recorded" || return 1
 
@@ -734,7 +738,7 @@ phase_step2() {
 
     local result
     # Prompts: config selection, standby host, db_unique_name, SID (default), confirm
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./primary/02_generate_standby_config.sh" \
         "1\n${STANDBY_HOST}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
 
@@ -749,20 +753,20 @@ phase_step2() {
     fi
 
     # Validate outputs
-    assert_remote_file_exists "$PRIMARY_HOST" \
+    assert_remote_file_exists "PRIMARY" \
         "${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env" \
         "standby_config on NFS" || return 1
 
-    assert_remote_file_exists "$PRIMARY_HOST" \
+    assert_remote_file_exists "PRIMARY" \
         "${NFS_SHARE}/tnsnames_entries_${TEST_STANDBY_DB_UNIQUE_NAME}.ora" \
         "TNS entries on NFS" || return 1
 
     # Validate standby config has correct values
-    assert_remote_grep "$PRIMARY_HOST" "STANDBY_HOSTNAME=.*${STANDBY_HOST}" \
+    assert_remote_grep "PRIMARY" "STANDBY_HOSTNAME=.*${STANDBY_HOST}" \
         "${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env" \
         "Standby hostname in config" || return 1
 
-    assert_remote_grep "$PRIMARY_HOST" "STANDBY_DB_UNIQUE_NAME=.*${TEST_STANDBY_DB_UNIQUE_NAME}" \
+    assert_remote_grep "PRIMARY" "STANDBY_DB_UNIQUE_NAME=.*${TEST_STANDBY_DB_UNIQUE_NAME}" \
         "${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env" \
         "Standby DB_UNIQUE_NAME in config" || return 1
 
@@ -778,7 +782,7 @@ phase_step3() {
 
     local result
     # Prompts: config selection, NFS default, hostname mismatch confirm
-    result=$(ssh_piped "$STANDBY_HOST" \
+    result=$(ssh_piped "STANDBY" \
         "./standby/03_setup_standby_env.sh" \
         "1\n\ny")
 
@@ -793,26 +797,26 @@ phase_step3() {
     fi
 
     # Validate: password file installed
-    assert_remote_file_exists "$STANDBY_HOST" \
+    assert_remote_file_exists "STANDBY" \
         "${ORACLE_HOME}/dbs/orapw${TEST_ORACLE_SID}" \
         "Password file on standby" || return 1
 
     # Validate: parameter file installed
-    assert_remote_file_exists "$STANDBY_HOST" \
+    assert_remote_file_exists "STANDBY" \
         "${ORACLE_HOME}/dbs/init${TEST_ORACLE_SID}.ora" \
         "Pfile on standby" || return 1
 
     # Validate: listener has static registration for standby
-    assert_remote_grep "$STANDBY_HOST" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
+    assert_remote_grep "STANDBY" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
         "${ORACLE_HOME}/network/admin/listener.ora" \
         "Standby SID in listener.ora" || return 1
 
     # Validate: tnsnames has both entries
-    assert_remote_grep "$STANDBY_HOST" "${TEST_DB_UNIQUE_NAME}" \
+    assert_remote_grep "STANDBY" "${TEST_DB_UNIQUE_NAME}" \
         "${ORACLE_HOME}/network/admin/tnsnames.ora" \
         "Primary TNS entry on standby" || return 1
 
-    assert_remote_grep "$STANDBY_HOST" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
+    assert_remote_grep "STANDBY" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
         "${ORACLE_HOME}/network/admin/tnsnames.ora" \
         "Standby TNS entry on standby" || return 1
 
@@ -836,7 +840,7 @@ phase_step4() {
 
     local result
     # Prompts: config selection, NFS default
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./primary/04_prepare_primary_dg.sh" \
         "1\n")
 
@@ -851,25 +855,25 @@ phase_step4() {
     fi
 
     # Validate: FORCE_LOGGING enabled
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT force_logging FROM v\$database;" \
         "YES" \
         "FORCE_LOGGING enabled" || return 1
 
     # Validate: DG_BROKER_START=TRUE
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT value FROM v\$parameter WHERE name = 'dg_broker_start';" \
         "TRUE" \
         "DG_BROKER_START=TRUE" || return 1
 
     # Validate: STANDBY_FILE_MANAGEMENT=AUTO
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT value FROM v\$parameter WHERE name = 'standby_file_management';" \
         "AUTO" \
         "STANDBY_FILE_MANAGEMENT=AUTO" || return 1
 
     # Validate: standby redo logs exist
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT 'SRL_COUNT=' || COUNT(*) FROM v\$standby_log;" \
         "SRL_COUNT=" \
         "Standby redo logs created" || true
@@ -889,12 +893,12 @@ SQLEOF
     fi
 
     # Validate: TNS entries on primary
-    assert_remote_grep "$PRIMARY_HOST" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
+    assert_remote_grep "PRIMARY" "${TEST_STANDBY_DB_UNIQUE_NAME}" \
         "${ORACLE_HOME}/network/admin/tnsnames.ora" \
         "Standby TNS entry on primary" || return 1
 
     # Validate: listener has primary static registration
-    assert_remote_grep "$PRIMARY_HOST" "${TEST_DB_UNIQUE_NAME}" \
+    assert_remote_grep "PRIMARY" "${TEST_DB_UNIQUE_NAME}" \
         "${ORACLE_HOME}/network/admin/listener.ora" \
         "Primary SID in listener.ora" || return 1
 
@@ -919,7 +923,7 @@ phase_step5() {
 
     local result
     # Prompts: config selection, NFS default, SYS password, typed confirmation
-    result=$(ssh_piped "$STANDBY_HOST" \
+    result=$(ssh_piped "STANDBY" \
         "./standby/05_clone_standby.sh" \
         "1\n\n${TEST_SYS_PASSWORD}\n${TEST_STANDBY_DB_UNIQUE_NAME}")
 
@@ -934,7 +938,7 @@ phase_step5() {
     fi
 
     # Validate: standby database role
-    assert_sql "$STANDBY_HOST" \
+    assert_sql "STANDBY" \
         "SELECT database_role FROM v\$database;" \
         "PHYSICAL STANDBY" \
         "Database role is PHYSICAL STANDBY" || return 1
@@ -968,7 +972,7 @@ phase_step6() {
 
     local result
     # Prompts: config selection, NFS default, possible remove config confirm
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./primary/06_configure_broker.sh" \
         "1\n\ny")
 
@@ -986,26 +990,26 @@ phase_step6() {
     sleep 15
 
     # Validate: broker configuration exists and is enabled
-    assert_dgmgrl "$PRIMARY_HOST" \
+    assert_dgmgrl "PRIMARY" \
         "SHOW CONFIGURATION" \
         "SUCCESS\|enabled\|Enabled" \
         "Broker configuration enabled" || {
         # Might still be starting - wait and retry
         log_info "Retrying after 30 seconds..."
         sleep 30
-        assert_dgmgrl "$PRIMARY_HOST" \
+        assert_dgmgrl "PRIMARY" \
             "SHOW CONFIGURATION" \
             "SUCCESS\|enabled\|Enabled" \
             "Broker configuration enabled (retry)" || return 1
     }
 
     # Validate: both databases in configuration
-    assert_dgmgrl "$PRIMARY_HOST" \
+    assert_dgmgrl "PRIMARY" \
         "SHOW DATABASE '${TEST_DB_UNIQUE_NAME}'" \
         "Primary\|PRIMARY" \
         "Primary database in broker" || return 1
 
-    assert_dgmgrl "$PRIMARY_HOST" \
+    assert_dgmgrl "PRIMARY" \
         "SHOW DATABASE '${TEST_STANDBY_DB_UNIQUE_NAME}'" \
         "Standby\|STANDBY\|Physical" \
         "Standby database in broker" || return 1
@@ -1022,7 +1026,7 @@ phase_step7() {
 
     local result
     # Prompts: config selection, NFS default, optional password (skip)
-    result=$(ssh_piped "$STANDBY_HOST" \
+    result=$(ssh_piped "STANDBY" \
         "./standby/07_verify_dataguard.sh" \
         "1\n\n")
 
@@ -1090,7 +1094,7 @@ phase_step8() {
 
     local result
     # Prompts: config selection, NFS default, typed confirmation
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./primary/08_security_hardening.sh" \
         "1\n\nSECURE ${TEST_DB_NAME}")
 
@@ -1105,13 +1109,13 @@ phase_step8() {
     fi
 
     # Validate: SYS account is locked
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT account_status FROM dba_users WHERE username = 'SYS';" \
         "LOCKED" \
         "SYS account locked" || return 1
 
     # Validate: OS authentication still works
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT 'OSAUTH=OK' FROM dual;" \
         "OSAUTH=OK" \
         "OS authentication works after lockout" || return 1
@@ -1133,7 +1137,7 @@ phase_step9() {
 
     local result
     # Prompts: config selection, NFS default, observer user, password, confirm
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "FSFO_THRESHOLD=${FSFO_THRESHOLD} ./primary/09_configure_fsfo.sh" \
         "1\n\n${TEST_OBSERVER_USER}\n${TEST_OBSERVER_PASSWORD}\ny")
 
@@ -1148,19 +1152,19 @@ phase_step9() {
     fi
 
     # Validate: FSFO enabled
-    assert_dgmgrl "$PRIMARY_HOST" \
+    assert_dgmgrl "PRIMARY" \
         "SHOW FAST_START FAILOVER" \
         "Enabled\|enabled\|ENABLED" \
         "FSFO is enabled" || return 1
 
     # Validate: protection mode
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT protection_mode FROM v\$database;" \
         "MAXIMUM AVAILABILITY" \
         "Protection mode = MAXIMUM AVAILABILITY" || return 1
 
     # Validate: observer user exists
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT username FROM dba_users WHERE username = '${TEST_OBSERVER_USER}';" \
         "${TEST_OBSERVER_USER}" \
         "Observer user exists" || return 1
@@ -1189,7 +1193,7 @@ phase_step10() {
     log_info "Setting up observer wallet..."
     local result
     # Prompts: config selection, NFS default, wallet pwd, wallet pwd again, observer pwd
-    result=$(ssh_piped "$STANDBY_HOST" \
+    result=$(ssh_piped "STANDBY" \
         "./fsfo/observer.sh setup" \
         "1\n\n${TEST_WALLET_PASSWORD}\n${TEST_WALLET_PASSWORD}\n${TEST_OBSERVER_PASSWORD}")
 
@@ -1208,7 +1212,7 @@ phase_step10() {
     # Start observer
     log_info "Starting observer..."
     # Prompts: config selection, NFS default
-    result=$(ssh_piped "$STANDBY_HOST" \
+    result=$(ssh_piped "STANDBY" \
         "./fsfo/observer.sh start" \
         "1\n")
 
@@ -1234,7 +1238,7 @@ phase_step10() {
 
     # Validate: observer registered in DGMGRL
     sleep 10
-    assert_dgmgrl "$PRIMARY_HOST" \
+    assert_dgmgrl "PRIMARY" \
         "SHOW FAST_START FAILOVER" \
         "Observer.*:.*\|observer" \
         "Observer registered in FSFO" || {
@@ -1258,7 +1262,7 @@ phase_step11() {
 
     local result
     # Prompts: config selection, NFS default, accept services, confirm deploy
-    result=$(ssh_piped "$PRIMARY_HOST" \
+    result=$(ssh_piped "PRIMARY" \
         "./trigger/create_role_trigger.sh" \
         "1\n\na\ny")
 
@@ -1279,18 +1283,18 @@ phase_step11() {
     fi
 
     # Validate: package exists and is valid
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT status FROM dba_objects WHERE object_name = 'DG_SERVICE_MGR' AND object_type = 'PACKAGE BODY' AND owner = 'SYS';" \
         "VALID" \
         "DG_SERVICE_MGR package is VALID" || return 1
 
     # Validate: triggers exist and are enabled
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT status FROM dba_triggers WHERE trigger_name = 'TRG_MANAGE_SERVICES_ROLE_CHG' AND owner = 'SYS';" \
         "ENABLED" \
         "Role change trigger is ENABLED" || return 1
 
-    assert_sql "$PRIMARY_HOST" \
+    assert_sql "PRIMARY" \
         "SELECT status FROM dba_triggers WHERE trigger_name = 'TRG_MANAGE_SERVICES_STARTUP' AND owner = 'SYS';" \
         "ENABLED" \
         "Startup trigger is ENABLED" || return 1
