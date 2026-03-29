@@ -7,17 +7,23 @@ This document describes what each automation script does and shows the equivalen
 ## Table of Contents
 
 1. [Prerequisites](#prerequisites)
-2. [Restartability](#restartability)
-3. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
-4. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
-5. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
-6. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
-7. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
-8. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
-9. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
-10. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
-11. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
-12. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
+2. [NFS Setup](#nfs-setup)
+3. [Restartability](#restartability)
+4. [Common Flags](#common-flags)
+5. [Session Management](#session-management)
+6. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
+7. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
+8. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
+9. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
+10. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
+11. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
+12. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
+13. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
+14. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
+15. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
+16. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
+17. [Summary](#summary-what-would-be-done-manually-without-scripts)
+18. [Common Monitoring Commands](#common-monitoring-commands)
 
 ---
 
@@ -29,7 +35,106 @@ Before beginning Data Guard setup, ensure:
 - Password file exists for the primary database
 - Network connectivity between primary and standby servers
 - Sufficient disk space on standby for database files
-- NFS share mounted at `/OINSTALL/_dataguard_setup` on both servers
+- NFS share mounted at `/OINSTALL/_dataguard_setup` on both servers (see [NFS Setup](#nfs-setup))
+
+---
+
+## NFS Setup
+
+The NFS share at `/OINSTALL/_dataguard_setup` is used to exchange files (config files, password files, logs, sessions) between primary and standby servers. **Set this up before running any Data Guard scripts.**
+
+### Step 0a: Setup NFS Server
+
+**Script:** `nfs/01_setup_nfs_server.sh` (requires sudo)
+
+Run this on the server that will host the NFS share (can be primary, standby, or a separate server).
+
+#### What the Script Does
+
+1. Validates root/sudo privileges
+2. Prompts for primary and standby server hostnames/IPs
+3. Installs NFS server packages (auto-detects yum, dnf, or apt-get)
+4. Creates NFS share directory: `/OINSTALL/_dataguard_setup` (with `logs/` subdirectory)
+5. Backs up `/etc/exports` and adds export entries for both servers
+6. Enables and starts NFS services (`nfs-server`, `rpcbind`)
+7. Exports the filesystem (`exportfs -ra`)
+8. Configures firewall (firewalld or ufw) for NFS ports 111 and 2049
+9. Verifies setup
+
+#### Manual Equivalent
+
+```bash
+# Install NFS server
+sudo yum install -y nfs-utils
+
+# Create directories
+sudo mkdir -p /OINSTALL/_dataguard_setup/logs
+sudo chmod 775 /OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup/logs
+
+# Add exports (replace hostnames)
+cat >> /etc/exports << 'EOF'
+/OINSTALL/_dataguard_setup primary_host(rw,sync,no_subtree_check,no_root_squash)
+/OINSTALL/_dataguard_setup standby_host(rw,sync,no_subtree_check,no_root_squash)
+EOF
+
+# Export and start services
+sudo exportfs -ra
+sudo systemctl enable --now nfs-server rpcbind
+
+# Open firewall
+sudo firewall-cmd --permanent --add-service=nfs
+sudo firewall-cmd --permanent --add-service=rpc-bind
+sudo firewall-cmd --permanent --add-service=mountd
+sudo firewall-cmd --reload
+```
+
+### Step 0b: Mount NFS on Client
+
+**Script:** `nfs/02_mount_nfs_client.sh` (requires sudo)
+
+Run this on **both** primary and standby servers.
+
+#### What the Script Does
+
+1. Validates root/sudo privileges
+2. Checks if NFS is already mounted (exits if working)
+3. Prompts for NFS server hostname/IP
+4. Installs NFS client packages
+5. Creates mount point directory
+6. Tests network connectivity to NFS server (ping)
+7. Verifies NFS export is available (`showmount -e`)
+8. Mounts the NFS share (NFSv4 with options: `rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576`)
+9. Tests write access
+10. Adds persistent mount entry to `/etc/fstab` (with backup)
+11. Sets ownership to `oracle:oinstall` (or `oracle:dba`)
+
+#### Manual Equivalent
+
+```bash
+# Install NFS client
+sudo yum install -y nfs-utils
+
+# Create mount point
+sudo mkdir -p /OINSTALL/_dataguard_setup
+
+# Test connectivity
+ping -c 1 -W 5 nfs-server
+showmount -e nfs-server
+
+# Mount
+sudo mount -t nfs4 nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup \
+  -o rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576
+
+# Verify write access
+touch /OINSTALL/_dataguard_setup/.test && rm /OINSTALL/_dataguard_setup/.test
+
+# Persist in fstab
+echo "nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup nfs4 rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576 0 0" >> /etc/fstab
+
+# Set permissions
+sudo chown oracle:oinstall /OINSTALL/_dataguard_setup
+sudo chmod 775 /OINSTALL/_dataguard_setup
+```
 
 ---
 
@@ -37,9 +142,12 @@ Before beginning Data Guard setup, ensure:
 
 | Steps | Restartable | Notes |
 |-------|-------------|-------|
+| 0a-0b | **Yes** | NFS scripts detect existing setup and skip if already done. |
 | 1-4 | **Yes** | Fully idempotent. Can restart from step 1 at any point. |
 | 5 | **No** | Once RMAN duplicate begins, cleanup required before restart. |
 | 6-8 | **Yes** | Broker config can be removed and recreated. Steps 7-8 are safe to re-run. |
+| 9-10 | **Yes** | FSFO can be disabled/re-enabled. Observer can be stopped/restarted. |
+| 11 | **Yes** | Re-running replaces existing PL/SQL objects with updated service list. |
 
 **To restart from Step 5 after a failure:**
 1. Shut down the standby instance: `SHUTDOWN ABORT`
@@ -51,6 +159,96 @@ Before beginning Data Guard setup, ensure:
 1. Connect to DGMGRL: `dgmgrl /`
 2. Remove existing config: `REMOVE CONFIGURATION`
 3. Re-run step 6
+
+---
+
+## Common Flags
+
+All setup scripts (steps 1-11) support these flags:
+
+| Flag | Description |
+|------|-------------|
+| `-v`, `--verbose` | Enable bash trace output (`set -x`) for debugging |
+| `-n`, `--check`, `--plan` | **Dry-run mode.** Script stops before making any changes and shows what would be done. |
+| `-a`, `--approval-mode`, `-s`, `--suspicious` | **Approval mode.** Every mutating action (database changes, file writes, etc.) requires interactive confirmation before execution. |
+| `-S <id>`, `--session <id>` | Restore a previously saved session (skips config file selection). See [Session Management](#session-management). |
+| `--list-sessions` | Display all available sessions and exit. |
+
+Flags can be combined:
+
+```bash
+# Dry-run with verbose output
+./primary/04_prepare_primary_dg.sh -n -v
+
+# Approval mode with a restored session
+./standby/05_clone_standby.sh -a -S mydb_stb_a3f1
+
+# All together
+./primary/04_prepare_primary_dg.sh -v -a -n -S mydb_stb_a3f1
+```
+
+### Check/Plan Mode
+
+When `-n` / `--check` / `--plan` is used, the script runs through validation and information gathering but exits before making any changes. This is useful for:
+
+- Reviewing what a script will do before committing
+- Verifying prerequisites are met
+- Planning in production environments
+
+### Approval Mode
+
+When `-a` / `--approval-mode` is used, every mutating action displays a prompt showing:
+
+- **Action title** (what will happen)
+- **Impact scope** (database change, filesystem change, broker change, etc.)
+- **Command preview** (exact command to be executed)
+
+You must type `y` or `yes` to approve each action. Declining skips that action with a warning.
+
+---
+
+## Session Management
+
+Sessions remember your config file selection so you don't have to re-select it on every script run. Sessions are stored on NFS (`${NFS_SHARE}/sessions/`) and work across both primary and standby servers.
+
+### How It Works
+
+1. When you run a script and select a config file, a session is automatically created
+2. The session ID is derived from the config filename plus a short random suffix (e.g., `standby_config_MYDB_STB.env` -> session `mydb_stb_a3f1`)
+3. On subsequent script runs, you can restore the session to skip file selection
+
+### Usage
+
+```bash
+# Run a script - session is created automatically after file selection
+./primary/04_prepare_primary_dg.sh
+
+# Restore a session directly (skips file selection)
+./primary/04_prepare_primary_dg.sh -S mydb_stb_a3f1
+./standby/05_clone_standby.sh -S mydb_stb_a3f1
+
+# List all sessions (from any script or standalone)
+./primary/04_prepare_primary_dg.sh --list-sessions
+./common/sessions.sh list
+
+# Delete a specific session
+./common/sessions.sh delete mydb_stb_a3f1
+
+# Delete all sessions
+./common/sessions.sh delete-all
+```
+
+### Session File Contents
+
+Each session file in `${NFS_SHARE}/sessions/` stores:
+
+```
+SESSION_ID="mydb_stb_a3f1"
+SESSION_CONFIG_FILE="/OINSTALL/_dataguard_setup/standby_config_MYDB_STB.env"
+SESSION_CREATED="2025-03-29 14:23:45"
+SESSION_LAST_USED="2025-03-29 15:10:22"
+SESSION_HOSTNAME="primary-host"
+```
 
 ---
 
@@ -674,71 +872,6 @@ EXIT;
 
 ---
 
-## Summary: What Would Be Done Manually Without Scripts
-
-| Step | Script | Manual Effort |
-|------|--------|--------------|
-| 1 | Gather Primary Info | Run ~20 SQL queries, document values, check prerequisites, copy password file |
-| 2 | Generate Config | Create parameter file, TNS entries, listener config, broker script manually |
-| 3 | Setup Standby Env | Create directories, copy files, configure listener, tnsnames, oratab |
-| 4 | Prepare Primary | Configure TNS, listener, enable force logging, create standby redo logs, enable broker |
-| 5 | Clone Standby | Start NOMOUNT, run RMAN duplicate, create SPFILE, start MRP |
-| 6 | Configure Broker | Run DGMGRL commands to create config, add database, enable |
-| 7 | Verify | Run multiple SQL queries and DGMGRL commands to check health |
-| 8 | Security Hardening | Change SYS password to random value, lock account (optional) |
-
-**Total Manual Steps:** ~80+ individual commands, queries, and file edits
-
-**Automation Benefits:**
-- Consistent configuration across setups
-- Built-in validation and prerequisite checking
-- Error handling and rollback
-- Single source of truth for configuration
-- Support for concurrent Data Guard setups
-- AIX compatibility
-- Comprehensive logging
-- Password security (never stored)
-
----
-
-## Common Monitoring Commands
-
-After setup, use these commands for ongoing monitoring:
-
-```sql
--- Check apply lag
-SELECT name, value, unit FROM v$dataguard_stats;
-
--- Check managed standby processes
-SELECT process, status, sequence# FROM v$managed_standby;
-
--- Check archive gaps
-SELECT * FROM v$archive_gap;
-```
-
-```
--- DGMGRL commands
-dgmgrl /
-SHOW CONFIGURATION;
-SHOW DATABASE 'primary_db';
-SHOW DATABASE 'standby_db';
-VALIDATE DATABASE 'standby_db';
-```
-
-```sql
--- Force log switch to test log shipping
-ALTER SYSTEM SWITCH LOGFILE;
-
--- Open standby read-only (requires stopping MRP)
-ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
-ALTER DATABASE OPEN READ ONLY;
-
--- Restart MRP after read-only access
-ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;
-```
-
----
-
 ## Step 9: Configure Fast-Start Failover (Optional)
 
 **Script:** `primary/09_configure_fsfo.sh`
@@ -900,3 +1033,224 @@ dgmgrl / "STOP OBSERVER"
    ```bash
    FSFO_THRESHOLD=60 ./primary/09_configure_fsfo.sh
    ```
+
+---
+
+## Step 11: Role-Aware Service Trigger (Optional)
+
+**Script:** `trigger/create_role_trigger.sh`
+
+Deploy this after Data Guard setup is complete (after Step 7). It creates PL/SQL objects that automatically start and stop user-defined database services based on the database role (PRIMARY vs STANDBY).
+
+### What the Script Does
+
+1. Validates Oracle environment and database connectivity
+2. Loads standby configuration from NFS
+3. Verifies the script is running on the PRIMARY database
+4. Discovers running user-defined services from the database
+5. Presents an interactive service list editor where you can:
+   - Accept the discovered services
+   - Add new service names manually
+   - Remove services from the list
+   - Clear and manually enter all services
+6. Checks for existing `SYS.DG_SERVICE_MGR` package and prompts before replacing
+7. Creates PL/SQL objects:
+   - **Package:** `SYS.DG_SERVICE_MGR` with `MANAGE_SERVICES` procedure
+   - **Trigger:** `SYS.TRG_MANAGE_SERVICES_ROLE_CHG` (fires `AFTER DB_ROLE_CHANGE`)
+   - **Trigger:** `SYS.TRG_MANAGE_SERVICES_STARTUP` (fires `AFTER STARTUP`)
+8. Verifies package is VALID and triggers are ENABLED
+9. Saves generated SQL to NFS for reference
+
+### How It Works at Runtime
+
+- **On switchover/failover:** The `DB_ROLE_CHANGE` trigger fires and calls `MANAGE_SERVICES`
+- **On database startup:** The `STARTUP` trigger fires and calls `MANAGE_SERVICES`
+- **PRIMARY role:** All configured services are **started**
+- **STANDBY role:** All configured services are **stopped**
+
+Objects replicate to the standby automatically via redo apply, so triggers fire on both databases.
+
+### Manual Equivalent
+
+```sql
+-- Connect as SYSDBA on PRIMARY
+sqlplus / as sysdba
+
+-- Discover user services currently running
+SELECT name FROM v$active_services
+WHERE name NOT IN ('SYS$BACKGROUND', 'SYS$USERS')
+AND name NOT LIKE '%XDB%';
+
+-- Create the package specification
+CREATE OR REPLACE PACKAGE SYS.DG_SERVICE_MGR AS
+    PROCEDURE MANAGE_SERVICES;
+END DG_SERVICE_MGR;
+/
+
+-- Create the package body (adjust service names)
+CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
+
+    TYPE service_list_t IS TABLE OF VARCHAR2(64);
+
+    FUNCTION get_service_list RETURN service_list_t IS
+        l_services service_list_t := service_list_t();
+    BEGIN
+        -- BEGIN SERVICE LIST
+        l_services.EXTEND; l_services(l_services.COUNT) := 'MY_APP_SERVICE';
+        l_services.EXTEND; l_services(l_services.COUNT) := 'MY_REPORTING_SVC';
+        -- END SERVICE LIST
+        RETURN l_services;
+    END get_service_list;
+
+    PROCEDURE MANAGE_SERVICES IS
+        l_role     VARCHAR2(30);
+        l_services service_list_t;
+    BEGIN
+        SELECT DATABASE_ROLE INTO l_role FROM V$DATABASE;
+        l_services := get_service_list();
+
+        IF l_role = 'PRIMARY' THEN
+            FOR i IN 1..l_services.COUNT LOOP
+                BEGIN
+                    DBMS_SERVICE.START_SERVICE(l_services(i));
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END;
+            END LOOP;
+        ELSE
+            FOR i IN 1..l_services.COUNT LOOP
+                BEGIN
+                    DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                EXCEPTION WHEN OTHERS THEN NULL;
+                END;
+            END LOOP;
+        END IF;
+    END MANAGE_SERVICES;
+
+END DG_SERVICE_MGR;
+/
+
+-- Create role-change trigger
+CREATE OR REPLACE TRIGGER SYS.TRG_MANAGE_SERVICES_ROLE_CHG
+    AFTER DB_ROLE_CHANGE ON DATABASE
+BEGIN
+    SYS.DG_SERVICE_MGR.MANAGE_SERVICES;
+END;
+/
+
+-- Create startup trigger
+CREATE OR REPLACE TRIGGER SYS.TRG_MANAGE_SERVICES_STARTUP
+    AFTER STARTUP ON DATABASE
+BEGIN
+    SYS.DG_SERVICE_MGR.MANAGE_SERVICES;
+END;
+/
+
+-- Verify
+SELECT object_name, object_type, status
+FROM dba_objects
+WHERE object_name = 'DG_SERVICE_MGR' AND owner = 'SYS';
+
+SELECT trigger_name, status
+FROM dba_triggers
+WHERE trigger_name LIKE 'TRG_MANAGE_SERVICES%' AND owner = 'SYS';
+
+-- Test manually
+EXEC SYS.DG_SERVICE_MGR.MANAGE_SERVICES;
+SELECT name FROM v$active_services;
+
+EXIT;
+```
+
+### Updating the Service List
+
+To change which services are managed, re-run the script:
+
+```bash
+./trigger/create_role_trigger.sh
+```
+
+The script will discover current services and let you edit the list interactively. Re-running replaces the existing PL/SQL objects.
+
+---
+
+## Summary: What Would Be Done Manually Without Scripts
+
+| Step | Script | Manual Effort |
+|------|--------|--------------|
+| 0a | NFS Server Setup | Install NFS, create exports, configure firewall |
+| 0b | NFS Client Mount | Install NFS client, mount share, add to fstab |
+| 1 | Gather Primary Info | Run ~20 SQL queries, document values, check prerequisites, copy password file |
+| 2 | Generate Config | Create parameter file, TNS entries, listener config, broker script manually |
+| 3 | Setup Standby Env | Create directories, copy files, configure listener, tnsnames, oratab |
+| 4 | Prepare Primary | Configure TNS, listener, enable force logging, create standby redo logs, enable broker |
+| 5 | Clone Standby | Start NOMOUNT, run RMAN duplicate, create SPFILE, start MRP |
+| 6 | Configure Broker | Run DGMGRL commands to create config, add database, enable |
+| 7 | Verify | Run multiple SQL queries and DGMGRL commands to check health |
+| 8 | Security Hardening | Change SYS password to random value, lock account (optional) |
+| 9 | Configure FSFO | Create observer user, set FASTSYNC, enable FSFO (optional) |
+| 10 | Observer Setup | Create wallet, add credentials, start observer process (optional) |
+| 11 | Service Trigger | Write PL/SQL package and triggers, deploy to database (optional) |
+
+**Total Manual Steps:** ~100+ individual commands, queries, and file edits
+
+**Automation Benefits:**
+- Consistent configuration across setups
+- Built-in validation and prerequisite checking
+- Error handling and rollback
+- Single source of truth for configuration
+- Support for concurrent Data Guard setups
+- AIX compatibility (printf instead of echo -e, sed instead of grep -P)
+- Comprehensive logging (all output saved to NFS)
+- Password security (prompted at runtime, never stored)
+- Session management (remember config selections across script runs)
+- Dry-run mode (review changes before applying)
+- Approval mode (gate every mutating action for high-security environments)
+
+---
+
+## Common Monitoring Commands
+
+After setup, use these commands for ongoing monitoring:
+
+```sql
+-- Check apply lag
+SELECT name, value, unit FROM v$dataguard_stats;
+
+-- Check managed standby processes
+SELECT process, status, sequence# FROM v$managed_standby;
+
+-- Check archive gaps
+SELECT * FROM v$archive_gap;
+```
+
+```
+-- DGMGRL commands
+dgmgrl /
+SHOW CONFIGURATION;
+SHOW DATABASE 'primary_db';
+SHOW DATABASE 'standby_db';
+VALIDATE DATABASE 'standby_db';
+```
+
+```sql
+-- Force log switch to test log shipping
+ALTER SYSTEM SWITCH LOGFILE;
+
+-- Open standby read-only (requires stopping MRP)
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL;
+ALTER DATABASE OPEN READ ONLY;
+
+-- Restart MRP after read-only access
+ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;
+```
+
+```
+-- FSFO monitoring
+dgmgrl / "SHOW FAST_START FAILOVER"
+
+-- Check active services
+SELECT name FROM v$active_services;
+
+-- Manually trigger service management
+EXEC SYS.DG_SERVICE_MGR.MANAGE_SERVICES;
+```
