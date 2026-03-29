@@ -541,19 +541,17 @@ cleanup_nfs() {
     log_info "Cleaning up NFS share..."
 
     ssh_primary "set +e;
-        rm -f '${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/init'*'${TEST_STANDBY_DB_UNIQUE_NAME}'* 2>/dev/null || true
-        rm -f '${NFS_SHARE}/orapw${TEST_ORACLE_SID}' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/tnsnames_entries_${TEST_STANDBY_DB_UNIQUE_NAME}.ora' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/listener_'*'${TEST_STANDBY_DB_UNIQUE_NAME}'* 2>/dev/null || true
-        rm -f '${NFS_SHARE}/listener_primary_${TEST_DB_UNIQUE_NAME}.ora' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/configure_broker_${TEST_STANDBY_DB_UNIQUE_NAME}.dgmgrl' 2>/dev/null || true
-        rm -f '${NFS_SHARE}/dg_service_mgr_'* 2>/dev/null || true
-        rm -f '${NFS_SHARE}/fsfo_observer_'* 2>/dev/null || true
-        rm -rf '${NFS_SHARE}/sessions/' 2>/dev/null || true
-        rm -rf '${NFS_SHARE}/logs/' 2>/dev/null || true
-        rm -rf '${NFS_SHARE}/state/' 2>/dev/null || true
+        # Remove ALL config/generated files (not just our test DB name)
+        # to prevent stale files from previous manual tests interfering
+        rm -f '${NFS_SHARE}'/*.env 2>/dev/null
+        rm -f '${NFS_SHARE}'/*.ora 2>/dev/null
+        rm -f '${NFS_SHARE}'/*.dgmgrl 2>/dev/null
+        rm -f '${NFS_SHARE}'/*.sql 2>/dev/null
+        rm -f '${NFS_SHARE}'/orapw* 2>/dev/null
+        rm -f '${NFS_SHARE}'/fsfo_observer_* 2>/dev/null
+        rm -rf '${NFS_SHARE}/sessions/' 2>/dev/null
+        rm -rf '${NFS_SHARE}/logs/' 2>/dev/null
+        rm -rf '${NFS_SHARE}/state/' 2>/dev/null
 
         echo 'NFS_CLEANUP_OK'
     "
