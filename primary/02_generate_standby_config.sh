@@ -36,7 +36,7 @@ progress_step "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for primary info files - support unique naming
-if ! select_config_file PRIMARY_INFO_FILE "primary database info" "${NFS_SHARE}/primary_info_*.env"; then
+if ! select_or_restore_config PRIMARY_INFO_FILE "primary database info" "${NFS_SHARE}/primary_info_*.env"; then
     log_error "Please run 01_gather_primary_info.sh on the primary server first"
     exit 1
 fi

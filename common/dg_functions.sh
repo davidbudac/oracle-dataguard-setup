@@ -20,6 +20,7 @@ VERBOSE_TRACE_PAUSED=0
 ERROR_TRAP_ACTIVE=0
 CURRENT_PROGRESS_TITLE=""
 STEP_STATE_FILE=""
+SESSION_ID="${SESSION_ID:-}"
 
 # Get the directory where this script is located
 DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -32,10 +33,11 @@ SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 # ============================================================
 
 enable_verbose_mode() {
-    local arg
+    local args=("$@")
+    local i=0
 
-    for arg in "$@"; do
-        case "$arg" in
+    while [[ $i -lt ${#args[@]} ]]; do
+        case "${args[$i]}" in
             -v|--verbose)
                 VERBOSE=1
                 ;;
@@ -54,7 +56,20 @@ enable_verbose_mode() {
             --execute)
                 CHECK_ONLY=0
                 ;;
+            -S|--session)
+                i=$((i + 1))
+                SESSION_ID="${args[$i]:-}"
+                if [[ -z "$SESSION_ID" ]]; then
+                    log_error "-S/--session requires a session ID argument"
+                    exit 1
+                fi
+                ;;
+            --list-sessions)
+                list_sessions
+                exit 0
+                ;;
         esac
+        i=$((i + 1))
     done
 
     export VERBOSE
@@ -77,6 +92,10 @@ enable_verbose_mode() {
 
     if [[ "$CHECK_ONLY" == "1" ]]; then
         log_info "Check mode enabled. The script will stop before making changes."
+    fi
+
+    if [[ -n "$SESSION_ID" ]]; then
+        log_info "Using session: $SESSION_ID"
     fi
 }
 
@@ -954,6 +973,262 @@ select_config_file() {
     local selected_file="${files_array[$((selection - 1))]}"
     eval "$result_var=\"$selected_file\""
     log_info "Selected: $selected_file"
+    return 0
+}
+
+# ============================================================
+# Session Management Functions
+# ============================================================
+# Sessions store the selected config file path on NFS so users
+# don't need to re-select it on every script run.
+#
+# Usage:
+#   <script> -S <session_id>      Restore a session (skip file selection)
+#   <script> --list-sessions      List available sessions and exit
+#
+# Sessions are created automatically after config file selection.
+# ============================================================
+
+# Read a value from a session file without sourcing
+# Usage: _read_session_field <session_file> <field_name>
+_read_session_field() {
+    local session_file="$1"
+    local field="$2"
+    grep "^${field}=" "$session_file" 2>/dev/null | head -1 | sed 's/^[^=]*=//; s/^"//; s/"$//'
+}
+
+# Generate a short random hex suffix (4 chars)
+# Usage: _random_suffix
+_random_suffix() {
+    printf '%04x' $RANDOM
+}
+
+# Derive a session ID from a config file name
+# Format: <db_unique_name>_<random> (e.g. mydb_stb_a3f1)
+# Usage: _derive_session_id <config_file_path>
+_derive_session_id() {
+    local base
+    base=$(basename "$1" | sed 's/^standby_config_//; s/^primary_info_//; s/\.env$//' | tr '[:upper:]' '[:lower:]')
+    printf '%s_%s' "$base" "$(_random_suffix)"
+}
+
+# Create or update a session file on NFS
+# Usage: create_session <config_file_path>
+create_session() {
+    local config_file="$1"
+    local sid
+    sid=$(_derive_session_id "$config_file")
+    local session_dir="${NFS_SHARE}/sessions"
+    local session_file="${session_dir}/${sid}.session"
+
+    mkdir -p "$session_dir" 2>/dev/null
+
+    printf 'SESSION_ID="%s"\nSESSION_CONFIG_FILE="%s"\nSESSION_CREATED="%s"\nSESSION_LAST_USED="%s"\nSESSION_HOSTNAME="%s"\n' \
+        "$sid" "$config_file" "$(date '+%Y-%m-%d %H:%M:%S')" "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)" \
+        > "$session_file"
+
+    log_info "Session saved: $sid (use -S $sid to restore)"
+    SESSION_ID="$sid"
+}
+
+# Update last-used timestamp in a session file (portable, no sed -i)
+# Usage: _touch_session <session_id>
+_touch_session() {
+    local sid="$1"
+    local session_file="${NFS_SHARE}/sessions/${sid}.session"
+
+    [[ -f "$session_file" ]] || return 0
+
+    local config_file created hostname
+    config_file=$(_read_session_field "$session_file" "SESSION_CONFIG_FILE")
+    created=$(_read_session_field "$session_file" "SESSION_CREATED")
+    hostname=$(_read_session_field "$session_file" "SESSION_HOSTNAME")
+
+    printf 'SESSION_ID="%s"\nSESSION_CONFIG_FILE="%s"\nSESSION_CREATED="%s"\nSESSION_LAST_USED="%s"\nSESSION_HOSTNAME="%s"\n' \
+        "$sid" "$config_file" "$created" "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)" \
+        > "$session_file"
+}
+
+# Restore a session by ID, setting the result variable to the config file path
+# Usage: restore_session <session_id> <result_var>
+restore_session() {
+    local sid="$1"
+    local result_var="$2"
+    local session_file="${NFS_SHARE}/sessions/${sid}.session"
+
+    if [[ ! -f "$session_file" ]]; then
+        log_error "Session not found: $sid"
+        log_error "Use --list-sessions to see available sessions"
+        return 1
+    fi
+
+    local config_file
+    config_file=$(_read_session_field "$session_file" "SESSION_CONFIG_FILE")
+
+    if [[ ! -f "$config_file" ]]; then
+        log_error "Config file from session no longer exists: $config_file"
+        return 1
+    fi
+
+    _touch_session "$sid"
+    eval "$result_var=\"$config_file\""
+    SESSION_ID="$sid"
+    log_info "Restored session: $sid (config: $(basename "$config_file"))"
+    return 0
+}
+
+# List all available sessions
+# Usage: list_sessions
+list_sessions() {
+    local session_dir="${NFS_SHARE}/sessions"
+    local found=0
+
+    echo ""
+    printf "${BLUE}============================================================${NC}\n"
+    printf "${BLUE}Available Sessions${NC}\n"
+    printf "${BLUE}============================================================${NC}\n"
+    echo ""
+
+    if [[ -d "$session_dir" ]]; then
+        local session_file
+        for session_file in "$session_dir"/*.session; do
+            [[ -f "$session_file" ]] || continue
+            found=1
+
+            local sid config last_used hostname
+            sid=$(_read_session_field "$session_file" "SESSION_ID")
+            config=$(_read_session_field "$session_file" "SESSION_CONFIG_FILE")
+            last_used=$(_read_session_field "$session_file" "SESSION_LAST_USED")
+            hostname=$(_read_session_field "$session_file" "SESSION_HOSTNAME")
+
+            printf "  ${GREEN}%-20s${NC} %s\n" "$sid" "$(basename "$config")"
+            printf "  %-20s Last used: %s on %s\n" "" "$last_used" "$hostname"
+            echo ""
+        done
+    fi
+
+    if [[ $found -eq 0 ]]; then
+        echo "  No sessions found."
+        echo ""
+        echo "  Sessions are created automatically when you select a config file."
+    fi
+
+    echo ""
+    printf "Usage: ${CYAN}<script> -S <session_id>${NC}\n"
+    echo ""
+}
+
+# Select a config file with session support
+# If SESSION_ID is set (via -S flag), restores from session directly.
+# Otherwise, offers to pick an existing session or do normal file selection.
+# After selection, creates/updates a session automatically.
+#
+# Usage: select_or_restore_config <result_var> <file_type> <glob_pattern>
+select_or_restore_config() {
+    local result_var="$1"
+    local file_type="$2"
+    local glob_pattern="$3"
+
+    # If -S was given, restore directly from session
+    if [[ -n "$SESSION_ID" ]]; then
+        if restore_session "$SESSION_ID" "$result_var"; then
+            return 0
+        fi
+        log_warn "Falling back to config file selection."
+        SESSION_ID=""
+    fi
+
+    # Check for existing sessions that match this config type
+    local session_dir="${NFS_SHARE}/sessions"
+    local matching_sessions=()
+    local matching_sids=()
+
+    if [[ -d "$session_dir" ]]; then
+        local sf
+        for sf in "$session_dir"/*.session; do
+            [[ -f "$sf" ]] || continue
+
+            local s_config
+            s_config=$(_read_session_field "$sf" "SESSION_CONFIG_FILE")
+            [[ -f "$s_config" ]] || continue
+
+            # Check if config matches the expected glob pattern
+            local s_basename pattern_basename pattern_regex
+            s_basename="$(basename "$s_config")"
+            pattern_basename="$(basename "$glob_pattern")"
+            pattern_regex=$(printf '%s' "$pattern_basename" | sed 's/\./\\./g; s/\*/.*/g')
+            if printf '%s' "$s_basename" | grep -q "^${pattern_regex}$"; then
+                matching_sessions+=("$sf")
+                matching_sids+=("$(_read_session_field "$sf" "SESSION_ID")")
+            fi
+        done
+    fi
+
+    # If matching sessions exist, offer to restore one
+    if [[ ${#matching_sessions[@]} -gt 0 ]]; then
+        echo ""
+        printf "${BLUE}============================================================${NC}\n"
+        printf "${BLUE}Session Selection${NC}\n"
+        printf "${BLUE}============================================================${NC}\n"
+        echo ""
+
+        local i=1
+        local total=${#matching_sessions[@]}
+        for sf in "${matching_sessions[@]}"; do
+            local sid config last_used hostname
+            sid=$(_read_session_field "$sf" "SESSION_ID")
+            config=$(_read_session_field "$sf" "SESSION_CONFIG_FILE")
+            last_used=$(_read_session_field "$sf" "SESSION_LAST_USED")
+            hostname=$(_read_session_field "$sf" "SESSION_HOSTNAME")
+
+            if [[ $total -eq 1 ]]; then
+                printf "  ${GREEN}%d) %-16s${NC} %s  [%s] (default)\n" "$i" "$sid" "$(basename "$config")" "$last_used"
+            else
+                printf "  ${GREEN}%d) %-16s${NC} %s  [%s]\n" "$i" "$sid" "$(basename "$config")" "$last_used"
+            fi
+            i=$((i + 1))
+        done
+
+        echo ""
+        printf "  ${YELLOW}n) New session${NC} (select config file and start fresh)\n"
+        echo ""
+
+        local selection
+        if [[ $total -eq 1 ]]; then
+            printf "Select session [1, n, default=1]: "
+        else
+            printf "Select session [1-%d, n]: " "$total"
+        fi
+        read selection
+
+        # Default to 1 if only one session and empty input
+        if [[ -z "$selection" && $total -eq 1 ]]; then
+            selection=1
+        fi
+
+        if [[ "$selection" != "n" && "$selection" != "N" ]]; then
+            if [[ "$selection" =~ ^[0-9]+$ ]] && [[ "$selection" -ge 1 ]] && [[ "$selection" -le $total ]]; then
+                local chosen_sid="${matching_sids[$((selection - 1))]}"
+                if restore_session "$chosen_sid" "$result_var"; then
+                    return 0
+                fi
+                log_warn "Session restore failed. Falling back to config file selection."
+            else
+                log_warn "Invalid selection. Proceeding to config file selection."
+            fi
+        fi
+    fi
+
+    # Normal config file selection
+    if ! select_config_file "$result_var" "$file_type" "$glob_pattern"; then
+        return 1
+    fi
+
+    # Create session for the selected file
+    local selected_file
+    eval "selected_file=\"\$$result_var\""
+    create_session "$selected_file"
+
     return 0
 }
 
