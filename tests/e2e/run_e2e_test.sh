@@ -401,9 +401,10 @@ phase_deploy() {
 phase_cleanup() {
     log_phase "CLEANUP: Removing test databases and files"
 
-    cleanup_standby
-    cleanup_primary
-    cleanup_nfs
+    # Cleanup should never abort the script - best effort
+    cleanup_standby || true
+    cleanup_primary || true
+    cleanup_nfs || true
 
     log_pass "Cleanup complete"
 }
@@ -411,7 +412,7 @@ phase_cleanup() {
 cleanup_standby() {
     log_info "Cleaning up standby host..."
 
-    ssh_cmd "STANDBY" "
+    ssh_cmd "STANDBY" "set +e;
         # Stop observer if running
         pkill -f 'dgmgrl.*observer' 2>/dev/null || true
 
@@ -471,7 +472,7 @@ SQLEOF
 cleanup_primary() {
     log_info "Cleaning up primary host..."
 
-    ssh_cmd "PRIMARY" "
+    ssh_cmd "PRIMARY" "set +e;
         # Remove DG broker config first (if broker is running)
         dgmgrl -silent / 'REMOVE CONFIGURATION' 2>/dev/null || true
 
@@ -539,7 +540,7 @@ SQLEOF
 cleanup_nfs() {
     log_info "Cleaning up NFS share..."
 
-    ssh_primary "
+    ssh_primary "set +e;
         rm -f '${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env' 2>/dev/null || true
         rm -f '${NFS_SHARE}/standby_config_${TEST_STANDBY_DB_UNIQUE_NAME}.env' 2>/dev/null || true
         rm -f '${NFS_SHARE}/init'*'${TEST_STANDBY_DB_UNIQUE_NAME}'* 2>/dev/null || true
