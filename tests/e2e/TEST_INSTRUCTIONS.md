@@ -182,6 +182,41 @@ updated. To debug: SSH to the host and run the script manually to see actual pro
 - **Fix:** `cleanup_nfs` now removes ALL `.env`/`.ora`/`.dgmgrl` files, not just
   those matching the test DB name
 
+### Issue: prompt_password stty fails under piped stdin
+- `common/dg_functions.sh` `prompt_password()` calls `stty -echo` / `stty echo`
+- When stdin is a pipe (not a tty), `stty` exits non-zero, triggering ERR trap
+- **Fix:** Added `2>/dev/null || true` to both stty calls in `prompt_password()`
+
+### Issue: RMAN heredoc consumed piped stdin
+- `standby/05_clone_standby.sh` used `<<EOF` heredoc to pass `@script_file` to RMAN
+- The heredoc reads from stdin, consuming bytes meant for interactive prompts
+- **Fix:** Changed to RMAN `cmdfile` parameter: `rman ... cmdfile "${RMAN_SCRIPT}"`
+
+### Issue: NAMES.DEFAULT_DOMAIN in sqlnet.ora breaks TNS resolution
+- Standby had `NAMES.DEFAULT_DOMAIN=world` in sqlnet.ora
+- This causes tnsping to append `.world` to TNS aliases, breaking resolution
+- **Fix:** Cleanup phase comments out `NAMES.DEFAULT_DOMAIN` in standby sqlnet.ora
+
+### Issue: Stale tnsnames entries from previous runs
+- Scripts append DG entries to tnsnames.ora; cleanup restored from stale backups
+- **Fix:** Cleanup uses `sed` to remove DG-added sections instead of restoring backups
+
+### Issue: assert_sql strips whitespace, breaking multi-word matches
+- `assert_sql` uses `tr -d '[:space:]'` so "PHYSICAL STANDBY" becomes "PHYSICALSTANDBY"
+- **Fix:** Match the stripped form in assertions
+
+### Issue: Step 11 prompt count varies between first run and re-run
+- First run: accept services (Enter), deploy (y) = 2 prompts
+- Re-run: accept services (Enter), replace existing (y), deploy (y) = 3 prompts
+- **Fix:** Provide `\ny\ny\ny` (Enter + 3 y's); extra y's are consumed by EOF
+
+## Last successful full run
+
+**Date:** 2026-03-29, **Duration:** ~20 minutes, **Result:** 62 PASS, 0 FAIL, 3 SKIP
+
+Phases tested: preflight, deploy, cleanup, create_db, steps 1-7, step 11
+Phases skipped: step 8 (security), step 9 (FSFO), step 10 (observer)
+
 ## Key files
 
 - `tests/e2e/config.env` - User's environment config (DO NOT commit - gitignored)
