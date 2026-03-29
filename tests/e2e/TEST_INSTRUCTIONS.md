@@ -155,6 +155,33 @@ updated. To debug: SSH to the host and run the script manually to see actual pro
 - **Fix:** Replaced with `ssh_piped()` using stdin pipe. Works because scripts'
   `prompt_password()` falls back to reading stdin when no tty is present.
 
+### Issue: SSH target differs from Oracle network hostname
+- SSH access uses `localhost` with port forwarding, but DB hosts know themselves
+  as `poug-dg1` / `poug-dg2` on the 192.168.56.x network
+- TNS entries must use real hostnames, not "localhost"
+- **Fix:** Added `PRIMARY_ORACLE_HOSTNAME` and `STANDBY_ORACLE_HOSTNAME` in config.env
+  Step 2 uses these for the standby hostname prompt instead of SSH target hostname
+
+### Issue: Config auto-selection skips menu prompt
+- When exactly one config file exists, `select_config_file()` auto-selects
+  without reading stdin. Piped "1" selection was consumed by the next prompt.
+- **Fix:** Removed "1" from all piped inputs. Scripts auto-select single files.
+
+### Issue: Sessions accumulate and create unexpected menus
+- `select_or_restore_config()` checks for sessions before file selection
+- Sessions from prior steps show a menu that consumes piped input lines
+- **Fix:** `clear_sessions` is called before every step phase in `run_phase()`
+
+### Issue: host command fails with non-zero exit when hostname not in DNS
+- `01_gather_primary_info.sh` runs `host "$PRIMARY_HOSTNAME"` which fails
+  if the hostname isn't in DNS, triggering the ERR trap under `set -e`
+- **Fix:** Added `|| true` to the `host` command in the FQDN lookup
+
+### Issue: NFS has stale files from previous manual tests
+- Old `.env` and `.ora` files cause wrong config selection in step 2
+- **Fix:** `cleanup_nfs` now removes ALL `.env`/`.ora`/`.dgmgrl` files, not just
+  those matching the test DB name
+
 ## Key files
 
 - `tests/e2e/config.env` - User's environment config (DO NOT commit - gitignored)
