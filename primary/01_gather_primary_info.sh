@@ -78,7 +78,7 @@ progress_step "Gathering Oracle Environment Information"
 PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
 # Try to get FQDN if possible
 if command -v host >/dev/null 2>&1; then
-    FQDN=$(host "$PRIMARY_HOSTNAME" 2>/dev/null | awk '/has address/{print $1; exit}')
+    FQDN=$(host "$PRIMARY_HOSTNAME" 2>/dev/null | awk '/has address/{print $1; exit}' || true)
     [[ -n "$FQDN" ]] && PRIMARY_HOSTNAME="$FQDN"
 fi
 PRIMARY_ORACLE_HOME="$ORACLE_HOME"
