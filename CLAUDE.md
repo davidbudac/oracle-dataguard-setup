@@ -13,7 +13,7 @@ trigger/       - Role-aware service trigger (run on PRIMARY)
 common/        - Shared scripts and functions
 templates/     - Reference templates
 docs/          - Detailed walkthrough documentation
-tests/         - Test scripts
+tests/         - Test scripts (unit tests and E2E test suite)
 ```
 
 ## Execution Order
@@ -106,7 +106,29 @@ Built-in validations:
 
 ## Testing
 
-Scripts are designed for Oracle 19c on Linux with filesystem storage. Test in non-production first.
+### Unit Tests
+- `tests/test_add_sid_to_listener.sh` - Tests the `add_sid_to_listener()` function
+
+### End-to-End Tests
+- `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator
+- `tests/e2e/config.env` - Test environment configuration (jump host, DB hosts, Oracle paths)
+- `tests/e2e/TEST_INSTRUCTIONS.md` - Full runbook with known issues and fixes
+
+**To run E2E tests:**
+```bash
+bash ./tests/e2e/run_e2e_test.sh           # Full run (~20 min)
+bash ./tests/e2e/run_e2e_test.sh --from step5  # Resume from a phase
+bash ./tests/e2e/run_e2e_test.sh --only cleanup # Clean up
+```
+
+The test creates a database (DBCA, no OMF/FRA), runs all walkthrough steps, validates each step, and cleans up. It connects through a jump host via SSH ProxyJump and automates interactive prompts via piped stdin.
+
+**Key gotchas for the test framework:**
+- Always run with `bash` explicitly (zsh breaks SSH_OPTS word splitting)
+- Sessions are cleared before each step to prevent menu interference with piped input
+- Config files auto-select when only one exists (no "1" needed in piped input)
+- RMAN uses `cmdfile` parameter instead of heredoc (heredoc consumes piped stdin)
+- `stty` calls in `prompt_password()` use `2>/dev/null || true` for piped stdin compatibility
 
 ## Fast-Start Failover (Optional)
 

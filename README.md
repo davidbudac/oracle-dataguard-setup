@@ -64,14 +64,22 @@ dataguard_setup/
 │   └── 07_verify_dataguard.sh         # Validation and health check
 ├── fsfo/
 │   └── observer.sh                    # Observer setup and lifecycle (setup/start/stop/status)
+├── trigger/
+│   └── create_role_trigger.sh         # Role-aware service trigger (optional)
 ├── common/
-│   └── dg_functions.sh                # Shared utility functions
+│   ├── dg_functions.sh                # Shared utility functions
+│   └── sessions.sh                    # Session management CLI
 ├── templates/
 │   ├── init_standby.ora.template      # Reference template
 │   ├── listener.ora.template          # Reference template
 │   └── tnsnames.ora.template          # Reference template
 └── tests/
-    └── test_add_sid_to_listener.sh    # Test script for listener functions
+    ├── test_add_sid_to_listener.sh    # Unit tests for listener functions
+    └── e2e/
+        ├── config.env.template        # Test environment configuration template
+        ├── config.env                 # Test environment configuration (fill in)
+        ├── run_e2e_test.sh            # E2E test orchestrator
+        └── TEST_INSTRUCTIONS.md       # Runbook for executing E2E tests
 ```
 
 ## Quick Start
@@ -90,12 +98,15 @@ dataguard_setup/
 | 8 | PRIMARY | `./primary/08_security_hardening.sh` | Yes** |
 | 9 | PRIMARY | `./primary/09_configure_fsfo.sh` | Yes*** |
 | 10 | OBSERVER | `./fsfo/observer.sh setup` then `start` | Yes*** |
+| 11 | PRIMARY | `./trigger/create_role_trigger.sh` | Yes |
 
 **\*** Step 5 requires cleanup before restart (see [Restartability](#restartability)).
 
 **\*\*** Step 8 is optional. Locks SYS account after setup is verified.
 
 **\*\*\*** Steps 9-10 are optional. Configures Fast-Start Failover for automatic failover.
+
+Step 11 is optional. Deploys role-aware service triggers for automatic service management on switchover/failover.
 
 ### Workflow Diagram
 
@@ -124,6 +135,10 @@ Step 8: Security Hardening (optional)
 Step 9: Configure FSFO ─────────────────► Step 10: Observer Setup & Start
     (creates SYSDG user,                    (wallet setup, start observer)
      enables FSFO)
+
+Step 11: Service Trigger (optional)
+    (auto-start/stop services
+     on role change/startup)
 ```
 
 ### Restartability
@@ -283,6 +298,44 @@ dgmgrl / "disable fast_start failover"
 # Re-enable FSFO
 dgmgrl / "enable fast_start failover"
 ```
+
+## End-to-End Testing
+
+A comprehensive E2E test suite validates the entire Data Guard setup workflow on real Oracle hosts. The test creates a database from scratch, runs every step, validates results, and cleans up.
+
+### Running the Tests
+
+```bash
+# 1. Configure test environment
+cp tests/e2e/config.env.template tests/e2e/config.env
+# Edit config.env with your host details (jump host, DB hosts, Oracle paths)
+
+# 2. Run all tests (~20 minutes)
+bash ./tests/e2e/run_e2e_test.sh
+
+# 3. Run individual phases
+bash ./tests/e2e/run_e2e_test.sh --only preflight    # Verify connectivity
+bash ./tests/e2e/run_e2e_test.sh --only create_db    # Just create test DB
+bash ./tests/e2e/run_e2e_test.sh --from step5         # Resume from a phase
+bash ./tests/e2e/run_e2e_test.sh --only cleanup       # Drop DBs, clean files
+```
+
+### What the Tests Cover
+
+| Phase | Validates |
+|-------|-----------|
+| create_db | DBCA creates DB with no OMF/FRA, ARCHIVELOG enabled |
+| step1-step2 | Config files generated correctly on NFS |
+| step3 | Standby dirs, password file, listener, tnsnames, oratab |
+| step4 | FORCE_LOGGING, standby redo logs, DG_BROKER_START, tnsping |
+| step5 | RMAN duplicate, PHYSICAL STANDBY role, MRP running |
+| step6 | Broker configuration enabled, both databases registered |
+| step7 | Health report HEALTHY, no archive log gaps |
+| step11 | PL/SQL package VALID, triggers ENABLED |
+
+### Architecture
+
+The test uses SSH with ProxyJump through a jump host to reach both DB servers. Interactive script prompts are automated via piped stdin. See `tests/e2e/TEST_INSTRUCTIONS.md` for the full runbook.
 
 ## Troubleshooting
 
