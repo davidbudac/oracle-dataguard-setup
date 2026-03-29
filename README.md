@@ -135,6 +135,8 @@ Step 9: Configure FSFO ─────────────────► St
 2. Remove standby data files, control files, and redo logs
 3. Re-run step 5
 
+Step 5 now requires typing the standby `DB_UNIQUE_NAME` before RMAN duplicate starts, to reduce accidental execution.
+
 **Steps 6-7 are restartable** - broker config can be removed with `REMOVE CONFIGURATION` in DGMGRL.
 
 ## Runtime Modes
@@ -142,17 +144,22 @@ Step 9: Configure FSFO ─────────────────► St
 All common-based workflow scripts support the following optional flags:
 
 ```bash
+./standby/03_setup_standby_env.sh --check
 ./primary/06_configure_broker.sh --verbose
 ./standby/05_clone_standby.sh --approval-mode
 APPROVAL_MODE=1 VERBOSE=1 ./primary/09_configure_fsfo.sh
 ```
 
+- `--check` or `--plan`
+  Runs a preflight-only pass for steps 3-9. The script resolves paths, selected config files, planned changes, touched files, and recovery guidance, then exits before making changes.
 - `--verbose` or `VERBOSE=1`
   Prints the exact shell commands being executed, with tracing temporarily suppressed around password entry and password-based connections.
 - `--approval-mode` or `APPROVAL_MODE=1`
   Pauses before mutating actions, shows a structured approval block with the action, impact, log file, and command preview, and asks for confirmation.
 - `--suspicious` and `SUSPICIOUS=1`
   Still work as backward-compatible aliases for `approval mode`.
+
+Each workflow step also writes a companion state file under `${NFS_SHARE}/state/` alongside the log files in `${NFS_SHARE}/logs/`. The state file captures the current step, final status, generated artifacts, and the suggested next step.
 
 ## Configuration
 

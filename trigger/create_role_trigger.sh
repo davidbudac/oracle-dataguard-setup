@@ -388,6 +388,20 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         RETURN l_services;
     END get_service_list;
 
+    PROCEDURE log_service_issue(
+        p_action  IN VARCHAR2,
+        p_service IN VARCHAR2,
+        p_error   IN VARCHAR2
+    ) IS
+    BEGIN
+        DBMS_SYSTEM.KSDWRT(
+            2,
+            'DG_SERVICE_MGR ' || p_action || ' failed for service ' || p_service || ': ' || SUBSTR(p_error, 1, 300)
+        );
+    EXCEPTION
+        WHEN OTHERS THEN NULL;
+    END log_service_issue;
+
     -- --------------------------------------------------------
     -- MANAGE_SERVICES: Start or stop services based on role
     -- --------------------------------------------------------
@@ -404,7 +418,8 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
                 BEGIN
                     DBMS_SERVICE.START_SERVICE(l_services(i));
                 EXCEPTION
-                    WHEN OTHERS THEN NULL;
+                    WHEN OTHERS THEN
+                        log_service_issue('START', l_services(i), SQLERRM);
                 END;
             END LOOP;
         ELSE
@@ -413,7 +428,8 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
                 BEGIN
                     DBMS_SERVICE.STOP_SERVICE(l_services(i));
                 EXCEPTION
-                    WHEN OTHERS THEN NULL;
+                    WHEN OTHERS THEN
+                        log_service_issue('STOP', l_services(i), SQLERRM);
                 END;
             END LOOP;
         END IF;
@@ -538,6 +554,20 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         RETURN l_services;
     END get_service_list;
 
+    PROCEDURE log_service_issue(
+        p_action  IN VARCHAR2,
+        p_service IN VARCHAR2,
+        p_error   IN VARCHAR2
+    ) IS
+    BEGIN
+        DBMS_SYSTEM.KSDWRT(
+            2,
+            'DG_SERVICE_MGR ' || p_action || ' failed for service ' || p_service || ': ' || SUBSTR(p_error, 1, 300)
+        );
+    EXCEPTION
+        WHEN OTHERS THEN NULL;
+    END log_service_issue;
+
     PROCEDURE MANAGE_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
@@ -550,7 +580,8 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
                 BEGIN
                     DBMS_SERVICE.START_SERVICE(l_services(i));
                 EXCEPTION
-                    WHEN OTHERS THEN NULL;
+                    WHEN OTHERS THEN
+                        log_service_issue('START', l_services(i), SQLERRM);
                 END;
             END LOOP;
         ELSE
@@ -558,7 +589,8 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
                 BEGIN
                     DBMS_SERVICE.STOP_SERVICE(l_services(i));
                 EXCEPTION
-                    WHEN OTHERS THEN NULL;
+                    WHEN OTHERS THEN
+                        log_service_issue('STOP', l_services(i), SQLERRM);
                 END;
             END LOOP;
         END IF;

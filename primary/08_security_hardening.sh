@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 8: Security Hardening"
-init_progress 4
+init_progress 5
 
 # Initialize logging
 init_log "08_security_hardening"
@@ -51,6 +51,33 @@ log_info "Confirmed: Running on PRIMARY database"
 # Get DB_UNIQUE_NAME for logging
 DB_UNIQUE_NAME=$(get_db_parameter "db_unique_name")
 init_log "08_security_hardening_${DB_UNIQUE_NAME}"
+
+# ============================================================
+# Review Planned Changes
+# ============================================================
+
+progress_step "Reviewing Planned Changes"
+
+print_list_block "This Step Will Change" \
+    "Change the SYS password to a random value that is not retained by the script." \
+    "Lock the SYS account on ${DB_UNIQUE_NAME}." \
+    "Leave Data Guard transport using the password file in place."
+
+print_list_block "This Step Will Not Change" \
+    "It will not modify Broker topology." \
+    "It will not unlock or change other accounts." \
+    "It will not store the generated SYS password anywhere."
+
+print_list_block "Recovery If This Step Fails" \
+    "Use OS authentication: sqlplus / as sysdba." \
+    "If SYS must be restored, manually set a new password and unlock the account." \
+    "Do not proceed unless OS authentication is available on the host."
+
+record_next_step "./primary/09_configure_fsfo.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Security hardening preflight complete. No account changes were applied."
+fi
 
 # ============================================================
 # Verify Data Guard Configuration
@@ -96,7 +123,15 @@ echo "  - Password-based SYS connections will no longer work"
 echo "  - The password file will still be used for Data Guard redo transport"
 echo ""
 
-if ! confirm_proceed "Are you sure you want to proceed with security hardening?"; then
+TEST_RESULT=$(run_sql_query "check_os_auth.sql")
+if echo "$TEST_RESULT" | grep -q "OS_AUTH_OK"; then
+    log_info "PASS: OS authentication '/ as sysdba' is working before hardening"
+else
+    log_error "OS authentication verification failed before hardening"
+    exit 1
+fi
+
+if ! confirm_typed_value "This will change and lock SYS on ${DB_UNIQUE_NAME}." "SECURE ${DB_UNIQUE_NAME}"; then
     log_info "Security hardening cancelled by user"
     exit 0
 fi

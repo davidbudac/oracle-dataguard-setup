@@ -36,7 +36,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
-init_progress 13
+init_progress 14
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -156,6 +156,28 @@ log_info "Current protection mode: $CURRENT_MODE"
 # ============================================================
 
 progress_step "Reviewing FSFO Configuration Summary"
+
+print_list_block "This Step Will Change" \
+    "Create or update an observer user with SYSDG privilege." \
+    "Set LogXptMode to FASTSYNC on ${PRIMARY_DB_UNIQUE_NAME} and ${STANDBY_DB_UNIQUE_NAME}." \
+    "Set protection mode to MAXIMUM AVAILABILITY when needed." \
+    "Enable Fast-Start Failover and persist observer metadata into ${STANDBY_CONFIG_FILE}."
+
+print_list_block "This Step Will Not Change" \
+    "It will not start the observer process." \
+    "It will not create the observer wallet." \
+    "It will not change application services."
+
+print_list_block "Recovery If This Step Fails" \
+    "Review dgmgrl / 'show fast_start failover' for the exact failed operation." \
+    "Disable FSFO or revert protection mode manually only if the failure leaves the config in an intermediate state." \
+    "Re-run this step after correcting the observer user or transport issue."
+
+record_next_step "./fsfo/observer.sh setup"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "FSFO preflight complete. No Broker or user changes were applied."
+fi
 
 # ============================================================
 # Prompt for Observer Username
@@ -427,7 +449,8 @@ fi
 
 log_section "Updating Configuration File"
 
-# Add FSFO settings to config file if not present
+FSFO_WALLET_PATH='${ORACLE_HOME}/network/admin/wallet'
+
 if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
     confirm_approval_action "Append FSFO settings to standby configuration" "append FSFO configuration to $STANDBY_CONFIG_FILE" || exit 1
     cat >> "$STANDBY_CONFIG_FILE" << EOF
@@ -438,22 +461,34 @@ if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
 FSFO_ENABLED="YES"
 FSFO_THRESHOLD="${FSFO_THRESHOLD}"
 OBSERVER_USER="${OBSERVER_USER}"
-OBSERVER_WALLET_DIR="\${ORACLE_HOME}/network/admin/wallet"
+OBSERVER_WALLET_DIR="${FSFO_WALLET_PATH}"
 EOF
     log_info "Added FSFO settings to configuration file"
 else
-    # Update OBSERVER_USER if it changed
-    # AIX compatible: use temp file instead of sed -i
-    if grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
-        confirm_approval_action "Update OBSERVER_USER in standby configuration" "rewrite OBSERVER_USER in $STANDBY_CONFIG_FILE" || exit 1
-        sed "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" "$STANDBY_CONFIG_FILE" > "${STANDBY_CONFIG_FILE}.tmp"
-        mv "${STANDBY_CONFIG_FILE}.tmp" "$STANDBY_CONFIG_FILE"
-    else
-        confirm_approval_action "Append OBSERVER_USER to standby configuration" "append OBSERVER_USER to $STANDBY_CONFIG_FILE" || exit 1
+    confirm_approval_action "Refresh FSFO settings in standby configuration" "rewrite FSFO metadata in $STANDBY_CONFIG_FILE" || exit 1
+    sed \
+        -e "s/^FSFO_ENABLED=.*/FSFO_ENABLED=\"YES\"/" \
+        -e "s/^FSFO_THRESHOLD=.*/FSFO_THRESHOLD=\"${FSFO_THRESHOLD}\"/" \
+        -e "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" \
+        -e "s|^OBSERVER_WALLET_DIR=.*|OBSERVER_WALLET_DIR=\"${FSFO_WALLET_PATH}\"|" \
+        "$STANDBY_CONFIG_FILE" > "${STANDBY_CONFIG_FILE}.tmp"
+    mv "${STANDBY_CONFIG_FILE}.tmp" "$STANDBY_CONFIG_FILE"
+
+    if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+        echo "FSFO_ENABLED=\"YES\"" >> "$STANDBY_CONFIG_FILE"
+    fi
+    if ! grep -q "^FSFO_THRESHOLD=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+        echo "FSFO_THRESHOLD=\"${FSFO_THRESHOLD}\"" >> "$STANDBY_CONFIG_FILE"
+    fi
+    if ! grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
         echo "OBSERVER_USER=\"${OBSERVER_USER}\"" >> "$STANDBY_CONFIG_FILE"
+    fi
+    if ! grep -q "^OBSERVER_WALLET_DIR=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
+        echo "OBSERVER_WALLET_DIR=\"${FSFO_WALLET_PATH}\"" >> "$STANDBY_CONFIG_FILE"
     fi
     log_info "FSFO settings updated in configuration file"
 fi
+record_artifact "fsfo_config:${STANDBY_CONFIG_FILE}"
 
 # ============================================================
 # Display Final Configuration

@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
-init_progress 6
+init_progress 7
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -48,6 +48,39 @@ source "$STANDBY_CONFIG_FILE"
 
 # Reinitialize log with standby DB name
 init_log "06_configure_broker_${STANDBY_DB_UNIQUE_NAME}"
+
+# ============================================================
+# Review Planned Changes
+# ============================================================
+
+progress_step "Reviewing Planned Changes"
+
+print_list_block "This Step Will Change" \
+    "Create or recreate the Data Guard Broker configuration ${DG_BROKER_CONFIG_NAME:-${PRIMARY_DB_NAME}_DG}." \
+    "Add ${STANDBY_DB_UNIQUE_NAME} as a physical standby in Broker." \
+    "Enable the Broker configuration and force a logfile switch test."
+
+print_list_block "This Step Will Not Change" \
+    "It will not run RMAN DUPLICATE." \
+    "It will not change filesystem config files on either host." \
+    "It will not enable FSFO."
+
+print_list_block "Files and Connections" \
+    "Standby config: ${STANDBY_CONFIG_FILE}" \
+    "Primary alias: ${PRIMARY_TNS_ALIAS}" \
+    "Standby alias: ${STANDBY_TNS_ALIAS}" \
+    "Broker command source: ${SQL_DIR}/dgmgrl"
+
+print_list_block "Recovery If This Step Fails" \
+    "Run dgmgrl / 'show configuration' to inspect the current broker state." \
+    "If needed, remove the partial configuration cleanly before re-running this step." \
+    "Use the generated log file to confirm which Broker command failed."
+
+record_next_step "./standby/07_verify_dataguard.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Broker configuration preflight complete. No Broker changes were applied."
+fi
 
 # ============================================================
 # Verify DG Broker is Running
@@ -121,7 +154,22 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
 
     log_info "Removing existing configuration..."
     log_cmd "dgmgrl /:" "REMOVE CONFIGURATION"
-    run_dgmgrl "remove_configuration.dgmgrl" || true
+    REMOVE_OUTPUT=$(run_dgmgrl "remove_configuration.dgmgrl" 2>&1)
+    if echo "$REMOVE_OUTPUT" | grep -qi "ORA-\|error"; then
+        log_error "Failed to remove the existing broker configuration"
+        echo ""
+        echo "$REMOVE_OUTPUT"
+        exit 1
+    fi
+
+    POST_REMOVE_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
+    if ! echo "$POST_REMOVE_STATUS" | grep -q "ORA-16532"; then
+        log_error "Broker configuration still exists after REMOVE CONFIGURATION"
+        echo ""
+        echo "$POST_REMOVE_STATUS"
+        exit 1
+    fi
+
     log_info "Existing configuration removed"
 fi
 

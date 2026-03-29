@@ -15,7 +15,11 @@ NC='\033[0m' # No Color
 NFS_SHARE="${NFS_SHARE:-/OINSTALL/_dataguard_setup}"
 VERBOSE="${VERBOSE:-0}"
 APPROVAL_MODE="${APPROVAL_MODE:-${SUSPICIOUS:-0}}"
+CHECK_ONLY="${CHECK_ONLY:-0}"
 VERBOSE_TRACE_PAUSED=0
+ERROR_TRAP_ACTIVE=0
+CURRENT_PROGRESS_TITLE=""
+STEP_STATE_FILE=""
 
 # Get the directory where this script is located
 DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -44,12 +48,22 @@ enable_verbose_mode() {
             --no-approval-mode|--no-suspicious)
                 APPROVAL_MODE=0
                 ;;
+            -n|--check|--plan)
+                CHECK_ONLY=1
+                ;;
+            --execute)
+                CHECK_ONLY=0
+                ;;
         esac
     done
 
     export VERBOSE
     export APPROVAL_MODE
+    export CHECK_ONLY
     export SUSPICIOUS="$APPROVAL_MODE"
+
+    set -E -o pipefail
+    trap 'handle_error "$?" "$BASH_COMMAND" "${BASH_LINENO[0]:-$LINENO}"' ERR
 
     if [[ "$VERBOSE" == "1" ]]; then
         export PS4='+ ${BASH_SOURCE##*/}:${LINENO}: '
@@ -59,6 +73,10 @@ enable_verbose_mode() {
 
     if [[ "$APPROVAL_MODE" == "1" ]]; then
         log_info "Approval mode enabled. Mutating actions require approval."
+    fi
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_info "Check mode enabled. The script will stop before making changes."
     fi
 }
 
@@ -120,6 +138,10 @@ log_cmd() {
     local cmd="$2"
     printf "${YELLOW}>>> %s${NC} %s\n" "$prefix" "$cmd"
     [ -n "$LOG_FILE" ] && echo ">>> $prefix $cmd" >> "$LOG_FILE" || :
+}
+
+log_detail() {
+    [ -n "$LOG_FILE" ] && printf "%s\n" "$1" >> "$LOG_FILE" || :
 }
 
 shell_join() {
@@ -207,13 +229,42 @@ run_mutating_command() {
     "$@"
 }
 
+handle_error() {
+    local exit_code="$1"
+    local failing_command="$2"
+    local line_no="$3"
+
+    if [[ "$ERROR_TRAP_ACTIVE" == "1" ]]; then
+        return "$exit_code"
+    fi
+
+    ERROR_TRAP_ACTIVE=1
+    log_error "Command failed at line ${line_no}: ${failing_command}"
+    if [[ -n "$CURRENT_PROGRESS_TITLE" ]]; then
+        log_error "Failure occurred during step: ${CURRENT_PROGRESS_TITLE}"
+    fi
+    if [[ -n "$LOG_FILE" ]]; then
+        log_error "Review log: ${LOG_FILE}"
+    fi
+    if [[ -n "$STEP_STATE_FILE" ]]; then
+        record_state_value "status" "ERROR"
+        record_state_value "failed_line" "$line_no"
+        record_state_value "failed_command" "$failing_command"
+    fi
+    ERROR_TRAP_ACTIVE=0
+    return "$exit_code"
+}
+
 # Initialize log file
 init_log() {
     local script_name="$1"
     local log_dir="${NFS_SHARE}/logs"
+    local state_dir="${NFS_SHARE}/state"
 
     mkdir -p "$log_dir" 2>/dev/null
+    mkdir -p "$state_dir" 2>/dev/null
     LOG_FILE="${log_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').log"
+    STEP_STATE_FILE="${state_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').state"
 
     echo "============================================================" > "$LOG_FILE"
     echo "Log started: $(date)" >> "$LOG_FILE"
@@ -221,7 +272,56 @@ init_log() {
     echo "Hostname: $(hostname)" >> "$LOG_FILE"
     echo "============================================================" >> "$LOG_FILE"
 
+    cat > "$STEP_STATE_FILE" <<EOF
+script_name=$(printf '%q' "$script_name")
+hostname=$(printf '%q' "$(hostname)")
+status=RUNNING
+log_file=$(printf '%q' "$LOG_FILE")
+check_only=$(printf '%q' "$CHECK_ONLY")
+EOF
+
     log_info "Log file initialized: $LOG_FILE"
+    log_info "State file initialized: $STEP_STATE_FILE"
+}
+
+record_state_value() {
+    local key="$1"
+    local value="$2"
+    local temp_file
+
+    [[ -z "$STEP_STATE_FILE" ]] && return 0
+
+    temp_file="${STEP_STATE_FILE}.tmp.$$"
+    if [[ -f "$STEP_STATE_FILE" ]]; then
+        grep -v "^${key}=" "$STEP_STATE_FILE" > "$temp_file" || true
+    else
+        : > "$temp_file"
+    fi
+    printf '%s=%q\n' "$key" "$value" >> "$temp_file"
+    mv "$temp_file" "$STEP_STATE_FILE"
+}
+
+append_state_value() {
+    local key="$1"
+    local value="$2"
+
+    [[ -z "$STEP_STATE_FILE" ]] && return 0
+    printf '%s=%q\n' "$key" "$value" >> "$STEP_STATE_FILE"
+}
+
+record_artifact() {
+    append_state_value "artifact" "$1"
+}
+
+record_next_step() {
+    record_state_value "next_step" "$1"
+}
+
+finish_check_mode() {
+    local message="$1"
+    record_state_value "status" "CHECK_ONLY"
+    print_summary "SUCCESS" "$message"
+    exit 0
 }
 
 # ============================================================
@@ -266,6 +366,28 @@ check_oracle_env() {
     log_info "ORACLE_SID: $ORACLE_SID"
     log_info "ORACLE_BASE: ${ORACLE_BASE:-not set}"
 
+    return 0
+}
+
+check_oracle_client_env() {
+    log_info "Checking Oracle client environment..."
+
+    if [[ -z "$ORACLE_HOME" ]]; then
+        log_error "ORACLE_HOME is not set"
+        return 1
+    fi
+
+    if [[ ! -d "$ORACLE_HOME" ]]; then
+        log_error "ORACLE_HOME directory does not exist: $ORACLE_HOME"
+        return 1
+    fi
+
+    if [[ ! -x "$ORACLE_HOME/bin/dgmgrl" ]]; then
+        log_error "dgmgrl not found or not executable: $ORACLE_HOME/bin/dgmgrl"
+        return 1
+    fi
+
+    log_info "ORACLE_HOME: $ORACLE_HOME"
     return 0
 }
 
@@ -565,6 +687,20 @@ backup_file() {
         local backup="${file}.bak.$(date '+%Y%m%d_%H%M%S')"
         run_mutating_command "Create backup file" cp "$file" "$backup" || return 1
         log_info "Backed up $file to $backup"
+        record_artifact "backup:${backup}"
+    fi
+}
+
+backup_directory() {
+    local dir="$1"
+    local backup
+
+    if [[ -d "$dir" ]]; then
+        backup="${dir}.bak.$(date '+%Y%m%d_%H%M%S')"
+        run_mutating_command "Create backup directory" mv "$dir" "$backup" || return 1
+        log_info "Backed up $dir to $backup"
+        record_artifact "backup:${backup}"
+        printf '%s\n' "$backup"
     fi
 }
 
@@ -600,6 +736,45 @@ tnsping_test() {
         log_error "tnsping $tns_alias failed"
         return 1
     fi
+}
+
+listener_has_global_dbname() {
+    local listener_file="$1"
+    local global_dbname="$2"
+
+    awk -v target="$global_dbname" '
+    {
+        line = $0
+        gsub(/[[:space:]]+/, "", line)
+        if (index(line, "GLOBAL_DBNAME=" target) > 0) {
+            found = 1
+        }
+    }
+    END {
+        exit(found ? 0 : 1)
+    }
+    ' "$listener_file"
+}
+
+write_sid_desc_entries() {
+    local output_file="$1"
+    shift
+    local sid_name="$1"
+    shift
+    local oracle_home="$1"
+    shift
+    local global_name
+
+    : > "$output_file"
+    for global_name in "$@"; do
+        cat >> "$output_file" <<EOF
+    (SID_DESC =
+      (GLOBAL_DBNAME = ${global_name})
+      (ORACLE_HOME = ${oracle_home})
+      (SID_NAME = ${sid_name})
+    )
+EOF
+    done
 }
 
 # ============================================================
@@ -805,6 +980,24 @@ confirm_proceed() {
     esac
 }
 
+confirm_typed_value() {
+    local message="$1"
+    local expected_value="$2"
+    local response
+
+    echo ""
+    printf "${YELLOW}%s${NC}\n" "$message"
+    printf "Type '%s' to continue: " "$expected_value"
+    read response
+
+    if [[ "$response" == "$expected_value" ]]; then
+        return 0
+    fi
+
+    log_warn "Confirmation text did not match. Expected '${expected_value}'."
+    return 1
+}
+
 # ============================================================
 # Display Functions
 # ============================================================
@@ -819,9 +1012,12 @@ init_progress() {
 
 progress_step() {
     local title="$1"
+    CURRENT_PROGRESS_TITLE="$title"
+    record_state_value "current_step" "$title"
 
     if [[ "$TOTAL_PROGRESS_STEPS" -gt 0 ]]; then
         CURRENT_PROGRESS_STEP=$((CURRENT_PROGRESS_STEP + 1))
+        record_state_value "progress" "${CURRENT_PROGRESS_STEP}/${TOTAL_PROGRESS_STEPS}"
         log_section "[$CURRENT_PROGRESS_STEP/$TOTAL_PROGRESS_STEPS] $title"
     else
         log_section "$title"
@@ -902,6 +1098,9 @@ print_banner() {
 print_summary() {
     local status="$1"
     local message="$2"
+
+    record_state_value "status" "$status"
+    record_state_value "summary" "$message"
 
     echo ""
     printf "${BLUE}============================================================${NC}\n"

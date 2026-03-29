@@ -106,17 +106,22 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 All workflow scripts that use `common/dg_functions.sh` support:
 
 ```bash
+./standby/03_setup_standby_env.sh --check
 ./primary/06_configure_broker.sh --verbose
 ./standby/05_clone_standby.sh --approval-mode
 APPROVAL_MODE=1 VERBOSE=1 ./primary/09_configure_fsfo.sh
 ```
 
+- `--check` or `--plan`
+  Runs a preflight-only pass for steps 3-9 and exits before making changes.
 - `--verbose`
   Prints exact shell command tracing.
 - `--approval-mode`
   Pauses before mutating actions and shows an approval block with action, impact, log file, and command preview.
 - `--suspicious`
   Backward-compatible alias for `--approval-mode`.
+
+Each workflow step writes a state file under `${NFS_SHARE}/state/` that records the current step, final status, generated artifacts, and next-step hint.
 
 ---
 
@@ -214,6 +219,7 @@ lsnrctl status
 
 **Prompts:**
 - SYS password (used for RMAN connection, not stored)
+- Type the standby `DB_UNIQUE_NAME` before the RMAN duplicate begins
 - If `--approval-mode` is enabled, approval before RMAN duplicate and other mutating actions
 
 **Duration:** Depends on database size (can take hours for large databases)

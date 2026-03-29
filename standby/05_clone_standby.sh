@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 5: Clone Standby Database"
-init_progress 8
+init_progress 9
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "05_clone_standby"
@@ -90,6 +90,39 @@ if ! "$ORACLE_HOME/bin/lsnrctl" status 2>&1 | grep -q "$STANDBY_DB_UNIQUE_NAME";
 fi
 
 log_info "Listener is running with static registration"
+
+# ============================================================
+# Review Planned Changes
+# ============================================================
+
+progress_step "Reviewing Planned Changes"
+
+print_list_block "This Step Will Change" \
+    "Shut down any existing standby instance for ${STANDBY_ORACLE_SID} before restarting it in NOMOUNT." \
+    "Run RMAN DUPLICATE FROM ACTIVE DATABASE against ${PRIMARY_TNS_ALIAS} -> ${STANDBY_TNS_ALIAS}." \
+    "Create or verify the SPFILE and start managed recovery."
+
+print_list_block "This Step Will Not Change" \
+    "It will not create the broker configuration." \
+    "It will not modify the primary host files." \
+    "It will not remove old standby files for you if a reset is required."
+
+print_list_block "Files and Commands" \
+    "PFILE: ${PFILE}" \
+    "Password file: ${PWD_FILE}" \
+    "RMAN script: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.rcv" \
+    "RMAN log: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.log"
+
+print_list_block "Recovery If This Step Fails" \
+    "This step is not directly restartable once RMAN duplicate starts." \
+    "To reset: shut down the standby instance, remove standby datafiles/controlfiles/redo logs, then re-run this step." \
+    "Review the RMAN log first to confirm whether cleanup is actually required."
+
+record_next_step "./primary/06_configure_broker.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Standby clone preflight complete. No instance or RMAN changes were applied."
+fi
 
 # ============================================================
 # Test TNS Connectivity
@@ -178,6 +211,11 @@ echo "Watch the RMAN output below for channel allocation, restore, and recovery 
 echo "================================================================"
 echo ""
 
+if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for ${STANDBY_DB_UNIQUE_NAME}." "${STANDBY_DB_UNIQUE_NAME}"; then
+    log_info "RMAN duplicate cancelled by user"
+    exit 0
+fi
+
 # Create RMAN script
 RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
 
@@ -215,12 +253,11 @@ ${FRA_SETTINGS}
 EOF
 
 log_info "RMAN script created: $RMAN_SCRIPT"
-echo ""
-echo "RMAN Script Contents:"
-echo "---------------------"
-cat "$RMAN_SCRIPT"
-echo "---------------------"
-echo ""
+log_detail "RMAN script contents:"
+while IFS= read -r line; do
+    log_detail "  $line"
+done < "$RMAN_SCRIPT"
+record_artifact "rman_script:${RMAN_SCRIPT}"
 
 # Execute RMAN
 RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').log"
@@ -255,6 +292,7 @@ if [[ $RMAN_EXIT_CODE -ne 0 ]]; then
 fi
 
 log_success "RMAN duplicate completed successfully"
+record_artifact "rman_log:${RMAN_LOG}"
 
 # ============================================================
 # Create SPFILE and Restart
@@ -278,6 +316,7 @@ else
     log_cmd "sqlplus / as sysdba:" "CREATE SPFILE FROM PFILE='${PFILE}'"
     run_sql_command "create_spfile.sql" "$PFILE"
 fi
+record_artifact "spfile:${SPFILE}"
 
 # ============================================================
 # Start Managed Recovery

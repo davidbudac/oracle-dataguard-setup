@@ -55,8 +55,8 @@ get_config() {
 
     source "$STANDBY_CONFIG_FILE"
 
-    # Set wallet directory (can be overridden by environment variable)
-    WALLET_DIR="${WALLET_DIR:-${ORACLE_HOME}/network/admin/wallet}"
+    # Set wallet directory (env override, then config, then ORACLE_HOME default)
+    WALLET_DIR="${WALLET_DIR:-${OBSERVER_WALLET_DIR:-${ORACLE_HOME}/network/admin/wallet}}"
 
     # Set PID and log file paths
     PID_FILE="${NFS_SHARE}/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.pid"
@@ -80,21 +80,17 @@ is_observer_running() {
     return 1
 }
 
+require_observer_tools() {
+    check_oracle_client_env || exit 1
+    export PATH="$ORACLE_HOME/bin:$PATH"
+}
+
 do_setup() {
     print_banner "Observer Wallet Setup"
 
     log_section "Pre-flight Checks"
 
-    # Check ORACLE_HOME
-    if [[ -z "$ORACLE_HOME" ]]; then
-        log_error "ORACLE_HOME is not set"
-        exit 1
-    fi
-
-    if [[ ! -d "$ORACLE_HOME" ]]; then
-        log_error "ORACLE_HOME directory does not exist: $ORACLE_HOME"
-        exit 1
-    fi
+    require_observer_tools
 
     # Check mkstore exists
     if [[ ! -x "$ORACLE_HOME/bin/mkstore" ]]; then
@@ -136,8 +132,13 @@ do_setup() {
                 fi
             fi
         else
-            log_info "Removing existing wallet..."
-            rm -rf "$WALLET_DIR"
+            if ! confirm_typed_value "This will replace the existing wallet at ${WALLET_DIR}." "RECREATE WALLET"; then
+                log_info "Wallet recreation cancelled by user"
+                exit 0
+            fi
+            log_info "Backing up existing wallet before recreation..."
+            WALLET_BACKUP=$(backup_directory "$WALLET_DIR") || exit 1
+            log_info "Wallet backup created at: $WALLET_BACKUP"
         fi
     fi
 
@@ -343,6 +344,7 @@ test_wallet_connection() {
 }
 
 do_start() {
+    require_observer_tools
     log_info "Starting FSFO observer..."
 
     # Check if already running
@@ -418,6 +420,7 @@ do_start() {
 }
 
 do_stop() {
+    require_observer_tools
     log_info "Stopping FSFO observer..."
 
     if ! is_observer_running; then
@@ -470,6 +473,7 @@ do_stop() {
 }
 
 do_status() {
+    require_observer_tools
     echo ""
     echo "FSFO Observer Status"
     echo "===================="
@@ -517,7 +521,11 @@ do_status() {
     # Get observer info from V$DATABASE (if local)
     echo "Database Observer Info"
     echo "----------------------"
-    FSFO_INFO=$(run_sql_query "get_fsfo_status.sql" 2>/dev/null || true)
+    if [[ -n "$ORACLE_SID" && -x "$ORACLE_HOME/bin/sqlplus" ]]; then
+        FSFO_INFO=$(run_sql_query "get_fsfo_status.sql" 2>/dev/null || true)
+    else
+        FSFO_INFO=""
+    fi
 
     if [[ -n "$FSFO_INFO" ]]; then
         echo "$FSFO_INFO" | while IFS='|' read -r status present host; do
@@ -549,7 +557,6 @@ fi
 COMMAND="$1"
 
 # Basic environment checks
-check_oracle_env || exit 1
 check_nfs_mount || exit 1
 
 # Load configuration

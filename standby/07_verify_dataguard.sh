@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 7: Verify Data Guard"
-init_progress 8
+init_progress 9
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "07_verify_dataguard"
@@ -53,6 +53,34 @@ export PATH="$ORACLE_HOME/bin:$PATH"
 
 check_oracle_env || exit 1
 check_db_connection || exit 1
+
+# ============================================================
+# Review Verification Scope
+# ============================================================
+
+progress_step "Reviewing Verification Scope"
+
+print_list_block "This Step Will Check" \
+    "Database role, open mode, and protection mode." \
+    "Managed recovery process, archive gaps, apply lag, and archive destination errors." \
+    "Broker configuration and network reachability to ${PRIMARY_TNS_ALIAS}." \
+    "Key Data Guard parameters and standby redo log configuration."
+
+print_list_block "This Step Will Not Change" \
+    "It does not modify Broker or database parameters." \
+    "It does not restart services or the database." \
+    "It does not enable FSFO or security hardening."
+
+print_list_block "Credentials and Outputs" \
+    "SYS password is only used for optional DGMGRL network validation." \
+    "Verification output is written to ${LOG_FILE}." \
+    "The script exits non-zero only when hard errors are found."
+
+record_next_step "./primary/08_security_hardening.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Verification preflight complete. No validation queries were executed."
+fi
 
 # ============================================================
 # Prompt for SYS Password (needed for DGMGRL network validation)

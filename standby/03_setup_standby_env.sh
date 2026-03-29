@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 3: Setup Standby Environment"
-init_progress 8
+init_progress 9
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "03_setup_standby_env"
@@ -127,6 +127,42 @@ fi
 check_oracle_env || exit 1
 
 # ============================================================
+# Review Planned Changes
+# ============================================================
+
+progress_step "Reviewing Planned Changes"
+
+print_list_block "This Step Will Change" \
+    "Create any missing standby directories under ${STANDBY_DATA_PATH}, ${STANDBY_REDO_PATH}, and ${STANDBY_ADMIN_DIR}." \
+    "Install the standby password file at ${ORACLE_HOME}/dbs/orapw${STANDBY_ORACLE_SID}." \
+    "Install the standby pfile at ${ORACLE_HOME}/dbs/init${STANDBY_ORACLE_SID}.ora." \
+    "Update ${ORACLE_HOME}/network/admin/listener.ora and ${ORACLE_HOME}/network/admin/tnsnames.ora." \
+    "Append ${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N to /etc/oratab when missing."
+
+print_list_block "This Step Will Not Change" \
+    "It will not run RMAN DUPLICATE." \
+    "It will not start or stop the database instance." \
+    "It will not configure Data Guard Broker."
+
+print_list_block "Files and Paths" \
+    "Config source: ${STANDBY_CONFIG_FILE}" \
+    "Password file source: ${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}" \
+    "Pfile source: ${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora" \
+    "Listener file: ${ORACLE_HOME}/network/admin/listener.ora" \
+    "TNS file: ${ORACLE_HOME}/network/admin/tnsnames.ora"
+
+print_list_block "Recovery If This Step Fails" \
+    "Restore any .bak timestamped files created for listener.ora, tnsnames.ora, or the dbs files." \
+    "Remove any directories created for the standby if you need to reset the host." \
+    "Re-run this step after correcting the reported problem."
+
+record_next_step "./primary/04_prepare_primary_dg.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Standby environment preflight complete. No changes were applied."
+fi
+
+# ============================================================
 # Create Directory Structure
 # ============================================================
 
@@ -185,6 +221,7 @@ for dir in "${DIRS_TO_CREATE[@]}"; do
 done
 
 log_success "Directory structure created successfully"
+record_artifact "directory_tree:${STANDBY_ADMIN_DIR}"
 
 # ============================================================
 # Copy Password File
@@ -210,6 +247,7 @@ confirm_approval_action "Install standby password file" "cp $SOURCE_PWD_FILE $DE
 cp "$SOURCE_PWD_FILE" "$DEST_PWD_FILE"
 chmod 640 "$DEST_PWD_FILE"
 log_success "Password file copied to: $DEST_PWD_FILE"
+record_artifact "password_file:${DEST_PWD_FILE}"
 
 # ============================================================
 # Copy Standby Init File
@@ -235,6 +273,7 @@ confirm_approval_action "Install standby parameter file" "cp $SOURCE_PFILE $DEST
 cp "$SOURCE_PFILE" "$DEST_PFILE"
 chmod 640 "$DEST_PFILE"
 log_success "Parameter file copied to: $DEST_PFILE"
+record_artifact "pfile:${DEST_PFILE}"
 
 # ============================================================
 # Configure Listener
@@ -250,47 +289,40 @@ if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
     exit 1
 fi
 
-# New SID_DESC entries to add - write to temp file for AIX compatibility
-# Includes _DGMGRL service for Data Guard Broker switchover
-# AIX compatible: use $$ (PID) instead of mktemp
+# Static services required for RMAN duplicate and broker switchover
 TEMP_SID_DESC="/tmp/dg_sid_desc_standby_$$.tmp"
-cat > "$TEMP_SID_DESC" <<EOF
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
-EOF
+STANDBY_STATIC_GLOBAL_NAME="${STANDBY_DB_UNIQUE_NAME}${DB_DOMAIN:+.${DB_DOMAIN}}"
+STANDBY_DGMGRL_GLOBAL_NAME="${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+MISSING_GLOBAL_NAMES=()
 
 # Check if listener.ora exists
 if [[ -f "$LISTENER_ORA" ]]; then
     backup_file "$LISTENER_ORA"
 
-    # Check if SID_LIST already contains our entry
-    if grep -q "SID_NAME.*=.*${STANDBY_ORACLE_SID}[^A-Za-z0-9_]" "$LISTENER_ORA" || \
-       grep -q "SID_NAME.*=.*${STANDBY_ORACLE_SID}$" "$LISTENER_ORA"; then
-        log_warn "Listener entry for $STANDBY_ORACLE_SID already exists"
-        log_info "Skipping listener configuration"
+    if ! listener_has_global_dbname "$LISTENER_ORA" "$STANDBY_STATIC_GLOBAL_NAME"; then
+        MISSING_GLOBAL_NAMES+=("$STANDBY_STATIC_GLOBAL_NAME")
+    fi
+    if ! listener_has_global_dbname "$LISTENER_ORA" "$STANDBY_DGMGRL_GLOBAL_NAME"; then
+        MISSING_GLOBAL_NAMES+=("$STANDBY_DGMGRL_GLOBAL_NAME")
+    fi
+
+    if [[ ${#MISSING_GLOBAL_NAMES[@]} -eq 0 ]]; then
+        log_info "Required standby static listener entries already exist"
     elif grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
-        # Use the add_sid_to_listener function from dg_functions.sh
-        log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
+        write_sid_desc_entries "$TEMP_SID_DESC" "$STANDBY_ORACLE_SID" "$ORACLE_HOME" "${MISSING_GLOBAL_NAMES[@]}"
+        log_info "SID_LIST_LISTENER exists - adding missing static registration entries"
         confirm_approval_action "Update standby listener.ora" "Insert standby SID_DESC entries into $LISTENER_ORA" || exit 1
         if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
-            log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
+            log_info "Missing SID_DESC entries added to existing SID_LIST_LISTENER"
         else
-            log_warn "Could not auto-insert SID_DESC entry"
+            log_warn "Could not auto-insert the standby static registration entries"
             log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
             echo ""
             cat "$TEMP_SID_DESC"
             echo ""
         fi
     else
-        # Append new SID_LIST_LISTENER section
+        write_sid_desc_entries "$TEMP_SID_DESC" "$STANDBY_ORACLE_SID" "$ORACLE_HOME" "${MISSING_GLOBAL_NAMES[@]}"
         log_info "Adding SID_LIST_LISTENER to listener.ora"
         confirm_approval_action "Append standby SID_LIST_LISTENER to listener.ora" "append Data Guard standby listener block to $LISTENER_ORA" || exit 1
         cat >> "$LISTENER_ORA" <<EOF
@@ -299,16 +331,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
 # Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
+$(cat "$TEMP_SID_DESC")
   )
 EOF
         log_info "Listener entry added successfully"
@@ -317,6 +340,7 @@ else
     # Create new listener.ora
     log_info "Creating new listener.ora"
     confirm_approval_action "Create standby listener.ora" "write $LISTENER_ORA" || exit 1
+    write_sid_desc_entries "$TEMP_SID_DESC" "$STANDBY_ORACLE_SID" "$ORACLE_HOME" "$STANDBY_STATIC_GLOBAL_NAME" "$STANDBY_DGMGRL_GLOBAL_NAME"
     cat > "$LISTENER_ORA" <<EOF
 # Listener configuration for Data Guard standby
 # Created: $(date)
@@ -331,22 +355,14 @@ LISTENER =
 # Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${STANDBY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${STANDBY_ORACLE_SID})
-    )
+$(cat "$TEMP_SID_DESC")
   )
 EOF
     log_info "listener.ora created successfully"
 fi
 
 rm -f "$TEMP_SID_DESC"
+record_artifact "listener:${LISTENER_ORA}"
 
 # ============================================================
 # Configure TNS Names
@@ -389,6 +405,7 @@ else
     cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
     log_info "tnsnames.ora created successfully"
 fi
+record_artifact "tnsnames:${TNSNAMES_ORA}"
 
 # ============================================================
 # Update oratab

@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 4: Prepare Primary for DG"
-init_progress 6
+init_progress 7
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "04_prepare_primary_dg"
@@ -47,6 +47,41 @@ source "$STANDBY_CONFIG_FILE"
 
 # Reinitialize log with standby DB name
 init_log "04_prepare_primary_dg_${STANDBY_DB_UNIQUE_NAME}"
+
+# ============================================================
+# Review Planned Changes
+# ============================================================
+
+progress_step "Reviewing Planned Changes"
+
+print_list_block "This Step Will Change" \
+    "Update ${ORACLE_HOME}/network/admin/tnsnames.ora with the standby aliases if missing." \
+    "Update ${ORACLE_HOME}/network/admin/listener.ora with static registration for primary and broker access." \
+    "Enable FORCE LOGGING if required." \
+    "Create missing standby redo log groups on the primary." \
+    "Enable DG_BROKER_START and set STANDBY_FILE_MANAGEMENT=AUTO."
+
+print_list_block "This Step Will Not Change" \
+    "It will not run RMAN DUPLICATE." \
+    "It will not create the broker configuration." \
+    "It will not perform switchover or failover."
+
+print_list_block "Files and Objects" \
+    "Standby config: ${STANDBY_CONFIG_FILE}" \
+    "Listener file: ${ORACLE_HOME}/network/admin/listener.ora" \
+    "TNS file: ${ORACLE_HOME}/network/admin/tnsnames.ora" \
+    "Database changes: FORCE LOGGING, standby redo logs, DG_BROKER_START, STANDBY_FILE_MANAGEMENT"
+
+print_list_block "Recovery If This Step Fails" \
+    "Restore any .bak timestamped listener.ora or tnsnames.ora files if needed." \
+    "Drop any standby redo log groups created in error and re-run the step." \
+    "Disable DG_BROKER_START or remove redo groups manually only if the failure requires rollback."
+
+record_next_step "./standby/05_clone_standby.sh"
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Primary Data Guard preflight complete. No changes were applied."
+fi
 
 # ============================================================
 # Configure TNS Names on Primary
@@ -95,38 +130,30 @@ progress_step "Configuring Listener on Primary"
 LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
 LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${PRIMARY_DB_UNIQUE_NAME}.ora"
 
-# New SID_DESC entries to add - write to temp file for AIX compatibility
-# Includes _DGMGRL service for Data Guard Broker switchover
-# AIX compatible: use $$ (PID) instead of mktemp
 TEMP_SID_DESC="/tmp/dg_sid_desc_primary_$$.tmp"
-cat > "$TEMP_SID_DESC" <<EOF
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-EOF
+PRIMARY_STATIC_GLOBAL_NAME="${PRIMARY_DB_UNIQUE_NAME}${DB_DOMAIN:+.${DB_DOMAIN}}"
+PRIMARY_DGMGRL_GLOBAL_NAME="${PRIMARY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+MISSING_GLOBAL_NAMES=()
 
 # Check if listener.ora exists
 if [[ -f "$LISTENER_ORA" ]]; then
     backup_file "$LISTENER_ORA"
 
-    # Check if SID_LIST already contains our entry
-    if grep -q "SID_NAME.*=.*${PRIMARY_ORACLE_SID}[^A-Za-z0-9_]" "$LISTENER_ORA" || \
-       grep -q "SID_NAME.*=.*${PRIMARY_ORACLE_SID}$" "$LISTENER_ORA"; then
-        log_info "Listener entry for $PRIMARY_ORACLE_SID already exists"
-        log_info "Skipping listener configuration"
+    if ! listener_has_global_dbname "$LISTENER_ORA" "$PRIMARY_STATIC_GLOBAL_NAME"; then
+        MISSING_GLOBAL_NAMES+=("$PRIMARY_STATIC_GLOBAL_NAME")
+    fi
+    if ! listener_has_global_dbname "$LISTENER_ORA" "$PRIMARY_DGMGRL_GLOBAL_NAME"; then
+        MISSING_GLOBAL_NAMES+=("$PRIMARY_DGMGRL_GLOBAL_NAME")
+    fi
+
+    if [[ ${#MISSING_GLOBAL_NAMES[@]} -eq 0 ]]; then
+        log_info "Required primary static listener entries already exist"
     elif grep -q "SID_LIST_LISTENER" "$LISTENER_ORA"; then
-        # Use the add_sid_to_listener function from dg_functions.sh
-        log_info "SID_LIST_LISTENER exists - adding new SID_DESC entry"
+        write_sid_desc_entries "$TEMP_SID_DESC" "$PRIMARY_ORACLE_SID" "$ORACLE_HOME" "${MISSING_GLOBAL_NAMES[@]}"
+        log_info "SID_LIST_LISTENER exists - adding missing primary static registration entries"
         confirm_approval_action "Update primary listener.ora" "Insert primary SID_DESC entries into $LISTENER_ORA" || exit 1
         if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
-            log_info "SID_DESC entry added to existing SID_LIST_LISTENER"
+            log_info "Missing SID_DESC entries added to existing SID_LIST_LISTENER"
         else
             log_warn "Could not auto-insert SID_DESC entry"
             log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
@@ -135,7 +162,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
             echo ""
         fi
     else
-        # Append new SID_LIST_LISTENER section
+        write_sid_desc_entries "$TEMP_SID_DESC" "$PRIMARY_ORACLE_SID" "$ORACLE_HOME" "${MISSING_GLOBAL_NAMES[@]}"
         log_info "Adding SID_LIST_LISTENER to listener.ora"
         confirm_approval_action "Append primary SID_LIST_LISTENER to listener.ora" "append Data Guard primary listener block to $LISTENER_ORA" || exit 1
         cat >> "$LISTENER_ORA" <<EOF
@@ -144,16 +171,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
 # Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
+$(cat "$TEMP_SID_DESC")
   )
 EOF
         log_info "Listener entry added successfully"
@@ -162,6 +180,7 @@ else
     # Create new listener.ora
     log_info "Creating new listener.ora"
     confirm_approval_action "Create primary listener.ora" "write $LISTENER_ORA" || exit 1
+    write_sid_desc_entries "$TEMP_SID_DESC" "$PRIMARY_ORACLE_SID" "$ORACLE_HOME" "$PRIMARY_STATIC_GLOBAL_NAME" "$PRIMARY_DGMGRL_GLOBAL_NAME"
     cat > "$LISTENER_ORA" <<EOF
 # Listener configuration for Data Guard primary
 # Created: $(date)
@@ -176,22 +195,14 @@ LISTENER =
 # Includes _DGMGRL service for Data Guard Broker switchover
 SID_LIST_LISTENER =
   (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME})
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_DB_UNIQUE_NAME}_DGMGRL)
-      (ORACLE_HOME = ${ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
+$(cat "$TEMP_SID_DESC")
   )
 EOF
     log_info "listener.ora created successfully"
 fi
 
 rm -f "$TEMP_SID_DESC"
+record_artifact "listener:${LISTENER_ORA}"
 
 log_info "Listener configuration updated (changes will take effect on next listener reload)"
 log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl reload"
@@ -243,8 +254,12 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     # Calculate how many to create
     GROUPS_TO_CREATE=$((REQUIRED_STBY_GROUPS - CURRENT_STBY_GROUPS))
 
-    # Standby redo log groups start at group 11
-    STANDBY_REDO_START_GROUP=11
+    if [[ -z "$MAX_GROUP" || "$MAX_GROUP" -lt 0 ]]; then
+        log_error "Could not determine the current maximum redo group number"
+        exit 1
+    fi
+
+    STANDBY_REDO_START_GROUP=$((MAX_GROUP + 1))
 
     log_info "Creating $GROUPS_TO_CREATE standby redo log groups starting at group $STANDBY_REDO_START_GROUP..."
 
@@ -257,6 +272,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
 
         run_sql_command "add_standby_logfile.sql" "$NEW_GROUP" "$STBY_LOG_FILE" "$REDO_LOG_SIZE_MB"
+        record_artifact "standby_redo_group:${NEW_GROUP}:${STBY_LOG_FILE}"
         i=$((i + 1))
     done
 
@@ -310,6 +326,7 @@ run_sql_command "set_standby_file_mgmt.sql"
 
 log_success "Data Guard Broker enabled successfully"
 log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
+record_artifact "tnsnames:${TNSNAMES_ORA}"
 
 # ============================================================
 # Configure RMAN Archivelog Deletion Policy
