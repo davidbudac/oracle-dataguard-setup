@@ -454,17 +454,21 @@ SQLEOF
         # Remove wallet (observer)
         rm -rf '${ORACLE_HOME}/network/admin/wallet' 2>/dev/null || true
 
-        # Restore listener.ora and tnsnames.ora from earliest backup
-        for f in listener.ora tnsnames.ora sqlnet.ora; do
-            earliest_bak=\$(ls -t '${ORACLE_HOME}/network/admin/\${f}.bak.'* 2>/dev/null | tail -1)
-            if [[ -n \"\${earliest_bak}\" ]]; then
-                cp \"\${earliest_bak}\" '${ORACLE_HOME}/network/admin/'\${f}
+        # Remove DG TNS entries (everything after the marker comment) from tnsnames.ora
+        for f in tnsnames.ora listener.ora; do
+            local_f='${ORACLE_HOME}/network/admin/'\${f}
+            if [[ -f \"\${local_f}\" ]]; then
+                sed -i '/^# Data Guard TNS entries/,\$d' \"\${local_f}\" 2>/dev/null || true
+                sed -i '/^# DG Listener/,\$d' \"\${local_f}\" 2>/dev/null || true
             fi
         done
 
+        # Remove SID entries added by DG scripts from listener.ora
+        # (remove any SID_DESC blocks for our test SID)
+        sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
+
         # Remove oratab entry
         if [[ -f /etc/oratab ]]; then
-            cp /etc/oratab /etc/oratab.bak.e2e_restore 2>/dev/null || true
             grep -v '^${TEST_ORACLE_SID}:' /etc/oratab > /tmp/oratab_clean 2>/dev/null || true
             cp /tmp/oratab_clean /etc/oratab 2>/dev/null || true
             rm -f /tmp/oratab_clean
@@ -523,13 +527,15 @@ SQLEOF
         rm -f '${ORACLE_HOME}/dbs/dr1*.dat' 2>/dev/null || true
         rm -f '${ORACLE_HOME}/dbs/dr2*.dat' 2>/dev/null || true
 
-        # Restore listener.ora and tnsnames.ora from earliest backup
-        for f in listener.ora tnsnames.ora; do
-            earliest_bak=\$(ls -t '${ORACLE_HOME}/network/admin/\${f}.bak.'* 2>/dev/null | tail -1)
-            if [[ -n \"\${earliest_bak}\" ]]; then
-                cp \"\${earliest_bak}\" '${ORACLE_HOME}/network/admin/'\${f}
+        # Remove DG TNS entries from tnsnames.ora and listener.ora
+        for f in tnsnames.ora listener.ora; do
+            local_f='${ORACLE_HOME}/network/admin/'\${f}
+            if [[ -f \"\${local_f}\" ]]; then
+                sed -i '/^# Data Guard TNS entries/,\$d' \"\${local_f}\" 2>/dev/null || true
+                sed -i '/^# DG Listener/,\$d' \"\${local_f}\" 2>/dev/null || true
             fi
         done
+        sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
 
         # Remove oratab entry
         if [[ -f /etc/oratab ]]; then
