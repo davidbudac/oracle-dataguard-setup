@@ -723,7 +723,7 @@ phase_step1() {
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "DB_UNIQUE_NAME in primary info" || return 1
 
-    assert_remote_grep "PRIMARY" "ARCHIVELOG_MODE=.ARCHIVELOG" \
+    assert_remote_grep "PRIMARY" "LOG_MODE=.*ARCHIVELOG" \
         "${NFS_SHARE}/primary_info_${TEST_DB_UNIQUE_NAME}.env" \
         "ARCHIVELOG mode recorded" || return 1
 
