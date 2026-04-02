@@ -1,0 +1,642 @@
+#!/usr/bin/env bash
+# =============================================================================
+# Oracle Data Guard - Local Status Check
+# =============================================================================
+#
+# Health check that runs directly on a database host (no SSH required).
+# Detects the local database role, queries local V$ views and DGMGRL,
+# then connects to the peer database over SQL*Net for remote checks.
+#
+# Prerequisites:
+#   - ORACLE_HOME and ORACLE_SID set, sqlplus / as sysdba working
+#   - DG Broker running (dg_broker_start = TRUE)
+#   - TNS connectivity to peer database (for remote checks)
+#
+# Remote connection:
+#   The script discovers the peer TNS alias from the broker configuration.
+#   It tries wallet-based auth first (sqlplus /@tns as sysdba), then
+#   prompts for the SYS password. Pass -P to force the password prompt,
+#   or -L to skip remote checks entirely (local + broker only).
+#
+# Usage:
+#   bash dg_check.sh            # Auto-detect role, try wallet for remote
+#   bash dg_check.sh -P         # Prompt for SYS password for remote
+#   bash dg_check.sh -L         # Local + broker only (skip remote SQL)
+#
+# Exit codes:
+#   0   All checks passed (may have warnings)
+#   N   Number of errors detected
+#
+# =============================================================================
+
+set -uo pipefail
+
+# -- Colors & symbols --------------------------------------------------------
+RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
+BLUE='\033[0;34m';   CYAN='\033[0;36m';   BOLD='\033[1m'
+DIM='\033[2m';       NC='\033[0m'
+CHK="${GREEN}OK${NC}"; WARN="${YELLOW}!!${NC}"; FAIL="${RED}XX${NC}"
+
+# -- Parse args ---------------------------------------------------------------
+PROMPT_PASSWORD=false
+LOCAL_ONLY=false
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -P|--password) PROMPT_PASSWORD=true; shift ;;
+        -L|--local)    LOCAL_ONLY=true; shift ;;
+        -h|--help)
+            printf "Usage: bash dg_check.sh [-P] [-L]\n"
+            printf "  -P, --password   Prompt for SYS password for remote connection\n"
+            printf "  -L, --local      Skip remote SQL checks (local + broker only)\n"
+            exit 0 ;;
+        *) printf "Unknown option: %s\n" "$1"; exit 1 ;;
+    esac
+done
+
+# -- Verify Oracle environment ------------------------------------------------
+if [[ -z "${ORACLE_SID:-}" ]]; then
+    printf "ERROR: ORACLE_SID is not set\n"
+    exit 1
+fi
+if [[ -z "${ORACLE_HOME:-}" ]]; then
+    printf "ERROR: ORACLE_HOME is not set\n"
+    exit 1
+fi
+export PATH="${ORACLE_HOME}/bin:${PATH}"
+
+# -- Helpers ------------------------------------------------------------------
+row() {
+    local label="$1" value="$2" status="${3:-}"
+    printf "  ${DIM}%-24s${NC} %-36s %b\n" "$label" "$value" "$status"
+}
+
+header() {
+    printf "\n ${BOLD}${BLUE}%-60s${NC}\n" "$1"
+    printf " ${DIM}────────────────────────────────────────────────────────────${NC}\n"
+}
+
+status_icon() {
+    local value="$1"; shift
+    for p in "$@"; do
+        if printf '%s' "$value" | grep -qi "$p"; then
+            printf '%b' "$CHK"; return
+        fi
+    done
+    printf '%b' "$FAIL"
+}
+
+warn_icon() {
+    local value="$1"; shift
+    for p in "$@"; do
+        if printf '%s' "$value" | grep -qi "$p"; then
+            printf '%b' "$CHK"; return
+        fi
+    done
+    printf '%b' "$WARN"
+}
+
+ERRORS=0; WARNINGS=0
+err()  { ERRORS=$((ERRORS+1)); }
+warn() { WARNINGS=$((WARNINGS+1)); }
+
+run_local_sql() {
+    sqlplus -s / as sysdba <<SQL
+SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
+$1
+EXIT;
+SQL
+}
+
+run_remote_sql() {
+    local connect="$1" query="$2"
+    sqlplus -s "${connect}" as sysdba <<SQL
+SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
+${query}
+EXIT;
+SQL
+}
+
+# -- Collect local data -------------------------------------------------------
+LOCAL_SQL=$(run_local_sql "
+SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
+SELECT 'DGPARAMS|' || NAME || '|' || VALUE FROM V\$PARAMETER WHERE NAME IN ('dg_broker_start') ORDER BY NAME;
+SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
+SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
+SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
+SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
+SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
+SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
+SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
+SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+")
+
+# -- Parse local identity -----------------------------------------------------
+LOC_DBSTATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
+LOC_ROLE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
+LOC_OPEN=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
+LOC_PROTECT=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
+LOC_SWITCH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
+LOC_FORCE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
+LOC_FLASH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
+LOC_DBUNIQ=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+
+if printf '%s' "$LOC_ROLE" | grep -qi "PRIMARY"; then
+    IS_PRIMARY=true
+    LOC_LABEL="PRIMARY"
+    PEER_LABEL="STANDBY"
+else
+    IS_PRIMARY=false
+    LOC_LABEL="STANDBY"
+    PEER_LABEL="PRIMARY"
+fi
+
+LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
+LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+LOC_REDO=$(printf '%s\n' "$LOCAL_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
+LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | xargs)
+LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | xargs)
+LOC_SRL=$(printf '%s\n' "$LOCAL_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
+LOC_DEST2_STATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | xargs)
+LOC_DEST2_DBUNIQ=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | xargs)
+LOC_DEST2_ERROR=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $5}' | xargs)
+
+LOC_FRA=$(printf '%s\n' "$LOCAL_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
+LOC_FRA_PATH=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $1}' | xargs)
+LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | xargs)
+LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | xargs)
+LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | xargs)
+LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | xargs)
+
+LOC_MRP=$(printf '%s\n' "$LOCAL_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
+LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | xargs)
+LOC_MRP_SEQ=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $3}' | xargs)
+
+LOC_TRANSPORT_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
+LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
+
+LOC_APPLYINFO=$(printf '%s\n' "$LOCAL_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
+LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
+LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
+
+# -- Collect broker data ------------------------------------------------------
+DGMGRL_CONFIG=$(dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1)
+DGMGRL_FSFO=$(dgmgrl -silent / 'SHOW FAST_START FAILOVER' 2>&1)
+
+BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | xargs)
+BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+
+# Find peer DB unique name from broker config
+# Members lines look like: "  cdb1_stby - Physical standby database"
+if $IS_PRIMARY; then
+    PEER_DBUNIQ=$(printf '%s\n' "$DGMGRL_CONFIG" | grep -i 'Physical standby' | head -1 | awk '{print $1}')
+else
+    PEER_DBUNIQ=$(printf '%s\n' "$DGMGRL_CONFIG" | grep -i 'Primary database' | head -1 | awk '{print $1}')
+fi
+
+# Get peer TNS alias from broker
+PEER_TNS=""
+if [[ -n "${PEER_DBUNIQ:-}" ]]; then
+    PEER_TNS_RAW=$(dgmgrl -silent / "SHOW DATABASE '${PEER_DBUNIQ}' 'DGConnectIdentifier'" 2>&1)
+    PEER_TNS=$(printf '%s\n' "$PEER_TNS_RAW" | grep 'DGConnectIdentifier' | sed "s/.*= *'//" | sed "s/'.*//")
+fi
+
+# Get broker detail for peer database
+DGMGRL_PEER=""
+if [[ -n "${PEER_DBUNIQ:-}" ]]; then
+    DGMGRL_PEER=$(dgmgrl -silent / "SHOW DATABASE '${PEER_DBUNIQ}'" 2>&1)
+fi
+
+# -- Remote connection to peer ------------------------------------------------
+REMOTE_SQL=""
+REMOTE_CONNECTED=false
+
+if [[ "$LOCAL_ONLY" != true ]] && [[ -n "${PEER_TNS:-}" ]]; then
+    # Try wallet-based connection first
+    if [[ "$PROMPT_PASSWORD" != true ]]; then
+        WALLET_TEST=$(sqlplus -s "/@${PEER_TNS}" as sysdba <<'SQL' 2>&1
+SET HEADING OFF FEEDBACK OFF LINESIZE 100 PAGESIZE 0
+SELECT 'WALLET_OK' FROM DUAL;
+EXIT;
+SQL
+)
+        if printf '%s' "$WALLET_TEST" | grep -q 'WALLET_OK'; then
+            REMOTE_CONNECT="/@${PEER_TNS}"
+            REMOTE_CONNECTED=true
+        fi
+    fi
+
+    # Prompt for SYS password if wallet failed or -P was given
+    if [[ "$REMOTE_CONNECTED" != true ]]; then
+        if [[ "$PROMPT_PASSWORD" == true ]] || [[ "$REMOTE_CONNECTED" != true ]]; then
+            printf "\n ${DIM}Peer database: %s (TNS: %s)${NC}\n" "${PEER_DBUNIQ}" "${PEER_TNS}"
+            printf " Enter SYS password for remote connection (or press Enter to skip): "
+            stty -echo 2>/dev/null || true
+            read -r SYS_PASS
+            stty echo 2>/dev/null || true
+            printf "\n"
+
+            if [[ -n "$SYS_PASS" ]]; then
+                REMOTE_CONNECT="sys/${SYS_PASS}@${PEER_TNS}"
+                # Test connection
+                PASS_TEST=$(run_remote_sql "$REMOTE_CONNECT" "SELECT 'PASS_OK' FROM DUAL;" 2>&1)
+                if printf '%s' "$PASS_TEST" | grep -q 'PASS_OK'; then
+                    REMOTE_CONNECTED=true
+                else
+                    printf " ${RED}Remote connection failed${NC} - continuing with local + broker only\n"
+                fi
+            fi
+        fi
+    fi
+
+    # Collect remote data
+    if [[ "$REMOTE_CONNECTED" == true ]]; then
+        REMOTE_SQL=$(run_remote_sql "$REMOTE_CONNECT" "
+SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
+SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
+SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
+SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
+SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
+SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
+SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+" 2>&1)
+    fi
+fi
+
+# -- Parse remote data -------------------------------------------------------
+REM_ROLE=""; REM_OPEN=""; REM_PROTECT=""; REM_SWITCH=""; REM_FORCE=""; REM_FLASH=""; REM_DBUNIQ=""
+REM_REDO_CNT=""; REM_REDO_MB=""; REM_SRL=""; REM_ARCHGAP=""
+REM_FRA_PATH=""; REM_FRA_SIZE=""; REM_FRA_USED=""; REM_FRA_RECLAIM=""; REM_FRA_FILES=""
+REM_MRP_STATUS=""; REM_MRP_SEQ=""
+REM_TRANSPORT_LAG=""; REM_APPLY_LAG=""
+REM_LAST_APPLIED=""; REM_LAST_RECEIVED=""
+
+if [[ -n "$REMOTE_SQL" ]]; then
+    REM_DBSTATUS=$(printf '%s\n' "$REMOTE_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
+    REM_ROLE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
+    REM_OPEN=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
+    REM_PROTECT=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
+    REM_SWITCH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
+    REM_FORCE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
+    REM_FLASH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
+    REM_DBUNIQ=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+
+    REM_REDO=$(printf '%s\n' "$REMOTE_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
+    REM_REDO_CNT=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $1}' | xargs)
+    REM_REDO_MB=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $2}' | xargs)
+    REM_SRL=$(printf '%s\n' "$REMOTE_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
+    REM_ARCHGAP=$(printf '%s\n' "$REMOTE_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+
+    REM_FRA=$(printf '%s\n' "$REMOTE_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
+    REM_FRA_PATH=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $1}' | xargs)
+    REM_FRA_SIZE=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $2}' | xargs)
+    REM_FRA_USED=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $3}' | xargs)
+    REM_FRA_RECLAIM=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $4}' | xargs)
+    REM_FRA_FILES=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $5}' | xargs)
+
+    REM_MRP=$(printf '%s\n' "$REMOTE_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
+    REM_MRP_STATUS=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $2}' | xargs)
+    REM_MRP_SEQ=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $3}' | xargs)
+
+    REM_TRANSPORT_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
+    REM_APPLY_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
+
+    REM_APPLYINFO=$(printf '%s\n' "$REMOTE_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
+    REM_LAST_APPLIED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
+    REM_LAST_RECEIVED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
+fi
+
+# =============================================================================
+# Assign to PRIMARY / STANDBY variables based on detected role
+# =============================================================================
+if $IS_PRIMARY; then
+    PRI_ROLE="$LOC_ROLE";       PRI_OPEN="$LOC_OPEN";       PRI_PROTECT="$LOC_PROTECT"
+    PRI_SWITCH="$LOC_SWITCH";   PRI_FORCE="$LOC_FORCE";     PRI_FLASH="$LOC_FLASH"
+    PRI_DBUNIQ="$LOC_DBUNIQ";   PRI_BROKER="$LOC_BROKER"
+    PRI_REDO_CNT="$LOC_REDO_CNT"; PRI_REDO_MB="$LOC_REDO_MB"; PRI_SRL="$LOC_SRL"
+    PRI_DEST2_STATUS="$LOC_DEST2_STATUS"; PRI_DEST2_ERROR="${LOC_DEST2_ERROR:-}"
+    PRI_ARCHGAP="$LOC_ARCHGAP"
+    PRI_FRA_PATH="$LOC_FRA_PATH"; PRI_FRA_SIZE="$LOC_FRA_SIZE"
+    PRI_FRA_USED="$LOC_FRA_USED"; PRI_FRA_RECLAIM="$LOC_FRA_RECLAIM"; PRI_FRA_FILES="$LOC_FRA_FILES"
+    PRI_HOST=$(hostname -s 2>/dev/null || hostname)
+
+    STB_ROLE="$REM_ROLE";       STB_OPEN="$REM_OPEN";       STB_PROTECT="$REM_PROTECT"
+    STB_SWITCH="$REM_SWITCH";   STB_FORCE="$REM_FORCE";     STB_FLASH="$REM_FLASH"
+    STB_DBUNIQ="${REM_DBUNIQ:-${PEER_DBUNIQ:-?}}"
+    STB_REDO_CNT="$REM_REDO_CNT"; STB_REDO_MB="$REM_REDO_MB"; STB_SRL="$REM_SRL"
+    STB_ARCHGAP="$REM_ARCHGAP"
+    STB_MRP_STATUS="$REM_MRP_STATUS"; STB_MRP_SEQ="$REM_MRP_SEQ"
+    STB_TRANSPORT_LAG="$REM_TRANSPORT_LAG"; STB_APPLY_LAG="$REM_APPLY_LAG"
+    STB_LAST_APPLIED="$REM_LAST_APPLIED"; STB_LAST_RECEIVED="$REM_LAST_RECEIVED"
+    STB_FRA_PATH="$REM_FRA_PATH"; STB_FRA_SIZE="$REM_FRA_SIZE"
+    STB_FRA_USED="$REM_FRA_USED"; STB_FRA_RECLAIM="$REM_FRA_RECLAIM"; STB_FRA_FILES="$REM_FRA_FILES"
+    STB_HOST="${PEER_TNS:-unknown}"
+else
+    STB_ROLE="$LOC_ROLE";       STB_OPEN="$LOC_OPEN";       STB_PROTECT="$LOC_PROTECT"
+    STB_SWITCH="$LOC_SWITCH";   STB_FORCE="$LOC_FORCE";     STB_FLASH="$LOC_FLASH"
+    STB_DBUNIQ="$LOC_DBUNIQ"
+    STB_REDO_CNT="$LOC_REDO_CNT"; STB_REDO_MB="$LOC_REDO_MB"; STB_SRL="$LOC_SRL"
+    STB_ARCHGAP="$LOC_ARCHGAP"
+    STB_MRP_STATUS="$LOC_MRP_STATUS"; STB_MRP_SEQ="$LOC_MRP_SEQ"
+    STB_TRANSPORT_LAG="$LOC_TRANSPORT_LAG"; STB_APPLY_LAG="$LOC_APPLY_LAG"
+    STB_LAST_APPLIED="$LOC_LAST_APPLIED"; STB_LAST_RECEIVED="$LOC_LAST_RECEIVED"
+    STB_FRA_PATH="$LOC_FRA_PATH"; STB_FRA_SIZE="$LOC_FRA_SIZE"
+    STB_FRA_USED="$LOC_FRA_USED"; STB_FRA_RECLAIM="$LOC_FRA_RECLAIM"; STB_FRA_FILES="$LOC_FRA_FILES"
+    STB_HOST=$(hostname -s 2>/dev/null || hostname)
+
+    PRI_ROLE="$REM_ROLE";       PRI_OPEN="$REM_OPEN";       PRI_PROTECT="$REM_PROTECT"
+    PRI_SWITCH="$REM_SWITCH";   PRI_FORCE="$REM_FORCE";     PRI_FLASH="$REM_FLASH"
+    PRI_DBUNIQ="${REM_DBUNIQ:-${PEER_DBUNIQ:-?}}"
+    PRI_BROKER="${LOC_BROKER}"
+    PRI_REDO_CNT="$REM_REDO_CNT"; PRI_REDO_MB="$REM_REDO_MB"; PRI_SRL="$REM_SRL"
+    PRI_DEST2_STATUS=""; PRI_DEST2_ERROR=""
+    PRI_ARCHGAP="$REM_ARCHGAP"
+    PRI_FRA_PATH="$REM_FRA_PATH"; PRI_FRA_SIZE="$REM_FRA_SIZE"
+    PRI_FRA_USED="$REM_FRA_USED"; PRI_FRA_RECLAIM="$REM_FRA_RECLAIM"; PRI_FRA_FILES="$REM_FRA_FILES"
+    PRI_HOST="${PEER_TNS:-unknown}"
+fi
+
+# Helper: show a row or "n/a" when remote data is missing
+row_or_na() {
+    local label="$1" value="$2" status="${3:-}"
+    if [[ -z "$value" ]]; then
+        row "$label" "${DIM}n/a (no remote connection)${NC}"
+    else
+        row "$label" "$value" "$status"
+    fi
+}
+
+# =============================================================================
+# Display
+# =============================================================================
+
+# -- Title
+printf "\n ${BOLD}${CYAN}Data Guard Status Check${NC}  ${DIM}$(date '+%Y-%m-%d %H:%M:%S')${NC}\n"
+printf " ${DIM}Local: $(hostname -s 2>/dev/null || hostname) (SID: ${ORACLE_SID}, role: ${LOC_LABEL})"
+if [[ "$REMOTE_CONNECTED" == true ]]; then
+    printf "  |  Remote: ${PEER_DBUNIQ} via ${PEER_TNS}"
+elif [[ "$LOCAL_ONLY" == true ]]; then
+    printf "  |  Remote: skipped (-L)"
+else
+    printf "  |  Remote: not connected"
+fi
+printf "${NC}\n"
+
+# -- Primary Database ---------------------------------------------------------
+header "PRIMARY DATABASE  (${PRI_DBUNIQ:-?})"
+
+if [[ -n "${PRI_ROLE:-}" ]]; then
+    icon=$(status_icon "$PRI_ROLE" "PRIMARY")
+    [[ "$icon" == *"XX"* ]] && err
+    row "Role" "$PRI_ROLE" "$icon"
+
+    icon=$(status_icon "$PRI_OPEN" "READ WRITE")
+    [[ "$icon" == *"XX"* ]] && err
+    row "Open Mode" "$PRI_OPEN" "$icon"
+
+    row "Protection Mode" "$PRI_PROTECT"
+
+    icon=$(warn_icon "$PRI_SWITCH" "TO STANDBY" "SESSIONS ACTIVE")
+    [[ "$icon" == *"!!"* ]] && warn
+    row "Switchover Status" "$PRI_SWITCH" "$icon"
+
+    icon=$(status_icon "$PRI_FORCE" "YES")
+    [[ "$icon" == *"XX"* ]] && err
+    row "Force Logging" "$PRI_FORCE" "$icon"
+
+    icon=$(warn_icon "$PRI_FLASH" "YES")
+    [[ "$icon" == *"!!"* ]] && warn
+    row "Flashback" "$PRI_FLASH" "$icon"
+
+    icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
+    [[ "$icon" == *"XX"* ]] && err
+    row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
+
+    row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
+    if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
+        row "Standby Redo Logs" "${PRI_SRL} groups" "$CHK"
+    else
+        row "Standby Redo Logs" "${PRI_SRL:-NONE}" "$WARN"; warn
+    fi
+
+    if [[ "${PRI_DEST2_STATUS:-}" == "VALID" ]]; then
+        row "Archive Dest 2 (Standby)" "$PRI_DEST2_STATUS" "$CHK"
+    elif [[ -n "${PRI_DEST2_STATUS:-}" ]]; then
+        row "Archive Dest 2 (Standby)" "${PRI_DEST2_STATUS} ${PRI_DEST2_ERROR:-}" "$FAIL"; err
+    fi
+
+    if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
+        row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; err
+    fi
+
+    if [[ -n "${PRI_FRA_PATH:-}" ]]; then
+        PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) printf \"%.0f\", (${PRI_FRA_USED:-0}/${PRI_FRA_SIZE})*100; else print 0}")
+        if [[ "$PRI_FRA_PCT" -ge 90 ]]; then
+            icon="$FAIL"; err
+        elif [[ "$PRI_FRA_PCT" -ge 80 ]]; then
+            icon="$WARN"; warn
+        else
+            icon="$CHK"
+        fi
+        row "FRA Usage" "${PRI_FRA_USED}/${PRI_FRA_SIZE} GB (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
+        row "FRA Location" "${PRI_FRA_PATH} (${PRI_FRA_FILES:-0} files)"
+    fi
+else
+    # No remote SQL to primary - show what broker knows
+    if [[ -n "${PEER_DBUNIQ:-}" ]] && [[ -n "$DGMGRL_PEER" ]]; then
+        PEER_ROLE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
+        PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
+        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+
+        row "Role" "${PEER_ROLE:-?}" "$(status_icon "${PEER_ROLE:-}" "PRIMARY")"
+        row "Intended State" "${PEER_STATE:-?}"
+        if [[ -n "${PEER_DB_STATUS:-}" ]]; then
+            icon=$(status_icon "$PEER_DB_STATUS" "SUCCESS")
+            [[ "$icon" == *"XX"* ]] && err
+            row "Broker Status" "$PEER_DB_STATUS" "$icon"
+        fi
+        printf '%s\n' "$DGMGRL_PEER" | grep -i 'ORA-' | while IFS= read -r line; do
+            line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+            printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
+        done
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "" "(broker view only - use -P for full remote checks)"
+    else
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "" "n/a (no remote connection to primary)"
+    fi
+fi
+
+# -- Standby Database ---------------------------------------------------------
+header "STANDBY DATABASE  (${STB_DBUNIQ:-?})"
+
+if [[ -n "${STB_ROLE:-}" ]]; then
+    icon=$(status_icon "$STB_ROLE" "PHYSICAL STANDBY")
+    [[ "$icon" == *"XX"* ]] && err
+    row "Role" "$STB_ROLE" "$icon"
+
+    icon=$(warn_icon "$STB_OPEN" "MOUNTED" "READ ONLY")
+    [[ "$icon" == *"!!"* ]] && warn
+    row "Open Mode" "$STB_OPEN" "$icon"
+
+    row "Protection Mode" "${STB_PROTECT:-$LOC_PROTECT}"
+
+    icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
+    row "Switchover Status" "$STB_SWITCH" "$icon"
+
+    # MRP
+    if [[ -n "${STB_MRP_STATUS:-}" ]]; then
+        icon=$(status_icon "$STB_MRP_STATUS" "APPLYING_LOG" "WAIT_FOR_LOG")
+        [[ "$icon" == *"XX"* ]] && err
+        row "MRP Status" "${STB_MRP_STATUS} (seq# ${STB_MRP_SEQ:-?})" "$icon"
+    else
+        row "MRP Status" "NOT RUNNING" "$FAIL"; err
+    fi
+
+    # Lag
+    if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
+        if [[ "$STB_TRANSPORT_LAG" == "+00 00:00:00" ]] || [[ "$STB_TRANSPORT_LAG" == "0" ]]; then
+            row "Transport Lag" "none" "$CHK"
+        else
+            row "Transport Lag" "$STB_TRANSPORT_LAG" "$WARN"; warn
+        fi
+    else
+        row "Transport Lag" "N/A (standby mounted)"
+    fi
+
+    if [[ -n "${STB_APPLY_LAG:-}" ]]; then
+        if [[ "$STB_APPLY_LAG" == "+00 00:00:00" ]] || [[ "$STB_APPLY_LAG" == "0" ]]; then
+            row "Apply Lag" "none" "$CHK"
+        else
+            row "Apply Lag" "$STB_APPLY_LAG" "$WARN"; warn
+        fi
+    else
+        row "Apply Lag" "N/A (standby mounted)"
+    fi
+
+    # Sequences
+    if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "${STB_LAST_RECEIVED:-0}" -gt 0 ]]; then
+        SEQ_LAG=$((STB_LAST_RECEIVED - STB_LAST_APPLIED))
+        if [[ "$SEQ_LAG" -le 1 ]]; then
+            row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}" "$CHK"
+        elif [[ "$SEQ_LAG" -le 5 ]]; then
+            row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$WARN"; warn
+        else
+            row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$FAIL"; err
+        fi
+    fi
+
+    if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -gt 0 ]]; then
+        row "Standby Redo Logs" "${STB_SRL} groups" "$CHK"
+    else
+        row "Standby Redo Logs" "${STB_SRL:-NONE}" "$FAIL"; err
+    fi
+
+    if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
+        row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; err
+    fi
+
+    if [[ -n "${STB_FRA_PATH:-}" ]]; then
+        STB_FRA_PCT=$(awk "BEGIN {if (${STB_FRA_SIZE:-0} > 0) printf \"%.0f\", (${STB_FRA_USED:-0}/${STB_FRA_SIZE})*100; else print 0}")
+        if [[ "$STB_FRA_PCT" -ge 90 ]]; then
+            icon="$FAIL"; err
+        elif [[ "$STB_FRA_PCT" -ge 80 ]]; then
+            icon="$WARN"; warn
+        else
+            icon="$CHK"
+        fi
+        row "FRA Usage" "${STB_FRA_USED}/${STB_FRA_SIZE} GB (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
+        row "FRA Location" "${STB_FRA_PATH} (${STB_FRA_FILES:-0} files)"
+    fi
+else
+    # No remote SQL - show what broker knows
+    if [[ -n "${PEER_DBUNIQ:-}" ]] && [[ -n "$DGMGRL_PEER" ]]; then
+        PEER_ROLE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
+        PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
+        PEER_TLAG=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | xargs)
+        PEER_ALAG=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//' | xargs)
+        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+
+        row "Role" "${PEER_ROLE:-?}" "$(status_icon "${PEER_ROLE:-}" "PHYSICAL STANDBY" "PRIMARY")"
+        row "Intended State" "${PEER_STATE:-?}"
+        row "Transport Lag" "${PEER_TLAG:-?}"
+        row "Apply Lag" "${PEER_ALAG:-?}"
+        if [[ -n "${PEER_DB_STATUS:-}" ]]; then
+            icon=$(status_icon "$PEER_DB_STATUS" "SUCCESS")
+            [[ "$icon" == *"XX"* ]] && err
+            row "Broker Status" "$PEER_DB_STATUS" "$icon"
+        fi
+        # Show warnings/errors from broker
+        printf '%s\n' "$DGMGRL_PEER" | grep -i 'ORA-' | while IFS= read -r line; do
+            line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+            printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
+        done
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "" "(broker view only - use -P for full remote checks)"
+    else
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "" "n/a (no remote connection to ${PEER_LABEL,,})"
+    fi
+fi
+
+# -- Broker Configuration ----------------------------------------------------
+header "DATA GUARD BROKER"
+
+if printf '%s' "$DGMGRL_CONFIG" | grep -q "ORA-16532\|not yet available\|not exist"; then
+    row "Configuration" "NOT CONFIGURED" "$FAIL"; err
+else
+    row "Configuration" "${BROKER_CFG_NAME:-unknown}"
+
+    if [[ -n "${BROKER_OVERALL:-}" ]]; then
+        icon=$(status_icon "$BROKER_OVERALL" "SUCCESS")
+        [[ "$icon" == *"XX"* ]] && err
+        row "Overall Status" "$BROKER_OVERALL" "$icon"
+    fi
+
+    # Show members and their ORA errors/warnings
+    while IFS= read -r line; do
+        line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
+        if printf '%s' "$line" | grep -qE '^\s+\S+\s+-\s+'; then
+            if printf '%s' "$line_trimmed" | grep -qi "Error"; then
+                row "" "$line_trimmed" "$FAIL"
+            elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
+                row "" "$line_trimmed" "$WARN"
+            else
+                row "" "$line_trimmed" "$CHK"
+            fi
+        elif printf '%s' "$line" | grep -qi 'ORA-'; then
+            printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
+        fi
+    done <<< "$DGMGRL_CONFIG"
+
+    # FSFO
+    FSFO_MODE=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Fast-Start Failover:' | head -1 | sed 's/.*: *//' | xargs)
+    if [[ -n "${FSFO_MODE:-}" ]]; then
+        if printf '%s' "$FSFO_MODE" | grep -qi "Enabled"; then
+            row "Fast-Start Failover" "$FSFO_MODE" "$CHK"
+            FSFO_TARGET=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Target:' | sed 's/.*: *//' | xargs)
+            FSFO_OBS=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Observer:' | sed 's/.*: *//' | xargs)
+            FSFO_THRESHOLD=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Threshold:' | sed 's/.*: *//' | xargs)
+            [[ -n "${FSFO_TARGET:-}" ]] && row "  Target" "$FSFO_TARGET"
+            [[ -n "${FSFO_OBS:-}" ]] && row "  Observer" "$FSFO_OBS"
+            [[ -n "${FSFO_THRESHOLD:-}" ]] && row "  Threshold" "$FSFO_THRESHOLD"
+        else
+            row "Fast-Start Failover" "${FSFO_MODE}" "${DIM}disabled${NC}"
+        fi
+    fi
+fi
+
+# =============================================================================
+# Summary
+# =============================================================================
+printf "\n ${DIM}────────────────────────────────────────────────────────────${NC}\n"
+
+if [[ $ERRORS -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
+    printf " ${BOLD}${GREEN} HEALTHY${NC}  ${DIM}No issues detected${NC}\n"
+elif [[ $ERRORS -eq 0 ]]; then
+    printf " ${BOLD}${YELLOW} WARNING${NC}  ${DIM}${WARNINGS} warning(s)${NC}\n"
+else
+    printf " ${BOLD}${RED} ISSUES ${NC}  ${RED}${ERRORS} error(s)${NC}"
+    [[ $WARNINGS -gt 0 ]] && printf "  ${YELLOW}${WARNINGS} warning(s)${NC}"
+    printf "\n"
+fi
+
+printf "\n"
+exit $ERRORS

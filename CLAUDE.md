@@ -6,6 +6,7 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 
 ```
 dg_status.sh   - Quick Data Guard health dashboard (run from jump host)
+dg_check.sh    - Local Data Guard health check (run directly on DB host)
 nfs/           - NFS setup scripts (run before Data Guard setup)
 primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
 standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
@@ -122,6 +123,18 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 **Exit code:** 0 = healthy, N = number of errors. Suitable for monitoring/cron.
 
 See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
+
+`dg_check.sh` is the same dashboard but runs directly on a DB host (no SSH). It auto-detects the local database role and discovers the peer via DGMGRL.
+
+```bash
+bash dg_check.sh              # Auto-detect role, try wallet for remote
+bash dg_check.sh -L           # Local + broker only (skip remote SQL)
+bash dg_check.sh -P           # Prompt for SYS password for remote
+```
+
+**Remote connection:** discovers the peer TNS alias from the broker, tries wallet auth first, then prompts for SYS password. Use `-L` to skip remote checks entirely (shows broker-view of the peer instead).
+
+See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 
 ## Testing
 
