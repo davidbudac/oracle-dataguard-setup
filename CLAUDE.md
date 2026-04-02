@@ -5,6 +5,7 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 ## Project Structure
 
 ```
+dg_status.sh   - Quick Data Guard health dashboard (run from jump host)
 nfs/           - NFS setup scripts (run before Data Guard setup)
 primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
 standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
@@ -103,6 +104,24 @@ Built-in validations:
 - Disk space on standby (step 3)
 - Port connectivity primary → standby (step 4)
 - Listener port detection from `lsnrctl status` (step 1)
+
+## Status Dashboard
+
+`dg_status.sh` provides a quick health overview of a running Data Guard configuration. Run it from the jump host (or any machine with SSH access to both DB hosts).
+
+```bash
+bash dg_status.sh                    # Uses $ORACLE_SID or auto-detects from pmon
+bash dg_status.sh -s cdb1            # Explicit SID
+bash dg_status.sh -c myconfig.env    # Custom SSH config
+```
+
+**What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, and broker configuration including FSFO and per-member ORA errors.
+
+**SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
+
+**Exit code:** 0 = healthy, N = number of errors. Suitable for monitoring/cron.
+
+See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
 
 ## Testing
 
