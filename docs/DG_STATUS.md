@@ -107,18 +107,9 @@ The Oracle SID is resolved in this order:
 
 The standby SID is always auto-detected from its own pmon process (it may differ from the primary SID).
 
-## Exit Codes
+## Exit Code
 
-| Code | Meaning |
-|---|---|
-| 0 | All checks passed (may include warnings) |
-| N | Number of errors detected |
-
-This makes the script suitable for use in monitoring or cron jobs:
-
-```bash
-bash dg_status.sh -s cdb1 > /dev/null 2>&1 || echo "Data Guard issues detected"
-```
+The script always exits with 0. It is an informational tool -- the colour-coded indicators in the output show what needs attention.
 
 ## How It Works
 

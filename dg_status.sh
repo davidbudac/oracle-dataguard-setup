@@ -24,9 +24,6 @@
 #   bash dg_status.sh -s cdb1                   # Specify Oracle SID explicitly
 #   bash dg_status.sh -c /path/to/config.env    # Use custom SSH config file
 #
-# Exit codes:
-#   0   All checks passed (may have warnings)
-#   N   Number of errors detected
 #
 # =============================================================================
 
@@ -471,4 +468,3 @@ else
 fi
 
 printf "\n"
-exit $ERRORS

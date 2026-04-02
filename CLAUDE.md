@@ -120,8 +120,6 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 
 **SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
 
-**Exit code:** 0 = healthy, N = number of errors. Suitable for monitoring/cron.
-
 See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
 
 `dg_check.sh` is the same dashboard but runs directly on a DB host (no SSH). It auto-detects the local database role and discovers the peer via DGMGRL.

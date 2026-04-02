@@ -83,12 +83,9 @@ The script tries to connect to the peer database in this order:
 
 The `-P` flag forces the password prompt even if a wallet might work.
 
-## Exit Codes
+## Exit Code
 
-| Code | Meaning |
-|---|---|
-| 0 | All checks passed (may include warnings) |
-| N | Number of errors detected |
+The script always exits with 0. It is an informational tool -- the colour-coded indicators in the output show what needs attention.
 
 ## Example Output
 

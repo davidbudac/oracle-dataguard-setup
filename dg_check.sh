@@ -23,9 +23,6 @@
 #   bash dg_check.sh -P         # Prompt for SYS password for remote
 #   bash dg_check.sh -L         # Local + broker only (skip remote SQL)
 #
-# Exit codes:
-#   0   All checks passed (may have warnings)
-#   N   Number of errors detected
 #
 # =============================================================================
 
@@ -639,4 +636,3 @@ else
 fi
 
 printf "\n"
-exit $ERRORS
