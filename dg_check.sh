@@ -380,6 +380,58 @@ else
 fi
 printf "${NC}\n"
 
+# -- Summary box --------------------------------------------------------------
+_W=29
+_BAR=$(printf '─%.0s' $(seq 1 $_W))
+
+box_row() {
+    local left="$1" right="$2"
+    local lp rp
+    lp=$(printf '%b' "$left" | sed $'s/\033\\[[0-9;]*m//g')
+    rp=$(printf '%b' "$right" | sed $'s/\033\\[[0-9;]*m//g')
+    local lpad=$((_W - ${#lp})); [[ $lpad -lt 0 ]] && lpad=0
+    local rpad=$((_W - ${#rp})); [[ $rpad -lt 0 ]] && rpad=0
+    printf ' │ %b%*s│ %b%*s│\n' "$left" "$lpad" "" "$right" "$rpad" ""
+}
+
+# Quick health check for summary dots
+PRI_OK=true; STB_OK=true
+if [[ -n "${PRI_ROLE:-}" ]]; then
+    printf '%s' "$PRI_ROLE" | grep -qi "PRIMARY" || PRI_OK=false
+    printf '%s' "${PRI_OPEN:-}" | grep -qi "READ WRITE" || PRI_OK=false
+else
+    PRI_OK=unknown
+fi
+if [[ -n "${STB_ROLE:-}" ]]; then
+    printf '%s' "$STB_ROLE" | grep -qi "PHYSICAL STANDBY" || STB_OK=false
+    if [[ -z "${STB_MRP_STATUS:-}" ]]; then
+        STB_OK=false
+    else
+        printf '%s' "$STB_MRP_STATUS" | grep -qiE "APPLYING_LOG|WAIT_FOR_LOG" || STB_OK=false
+    fi
+else
+    STB_OK=unknown
+fi
+
+if [[ "$PRI_OK" == true ]]; then PRI_DOT="${GREEN}●${NC}"
+elif [[ "$PRI_OK" == false ]]; then PRI_DOT="${RED}●${NC}"
+else PRI_DOT="${DIM}●${NC}"; fi
+
+if [[ "$STB_OK" == true ]]; then STB_DOT="${GREEN}●${NC}"
+elif [[ "$STB_OK" == false ]]; then STB_DOT="${RED}●${NC}"
+else STB_DOT="${DIM}●${NC}"; fi
+
+# Determine display values for summary
+_PRI_MODE="${PRI_OPEN:-${DIM}(broker only)${NC}}"
+_STB_MODE="${STB_OPEN:-${DIM}(broker only)${NC}}"
+_STB_MRP="${STB_MRP_STATUS:-${DIM}n/a${NC}}"
+
+printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
+box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
+box_row "${PRI_DBUNIQ:-?}" "${STB_DBUNIQ:-?}"
+box_row "$_PRI_MODE" "${_STB_MODE} / MRP: ${_STB_MRP}"
+printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
+
 # -- Primary Database ---------------------------------------------------------
 header "PRIMARY DATABASE  (${PRI_DBUNIQ:-?})"
 

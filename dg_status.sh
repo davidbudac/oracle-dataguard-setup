@@ -263,6 +263,39 @@ BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | grep -oE '(SUCCESS|W
 # Display
 # =============================================================================
 
+# -- Summary box --------------------------------------------------------------
+_W=29
+_BAR=$(printf '─%.0s' $(seq 1 $_W))
+
+box_row() {
+    local left="$1" right="$2"
+    local lp rp
+    lp=$(printf '%b' "$left" | sed $'s/\033\\[[0-9;]*m//g')
+    rp=$(printf '%b' "$right" | sed $'s/\033\\[[0-9;]*m//g')
+    local lpad=$((_W - ${#lp})); [[ $lpad -lt 0 ]] && lpad=0
+    local rpad=$((_W - ${#rp})); [[ $rpad -lt 0 ]] && rpad=0
+    printf ' │ %b%*s│ %b%*s│\n' "$left" "$lpad" "" "$right" "$rpad" ""
+}
+
+# Quick health check for summary dots
+PRI_OK=true; STB_OK=true
+printf '%s' "${PRI_ROLE:-}" | grep -qi "PRIMARY" || PRI_OK=false
+printf '%s' "${PRI_OPEN:-}" | grep -qi "READ WRITE" || PRI_OK=false
+printf '%s' "${STB_ROLE:-}" | grep -qi "PHYSICAL STANDBY" || STB_OK=false
+if [[ -z "${STB_MRP_STATUS:-}" ]]; then
+    STB_OK=false
+else
+    printf '%s' "$STB_MRP_STATUS" | grep -qiE "APPLYING_LOG|WAIT_FOR_LOG" || STB_OK=false
+fi
+if $PRI_OK; then PRI_DOT="${GREEN}●${NC}"; else PRI_DOT="${RED}●${NC}"; fi
+if $STB_OK; then STB_DOT="${GREEN}●${NC}"; else STB_DOT="${RED}●${NC}"; fi
+
+printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
+box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
+box_row "${PRI_DBUNIQ:-?} @ ${PRIMARY_ORACLE_HOSTNAME}" "${STB_DBUNIQ:-?} @ ${STANDBY_ORACLE_HOSTNAME}"
+box_row "${PRI_OPEN:-?}" "${STB_OPEN:-?} / MRP: ${STB_MRP_STATUS:-NOT RUNNING}"
+printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
+
 # -- Primary Database ---------------------------------------------------------
 header "PRIMARY DATABASE  (${PRIMARY_ORACLE_HOSTNAME} / ${PRI_DBUNIQ:-?})"
 
