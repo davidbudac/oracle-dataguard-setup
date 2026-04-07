@@ -438,7 +438,7 @@ if [[ -f "$LOC_ALERT_FILE" ]]; then
     LOC_ALERT_ENTRIES=$(tail -2000 "$LOC_ALERT_FILE" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
 { low = tolower($0) }
-low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag/ {
+low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag|unsynchronized|synchronized|maximum availability|maximum performance|maximum protection|redo transport|log shipping|media recovery|recovery stopped|recovery paused|catching up|incomplete/ {
     if (ts != "") printf "%s  %s\n", ts, $0; else print $0
 }' 2>/dev/null | tail -15)
 fi
@@ -862,11 +862,10 @@ header "RECENT ALERT LOG (Data Guard)"
 _show_alert_entries() {
     local label="$1" entries="$2"
     if [[ -z "$entries" ]]; then
-        row "$label" "No recent DG-related entries"
+        printf "  ${DIM}%s${NC}  ${DIM}(none)${NC}\n" "$label"
     else
-        row "$label" ""
+        printf "  ${DIM}%s${NC}\n" "$label"
         while IFS= read -r line; do
-            # Format: "YYYY-MM-DD HH:MM:SS  message" or just "message" (no timestamp)
             local ts="" msg="$line"
             if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
                 ts="${line:0:19}"
@@ -874,15 +873,15 @@ _show_alert_entries() {
             fi
             if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
                 if [[ -n "$ts" ]]; then
-                    printf "  %-*s ${DIM}%s${NC}  ${RED}%s${NC}\n" "$LABEL_W" "" "$ts" "$msg"
+                    printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
                 else
-                    printf "  %-*s ${RED}%s${NC}\n" "$LABEL_W" "" "$msg"
+                    printf "    ${RED}%s${NC}\n" "$msg"
                 fi
             else
                 if [[ -n "$ts" ]]; then
-                    printf "  %-*s ${DIM}%s${NC}  %s\n" "$LABEL_W" "" "$ts" "$msg"
+                    printf "    ${DIM}%s${NC}  %s\n" "$ts" "$msg"
                 else
-                    printf "  %-*s %s\n" "$LABEL_W" "" "$msg"
+                    printf "    %s\n" "$msg"
                 fi
             fi
         done <<< "$entries"
