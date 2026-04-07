@@ -127,6 +127,21 @@ ERRORS=0; WARNINGS=0
 err()  { ERRORS=$((ERRORS+1)); }
 warn() { WARNINGS=$((WARNINGS+1)); }
 
+declare -a SUMMARY_ERRORS=()
+declare -a SUMMARY_WARNINGS=()
+
+add_summary_error() {
+    local message="$1"
+    SUMMARY_ERRORS+=("$message")
+    err
+}
+
+add_summary_warning() {
+    local message="$1"
+    SUMMARY_WARNINGS+=("$message")
+    warn
+}
+
 # -- Resolve SID --------------------------------------------------------------
 # Priority: -s flag > $ORACLE_SID > auto-detect from pmon
 if [[ -n "$ORACLE_SID_OVERRIDE" ]]; then
@@ -277,6 +292,15 @@ box_row() {
     printf ' │ %b%*s│ %b%*s│\n' "$left" "$lpad" "" "$right" "$rpad" ""
 }
 
+summary_box_row() {
+    local text="$1"
+    local plain pad
+    plain=$(printf '%b' "$text" | sed $'s/\033\\[[0-9;]*m//g')
+    pad=$((60 - ${#plain}))
+    [[ $pad -lt 0 ]] && pad=0
+    printf ' │ %b%*s │\n' "$text" "$pad" ""
+}
+
 # Quick health check for summary dots
 PRI_OK=true; STB_OK=true
 printf '%s' "${PRI_ROLE:-}" | grep -qi "PRIMARY" || PRI_OK=false
@@ -300,58 +324,59 @@ printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 header "PRIMARY DATABASE  (${PRIMARY_ORACLE_HOSTNAME} / ${PRI_DBUNIQ:-?})"
 
 icon=$(status_icon "$PRI_ROLE" "PRIMARY")
-[[ "$icon" == *"XX"* ]] && err
+[[ "$icon" == *"XX"* ]] && add_summary_error "Primary role is '$PRI_ROLE' (expected PRIMARY)"
 row "Role" "$PRI_ROLE" "$icon"
 
 icon=$(status_icon "$PRI_OPEN" "READ WRITE")
-[[ "$icon" == *"XX"* ]] && err
+[[ "$icon" == *"XX"* ]] && add_summary_error "Primary open mode is '$PRI_OPEN' (expected READ WRITE)"
 row "Open Mode" "$PRI_OPEN" "$icon"
 
 row "Protection Mode" "$PRI_PROTECT"
 
 icon=$(warn_icon "$PRI_SWITCH" "TO STANDBY" "SESSIONS ACTIVE")
-[[ "$icon" == *"!!"* ]] && warn
+[[ "$icon" == *"!!"* ]] && add_summary_warning "Primary switchover status is '$PRI_SWITCH'"
 row "Switchover Status" "$PRI_SWITCH" "$icon"
 
 icon=$(status_icon "$PRI_FORCE" "YES")
-[[ "$icon" == *"XX"* ]] && err
+[[ "$icon" == *"XX"* ]] && add_summary_error "Force logging is '$PRI_FORCE' on primary"
 row "Force Logging" "$PRI_FORCE" "$icon"
 
 icon=$(warn_icon "$PRI_FLASH" "YES")
-[[ "$icon" == *"!!"* ]] && warn
+[[ "$icon" == *"!!"* ]] && add_summary_warning "Flashback is '$PRI_FLASH' on primary"
 row "Flashback" "$PRI_FLASH" "$icon"
 
 icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
-[[ "$icon" == *"XX"* ]] && err
+[[ "$icon" == *"XX"* ]] && add_summary_error "DG Broker is '${PRI_BROKER:-FALSE}' on primary"
 row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
 
 row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
 if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
     row "Standby Redo Logs" "${PRI_SRL} groups" "$CHK"
 else
-    row "Standby Redo Logs" "NONE" "$WARN"; warn
+    row "Standby Redo Logs" "NONE" "$WARN"; add_summary_warning "Primary has no standby redo logs configured"
 fi
 
 if [[ "${PRI_DEST2_STATUS:-}" == "VALID" ]]; then
     row "Archive Dest 2 (Standby)" "$PRI_DEST2_STATUS" "$CHK"
 elif [[ -n "${PRI_DEST2_STATUS:-}" ]]; then
-    row "Archive Dest 2 (Standby)" "${PRI_DEST2_STATUS} ${PRI_DEST2_ERROR:-}" "$FAIL"; err
+    row "Archive Dest 2 (Standby)" "${PRI_DEST2_STATUS} ${PRI_DEST2_ERROR:-}" "$FAIL"; add_summary_error "Archive destination 2 is '${PRI_DEST2_STATUS}' ${PRI_DEST2_ERROR:-}"
 fi
 
 if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
-    row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; err
+    row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Primary reports ${PRI_ARCHGAP} archive gap(s)"
 fi
 
 if [[ -n "${PRI_FRA_PATH:-}" ]]; then
-    PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) printf \"%.0f\", (${PRI_FRA_USED:-0}/${PRI_FRA_SIZE})*100; else print 0}")
+    PRI_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
+    PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${PRI_FRA_SIZE})*100} else print 0}")
     if [[ "$PRI_FRA_PCT" -ge 90 ]]; then
-        icon="$FAIL"; err
+        icon="$FAIL"; add_summary_error "Primary FRA usage is ${PRI_FRA_PCT}%"
     elif [[ "$PRI_FRA_PCT" -ge 80 ]]; then
-        icon="$WARN"; warn
+        icon="$WARN"; add_summary_warning "Primary FRA usage is ${PRI_FRA_PCT}%"
     else
         icon="$CHK"
     fi
-    row "FRA Usage" "${PRI_FRA_USED}/${PRI_FRA_SIZE} GB (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
+    row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
     row "FRA Location" "${PRI_FRA_PATH} (${PRI_FRA_FILES:-0} files)"
 fi
 
@@ -359,11 +384,11 @@ fi
 header "STANDBY DATABASE  (${STANDBY_ORACLE_HOSTNAME} / ${STB_DBUNIQ:-?})"
 
 icon=$(status_icon "$STB_ROLE" "PHYSICAL STANDBY")
-[[ "$icon" == *"XX"* ]] && err
+[[ "$icon" == *"XX"* ]] && add_summary_error "Standby role is '$STB_ROLE' (expected PHYSICAL STANDBY)"
 row "Role" "$STB_ROLE" "$icon"
 
 icon=$(warn_icon "$STB_OPEN" "MOUNTED" "READ ONLY")
-[[ "$icon" == *"!!"* ]] && warn
+[[ "$icon" == *"!!"* ]] && add_summary_warning "Standby open mode is '$STB_OPEN'"
 row "Open Mode" "$STB_OPEN" "$icon"
 
 row "Protection Mode" "$STB_PROTECT"
@@ -374,10 +399,10 @@ row "Switchover Status" "$STB_SWITCH" "$icon"
 # MRP (Managed Recovery Process)
 if [[ -n "${STB_MRP_STATUS:-}" ]]; then
     icon=$(status_icon "$STB_MRP_STATUS" "APPLYING_LOG" "WAIT_FOR_LOG")
-    [[ "$icon" == *"XX"* ]] && err
+    [[ "$icon" == *"XX"* ]] && add_summary_error "MRP status is '$STB_MRP_STATUS'"
     row "MRP Status" "${STB_MRP_STATUS} (seq# ${STB_MRP_SEQ:-?})" "$icon"
 else
-    row "MRP Status" "NOT RUNNING" "$FAIL"; err
+    row "MRP Status" "NOT RUNNING" "$FAIL"; add_summary_error "MRP is not running on standby"
 fi
 
 # Lag
@@ -385,7 +410,7 @@ if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
     if [[ "$STB_TRANSPORT_LAG" == "+00 00:00:00" ]] || [[ "$STB_TRANSPORT_LAG" == "0" ]]; then
         row "Transport Lag" "none" "$CHK"
     else
-        row "Transport Lag" "$STB_TRANSPORT_LAG" "$WARN"; warn
+        row "Transport Lag" "$STB_TRANSPORT_LAG" "$WARN"; add_summary_warning "Transport lag is $STB_TRANSPORT_LAG"
     fi
 else
     row "Transport Lag" "N/A (standby mounted)"
@@ -395,7 +420,7 @@ if [[ -n "${STB_APPLY_LAG:-}" ]]; then
     if [[ "$STB_APPLY_LAG" == "+00 00:00:00" ]] || [[ "$STB_APPLY_LAG" == "0" ]]; then
         row "Apply Lag" "none" "$CHK"
     else
-        row "Apply Lag" "$STB_APPLY_LAG" "$WARN"; warn
+        row "Apply Lag" "$STB_APPLY_LAG" "$WARN"; add_summary_warning "Apply lag is $STB_APPLY_LAG"
     fi
 else
     row "Apply Lag" "N/A (standby mounted)"
@@ -407,32 +432,33 @@ if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "
     if [[ "$SEQ_LAG" -le 1 ]]; then
         row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}" "$CHK"
     elif [[ "$SEQ_LAG" -le 5 ]]; then
-        row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$WARN"; warn
+        row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$WARN"; add_summary_warning "Standby sequence lag is ${SEQ_LAG}"
     else
-        row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$FAIL"; err
+        row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$FAIL"; add_summary_error "Standby sequence lag is ${SEQ_LAG}"
     fi
 fi
 
 if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -gt 0 ]]; then
     row "Standby Redo Logs" "${STB_SRL} groups" "$CHK"
 else
-    row "Standby Redo Logs" "NONE" "$FAIL"; err
+    row "Standby Redo Logs" "NONE" "$FAIL"; add_summary_error "Standby has no standby redo logs configured"
 fi
 
 if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
-    row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; err
+    row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Standby reports ${STB_ARCHGAP} archive gap(s)"
 fi
 
 if [[ -n "${STB_FRA_PATH:-}" ]]; then
-    STB_FRA_PCT=$(awk "BEGIN {if (${STB_FRA_SIZE:-0} > 0) printf \"%.0f\", (${STB_FRA_USED:-0}/${STB_FRA_SIZE})*100; else print 0}")
+    STB_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
+    STB_FRA_PCT=$(awk "BEGIN {if (${STB_FRA_SIZE:-0} > 0) {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${STB_FRA_SIZE})*100} else print 0}")
     if [[ "$STB_FRA_PCT" -ge 90 ]]; then
-        icon="$FAIL"; err
+        icon="$FAIL"; add_summary_error "Standby FRA usage is ${STB_FRA_PCT}%"
     elif [[ "$STB_FRA_PCT" -ge 80 ]]; then
-        icon="$WARN"; warn
+        icon="$WARN"; add_summary_warning "Standby FRA usage is ${STB_FRA_PCT}%"
     else
         icon="$CHK"
     fi
-    row "FRA Usage" "${STB_FRA_USED}/${STB_FRA_SIZE} GB (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
+    row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
     row "FRA Location" "${STB_FRA_PATH} (${STB_FRA_FILES:-0} files)"
 fi
 
@@ -440,13 +466,13 @@ fi
 header "DATA GUARD BROKER"
 
 if printf '%s' "$DGMGRL_CONFIG" | grep -q "ORA-16532\|not yet available\|not exist"; then
-    row "Configuration" "NOT CONFIGURED" "$FAIL"; err
+    row "Configuration" "NOT CONFIGURED" "$FAIL"; add_summary_error "Data Guard Broker configuration is not configured or not available"
 else
     row "Configuration" "${BROKER_CFG_NAME:-unknown}"
 
     if [[ -n "${BROKER_OVERALL:-}" ]]; then
         icon=$(status_icon "$BROKER_OVERALL" "SUCCESS")
-        [[ "$icon" == *"XX"* ]] && err
+        [[ "$icon" == *"XX"* ]] && add_summary_error "Broker overall status is '$BROKER_OVERALL'"
         row "Overall Status" "$BROKER_OVERALL" "$icon"
     fi
 
@@ -456,8 +482,10 @@ else
         if printf '%s' "$line" | grep -qE '^\s+\S+\s+-\s+'; then
             # Member line (e.g. "cdb1 - Primary database")
             if printf '%s' "$line_trimmed" | grep -qi "Error"; then
+                add_summary_error "Broker member issue: $line_trimmed"
                 row "" "$line_trimmed" "$FAIL"
             elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
+                add_summary_warning "Broker member warning: $line_trimmed"
                 row "" "$line_trimmed" "$WARN"
             else
                 row "" "$line_trimmed" "$CHK"
@@ -481,6 +509,7 @@ else
             [[ -n "${FSFO_THRESHOLD:-}" ]] && row "  Threshold" "$FSFO_THRESHOLD"
         else
             row "Fast-Start Failover" "${FSFO_MODE}" "${DIM}disabled${NC}"
+            add_summary_warning "Fast-Start Failover is ${FSFO_MODE}"
         fi
     fi
 fi
@@ -499,5 +528,70 @@ else
     [[ $WARNINGS -gt 0 ]] && printf "  ${YELLOW}${WARNINGS} warning(s)${NC}"
     printf "\n"
 fi
+
+if [[ $ERRORS -gt 0 ]]; then
+    OVERALL_STATE="${RED}CRITICAL${NC}"
+elif [[ $WARNINGS -gt 0 ]]; then
+    OVERALL_STATE="${YELLOW}ATTENTION${NC}"
+else
+    OVERALL_STATE="${GREEN}HEALTHY${NC}"
+fi
+
+if $PRI_OK; then
+    PRIMARY_STATE="${GREEN}OK${NC}"
+else
+    PRIMARY_STATE="${RED}CHECK${NC}"
+fi
+
+if $STB_OK; then
+    STANDBY_STATE="${GREEN}OK${NC}"
+else
+    STANDBY_STATE="${RED}CHECK${NC}"
+fi
+
+if [[ "${BROKER_OVERALL:-}" == "SUCCESS" ]]; then
+    BROKER_STATE="${GREEN}${BROKER_OVERALL}${NC}"
+elif [[ -n "${BROKER_OVERALL:-}" ]]; then
+    BROKER_STATE="${RED}${BROKER_OVERALL}${NC}"
+else
+    BROKER_STATE="${YELLOW}UNKNOWN${NC}"
+fi
+
+if [[ -n "${STB_TRANSPORT_LAG:-}" && "$STB_TRANSPORT_LAG" != "+00 00:00:00" && "$STB_TRANSPORT_LAG" != "0" ]]; then
+    REPL_STATE="${YELLOW}LAGGING${NC}"
+elif [[ -n "${STB_APPLY_LAG:-}" && "$STB_APPLY_LAG" != "+00 00:00:00" && "$STB_APPLY_LAG" != "0" ]]; then
+    REPL_STATE="${YELLOW}LAGGING${NC}"
+elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt 5 ]]; then
+    REPL_STATE="${RED}BEHIND${NC}"
+elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt 1 ]]; then
+    REPL_STATE="${YELLOW}BEHIND${NC}"
+else
+    REPL_STATE="${GREEN}IN SYNC${NC}"
+fi
+
+printf '\n ${BOLD}${CYAN}FINAL SUMMARY${NC}\n'
+printf ' ┌──────────────────────────────────────────────────────────────┐\n'
+summary_box_row "${BOLD}Overall${NC}      ${OVERALL_STATE}   errors=${ERRORS} warnings=${WARNINGS}"
+summary_box_row "${BOLD}Primary${NC}      ${PRIMARY_STATE}   ${PRI_DBUNIQ:-?} / ${PRI_OPEN:-unknown}"
+summary_box_row "${BOLD}Standby${NC}      ${STANDBY_STATE}   ${STB_DBUNIQ:-?} / MRP ${STB_MRP_STATUS:-NOT RUNNING}"
+summary_box_row "${BOLD}Broker${NC}       ${BROKER_STATE}   ${BROKER_CFG_NAME:-not configured}"
+summary_box_row "${BOLD}Redo Apply${NC}   ${REPL_STATE}   transport=${STB_TRANSPORT_LAG:-n/a}, apply=${STB_APPLY_LAG:-n/a}"
+
+if [[ $ERRORS -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
+    summary_box_row "${GREEN}No problems detected${NC}"
+else
+    summary_box_row "${BOLD}Problems Detected${NC}"
+    if [[ ${#SUMMARY_ERRORS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_ERRORS[@]}"; do
+            summary_box_row "${RED}XX${NC} $item"
+        done
+    fi
+    if [[ ${#SUMMARY_WARNINGS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_WARNINGS[@]}"; do
+            summary_box_row "${YELLOW}!!${NC} $item"
+        done
+    fi
+fi
+printf ' └──────────────────────────────────────────────────────────────┘\n'
 
 printf "\n"
