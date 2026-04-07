@@ -92,6 +92,16 @@ _ssh_ora() {
 }
 
 # -- Helpers ------------------------------------------------------------------
+format_services() {
+    local input="$1" formatted
+    formatted=$(printf '%s\n' "$input" | sed '/^$/d' | awk 'BEGIN{ORS=""} {if (NR>1) printf ", "; printf "%s", $0}')
+    if [[ -n "$formatted" ]]; then
+        printf '%s' "$formatted"
+    else
+        printf 'NONE'
+    fi
+}
+
 row() {
     local label="$1" value="$2" status="${3:-}"
     printf "  ${DIM}%-24s${NC} %-36s %b\n" "$label" "$value" "$status"
@@ -183,6 +193,21 @@ SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
 SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
 SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
 SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'SERVICE|' || NAME
+  FROM (
+    SELECT NAME
+      FROM V\$ACTIVE_SERVICES
+     WHERE NAME NOT IN (
+               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT INSTANCE_NAME FROM V\$INSTANCE
+           )
+       AND NAME NOT LIKE 'SYS$%'
+       AND UPPER(NAME) NOT LIKE '%XDB%'
+     ORDER BY NAME
+  );
 EXIT;
 SQL" > "$TMP/primary_sql" &
 
@@ -202,6 +227,21 @@ SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
 SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
 SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'SERVICE|' || NAME
+  FROM (
+    SELECT NAME
+      FROM V\$ACTIVE_SERVICES
+     WHERE NAME NOT IN (
+               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT INSTANCE_NAME FROM V\$INSTANCE
+           )
+       AND NAME NOT LIKE 'SYS$%'
+       AND UPPER(NAME) NOT LIKE '%XDB%'
+     ORDER BY NAME
+  );
 EXIT;
 SQL" > "$TMP/standby_sql" &
 
@@ -235,6 +275,7 @@ PRI_FRA_SIZE=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $2}' | xargs)
 PRI_FRA_USED=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $3}' | xargs)
 PRI_FRA_RECLAIM=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $4}' | xargs)
 PRI_FRA_FILES=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $5}' | xargs)
+PRI_SERVICES=$(format_services "$(printf '%s\n' "$PRI_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
 # -- Parse standby SQL --------------------------------------------------------
 STB_SQL=$(cat "$TMP/standby_sql")
@@ -266,6 +307,7 @@ STB_FRA_SIZE=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $2}' | xargs)
 STB_FRA_USED=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $3}' | xargs)
 STB_FRA_RECLAIM=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $4}' | xargs)
 STB_FRA_FILES=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $5}' | xargs)
+STB_SERVICES=$(format_services "$(printf '%s\n' "$STB_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
 # -- Parse DGMGRL output -----------------------------------------------------
 DGMGRL_CONFIG=$(cat "$TMP/dgmgrl_config")
@@ -348,6 +390,7 @@ row "Flashback" "$PRI_FLASH" "$icon"
 icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
 [[ "$icon" == *"XX"* ]] && add_summary_error "DG Broker is '${PRI_BROKER:-FALSE}' on primary"
 row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
+row "Running Services" "${PRI_SERVICES:-NONE}"
 
 row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
 if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
@@ -395,6 +438,7 @@ row "Protection Mode" "$STB_PROTECT"
 
 icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
 row "Switchover Status" "$STB_SWITCH" "$icon"
+row "Running Services" "${STB_SERVICES:-NONE}"
 
 # MRP (Managed Recovery Process)
 if [[ -n "${STB_MRP_STATUS:-}" ]]; then

@@ -113,6 +113,16 @@ EXIT;
 SQL
 }
 
+format_services() {
+    local input="$1" formatted
+    formatted=$(printf '%s\n' "$input" | sed '/^$/d' | awk 'BEGIN{ORS=""} {if (NR>1) printf ", "; printf "%s", $0}')
+    if [[ -n "$formatted" ]]; then
+        printf '%s' "$formatted"
+    else
+        printf 'NONE'
+    fi
+}
+
 # -- Collect local data -------------------------------------------------------
 LOCAL_SQL=$(run_local_sql "
 SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
@@ -123,6 +133,21 @@ SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
 SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
 SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
 SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'SERVICE|' || NAME
+  FROM (
+    SELECT NAME
+      FROM V\$ACTIVE_SERVICES
+     WHERE NAME NOT IN (
+               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT INSTANCE_NAME FROM V\$INSTANCE
+           )
+       AND NAME NOT LIKE 'SYS$%'
+       AND UPPER(NAME) NOT LIKE '%XDB%'
+     ORDER BY NAME
+  );
 SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
 SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
@@ -164,6 +189,7 @@ LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | xargs)
 LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | xargs)
 LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | xargs)
 LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | xargs)
+LOC_SERVICES=$(format_services "$(printf '%s\n' "$LOCAL_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
 LOC_MRP=$(printf '%s\n' "$LOCAL_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
 LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | xargs)
@@ -254,6 +280,21 @@ SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
 SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
 SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
 SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'SERVICE|' || NAME
+  FROM (
+    SELECT NAME
+      FROM V\$ACTIVE_SERVICES
+     WHERE NAME NOT IN (
+               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT NAME FROM V\$DATABASE
+               UNION ALL
+               SELECT INSTANCE_NAME FROM V\$INSTANCE
+           )
+       AND NAME NOT LIKE 'SYS$%'
+       AND UPPER(NAME) NOT LIKE '%XDB%'
+     ORDER BY NAME
+  );
 SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
 SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
@@ -268,6 +309,7 @@ REM_FRA_PATH=""; REM_FRA_SIZE=""; REM_FRA_USED=""; REM_FRA_RECLAIM=""; REM_FRA_F
 REM_MRP_STATUS=""; REM_MRP_SEQ=""
 REM_TRANSPORT_LAG=""; REM_APPLY_LAG=""
 REM_LAST_APPLIED=""; REM_LAST_RECEIVED=""
+REM_SERVICES=""
 
 if [[ -n "$REMOTE_SQL" ]]; then
     REM_DBSTATUS=$(printf '%s\n' "$REMOTE_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
@@ -291,6 +333,7 @@ if [[ -n "$REMOTE_SQL" ]]; then
     REM_FRA_USED=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $3}' | xargs)
     REM_FRA_RECLAIM=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $4}' | xargs)
     REM_FRA_FILES=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $5}' | xargs)
+    REM_SERVICES=$(format_services "$(printf '%s\n' "$REMOTE_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
     REM_MRP=$(printf '%s\n' "$REMOTE_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
     REM_MRP_STATUS=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $2}' | xargs)
@@ -316,6 +359,7 @@ if $IS_PRIMARY; then
     PRI_ARCHGAP="$LOC_ARCHGAP"
     PRI_FRA_PATH="$LOC_FRA_PATH"; PRI_FRA_SIZE="$LOC_FRA_SIZE"
     PRI_FRA_USED="$LOC_FRA_USED"; PRI_FRA_RECLAIM="$LOC_FRA_RECLAIM"; PRI_FRA_FILES="$LOC_FRA_FILES"
+    PRI_SERVICES="$LOC_SERVICES"
     PRI_HOST=$(hostname -s 2>/dev/null || hostname)
 
     STB_ROLE="$REM_ROLE";       STB_OPEN="$REM_OPEN";       STB_PROTECT="$REM_PROTECT"
@@ -328,6 +372,7 @@ if $IS_PRIMARY; then
     STB_LAST_APPLIED="$REM_LAST_APPLIED"; STB_LAST_RECEIVED="$REM_LAST_RECEIVED"
     STB_FRA_PATH="$REM_FRA_PATH"; STB_FRA_SIZE="$REM_FRA_SIZE"
     STB_FRA_USED="$REM_FRA_USED"; STB_FRA_RECLAIM="$REM_FRA_RECLAIM"; STB_FRA_FILES="$REM_FRA_FILES"
+    STB_SERVICES="$REM_SERVICES"
     STB_HOST="${PEER_TNS:-unknown}"
 else
     STB_ROLE="$LOC_ROLE";       STB_OPEN="$LOC_OPEN";       STB_PROTECT="$LOC_PROTECT"
@@ -340,6 +385,7 @@ else
     STB_LAST_APPLIED="$LOC_LAST_APPLIED"; STB_LAST_RECEIVED="$LOC_LAST_RECEIVED"
     STB_FRA_PATH="$LOC_FRA_PATH"; STB_FRA_SIZE="$LOC_FRA_SIZE"
     STB_FRA_USED="$LOC_FRA_USED"; STB_FRA_RECLAIM="$LOC_FRA_RECLAIM"; STB_FRA_FILES="$LOC_FRA_FILES"
+    STB_SERVICES="$LOC_SERVICES"
     STB_HOST=$(hostname -s 2>/dev/null || hostname)
 
     PRI_ROLE="$REM_ROLE";       PRI_OPEN="$REM_OPEN";       PRI_PROTECT="$REM_PROTECT"
@@ -351,6 +397,7 @@ else
     PRI_ARCHGAP="$REM_ARCHGAP"
     PRI_FRA_PATH="$REM_FRA_PATH"; PRI_FRA_SIZE="$REM_FRA_SIZE"
     PRI_FRA_USED="$REM_FRA_USED"; PRI_FRA_RECLAIM="$REM_FRA_RECLAIM"; PRI_FRA_FILES="$REM_FRA_FILES"
+    PRI_SERVICES="$REM_SERVICES"
     PRI_HOST="${PEER_TNS:-unknown}"
 fi
 
@@ -461,6 +508,7 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
     icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
     [[ "$icon" == *"XX"* ]] && err
     row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
+    row "Running Services" "${PRI_SERVICES:-NONE}"
 
     row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
     if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
@@ -532,6 +580,7 @@ if [[ -n "${STB_ROLE:-}" ]]; then
 
     icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
     row "Switchover Status" "$STB_SWITCH" "$icon"
+    row "Running Services" "${STB_SERVICES:-NONE}"
 
     # MRP
     if [[ -n "${STB_MRP_STATUS:-}" ]]; then

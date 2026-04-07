@@ -44,6 +44,7 @@ The checks are identical to [`dg_status.sh`](DG_STATUS.md) -- see that document 
 - Database role, open mode, protection mode, switchover status
 - Force logging, flashback
 - DG broker enabled
+- Currently running user services
 - Online redo log and standby redo log counts
 - Archive destination status and errors (primary)
 - Archive gaps
@@ -104,10 +105,11 @@ The script always exits with 0. It is an informational tool -- the colour-coded 
   Force Logging            YES                                  OK
   Flashback                YES                                  OK
   DG Broker                TRUE                                 OK
+  Running Services         MY_APP_SERVICE
   Online Redo Logs         3 groups (150 MB total)
   Standby Redo Logs        4 groups                             OK
   Archive Dest 2 (Standby) VALID                                OK
-  FRA Usage                14.2/20 GB (71%), reclaimable 13.7 GB OK
+  FRA Usage                0.5/20 GB effective (2%), reclaimable 13.7 GB OK
   FRA Location             /u01/app/oracle/fast_recovery_area (317 files)
 
  STANDBY DATABASE  (cdb1_stby)
@@ -146,12 +148,13 @@ The script always exits with 0. It is an informational tool -- the colour-coded 
   Open Mode                MOUNTED                              OK
   Protection Mode          MAXIMUM AVAILABILITY
   Switchover Status        NOT ALLOWED                          OK
+  Running Services         NONE
   MRP Status               APPLYING_LOG (seq# 1295)             OK
   Transport Lag            none                                 OK
   Apply Lag                none                                 OK
   Sequences                applied=1294  received=1294          OK
   Standby Redo Logs        4 groups                             OK
-  FRA Usage                .5/20 GB (2%), reclaimable .5 GB     OK
+  FRA Usage                0.0/20 GB effective (0%), reclaimable .5 GB OK
   FRA Location             /u01/app/oracle/fast_recovery_area (12 files)
 
  DATA GUARD BROKER

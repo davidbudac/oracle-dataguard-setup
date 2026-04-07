@@ -28,6 +28,7 @@ bash dg_status.sh -c /path/to/config.env
 | Force Logging | `V$DATABASE.FORCE_LOGGING` | YES | - | NO |
 | Flashback | `V$DATABASE.FLASHBACK_ON` | YES | NO | - |
 | DG Broker | `V$PARAMETER (dg_broker_start)` | TRUE | - | FALSE |
+| Running Services | `V$ACTIVE_SERVICES` | _(displayed, not graded)_ | | |
 | Online Redo Logs | `V$LOG` | _(displayed, not graded)_ | | |
 | Standby Redo Logs | `V$STANDBY_LOG` | Count > 0 | NONE | - |
 | Archive Dest 2 | `V$ARCHIVE_DEST` | VALID | - | ERROR (with ORA message) |
@@ -42,6 +43,7 @@ bash dg_status.sh -c /path/to/config.env
 | Open Mode | `V$DATABASE.OPEN_MODE` | MOUNTED / READ ONLY | Anything else | - |
 | Protection Mode | `V$DATABASE.PROTECTION_MODE` | _(displayed, not graded)_ | | |
 | Switchover Status | `V$DATABASE.SWITCHOVER_STATUS` | NOT ALLOWED / SWITCHOVER PENDING | Anything else | - |
+| Running Services | `V$ACTIVE_SERVICES` | _(displayed, not graded)_ | | |
 | MRP Status | `V$MANAGED_STANDBY (MRP0)` | APPLYING_LOG / WAIT_FOR_LOG | - | Not running / other |
 | Transport Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
 | Apply Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
@@ -115,9 +117,9 @@ The script always exits with 0. It is an informational tool -- the colour-coded 
 
 The script runs all SSH connections in parallel (5 concurrent sessions) to minimise wall-clock time:
 
-1. **Primary SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$PARAMETER`, `V$LOG`, `V$STANDBY_LOG`, `V$ARCHIVE_GAP`, `V$ARCHIVE_DEST`, `V$RECOVERY_FILE_DEST`
+1. **Primary SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$PARAMETER`, `V$LOG`, `V$STANDBY_LOG`, `V$ARCHIVE_GAP`, `V$ARCHIVE_DEST`, `V$RECOVERY_FILE_DEST`, `V$ACTIVE_SERVICES`
 2. **Primary DGMGRL** -- `SHOW CONFIGURATION` and `SHOW FAST_START FAILOVER`
-3. **Standby SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$MANAGED_STANDBY`, `V$DATAGUARD_STATS`, `V$ARCHIVE_GAP`, `V$ARCHIVED_LOG`, `V$STANDBY_LOG`, `V$RECOVERY_FILE_DEST`
+3. **Standby SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$MANAGED_STANDBY`, `V$DATAGUARD_STATS`, `V$ARCHIVE_GAP`, `V$ARCHIVED_LOG`, `V$STANDBY_LOG`, `V$RECOVERY_FILE_DEST`, `V$ACTIVE_SERVICES`
 
 Results are parsed and displayed with colour-coded status indicators:
 - **OK** (green) -- check passed
@@ -139,10 +141,11 @@ Results are parsed and displayed with colour-coded status indicators:
   Force Logging            YES                                  OK
   Flashback                YES                                  OK
   DG Broker                TRUE                                 OK
+  Running Services         MY_APP_SERVICE
   Online Redo Logs         3 groups (150 MB total)
   Standby Redo Logs        4 groups                             OK
   Archive Dest 2 (Standby) VALID                                OK
-  FRA Usage                14.1/20 GB (70%), reclaimable 13.7 GB OK
+  FRA Usage                0.4/20 GB effective (2%), reclaimable 13.7 GB OK
   FRA Location             /u01/app/oracle/fast_recovery_area (316 files)
 
  STANDBY DATABASE  (poug-dg2 / cdb1_stby)
@@ -151,12 +154,13 @@ Results are parsed and displayed with colour-coded status indicators:
   Open Mode                MOUNTED                              OK
   Protection Mode          MAXIMUM AVAILABILITY
   Switchover Status        NOT ALLOWED                          OK
+  Running Services         NONE
   MRP Status               APPLYING_LOG (seq# 1295)             OK
   Transport Lag            none                                 OK
   Apply Lag                none                                 OK
   Sequences                applied=1294  received=1294          OK
   Standby Redo Logs        4 groups                             OK
-  FRA Usage                .5/20 GB (2%), reclaimable .5 GB     OK
+  FRA Usage                0.0/20 GB effective (0%), reclaimable .5 GB OK
   FRA Location             /u01/app/oracle/fast_recovery_area (12 files)
 
  DATA GUARD BROKER
