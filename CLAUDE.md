@@ -116,7 +116,7 @@ bash dg_status.sh -s cdb1            # Explicit SID
 bash dg_status.sh -c myconfig.env    # Custom SSH config
 ```
 
-**What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, currently running services, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, and broker configuration including FSFO and per-member ORA errors.
+**What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, currently running services, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, broker configuration including FSFO and per-member ORA errors, and recent Data Guard-related alert log entries.
 
 **SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
 

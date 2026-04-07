@@ -428,6 +428,18 @@ if [[ -n "$REMOTE_SQL" ]]; then
     REM_LAST_RECEIVED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
 fi
 
+# -- Collect alert log entries (DG-related) -----------------------------------
+# Local alert log
+LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" | xargs)
+LOC_ALERT_FILE="${LOC_ALERT_TRACE}/alert_${ORACLE_SID}.log"
+LOC_ALERT_ENTRIES=""
+if [[ -f "$LOC_ALERT_FILE" ]]; then
+    LOC_ALERT_ENTRIES=$(tail -2000 "$LOC_ALERT_FILE" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' 2>/dev/null | tail -15)
+fi
+
+# Remote alert log (via SQL - read from X$DBGALERTEXT is not reliable, so skip for remote)
+REM_ALERT_ENTRIES=""
+
 # =============================================================================
 # Assign to PRIMARY / STANDBY variables based on detected role
 # =============================================================================
@@ -828,6 +840,39 @@ else
         fi
     fi
 fi
+
+# -- Recent Alert Log (DG-related) --------------------------------------------
+header "RECENT ALERT LOG (Data Guard)"
+
+_show_alert_entries() {
+    local label="$1" entries="$2"
+    if [[ -z "$entries" ]]; then
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "$label" "No recent DG-related entries"
+    else
+        local first=true
+        while IFS= read -r line; do
+            # Strip the line-number prefix from grep -n (e.g. "12345:...")
+            local text="${line#*:}"
+            if $first; then
+                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$label" "$text"
+                else
+                    printf "  ${DIM}%-24s${NC} %s\n" "$label" "$text"
+                fi
+                first=false
+            else
+                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$text"
+                else
+                    printf "  ${DIM}%-24s${NC} %s\n" "" "$text"
+                fi
+            fi
+        done <<< "$entries"
+    fi
+}
+
+subheader "Local ($(short_hostname) / ${ORACLE_SID})"
+_show_alert_entries "Alert Log" "$LOC_ALERT_ENTRIES"
 
 # =============================================================================
 # Summary

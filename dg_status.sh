@@ -311,6 +311,36 @@ SELECT 'SERVICE|' || NAME
 EXIT;
 SQL" > "$TMP/standby_sql" &
 
+# Alert log: primary (get diag trace path, then grep DG-related entries from last 1000 lines)
+_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" "
+TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
+SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
+SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
+EXIT;
+SQLT
+)
+TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
+ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID}.log\"
+if [ -f \"\$ALERT_FILE\" ]; then
+    tail -2000 \"\$ALERT_FILE\" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' | tail -15
+fi
+" > "$TMP/primary_alert" 2>/dev/null &
+
+# Alert log: standby
+_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" "
+TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
+SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
+SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
+EXIT;
+SQLT
+)
+TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
+ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID_STB}.log\"
+if [ -f \"\$ALERT_FILE\" ]; then
+    tail -2000 \"\$ALERT_FILE\" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' | tail -15
+fi
+" > "$TMP/standby_alert" 2>/dev/null &
+
 wait
 
 # -- Parse primary SQL --------------------------------------------------------
@@ -633,6 +663,44 @@ else
         fi
     fi
 fi
+
+# -- Recent Alert Log (DG-related) --------------------------------------------
+header "RECENT ALERT LOG (Data Guard)"
+
+_show_alert_entries() {
+    local label="$1" file="$2"
+    local entries
+    entries=$(cat "$file" 2>/dev/null | sed '/^$/d')
+    if [[ -z "$entries" ]]; then
+        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "$label" "No recent DG-related entries"
+    else
+        local first=true
+        while IFS= read -r line; do
+            # Strip the line-number prefix from grep -n (e.g. "12345:...")
+            local text="${line#*:}"
+            if $first; then
+                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$label" "$text"
+                else
+                    printf "  ${DIM}%-24s${NC} %s\n" "$label" "$text"
+                fi
+                first=false
+            else
+                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$text"
+                else
+                    printf "  ${DIM}%-24s${NC} %s\n" "" "$text"
+                fi
+            fi
+        done <<< "$entries"
+    fi
+}
+
+subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
+_show_alert_entries "Alert Log" "$TMP/primary_alert"
+
+subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
+_show_alert_entries "Alert Log" "$TMP/standby_alert"
 
 # =============================================================================
 # Summary
