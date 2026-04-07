@@ -480,7 +480,8 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
     fi
 
     if [[ -n "${PRI_FRA_PATH:-}" ]]; then
-        PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) printf \"%.0f\", (${PRI_FRA_USED:-0}/${PRI_FRA_SIZE})*100; else print 0}")
+        PRI_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
+        PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${PRI_FRA_SIZE})*100} else print 0}")
         if [[ "$PRI_FRA_PCT" -ge 90 ]]; then
             icon="$FAIL"; err
         elif [[ "$PRI_FRA_PCT" -ge 80 ]]; then
@@ -488,7 +489,7 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
         else
             icon="$CHK"
         fi
-        row "FRA Usage" "${PRI_FRA_USED}/${PRI_FRA_SIZE} GB (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
+        row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
         row "FRA Location" "${PRI_FRA_PATH} (${PRI_FRA_FILES:-0} files)"
     fi
 else
@@ -585,7 +586,8 @@ if [[ -n "${STB_ROLE:-}" ]]; then
     fi
 
     if [[ -n "${STB_FRA_PATH:-}" ]]; then
-        STB_FRA_PCT=$(awk "BEGIN {if (${STB_FRA_SIZE:-0} > 0) printf \"%.0f\", (${STB_FRA_USED:-0}/${STB_FRA_SIZE})*100; else print 0}")
+        STB_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
+        STB_FRA_PCT=$(awk "BEGIN {if (${STB_FRA_SIZE:-0} > 0) {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${STB_FRA_SIZE})*100} else print 0}")
         if [[ "$STB_FRA_PCT" -ge 90 ]]; then
             icon="$FAIL"; err
         elif [[ "$STB_FRA_PCT" -ge 80 ]]; then
@@ -593,7 +595,7 @@ if [[ -n "${STB_ROLE:-}" ]]; then
         else
             icon="$CHK"
         fi
-        row "FRA Usage" "${STB_FRA_USED}/${STB_FRA_SIZE} GB (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
+        row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
         row "FRA Location" "${STB_FRA_PATH} (${STB_FRA_FILES:-0} files)"
     fi
 else
