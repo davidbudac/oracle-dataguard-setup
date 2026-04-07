@@ -137,14 +137,7 @@ SELECT 'SERVICE|' || NAME
   FROM (
     SELECT NAME
       FROM V\$ACTIVE_SERVICES
-     WHERE NAME NOT IN (
-               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
-               UNION ALL
-               SELECT NAME FROM V\$DATABASE
-               UNION ALL
-               SELECT INSTANCE_NAME FROM V\$INSTANCE
-           )
-       AND NAME NOT LIKE 'SYS$%'
+     WHERE NAME NOT LIKE 'SYS$%'
        AND UPPER(NAME) NOT LIKE '%XDB%'
      ORDER BY NAME
   );
@@ -284,14 +277,7 @@ SELECT 'SERVICE|' || NAME
   FROM (
     SELECT NAME
       FROM V\$ACTIVE_SERVICES
-     WHERE NAME NOT IN (
-               SELECT DB_UNIQUE_NAME FROM V\$DATABASE
-               UNION ALL
-               SELECT NAME FROM V\$DATABASE
-               UNION ALL
-               SELECT INSTANCE_NAME FROM V\$INSTANCE
-           )
-       AND NAME NOT LIKE 'SYS$%'
+     WHERE NAME NOT LIKE 'SYS$%'
        AND UPPER(NAME) NOT LIKE '%XDB%'
      ORDER BY NAME
   );

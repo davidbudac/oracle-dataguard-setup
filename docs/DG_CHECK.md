@@ -44,7 +44,7 @@ The checks are identical to [`dg_status.sh`](DG_STATUS.md) -- see that document 
 - Database role, open mode, protection mode, switchover status
 - Force logging, flashback
 - DG broker enabled
-- Currently running user services
+- Currently running services
 - Online redo log and standby redo log counts
 - Archive destination status and errors (primary)
 - Archive gaps

@@ -141,7 +141,7 @@ Results are parsed and displayed with colour-coded status indicators:
   Force Logging            YES                                  OK
   Flashback                YES                                  OK
   DG Broker                TRUE                                 OK
-  Running Services         MY_APP_SERVICE
+  Running Services         CDB1, MY_APP_SERVICE
   Online Redo Logs         3 groups (150 MB total)
   Standby Redo Logs        4 groups                             OK
   Archive Dest 2 (Standby) VALID                                OK
@@ -154,7 +154,7 @@ Results are parsed and displayed with colour-coded status indicators:
   Open Mode                MOUNTED                              OK
   Protection Mode          MAXIMUM AVAILABILITY
   Switchover Status        NOT ALLOWED                          OK
-  Running Services         NONE
+  Running Services         CDB1_STBY
   MRP Status               APPLYING_LOG (seq# 1295)             OK
   Transport Lag            none                                 OK
   Apply Lag                none                                 OK
