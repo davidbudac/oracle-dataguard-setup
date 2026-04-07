@@ -83,7 +83,8 @@ DB_SSH_KEY_OPT=""
 [[ -n "${SSH_KEY:-}" ]] && DB_SSH_KEY_OPT="-i ${SSH_KEY}"
 
 # Skip ProxyJump if we're already on the jump host
-_CURRENT_HOST=$(hostname -s 2>/dev/null || hostname)
+_CURRENT_HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
+_CURRENT_HOST=${_CURRENT_HOST%%.*}
 if [[ "$_CURRENT_HOST" == "${JUMP_HOST}"* ]]; then
     _JUMP_OPT=""
 else
@@ -108,6 +109,38 @@ _ssh_ora() {
 }
 
 # -- Helpers ------------------------------------------------------------------
+repeat_char() {
+    local char="$1" count="$2" out=""
+    while (( count > 0 )); do
+        out="${out}${char}"
+        count=$((count - 1))
+    done
+    printf '%s' "$out"
+}
+
+short_hostname() {
+    local host
+    host=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
+    printf '%s' "${host%%.*}"
+}
+
+extract_first_status() {
+    awk '
+        match($0, /(SUCCESS|WARNING|ERROR)/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    '
+}
+
+make_temp_dir() {
+    if command -v mktemp >/dev/null 2>&1; then
+        mktemp -d 2>/dev/null && return
+    fi
+    local dir="${TMPDIR:-/tmp}/dg_status.$$"
+    mkdir -p "$dir" && printf '%s\n' "$dir"
+}
+
 fit_text() {
     local text="$1" width="$2" plain
     plain=$(printf '%b' "$text" | sed $'s/\033\\[[0-9;]*m//g')
@@ -226,7 +259,7 @@ printf "\n ${BOLD}${CYAN}Data Guard Status Dashboard${NC}  ${DIM}$(date '+%Y-%m-
 printf " ${DIM}Primary: ${PRIMARY_ORACLE_HOSTNAME} (SID: ${DETECTED_SID})  |  Standby: ${STANDBY_ORACLE_HOSTNAME} (SID: ${DETECTED_SID_STB})${NC}\n"
 
 # -- Collect data in parallel -------------------------------------------------
-TMP=$(mktemp -d)
+TMP=$(make_temp_dir)
 trap 'rm -rf "$TMP"' EXIT
 
 # Primary: SQL data + DGMGRL
@@ -347,7 +380,7 @@ DGMGRL_CONFIG=$(cat "$TMP/dgmgrl_config")
 DGMGRL_FSFO=$(cat "$TMP/dgmgrl_fsfo" 2>/dev/null)
 
 BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | xargs)
-BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | extract_first_status)
 
 # =============================================================================
 # Display
@@ -355,7 +388,7 @@ BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | grep -oE '(SUCCESS|W
 
 # -- Summary box --------------------------------------------------------------
 _W=29
-_BAR=$(printf '─%.0s' $(seq 1 $_W))
+_BAR=$(repeat_char '─' "$_W")
 
 box_row() {
     local left="$1" right="$2"

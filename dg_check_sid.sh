@@ -82,6 +82,30 @@ printf "\n ${BOLD}${CYAN}Data Guard Status Check${NC}  ${DIM}starting...${NC}\n"
 printf " ${DIM}Local SID: %s${NC}\n" "${ORACLE_SID}"
 
 # -- Helpers ------------------------------------------------------------------
+repeat_char() {
+    local char="$1" count="$2" out=""
+    while (( count > 0 )); do
+        out="${out}${char}"
+        count=$((count - 1))
+    done
+    printf '%s' "$out"
+}
+
+short_hostname() {
+    local host
+    host=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
+    printf '%s' "${host%%.*}"
+}
+
+extract_first_status() {
+    awk '
+        match($0, /(SUCCESS|WARNING|ERROR)/) {
+            print substr($0, RSTART, RLENGTH)
+            exit
+        }
+    '
+}
+
 fit_text() {
     local text="$1" width="$2" plain
     plain=$(printf '%b' "$text" | sed $'s/\033\\[[0-9;]*m//g')
@@ -211,7 +235,7 @@ DGMGRL_CONFIG=$(dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1)
 DGMGRL_FSFO=$(dgmgrl -silent / 'SHOW FAST_START FAILOVER' 2>&1)
 
 BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | xargs)
-BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | extract_first_status)
 
 # Find peer DB unique name from broker config
 # Members lines look like: "  cdb1_stby - Physical standby database"
@@ -417,7 +441,7 @@ if $IS_PRIMARY; then
     PRI_FRA_PATH="$LOC_FRA_PATH"; PRI_FRA_SIZE="$LOC_FRA_SIZE"
     PRI_FRA_USED="$LOC_FRA_USED"; PRI_FRA_RECLAIM="$LOC_FRA_RECLAIM"; PRI_FRA_FILES="$LOC_FRA_FILES"
     PRI_SERVICES="$LOC_SERVICES"
-    PRI_HOST=$(hostname -s 2>/dev/null || hostname)
+    PRI_HOST=$(short_hostname)
 
     STB_ROLE="$REM_ROLE";       STB_OPEN="$REM_OPEN";       STB_PROTECT="$REM_PROTECT"
     STB_SWITCH="$REM_SWITCH";   STB_FORCE="$REM_FORCE";     STB_FLASH="$REM_FLASH"
@@ -443,7 +467,7 @@ else
     STB_FRA_PATH="$LOC_FRA_PATH"; STB_FRA_SIZE="$LOC_FRA_SIZE"
     STB_FRA_USED="$LOC_FRA_USED"; STB_FRA_RECLAIM="$LOC_FRA_RECLAIM"; STB_FRA_FILES="$LOC_FRA_FILES"
     STB_SERVICES="$LOC_SERVICES"
-    STB_HOST=$(hostname -s 2>/dev/null || hostname)
+    STB_HOST=$(short_hostname)
 
     PRI_ROLE="$REM_ROLE";       PRI_OPEN="$REM_OPEN";       PRI_PROTECT="$REM_PROTECT"
     PRI_SWITCH="$REM_SWITCH";   PRI_FORCE="$REM_FORCE";     PRI_FLASH="$REM_FLASH"
@@ -474,7 +498,7 @@ row_or_na() {
 
 # -- Title
 printf "\n ${BOLD}${CYAN}Data Guard Status Check${NC}  ${DIM}$(date '+%Y-%m-%d %H:%M:%S')${NC}\n"
-printf " ${DIM}Local: $(hostname -s 2>/dev/null || hostname) (SID: ${ORACLE_SID}, role: ${LOC_LABEL})"
+printf " ${DIM}Local: $(short_hostname) (SID: ${ORACLE_SID}, role: ${LOC_LABEL})"
 if [[ "$REMOTE_CONNECTED" == true ]]; then
     printf "  |  Remote: ${PEER_DBUNIQ} via ${PEER_TNS}"
 elif [[ "$LOCAL_ONLY" == true ]]; then
@@ -486,7 +510,7 @@ printf "${NC}\n"
 
 # -- Summary box --------------------------------------------------------------
 _W=29
-_BAR=$(printf '─%.0s' $(seq 1 $_W))
+_BAR=$(repeat_char '─' "$_W")
 
 box_row() {
     local left="$1" right="$2"
@@ -614,7 +638,7 @@ else
 
         PEER_ROLE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
         PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
-        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | extract_first_status)
 
         row "Role" "${PEER_ROLE:-?}" "$(status_icon "${PEER_ROLE:-}" "PRIMARY")"
         row "Intended State" "${PEER_STATE:-?}"
@@ -736,7 +760,7 @@ else
         PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
         PEER_TLAG=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | xargs)
         PEER_ALAG=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//' | xargs)
-        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
+        PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | extract_first_status)
 
         row "Role" "${PEER_ROLE:-?}" "$(status_icon "${PEER_ROLE:-}" "PHYSICAL STANDBY" "PRIMARY")"
         row "Intended State" "${PEER_STATE:-?}"
