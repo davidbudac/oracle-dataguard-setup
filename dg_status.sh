@@ -155,6 +155,10 @@ header() {
     printf " ${DIM}%s${NC}\n" "$HLINE"
 }
 
+subheader() {
+    printf " ${BOLD}${CYAN}%s${NC}\n" "$1"
+}
+
 status_icon() {
     local value="$1"; shift
     for p in "$@"; do
@@ -386,6 +390,7 @@ printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 
 # -- Primary Database ---------------------------------------------------------
 header "PRIMARY DATABASE  (${PRIMARY_ORACLE_HOSTNAME} / ${PRI_DBUNIQ:-?})"
+subheader "Identity"
 
 icon=$(status_icon "$PRI_ROLE" "PRIMARY")
 [[ "$icon" == *"XX"* ]] && add_summary_error "Primary role is '$PRI_ROLE' (expected PRIMARY)"
@@ -409,10 +414,14 @@ icon=$(warn_icon "$PRI_FLASH" "YES")
 [[ "$icon" == *"!!"* ]] && add_summary_warning "Flashback is '$PRI_FLASH' on primary"
 row "Flashback" "$PRI_FLASH" "$icon"
 
+subheader "Services"
+
 icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
 [[ "$icon" == *"XX"* ]] && add_summary_error "DG Broker is '${PRI_BROKER:-FALSE}' on primary"
 row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
 row "Running Services" "${PRI_SERVICES:-NONE}"
+
+subheader "Redo / Archive"
 
 row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
 if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
@@ -431,6 +440,8 @@ if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
     row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Primary reports ${PRI_ARCHGAP} archive gap(s)"
 fi
 
+subheader "Recovery Area"
+
 if [[ -n "${PRI_FRA_PATH:-}" ]]; then
     PRI_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
     PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${PRI_FRA_SIZE})*100} else print 0}")
@@ -447,6 +458,7 @@ fi
 
 # -- Standby Database ---------------------------------------------------------
 header "STANDBY DATABASE  (${STANDBY_ORACLE_HOSTNAME} / ${STB_DBUNIQ:-?})"
+subheader "Identity"
 
 icon=$(status_icon "$STB_ROLE" "PHYSICAL STANDBY")
 [[ "$icon" == *"XX"* ]] && add_summary_error "Standby role is '$STB_ROLE' (expected PHYSICAL STANDBY)"
@@ -460,7 +472,12 @@ row "Protection Mode" "$STB_PROTECT"
 
 icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
 row "Switchover Status" "$STB_SWITCH" "$icon"
+
+subheader "Services"
+
 row "Running Services" "${STB_SERVICES:-NONE}"
+
+subheader "Recovery / Apply"
 
 # MRP (Managed Recovery Process)
 if [[ -n "${STB_MRP_STATUS:-}" ]]; then
@@ -504,6 +521,8 @@ if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "
     fi
 fi
 
+subheader "Redo / Archive"
+
 if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -gt 0 ]]; then
     row "Standby Redo Logs" "${STB_SRL} groups" "$CHK"
 else
@@ -513,6 +532,8 @@ fi
 if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
     row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Standby reports ${STB_ARCHGAP} archive gap(s)"
 fi
+
+subheader "Recovery Area"
 
 if [[ -n "${STB_FRA_PATH:-}" ]]; then
     STB_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")

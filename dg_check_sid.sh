@@ -119,6 +119,10 @@ header() {
     printf " ${DIM}%s${NC}\n" "$HLINE"
 }
 
+subheader() {
+    printf " ${BOLD}${CYAN}%s${NC}\n" "$1"
+}
+
 status_icon() {
     local value="$1"; shift
     for p in "$@"; do
@@ -538,6 +542,8 @@ printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 header "PRIMARY DATABASE  (${PRI_DBUNIQ:-?})"
 
 if [[ -n "${PRI_ROLE:-}" ]]; then
+    subheader "Identity"
+
     icon=$(status_icon "$PRI_ROLE" "PRIMARY")
     [[ "$icon" == *"XX"* ]] && err
     row "Role" "$PRI_ROLE" "$icon"
@@ -560,10 +566,14 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
     [[ "$icon" == *"!!"* ]] && warn
     row "Flashback" "$PRI_FLASH" "$icon"
 
+    subheader "Services"
+
     icon=$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")
     [[ "$icon" == *"XX"* ]] && err
     row "DG Broker" "${PRI_BROKER:-FALSE}" "$icon"
     row "Running Services" "${PRI_SERVICES:-NONE}"
+
+    subheader "Redo / Archive"
 
     row "Online Redo Logs" "${PRI_REDO_CNT:-?} groups (${PRI_REDO_MB:-?} MB total)"
     if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -gt 0 ]]; then
@@ -582,6 +592,8 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
         row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; err
     fi
 
+    subheader "Recovery Area"
+
     if [[ -n "${PRI_FRA_PATH:-}" ]]; then
         PRI_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
         PRI_FRA_PCT=$(awk "BEGIN {if (${PRI_FRA_SIZE:-0} > 0) {effective=${PRI_FRA_USED:-0}-${PRI_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${PRI_FRA_SIZE})*100} else print 0}")
@@ -598,6 +610,8 @@ if [[ -n "${PRI_ROLE:-}" ]]; then
 else
     # No remote SQL to primary - show what broker knows
     if [[ -n "${PEER_DBUNIQ:-}" ]] && [[ -n "$DGMGRL_PEER" ]]; then
+        subheader "Broker View"
+
         PEER_ROLE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
         PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
         PEER_DB_STATUS=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | grep -oE '(SUCCESS|WARNING|ERROR)' | head -1)
@@ -623,6 +637,8 @@ fi
 header "STANDBY DATABASE  (${STB_DBUNIQ:-?})"
 
 if [[ -n "${STB_ROLE:-}" ]]; then
+    subheader "Identity"
+
     icon=$(status_icon "$STB_ROLE" "PHYSICAL STANDBY")
     [[ "$icon" == *"XX"* ]] && err
     row "Role" "$STB_ROLE" "$icon"
@@ -635,7 +651,12 @@ if [[ -n "${STB_ROLE:-}" ]]; then
 
     icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
     row "Switchover Status" "$STB_SWITCH" "$icon"
+
+    subheader "Services"
+
     row "Running Services" "${STB_SERVICES:-NONE}"
+
+    subheader "Recovery / Apply"
 
     # MRP
     if [[ -n "${STB_MRP_STATUS:-}" ]]; then
@@ -679,6 +700,8 @@ if [[ -n "${STB_ROLE:-}" ]]; then
         fi
     fi
 
+    subheader "Redo / Archive"
+
     if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -gt 0 ]]; then
         row "Standby Redo Logs" "${STB_SRL} groups" "$CHK"
     else
@@ -688,6 +711,8 @@ if [[ -n "${STB_ROLE:-}" ]]; then
     if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
         row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; err
     fi
+
+    subheader "Recovery Area"
 
     if [[ -n "${STB_FRA_PATH:-}" ]]; then
         STB_FRA_EFFECTIVE_USED=$(awk "BEGIN {effective=${STB_FRA_USED:-0}-${STB_FRA_RECLAIM:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}")
@@ -705,6 +730,8 @@ if [[ -n "${STB_ROLE:-}" ]]; then
 else
     # No remote SQL - show what broker knows
     if [[ -n "${PEER_DBUNIQ:-}" ]] && [[ -n "$DGMGRL_PEER" ]]; then
+        subheader "Broker View"
+
         PEER_ROLE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
         PEER_STATE=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
         PEER_TLAG=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | xargs)
