@@ -299,6 +299,7 @@ SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN 
 SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
 SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
+SELECT 'RECMODE|' || RECOVERY_MODE FROM V\$ARCHIVE_DEST_STATUS WHERE TYPE = 'LOCAL' AND STATUS = 'VALID' AND ROWNUM = 1;
 SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
 SELECT 'SERVICE|' || NAME
   FROM (
@@ -442,6 +443,7 @@ STB_DBUNIQ=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
 STB_MRP=$(printf '%s\n' "$STB_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
 STB_MRP_STATUS=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $2}' | xargs)
 STB_MRP_SEQ=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $3}' | xargs)
+STB_RECOVERY_MODE=$(printf '%s\n' "$STB_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
 
 STB_TRANSPORT_LAG=$(printf '%s\n' "$STB_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
 STB_APPLY_LAG=$(printf '%s\n' "$STB_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
@@ -605,6 +607,12 @@ if [[ -n "${STB_MRP_STATUS:-}" ]]; then
     row "MRP Status" "${STB_MRP_STATUS} (seq# ${STB_MRP_SEQ:-?})" "$icon"
 else
     row "MRP Status" "NOT RUNNING" "$FAIL"; add_summary_error "MRP is not running on standby"
+fi
+
+if [[ -n "${STB_RECOVERY_MODE:-}" ]]; then
+    icon=$(status_icon "$STB_RECOVERY_MODE" "REAL TIME")
+    [[ "$icon" == *"XX"* ]] && add_summary_warning "Recovery mode is '${STB_RECOVERY_MODE}' (not real-time apply)"
+    row "Recovery Mode" "$STB_RECOVERY_MODE" "$icon"
 fi
 
 # Lag

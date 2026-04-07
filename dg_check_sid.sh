@@ -318,6 +318,7 @@ SELECT 'SERVICE|' || NAME
 SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
 SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+SELECT 'RECMODE|' || RECOVERY_MODE FROM V\$ARCHIVE_DEST_STATUS WHERE TYPE = 'LOCAL' AND STATUS = 'VALID' AND ROWNUM = 1;
 " 2>&1)
     fi
 fi
@@ -344,6 +345,7 @@ SELECT 'SERVICE|' || NAME
 SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
 SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
 SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+SELECT 'RECMODE|' || RECOVERY_MODE FROM V\$ARCHIVE_DEST_STATUS WHERE TYPE = 'LOCAL' AND STATUS = 'VALID' AND ROWNUM = 1;
 ")
 
 LOC_DBSTATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
@@ -382,6 +384,7 @@ LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{prin
 LOC_APPLYINFO=$(printf '%s\n' "$LOCAL_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
 LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
 LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
+LOC_RECOVERY_MODE=$(printf '%s\n' "$LOCAL_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
 
 # -- Parse remote data -------------------------------------------------------
 REM_ROLE=""; REM_OPEN=""; REM_PROTECT=""; REM_SWITCH=""; REM_FORCE=""; REM_FLASH=""; REM_DBUNIQ=""
@@ -390,6 +393,7 @@ REM_FRA_PATH=""; REM_FRA_SIZE=""; REM_FRA_USED=""; REM_FRA_RECLAIM=""; REM_FRA_F
 REM_MRP_STATUS=""; REM_MRP_SEQ=""
 REM_TRANSPORT_LAG=""; REM_APPLY_LAG=""
 REM_LAST_APPLIED=""; REM_LAST_RECEIVED=""
+REM_RECOVERY_MODE=""
 REM_SERVICES=""
 
 if [[ -n "$REMOTE_SQL" ]]; then
@@ -426,6 +430,7 @@ if [[ -n "$REMOTE_SQL" ]]; then
     REM_APPLYINFO=$(printf '%s\n' "$REMOTE_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
     REM_LAST_APPLIED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
     REM_LAST_RECEIVED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
+    REM_RECOVERY_MODE=$(printf '%s\n' "$REMOTE_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
 fi
 
 # -- Collect alert log entries (DG-related) -----------------------------------
@@ -478,6 +483,7 @@ if $IS_PRIMARY; then
     STB_MRP_STATUS="$REM_MRP_STATUS"; STB_MRP_SEQ="$REM_MRP_SEQ"
     STB_TRANSPORT_LAG="$REM_TRANSPORT_LAG"; STB_APPLY_LAG="$REM_APPLY_LAG"
     STB_LAST_APPLIED="$REM_LAST_APPLIED"; STB_LAST_RECEIVED="$REM_LAST_RECEIVED"
+    STB_RECOVERY_MODE="$REM_RECOVERY_MODE"
     STB_FRA_PATH="$REM_FRA_PATH"; STB_FRA_SIZE="$REM_FRA_SIZE"
     STB_FRA_USED="$REM_FRA_USED"; STB_FRA_RECLAIM="$REM_FRA_RECLAIM"; STB_FRA_FILES="$REM_FRA_FILES"
     STB_SERVICES="$REM_SERVICES"
@@ -491,6 +497,7 @@ else
     STB_MRP_STATUS="$LOC_MRP_STATUS"; STB_MRP_SEQ="$LOC_MRP_SEQ"
     STB_TRANSPORT_LAG="$LOC_TRANSPORT_LAG"; STB_APPLY_LAG="$LOC_APPLY_LAG"
     STB_LAST_APPLIED="$LOC_LAST_APPLIED"; STB_LAST_RECEIVED="$LOC_LAST_RECEIVED"
+    STB_RECOVERY_MODE="$LOC_RECOVERY_MODE"
     STB_FRA_PATH="$LOC_FRA_PATH"; STB_FRA_SIZE="$LOC_FRA_SIZE"
     STB_FRA_USED="$LOC_FRA_USED"; STB_FRA_RECLAIM="$LOC_FRA_RECLAIM"; STB_FRA_FILES="$LOC_FRA_FILES"
     STB_SERVICES="$LOC_SERVICES"
@@ -716,6 +723,12 @@ if [[ -n "${STB_ROLE:-}" ]]; then
         row "MRP Status" "${STB_MRP_STATUS} (seq# ${STB_MRP_SEQ:-?})" "$icon"
     else
         row "MRP Status" "NOT RUNNING" "$FAIL"; err
+    fi
+
+    if [[ -n "${STB_RECOVERY_MODE:-}" ]]; then
+        icon=$(status_icon "$STB_RECOVERY_MODE" "REAL TIME")
+        [[ "$icon" == *"XX"* ]] && warn
+        row "Recovery Mode" "$STB_RECOVERY_MODE" "$icon"
     fi
 
     # Lag
