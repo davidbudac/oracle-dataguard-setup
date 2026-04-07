@@ -311,7 +311,9 @@ SELECT 'SERVICE|' || NAME
 EXIT;
 SQL" > "$TMP/standby_sql" &
 
-# Alert log: primary (get diag trace path, then grep DG-related entries from last 1000 lines)
+# Alert log: primary (get diag trace path, then extract DG-related entries with timestamps)
+# Oracle 19c alert log has ISO timestamps on their own line (e.g. 2024-01-15T10:30:45.123+00:00)
+# awk tracks the last timestamp and prepends it to matching DG lines
 _ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" "
 TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
 SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
@@ -322,7 +324,12 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
-    tail -2000 \"\$ALERT_FILE\" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' | tail -15
+    tail -2000 \"\$ALERT_FILE\" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
+{ low = tolower(\$0) }
+low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag/ {
+    if (ts != \"\") printf \"%s  %s\n\", ts, \$0; else print \$0
+}' | tail -15
 fi
 " > "$TMP/primary_alert" 2>/dev/null &
 
@@ -337,9 +344,54 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID_STB}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
-    tail -2000 \"\$ALERT_FILE\" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' | tail -15
+    tail -2000 \"\$ALERT_FILE\" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
+{ low = tolower(\$0) }
+low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag/ {
+    if (ts != \"\") printf \"%s  %s\n\", ts, \$0; else print \$0
+}' | tail -15
 fi
 " > "$TMP/standby_alert" 2>/dev/null &
+
+# Broker log (drc<SID>.log): primary
+_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" "
+TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
+SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
+SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
+EXIT;
+SQLT
+)
+TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
+DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID}.log\"
+if [ -f \"\$DRC_FILE\" ]; then
+    tail -500 \"\$DRC_FILE\" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
+{ low = tolower(\$0) }
+low ~ /ora-|error|warning|fail|switchover|failover|role change|fsfo|reinstate|disable|enable|nsv|broker/ {
+    if (ts != \"\") printf \"%s  %s\n\", ts, \$0; else print \$0
+}' | tail -10
+fi
+" > "$TMP/primary_drc" 2>/dev/null &
+
+# Broker log (drc<SID>.log): standby
+_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" "
+TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
+SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
+SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
+EXIT;
+SQLT
+)
+TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
+DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID_STB}.log\"
+if [ -f \"\$DRC_FILE\" ]; then
+    tail -500 \"\$DRC_FILE\" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
+{ low = tolower(\$0) }
+low ~ /ora-|error|warning|fail|switchover|failover|role change|fsfo|reinstate|disable|enable|nsv|broker/ {
+    if (ts != \"\") printf \"%s  %s\n\", ts, \$0; else print \$0
+}' | tail -10
+fi
+" > "$TMP/standby_drc" 2>/dev/null &
 
 wait
 
@@ -676,20 +728,25 @@ _show_alert_entries() {
     else
         local first=true
         while IFS= read -r line; do
-            # Strip the line-number prefix from grep -n (e.g. "12345:...")
-            local text="${line#*:}"
-            if $first; then
-                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
-                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$label" "$text"
+            # Format: "YYYY-MM-DD HH:MM:SS  message" or just "message" (no timestamp)
+            local ts="" msg="$line"
+            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
+                ts="${line:0:19}"
+                msg="${line:21}"
+            fi
+            local display_label=""
+            if $first; then display_label="$label"; first=false; fi
+            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
+                if [[ -n "$ts" ]]; then
+                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  ${RED}%s${NC}\n" "$display_label" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} %s\n" "$label" "$text"
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$display_label" "$msg"
                 fi
-                first=false
             else
-                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
-                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$text"
+                if [[ -n "$ts" ]]; then
+                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  %s\n" "$display_label" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} %s\n" "" "$text"
+                    printf "  ${DIM}%-24s${NC} %s\n" "$display_label" "$msg"
                 fi
             fi
         done <<< "$entries"
@@ -698,9 +755,11 @@ _show_alert_entries() {
 
 subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
 _show_alert_entries "Alert Log" "$TMP/primary_alert"
+_show_alert_entries "Broker Log" "$TMP/primary_drc"
 
 subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
 _show_alert_entries "Alert Log" "$TMP/standby_alert"
+_show_alert_entries "Broker Log" "$TMP/standby_drc"
 
 # =============================================================================
 # Summary

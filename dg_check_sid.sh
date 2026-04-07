@@ -429,16 +429,31 @@ if [[ -n "$REMOTE_SQL" ]]; then
 fi
 
 # -- Collect alert log entries (DG-related) -----------------------------------
-# Local alert log
+# Oracle 19c alert log has ISO timestamps on their own line (e.g. 2024-01-15T10:30:45.123+00:00)
+# awk tracks the last timestamp and prepends it to matching DG lines
 LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" | xargs)
 LOC_ALERT_FILE="${LOC_ALERT_TRACE}/alert_${ORACLE_SID}.log"
 LOC_ALERT_ENTRIES=""
 if [[ -f "$LOC_ALERT_FILE" ]]; then
-    LOC_ALERT_ENTRIES=$(tail -2000 "$LOC_ALERT_FILE" | grep -inE 'ORA-16[0-9]{3}|ORA-01034|ORA-03113|ORA-12541|switchover|failover|Data Guard|MRP0|FAL\[|RFS\[|LNS[0-9]|broker|DGMGRL|role.change|arch.*gap|APPLY_LAG|TRANSPORT_LAG' 2>/dev/null | tail -15)
+    LOC_ALERT_ENTRIES=$(tail -2000 "$LOC_ALERT_FILE" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
+{ low = tolower($0) }
+low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag/ {
+    if (ts != "") printf "%s  %s\n", ts, $0; else print $0
+}' 2>/dev/null | tail -15)
 fi
 
-# Remote alert log (via SQL - read from X$DBGALERTEXT is not reliable, so skip for remote)
-REM_ALERT_ENTRIES=""
+# Broker log (drc<SID>.log) - contains DGMGRL and broker internal messages
+LOC_DRC_FILE="${LOC_ALERT_TRACE}/drc${ORACLE_SID}.log"
+LOC_DRC_ENTRIES=""
+if [[ -f "$LOC_DRC_FILE" ]]; then
+    LOC_DRC_ENTRIES=$(tail -500 "$LOC_DRC_FILE" | awk '
+/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
+{ low = tolower($0) }
+low ~ /ora-|error|warning|fail|switchover|failover|role change|fsfo|reinstate|disable|enable|nsv|broker/ {
+    if (ts != "") printf "%s  %s\n", ts, $0; else print $0
+}' 2>/dev/null | tail -10)
+fi
 
 # =============================================================================
 # Assign to PRIMARY / STANDBY variables based on detected role
@@ -851,20 +866,25 @@ _show_alert_entries() {
     else
         local first=true
         while IFS= read -r line; do
-            # Strip the line-number prefix from grep -n (e.g. "12345:...")
-            local text="${line#*:}"
-            if $first; then
-                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
-                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$label" "$text"
+            # Format: "YYYY-MM-DD HH:MM:SS  message" or just "message" (no timestamp)
+            local ts="" msg="$line"
+            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
+                ts="${line:0:19}"
+                msg="${line:21}"
+            fi
+            local display_label=""
+            if $first; then display_label="$label"; first=false; fi
+            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
+                if [[ -n "$ts" ]]; then
+                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  ${RED}%s${NC}\n" "$display_label" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} %s\n" "$label" "$text"
+                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$display_label" "$msg"
                 fi
-                first=false
             else
-                if printf '%s' "$text" | grep -qiE 'ORA-|error|fail'; then
-                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$text"
+                if [[ -n "$ts" ]]; then
+                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  %s\n" "$display_label" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} %s\n" "" "$text"
+                    printf "  ${DIM}%-24s${NC} %s\n" "$display_label" "$msg"
                 fi
             fi
         done <<< "$entries"
@@ -873,6 +893,7 @@ _show_alert_entries() {
 
 subheader "Local ($(short_hostname) / ${ORACLE_SID})"
 _show_alert_entries "Alert Log" "$LOC_ALERT_ENTRIES"
+_show_alert_entries "Broker Log" "$LOC_DRC_ENTRIES"
 
 # =============================================================================
 # Summary
