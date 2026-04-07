@@ -33,6 +33,7 @@ RED='\033[0;31m';    GREEN='\033[0;32m';  YELLOW='\033[1;33m'
 BLUE='\033[0;34m';   CYAN='\033[0;36m';   BOLD='\033[1m'
 DIM='\033[2m';       NC='\033[0m'
 CHK="${GREEN}OK${NC}"; WARN="${YELLOW}!!${NC}"; FAIL="${RED}XX${NC}"
+INFO="${CYAN}..${NC}"
 
 if command -v tput >/dev/null 2>&1; then
     TERM_WIDTH=$(tput cols 2>/dev/null || printf '100')
@@ -76,6 +77,9 @@ if [[ -z "${ORACLE_HOME:-}" ]]; then
     exit 1
 fi
 export PATH="${ORACLE_HOME}/bin:${PATH}"
+
+printf "\n ${BOLD}${CYAN}Data Guard Status Check${NC}  ${DIM}starting...${NC}\n"
+printf " ${DIM}Local SID: %s${NC}\n" "${ORACLE_SID}"
 
 # -- Helpers ------------------------------------------------------------------
 fit_text() {
@@ -156,6 +160,19 @@ EXIT;
 SQL
 }
 
+run_remote_sql_timeout() {
+    local timeout_secs="$1" connect="$2" query="$3"
+    if command -v timeout >/dev/null 2>&1; then
+        timeout "${timeout_secs}"s sqlplus -s "${connect}" as sysdba <<SQL
+SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
+${query}
+EXIT;
+SQL
+    else
+        run_remote_sql "$connect" "$query"
+    fi
+}
+
 format_services() {
     local input="$1" formatted
     formatted=$(printf '%s\n' "$input" | sed '/^$/d' | awk 'BEGIN{ORS=""} {if (NR>1) printf ", "; printf "%s", $0}')
@@ -166,38 +183,14 @@ format_services() {
     fi
 }
 
-# -- Collect local data -------------------------------------------------------
-LOCAL_SQL=$(run_local_sql "
-SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
-SELECT 'DGPARAMS|' || NAME || '|' || VALUE FROM V\$PARAMETER WHERE NAME IN ('dg_broker_start') ORDER BY NAME;
-SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
-SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
-SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
-SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
-SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
-SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
-SELECT 'SERVICE|' || NAME
-  FROM (
-    SELECT NAME
-      FROM V\$ACTIVE_SERVICES
-     WHERE NAME NOT LIKE 'SYS$%'
-       AND UPPER(NAME) NOT LIKE '%XDB%'
-     ORDER BY NAME
-  );
-SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
-SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
-SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+# -- Minimal local identity ---------------------------------------------------
+LOCAL_ID_SQL=$(run_local_sql "
+SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
 ")
 
-# -- Parse local identity -----------------------------------------------------
-LOC_DBSTATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-LOC_ROLE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
-LOC_OPEN=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
-LOC_PROTECT=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
-LOC_SWITCH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
-LOC_FORCE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
-LOC_FLASH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
-LOC_DBUNIQ=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+LOC_ID_STATUS=$(printf '%s\n' "$LOCAL_ID_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
+LOC_ROLE=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $1}' | xargs)
+LOC_DBUNIQ=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $2}' | xargs)
 
 if printf '%s' "$LOC_ROLE" | grep -qi "PRIMARY"; then
     IS_PRIMARY=true
@@ -208,35 +201,6 @@ else
     LOC_LABEL="STANDBY"
     PEER_LABEL="PRIMARY"
 fi
-
-LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
-LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
-LOC_REDO=$(printf '%s\n' "$LOCAL_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
-LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | xargs)
-LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | xargs)
-LOC_SRL=$(printf '%s\n' "$LOCAL_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
-LOC_DEST2_STATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | xargs)
-LOC_DEST2_DBUNIQ=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | xargs)
-LOC_DEST2_ERROR=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $5}' | xargs)
-
-LOC_FRA=$(printf '%s\n' "$LOCAL_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
-LOC_FRA_PATH=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $1}' | xargs)
-LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | xargs)
-LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | xargs)
-LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | xargs)
-LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | xargs)
-LOC_SERVICES=$(format_services "$(printf '%s\n' "$LOCAL_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
-
-LOC_MRP=$(printf '%s\n' "$LOCAL_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
-LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | xargs)
-LOC_MRP_SEQ=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $3}' | xargs)
-
-LOC_TRANSPORT_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
-LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
-
-LOC_APPLYINFO=$(printf '%s\n' "$LOCAL_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
-LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
-LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
 
 # -- Collect broker data ------------------------------------------------------
 DGMGRL_CONFIG=$(dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1)
@@ -269,16 +233,16 @@ fi
 # -- Remote connection to peer ------------------------------------------------
 REMOTE_SQL=""
 REMOTE_CONNECTED=false
+REMOTE_TEST_TIMEOUT="${REMOTE_TEST_TIMEOUT:-5}"
 
 if [[ "$LOCAL_ONLY" != true ]] && [[ -n "${PEER_TNS:-}" ]]; then
+    printf " ${DIM}Peer database: %s (TNS: %s)${NC}\n" "${PEER_DBUNIQ}" "${PEER_TNS}"
     # Try wallet-based connection first
     if [[ "$PROMPT_PASSWORD" != true ]]; then
-        WALLET_TEST=$(sqlplus -s "/@${PEER_TNS}" as sysdba <<'SQL' 2>&1
-SET HEADING OFF FEEDBACK OFF LINESIZE 100 PAGESIZE 0
+        printf " ${DIM}Checking wallet authentication (timeout: %ss)...${NC}\n" "$REMOTE_TEST_TIMEOUT"
+        WALLET_TEST=$(run_remote_sql_timeout "$REMOTE_TEST_TIMEOUT" "/@${PEER_TNS}" "
 SELECT 'WALLET_OK' FROM DUAL;
-EXIT;
-SQL
-)
+" 2>&1)
         if printf '%s' "$WALLET_TEST" | grep -q 'WALLET_OK'; then
             REMOTE_CONNECT="/@${PEER_TNS}"
             REMOTE_CONNECTED=true
@@ -288,7 +252,6 @@ SQL
     # Prompt for SYS password if wallet failed or -P was given
     if [[ "$REMOTE_CONNECTED" != true ]]; then
         if [[ "$PROMPT_PASSWORD" == true ]] || [[ "$REMOTE_CONNECTED" != true ]]; then
-            printf "\n ${DIM}Peer database: %s (TNS: %s)${NC}\n" "${PEER_DBUNIQ}" "${PEER_TNS}"
             printf " Enter SYS password for remote connection (or press Enter to skip): "
             stty -echo 2>/dev/null || true
             read -r SYS_PASS
@@ -298,7 +261,7 @@ SQL
             if [[ -n "$SYS_PASS" ]]; then
                 REMOTE_CONNECT="sys/${SYS_PASS}@${PEER_TNS}"
                 # Test connection
-                PASS_TEST=$(run_remote_sql "$REMOTE_CONNECT" "SELECT 'PASS_OK' FROM DUAL;" 2>&1)
+                PASS_TEST=$(run_remote_sql_timeout "$REMOTE_TEST_TIMEOUT" "$REMOTE_CONNECT" "SELECT 'PASS_OK' FROM DUAL;" 2>&1)
                 if printf '%s' "$PASS_TEST" | grep -q 'PASS_OK'; then
                     REMOTE_CONNECTED=true
                 else
@@ -330,6 +293,67 @@ SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) ||
 " 2>&1)
     fi
 fi
+
+# -- Collect full local data --------------------------------------------------
+printf " ${DIM}Collecting local database data...${NC}\n"
+LOCAL_SQL=$(run_local_sql "
+SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
+SELECT 'DGPARAMS|' || NAME || '|' || VALUE FROM V\$PARAMETER WHERE NAME IN ('dg_broker_start') ORDER BY NAME;
+SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
+SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
+SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
+SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
+SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
+SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
+SELECT 'SERVICE|' || NAME
+  FROM (
+    SELECT NAME
+      FROM V\$ACTIVE_SERVICES
+     WHERE NAME NOT LIKE 'SYS$%'
+       AND UPPER(NAME) NOT LIKE '%XDB%'
+     ORDER BY NAME
+  );
+SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
+SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
+SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
+")
+
+LOC_DBSTATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
+LOC_ROLE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
+LOC_OPEN=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
+LOC_PROTECT=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
+LOC_SWITCH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
+LOC_FORCE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
+LOC_FLASH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
+LOC_DBUNIQ=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
+LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+LOC_REDO=$(printf '%s\n' "$LOCAL_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
+LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | xargs)
+LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | xargs)
+LOC_SRL=$(printf '%s\n' "$LOCAL_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
+LOC_DEST2_STATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | xargs)
+LOC_DEST2_DBUNIQ=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | xargs)
+LOC_DEST2_ERROR=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $5}' | xargs)
+
+LOC_FRA=$(printf '%s\n' "$LOCAL_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
+LOC_FRA_PATH=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $1}' | xargs)
+LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | xargs)
+LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | xargs)
+LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | xargs)
+LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | xargs)
+LOC_SERVICES=$(format_services "$(printf '%s\n' "$LOCAL_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
+
+LOC_MRP=$(printf '%s\n' "$LOCAL_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
+LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | xargs)
+LOC_MRP_SEQ=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $3}' | xargs)
+
+LOC_TRANSPORT_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
+LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
+
+LOC_APPLYINFO=$(printf '%s\n' "$LOCAL_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
+LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
+LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
 
 # -- Parse remote data -------------------------------------------------------
 REM_ROLE=""; REM_OPEN=""; REM_PROTECT=""; REM_SWITCH=""; REM_FORCE=""; REM_FLASH=""; REM_DBUNIQ=""
