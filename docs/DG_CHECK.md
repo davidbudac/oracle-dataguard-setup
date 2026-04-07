@@ -1,19 +1,19 @@
 # Data Guard Local Status Check
 
-`dg_check.sh` is a health check that runs directly on an Oracle database host -- no SSH or external config file required. It detects the local database role (primary or standby), queries local V$ views and DGMGRL, then automatically discovers and connects to the peer database over SQL*Net for a complete picture.
+`dg_check_sid.sh` is a health check that runs directly on an Oracle database host -- no SSH or external config file required. It detects the local database role (primary or standby), queries local V$ views and DGMGRL, then automatically discovers and connects to the peer database over SQL*Net for a complete picture.
 
 ## Quick Start
 
 ```bash
 # Run on any DG host - auto-detects everything
 export ORACLE_SID=cdb1
-bash dg_check.sh
+bash dg_check_sid.sh
 
 # Local + broker only (no remote SQL connection)
-bash dg_check.sh -L
+bash dg_check_sid.sh -L
 
 # Force password prompt for remote connection
-bash dg_check.sh -P
+bash dg_check_sid.sh -P
 ```
 
 ## How It Works
@@ -31,7 +31,7 @@ If the remote connection is unavailable (TNS error, no password, `-L` flag), the
 
 The checks are identical to [`dg_status.sh`](DG_STATUS.md) -- see that document for the full table of checks and thresholds. The only difference is the data source:
 
-| Data | `dg_status.sh` (SSH-based) | `dg_check.sh` (local) |
+| Data | `dg_status.sh` (SSH-based) | `dg_check_sid.sh` (local) |
 |---|---|---|
 | Local database | SSH + sqlplus | Direct sqlplus |
 | Peer database | SSH + sqlplus | SQL*Net via TNS |

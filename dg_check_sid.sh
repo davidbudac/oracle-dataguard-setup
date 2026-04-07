@@ -19,9 +19,9 @@
 #   or -L to skip remote checks entirely (local + broker only).
 #
 # Usage:
-#   bash dg_check.sh            # Auto-detect role, try wallet for remote
-#   bash dg_check.sh -P         # Prompt for SYS password for remote
-#   bash dg_check.sh -L         # Local + broker only (skip remote SQL)
+#   bash dg_check_sid.sh            # Auto-detect role, try wallet for remote
+#   bash dg_check_sid.sh -P         # Prompt for SYS password for remote
+#   bash dg_check_sid.sh -L         # Local + broker only (skip remote SQL)
 #
 #
 # =============================================================================
@@ -42,7 +42,7 @@ while [[ $# -gt 0 ]]; do
         -P|--password) PROMPT_PASSWORD=true; shift ;;
         -L|--local)    LOCAL_ONLY=true; shift ;;
         -h|--help)
-            printf "Usage: bash dg_check.sh [-P] [-L]\n"
+            printf "Usage: bash dg_check_sid.sh [-P] [-L]\n"
             printf "  -P, --password   Prompt for SYS password for remote connection\n"
             printf "  -L, --local      Skip remote SQL checks (local + broker only)\n"
             exit 0 ;;
