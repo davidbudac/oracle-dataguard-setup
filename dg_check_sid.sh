@@ -34,6 +34,22 @@ BLUE='\033[0;34m';   CYAN='\033[0;36m';   BOLD='\033[1m'
 DIM='\033[2m';       NC='\033[0m'
 CHK="${GREEN}OK${NC}"; WARN="${YELLOW}!!${NC}"; FAIL="${RED}XX${NC}"
 
+if command -v tput >/dev/null 2>&1; then
+    TERM_WIDTH=$(tput cols 2>/dev/null || printf '100')
+else
+    TERM_WIDTH=100
+fi
+[[ "$TERM_WIDTH" =~ ^[0-9]+$ ]] || TERM_WIDTH=100
+(( TERM_WIDTH < 80 )) && TERM_WIDTH=80
+
+LABEL_W=24
+STATUS_W=4
+ROW_VALUE_W=$((TERM_WIDTH - LABEL_W - STATUS_W - 6))
+(( ROW_VALUE_W < 28 )) && ROW_VALUE_W=28
+
+HLINE=$(printf '%*s' $((TERM_WIDTH - 2)) '')
+HLINE=${HLINE// /─}
+
 # -- Parse args ---------------------------------------------------------------
 PROMPT_PASSWORD=false
 LOCAL_ONLY=false
@@ -62,14 +78,41 @@ fi
 export PATH="${ORACLE_HOME}/bin:${PATH}"
 
 # -- Helpers ------------------------------------------------------------------
+fit_text() {
+    local text="$1" width="$2" plain
+    plain=$(printf '%b' "$text" | sed $'s/\033\\[[0-9;]*m//g')
+    if [[ ${#plain} -le $width ]]; then
+        printf '%s' "$text"
+    elif (( width > 3 )); then
+        printf '%s...' "${plain:0:$((width - 3))}"
+    else
+        printf '%s' "${plain:0:$width}"
+    fi
+}
+
+wrap_text() {
+    local text="$1" width="$2"
+    text=$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    [[ -z "$text" ]] && text="-"
+    printf '%s\n' "$text" | fold -s -w "$width"
+}
+
 row() {
     local label="$1" value="$2" status="${3:-}"
-    printf "  ${DIM}%-24s${NC} %-36s %b\n" "$label" "$value" "$status"
+    local first=true line
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if $first; then
+            printf "  ${DIM}%-*s${NC} %-*s %b\n" "$LABEL_W" "$label" "$ROW_VALUE_W" "$line" "$status"
+            first=false
+        else
+            printf "  ${DIM}%-*s${NC} %-*s\n" "$LABEL_W" "" "$ROW_VALUE_W" "$line"
+        fi
+    done < <(wrap_text "$value" "$ROW_VALUE_W")
 }
 
 header() {
-    printf "\n ${BOLD}${BLUE}%-60s${NC}\n" "$1"
-    printf " ${DIM}────────────────────────────────────────────────────────────${NC}\n"
+    printf "\n ${BOLD}${BLUE}%s${NC}\n" "$1"
+    printf " ${DIM}%s${NC}\n" "$HLINE"
 }
 
 status_icon() {
@@ -420,6 +463,8 @@ _BAR=$(printf '─%.0s' $(seq 1 $_W))
 box_row() {
     local left="$1" right="$2"
     local lp rp
+    left=$(fit_text "$left" "$_W")
+    right=$(fit_text "$right" "$_W")
     lp=$(printf '%b' "$left" | sed $'s/\033\\[[0-9;]*m//g')
     rp=$(printf '%b' "$right" | sed $'s/\033\\[[0-9;]*m//g')
     local lpad=$((_W - ${#lp})); [[ $lpad -lt 0 ]] && lpad=0
@@ -712,7 +757,7 @@ fi
 # =============================================================================
 # Summary
 # =============================================================================
-printf "\n ${DIM}────────────────────────────────────────────────────────────${NC}\n"
+printf "\n ${DIM}%s${NC}\n" "$HLINE"
 
 if [[ $ERRORS -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
     printf " ${BOLD}${GREEN} HEALTHY${NC}  ${DIM}No issues detected${NC}\n"
