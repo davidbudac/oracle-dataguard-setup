@@ -724,9 +724,9 @@ _show_alert_entries() {
     local entries
     entries=$(cat "$file" 2>/dev/null | sed '/^$/d')
     if [[ -z "$entries" ]]; then
-        printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}\n" "$label" "No recent DG-related entries"
+        row "$label" "No recent DG-related entries"
     else
-        local first=true
+        row "$label" ""
         while IFS= read -r line; do
             # Format: "YYYY-MM-DD HH:MM:SS  message" or just "message" (no timestamp)
             local ts="" msg="$line"
@@ -734,19 +734,17 @@ _show_alert_entries() {
                 ts="${line:0:19}"
                 msg="${line:21}"
             fi
-            local display_label=""
-            if $first; then display_label="$label"; first=false; fi
             if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
                 if [[ -n "$ts" ]]; then
-                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  ${RED}%s${NC}\n" "$display_label" "$ts" "$msg"
+                    printf "  %-*s ${DIM}%s${NC}  ${RED}%s${NC}\n" "$LABEL_W" "" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "$display_label" "$msg"
+                    printf "  %-*s ${RED}%s${NC}\n" "$LABEL_W" "" "$msg"
                 fi
             else
                 if [[ -n "$ts" ]]; then
-                    printf "  ${DIM}%-24s${NC} ${DIM}%s${NC}  %s\n" "$display_label" "$ts" "$msg"
+                    printf "  %-*s ${DIM}%s${NC}  %s\n" "$LABEL_W" "" "$ts" "$msg"
                 else
-                    printf "  ${DIM}%-24s${NC} %s\n" "$display_label" "$msg"
+                    printf "  %-*s %s\n" "$LABEL_W" "" "$msg"
                 fi
             fi
         done <<< "$entries"
