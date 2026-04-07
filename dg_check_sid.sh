@@ -435,7 +435,7 @@ LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Di
 LOC_ALERT_FILE="${LOC_ALERT_TRACE}/alert_${ORACLE_SID}.log"
 LOC_ALERT_ENTRIES=""
 if [[ -f "$LOC_ALERT_FILE" ]]; then
-    LOC_ALERT_ENTRIES=$(tail -2000 "$LOC_ALERT_FILE" | awk '
+    LOC_ALERT_ENTRIES=$(printf 'FILE|%s\n' "$LOC_ALERT_FILE"; tail -2000 "$LOC_ALERT_FILE" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
 { low = tolower($0) }
 low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag|unsynchronized|synchronized|maximum availability|maximum performance|maximum protection|redo transport|log shipping|media recovery|recovery stopped|recovery paused|catching up|incomplete/ {
@@ -447,7 +447,7 @@ fi
 LOC_DRC_FILE="${LOC_ALERT_TRACE}/drc${ORACLE_SID}.log"
 LOC_DRC_ENTRIES=""
 if [[ -f "$LOC_DRC_FILE" ]]; then
-    LOC_DRC_ENTRIES=$(tail -500 "$LOC_DRC_FILE" | awk '
+    LOC_DRC_ENTRIES=$(printf 'FILE|%s\n' "$LOC_DRC_FILE"; tail -500 "$LOC_DRC_FILE" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
 { low = tolower($0) }
 low ~ /ora-|error|warning|fail|switchover|failover|role change|fsfo|reinstate|disable|enable|nsv|broker/ {
@@ -860,11 +860,18 @@ fi
 header "RECENT ALERT LOG (Data Guard)"
 
 _show_alert_entries() {
-    local label="$1" entries="$2"
-    if [[ -z "$entries" ]]; then
-        printf "  ${DIM}%s${NC}  ${DIM}(none)${NC}\n" "$label"
+    local label="$1" raw="$2"
+    local filepath entries
+    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
+    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|' | sed '/^$/d')
+    if [[ -n "$filepath" ]]; then
+        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
     else
         printf "  ${DIM}%s${NC}\n" "$label"
+    fi
+    if [[ -z "$entries" ]]; then
+        printf "    ${DIM}(none)${NC}\n"
+    else
         while IFS= read -r line; do
             local ts="" msg="$line"
             if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
@@ -890,6 +897,7 @@ _show_alert_entries() {
 
 subheader "Local ($(short_hostname) / ${ORACLE_SID})"
 _show_alert_entries "Alert Log" "$LOC_ALERT_ENTRIES"
+printf "\n"
 _show_alert_entries "Broker Log" "$LOC_DRC_ENTRIES"
 
 # =============================================================================

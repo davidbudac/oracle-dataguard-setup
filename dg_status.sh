@@ -324,6 +324,7 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
+    printf 'FILE|%s\n' \"\$ALERT_FILE\"
     tail -2000 \"\$ALERT_FILE\" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
 { low = tolower(\$0) }
@@ -344,6 +345,7 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID_STB}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
+    printf 'FILE|%s\n' \"\$ALERT_FILE\"
     tail -2000 \"\$ALERT_FILE\" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
 { low = tolower(\$0) }
@@ -364,6 +366,7 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID}.log\"
 if [ -f \"\$DRC_FILE\" ]; then
+    printf 'FILE|%s\n' \"\$DRC_FILE\"
     tail -500 \"\$DRC_FILE\" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
 { low = tolower(\$0) }
@@ -384,6 +387,7 @@ SQLT
 TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID_STB}.log\"
 if [ -f \"\$DRC_FILE\" ]; then
+    printf 'FILE|%s\n' \"\$DRC_FILE\"
     tail -500 \"\$DRC_FILE\" | awk '
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr(\$0, 1, 19); gsub(/T/, \" \", ts); next }
 { low = tolower(\$0) }
@@ -721,12 +725,18 @@ header "RECENT ALERT LOG (Data Guard)"
 
 _show_alert_entries() {
     local label="$1" file="$2"
-    local entries
-    entries=$(cat "$file" 2>/dev/null | sed '/^$/d')
-    if [[ -z "$entries" ]]; then
-        printf "  ${DIM}%s${NC}  ${DIM}(none)${NC}\n" "$label"
+    local raw filepath entries
+    raw=$(cat "$file" 2>/dev/null | sed '/^$/d')
+    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
+    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|')
+    if [[ -n "$filepath" ]]; then
+        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
     else
         printf "  ${DIM}%s${NC}\n" "$label"
+    fi
+    if [[ -z "$entries" ]]; then
+        printf "    ${DIM}(none)${NC}\n"
+    else
         while IFS= read -r line; do
             local ts="" msg="$line"
             if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
@@ -752,10 +762,12 @@ _show_alert_entries() {
 
 subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
 _show_alert_entries "Alert Log" "$TMP/primary_alert"
+printf "\n"
 _show_alert_entries "Broker Log" "$TMP/primary_drc"
 
 subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
 _show_alert_entries "Alert Log" "$TMP/standby_alert"
+printf "\n"
 _show_alert_entries "Broker Log" "$TMP/standby_drc"
 
 # =============================================================================
