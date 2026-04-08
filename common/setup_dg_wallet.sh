@@ -60,16 +60,29 @@ SQL
 
 # -- Parse args ---------------------------------------------------------------
 WALLET_DIR=""
+AUTO_PASSWORD=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -w|--wallet-dir) WALLET_DIR="$2"; shift 2 ;;
+        -A|--auto-password) AUTO_PASSWORD=true; shift ;;
         -h|--help)
-            printf "Usage: bash common/setup_dg_wallet.sh [-w wallet_dir]\n"
+            printf "Usage: bash common/setup_dg_wallet.sh [-w wallet_dir] [-A]\n"
             printf "  -w, --wallet-dir DIR   Wallet directory (default: \$ORACLE_HOME/network/admin)\n"
+            printf "  -A, --auto-password    Generate wallet password automatically (no prompt)\n"
+            printf "                         The auto-login wallet handles all connections;\n"
+            printf "                         to modify the wallet later, re-run this script\n"
             exit 0 ;;
         *) printf "Unknown option: %s\n" "$1"; exit 1 ;;
     esac
 done
+
+generate_random_password() {
+    # Generate a random 24-char password (AIX compatible — no /dev/urandom dependency)
+    local pw=""
+    pw=$(printf '%s%s%s' "$(date '+%N%s')" "$$" "${RANDOM:-0}" | cksum | awk '{print $1}')
+    pw="Wlt_${pw}_$(printf '%05d' "$$")Aa1"
+    printf '%s' "$pw"
+}
 
 # -- Verify Oracle environment ------------------------------------------------
 if [[ -z "${ORACLE_SID:-}" ]]; then
@@ -207,55 +220,76 @@ step "Setting up wallet"
 
 WALLET_PASSWORD=""
 
+CREATE_NEW_WALLET=false
+
 if [[ -f "${WALLET_DIR}/ewallet.p12" ]]; then
     info "Existing wallet found at: ${WALLET_DIR}"
-    info "Credentials will be added/updated in the existing wallet"
 
-    WALLET_PASSWORD=$(prompt_password "Enter existing wallet password")
+    if $AUTO_PASSWORD; then
+        info "Auto-password mode: recreating wallet (existing wallet requires its password)"
+        BACKUP_DIR="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')"
+        mv "$WALLET_DIR" "$BACKUP_DIR"
+        info "Backed up existing wallet to: ${BACKUP_DIR}"
+        CREATE_NEW_WALLET=true
+    else
+        info "Credentials will be added/updated in the existing wallet"
 
-    if [[ -z "$WALLET_PASSWORD" ]]; then
-        error "Wallet password cannot be empty"
-        unset SYS_PASSWORD
-        exit 1
-    fi
+        WALLET_PASSWORD=$(prompt_password "Enter existing wallet password")
 
-    # Verify wallet password by listing contents
-    VERIFY_OUT=$("$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -listCredential <<EOF 2>&1
+        if [[ -z "$WALLET_PASSWORD" ]]; then
+            error "Wallet password cannot be empty"
+            unset SYS_PASSWORD
+            exit 1
+        fi
+
+        # Verify wallet password by listing contents
+        VERIFY_OUT=$("$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -listCredential <<EOF 2>&1
 ${WALLET_PASSWORD}
 EOF
-    )
-    if printf '%s' "$VERIFY_OUT" | grep -qi "error\|failed\|incorrect\|denied"; then
-        error "Invalid wallet password"
-        unset SYS_PASSWORD WALLET_PASSWORD
-        exit 1
-    fi
-    info "Wallet password verified"
+        )
+        if printf '%s' "$VERIFY_OUT" | grep -qi "error\|failed\|incorrect\|denied"; then
+            error "Invalid wallet password"
+            unset SYS_PASSWORD WALLET_PASSWORD
+            exit 1
+        fi
+        info "Wallet password verified"
 
-    # Show existing credentials
-    info "Current wallet entries:"
-    printf '%s\n' "$VERIFY_OUT" | grep -i 'oracle.security.client.connect_string' | while IFS= read -r line; do
-        printf "   ${DIM}%s${NC}\n" "$line"
-    done
+        # Show existing credentials
+        info "Current wallet entries:"
+        printf '%s\n' "$VERIFY_OUT" | grep -i 'oracle.security.client.connect_string' | while IFS= read -r line; do
+            printf "   ${DIM}%s${NC}\n" "$line"
+        done
+    fi
 else
-    info "No existing wallet found — creating new auto-login wallet"
+    CREATE_NEW_WALLET=true
+fi
+
+if $CREATE_NEW_WALLET; then
+    info "Creating new auto-login wallet"
 
     mkdir -p "$WALLET_DIR"
     chmod 700 "$WALLET_DIR"
 
-    WALLET_PASSWORD=$(prompt_password "Enter new wallet password (protects the wallet file)")
-    if [[ -z "$WALLET_PASSWORD" ]]; then
-        error "Wallet password cannot be empty"
-        unset SYS_PASSWORD
-        exit 1
-    fi
+    if $AUTO_PASSWORD; then
+        WALLET_PASSWORD=$(generate_random_password)
+        info "Auto-generated wallet password (auto-login; password not needed for connections)"
+        info "To modify this wallet later, re-run with -A to recreate it"
+    else
+        WALLET_PASSWORD=$(prompt_password "Enter new wallet password (protects the wallet file)")
+        if [[ -z "$WALLET_PASSWORD" ]]; then
+            error "Wallet password cannot be empty"
+            unset SYS_PASSWORD
+            exit 1
+        fi
 
-    WALLET_PASSWORD_CONFIRM=$(prompt_password "Confirm wallet password")
-    if [[ "$WALLET_PASSWORD" != "$WALLET_PASSWORD_CONFIRM" ]]; then
-        error "Passwords do not match"
-        unset SYS_PASSWORD WALLET_PASSWORD WALLET_PASSWORD_CONFIRM
-        exit 1
+        WALLET_PASSWORD_CONFIRM=$(prompt_password "Confirm wallet password")
+        if [[ "$WALLET_PASSWORD" != "$WALLET_PASSWORD_CONFIRM" ]]; then
+            error "Passwords do not match"
+            unset SYS_PASSWORD WALLET_PASSWORD WALLET_PASSWORD_CONFIRM
+            exit 1
+        fi
+        unset WALLET_PASSWORD_CONFIRM
     fi
-    unset WALLET_PASSWORD_CONFIRM
 
     # Create the wallet (ewallet.p12)
     "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -create <<EOF
