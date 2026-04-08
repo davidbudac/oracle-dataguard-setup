@@ -98,6 +98,18 @@ Sessions remember your config file selection so you don't need to re-select it o
 - `select_or_restore_config` - Session-aware config file selection
 - `list_sessions`, `create_session`, `restore_session` - Session management
 
+## Wallet Setup for Peer Connectivity
+
+After Data Guard is configured, you can set up Oracle Wallet on each DB host so that scripts (like `dg_check_sid.sh`) can connect to the peer database without prompting for a password.
+
+```bash
+bash common/setup_dg_wallet.sh              # Run on primary
+bash common/setup_dg_wallet.sh              # Run on standby
+bash common/setup_dg_wallet.sh -w /path     # Custom wallet directory
+```
+
+The script auto-detects the local role, discovers the peer TNS alias from the broker, creates an auto-login wallet with SYS credentials, configures `sqlnet.ora`, and tests the connection. It is idempotent — re-running adds/updates credentials in an existing wallet.
+
 ## Validation Checks
 
 Built-in validations:
