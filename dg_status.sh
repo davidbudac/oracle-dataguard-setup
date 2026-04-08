@@ -490,7 +490,7 @@ box_row() {
     printf ' │ %b%*s│ %b%*s│\n' "$left" "$lpad" "" "$right" "$rpad" ""
 }
 
-# Quick health check for summary dots
+# Quick health check for summary dots (computed early, displayed later)
 PRI_OK=true; STB_OK=true
 printf '%s' "${PRI_ROLE:-}" | grep -qi "PRIMARY" || PRI_OK=false
 printf '%s' "${PRI_OPEN:-}" | grep -qi "READ WRITE" || PRI_OK=false
@@ -503,11 +503,56 @@ fi
 if $PRI_OK; then PRI_DOT="${GREEN}●${NC}"; else PRI_DOT="${RED}●${NC}"; fi
 if $STB_OK; then STB_DOT="${GREEN}●${NC}"; else STB_DOT="${RED}●${NC}"; fi
 
-printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
-box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
-box_row "${PRI_DBUNIQ:-?} @ ${PRIMARY_ORACLE_HOSTNAME}" "${STB_DBUNIQ:-?} @ ${STANDBY_ORACLE_HOSTNAME}"
-box_row "${PRI_OPEN:-?}" "${STB_OPEN:-?} / MRP: ${STB_MRP_STATUS:-NOT RUNNING}"
-printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
+# -- Recent Alert Log (DG-related) --------------------------------------------
+# Shown first (least urgent — historical context scrolls off the top)
+header "RECENT ALERT LOG (Data Guard)"
+
+_show_alert_entries() {
+    local label="$1" file="$2"
+    local raw filepath entries
+    raw=$(cat "$file" 2>/dev/null | sed '/^$/d')
+    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
+    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|')
+    if [[ -n "$filepath" ]]; then
+        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
+    else
+        printf "  ${DIM}%s${NC}\n" "$label"
+    fi
+    if [[ -z "$entries" ]]; then
+        printf "    ${DIM}(none)${NC}\n"
+    else
+        while IFS= read -r line; do
+            local ts="" msg="$line"
+            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
+                ts="${line:0:19}"
+                msg="${line:21}"
+            fi
+            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
+                if [[ -n "$ts" ]]; then
+                    printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
+                else
+                    printf "    ${RED}%s${NC}\n" "$msg"
+                fi
+            else
+                if [[ -n "$ts" ]]; then
+                    printf "    ${DIM}%s${NC}  %s\n" "$ts" "$msg"
+                else
+                    printf "    %s\n" "$msg"
+                fi
+            fi
+        done <<< "$entries"
+    fi
+}
+
+subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
+_show_alert_entries "Alert Log" "$TMP/primary_alert"
+printf "\n"
+_show_alert_entries "Broker Log" "$TMP/primary_drc"
+
+subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
+_show_alert_entries "Alert Log" "$TMP/standby_alert"
+printf "\n"
+_show_alert_entries "Broker Log" "$TMP/standby_drc"
 
 # -- Primary Database ---------------------------------------------------------
 header "PRIMARY DATABASE  (${PRIMARY_ORACLE_HOSTNAME} / ${PRI_DBUNIQ:-?})"
@@ -728,55 +773,12 @@ else
     fi
 fi
 
-# -- Recent Alert Log (DG-related) --------------------------------------------
-header "RECENT ALERT LOG (Data Guard)"
-
-_show_alert_entries() {
-    local label="$1" file="$2"
-    local raw filepath entries
-    raw=$(cat "$file" 2>/dev/null | sed '/^$/d')
-    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
-    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|')
-    if [[ -n "$filepath" ]]; then
-        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
-    else
-        printf "  ${DIM}%s${NC}\n" "$label"
-    fi
-    if [[ -z "$entries" ]]; then
-        printf "    ${DIM}(none)${NC}\n"
-    else
-        while IFS= read -r line; do
-            local ts="" msg="$line"
-            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
-                ts="${line:0:19}"
-                msg="${line:21}"
-            fi
-            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
-                if [[ -n "$ts" ]]; then
-                    printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
-                else
-                    printf "    ${RED}%s${NC}\n" "$msg"
-                fi
-            else
-                if [[ -n "$ts" ]]; then
-                    printf "    ${DIM}%s${NC}  %s\n" "$ts" "$msg"
-                else
-                    printf "    %s\n" "$msg"
-                fi
-            fi
-        done <<< "$entries"
-    fi
-}
-
-subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
-_show_alert_entries "Alert Log" "$TMP/primary_alert"
-printf "\n"
-_show_alert_entries "Broker Log" "$TMP/primary_drc"
-
-subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
-_show_alert_entries "Alert Log" "$TMP/standby_alert"
-printf "\n"
-_show_alert_entries "Broker Log" "$TMP/standby_drc"
+# -- Summary box (right before final summary) ---------------------------------
+printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
+box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
+box_row "${PRI_DBUNIQ:-?} @ ${PRIMARY_ORACLE_HOSTNAME}" "${STB_DBUNIQ:-?} @ ${STANDBY_ORACLE_HOSTNAME}"
+box_row "${PRI_OPEN:-?}" "${STB_OPEN:-?} / MRP: ${STB_MRP_STATUS:-NOT RUNNING}"
+printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 
 # =============================================================================
 # Summary

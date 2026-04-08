@@ -590,11 +590,50 @@ _PRI_MODE="${PRI_OPEN:-${DIM}(broker only)${NC}}"
 _STB_MODE="${STB_OPEN:-${DIM}(broker only)${NC}}"
 _STB_MRP="${STB_MRP_STATUS:-${DIM}n/a${NC}}"
 
-printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
-box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
-box_row "${PRI_DBUNIQ:-?}" "${STB_DBUNIQ:-?}"
-box_row "$_PRI_MODE" "${_STB_MODE} / MRP: ${_STB_MRP}"
-printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
+# -- Recent Alert Log (DG-related) --------------------------------------------
+# Shown first (least urgent — historical context scrolls off the top)
+header "RECENT ALERT LOG (Data Guard)"
+
+_show_alert_entries() {
+    local label="$1" raw="$2"
+    local filepath entries
+    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
+    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|' | sed '/^$/d')
+    if [[ -n "$filepath" ]]; then
+        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
+    else
+        printf "  ${DIM}%s${NC}\n" "$label"
+    fi
+    if [[ -z "$entries" ]]; then
+        printf "    ${DIM}(none)${NC}\n"
+    else
+        while IFS= read -r line; do
+            local ts="" msg="$line"
+            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
+                ts="${line:0:19}"
+                msg="${line:21}"
+            fi
+            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
+                if [[ -n "$ts" ]]; then
+                    printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
+                else
+                    printf "    ${RED}%s${NC}\n" "$msg"
+                fi
+            else
+                if [[ -n "$ts" ]]; then
+                    printf "    ${DIM}%s${NC}  %s\n" "$ts" "$msg"
+                else
+                    printf "    %s\n" "$msg"
+                fi
+            fi
+        done <<< "$entries"
+    fi
+}
+
+subheader "Local ($(short_hostname) / ${ORACLE_SID})"
+_show_alert_entries "Alert Log" "$LOC_ALERT_ENTRIES"
+printf "\n"
+_show_alert_entries "Broker Log" "$LOC_DRC_ENTRIES"
 
 # -- Primary Database ---------------------------------------------------------
 header "PRIMARY DATABASE  (${PRI_DBUNIQ:-?})"
@@ -869,49 +908,12 @@ else
     fi
 fi
 
-# -- Recent Alert Log (DG-related) --------------------------------------------
-header "RECENT ALERT LOG (Data Guard)"
-
-_show_alert_entries() {
-    local label="$1" raw="$2"
-    local filepath entries
-    filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
-    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|' | sed '/^$/d')
-    if [[ -n "$filepath" ]]; then
-        printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
-    else
-        printf "  ${DIM}%s${NC}\n" "$label"
-    fi
-    if [[ -z "$entries" ]]; then
-        printf "    ${DIM}(none)${NC}\n"
-    else
-        while IFS= read -r line; do
-            local ts="" msg="$line"
-            if printf '%s' "$line" | grep -q '^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] '; then
-                ts="${line:0:19}"
-                msg="${line:21}"
-            fi
-            if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
-                if [[ -n "$ts" ]]; then
-                    printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
-                else
-                    printf "    ${RED}%s${NC}\n" "$msg"
-                fi
-            else
-                if [[ -n "$ts" ]]; then
-                    printf "    ${DIM}%s${NC}  %s\n" "$ts" "$msg"
-                else
-                    printf "    %s\n" "$msg"
-                fi
-            fi
-        done <<< "$entries"
-    fi
-}
-
-subheader "Local ($(short_hostname) / ${ORACLE_SID})"
-_show_alert_entries "Alert Log" "$LOC_ALERT_ENTRIES"
-printf "\n"
-_show_alert_entries "Broker Log" "$LOC_DRC_ENTRIES"
+# -- Summary box (right before final summary) ---------------------------------
+printf '\n ┌%s┬%s┐\n' "$_BAR" "$_BAR"
+box_row "${PRI_DOT} ${BOLD}PRIMARY${NC}" "${STB_DOT} ${BOLD}PHYSICAL STANDBY${NC}"
+box_row "${PRI_DBUNIQ:-?}" "${STB_DBUNIQ:-?}"
+box_row "$_PRI_MODE" "${_STB_MODE} / MRP: ${_STB_MRP}"
+printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 
 # =============================================================================
 # Summary
