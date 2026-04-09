@@ -51,7 +51,7 @@ tests/         - Test scripts (unit tests and E2E test suite)
 - **Use DGMGRL for all Data Guard configuration** - Always prefer Data Guard Broker commands over manual ALTER SYSTEM/ALTER DATABASE commands when configuring anything Data Guard related
 - **Data Guard Broker (DGMGRL)** manages DG parameters instead of manual ALTER SYSTEM commands
 - **NFS share** at `/OINSTALL/_dataguard_setup` for file exchange between servers
-- **Single source of truth**: `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` contains all configuration
+- **Single source of truth**: `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` contains all configuration. After editing it, run `02_generate_standby_config.sh --regenerate` to update derived files (pfile, TNS, listener, DGMGRL)
 - **Concurrent builds**: All generated files include DB_UNIQUE_NAME to support multiple DG setups
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)

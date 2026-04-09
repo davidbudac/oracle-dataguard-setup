@@ -5,6 +5,10 @@
 # Run this script after gathering primary info.
 # It generates the standby configuration (single source of truth)
 # and displays it for user review.
+#
+# After editing standby_config_*.env, re-run with --regenerate
+# to update all derived files (pfile, TNS, listener, DGMGRL)
+# without repeating the interactive prompts.
 # ============================================================
 
 set -e
@@ -17,8 +21,63 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 source "${COMMON_DIR}/dg_functions.sh"
 enable_verbose_mode "$@"
 
+# Check for --regenerate flag
+REGENERATE=0
+for _arg in "$@"; do
+    [[ "$_arg" == "--regenerate" ]] && REGENERATE=1
+done
+
 # ============================================================
 # Main Script
+# ============================================================
+
+if [[ "$REGENERATE" == "1" ]]; then
+
+# ============================================================
+# REGENERATE MODE
+# ============================================================
+# Re-read an existing standby_config_*.env file (which the user
+# may have edited) and regenerate all derived files: pfile,
+# tnsnames, listener configs, and DGMGRL script.
+# ============================================================
+
+print_banner "Step 2: Regenerate Config Files"
+init_log "02_regenerate_config"
+
+check_nfs_mount || exit 1
+
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+    log_error "No standby config file found to regenerate from"
+    exit 1
+fi
+
+log_info "Regenerating from: $STANDBY_CONFIG_FILE"
+source "$STANDBY_CONFIG_FILE"
+
+# Set aliases expected by the file generation code below.
+# The generation sections use variable names that come from the
+# primary_info file in normal mode; map them from the config.
+DB_NAME="$PRIMARY_DB_NAME"
+DB_UNIQUE_NAME="$PRIMARY_DB_UNIQUE_NAME"
+LISTENER_PORT="${STANDBY_LISTENER_PORT:-${PRIMARY_LISTENER_PORT}}"
+RECOMMENDED_STBY_GROUPS="${STANDBY_REDO_GROUPS}"
+
+# Derive service names (same logic as normal flow)
+if [[ -n "$DB_DOMAIN" ]]; then
+    PRIMARY_SERVICE_NAME="${PRIMARY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
+    STANDBY_SERVICE_NAME="${STANDBY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
+else
+    PRIMARY_SERVICE_NAME="${PRIMARY_DB_UNIQUE_NAME}"
+    STANDBY_SERVICE_NAME="${STANDBY_DB_UNIQUE_NAME}"
+fi
+
+init_log "02_regenerate_config_${STANDBY_DB_UNIQUE_NAME}"
+log_info "Config: ${PRIMARY_DB_UNIQUE_NAME} -> ${STANDBY_DB_UNIQUE_NAME}"
+
+else
+
+# ============================================================
+# NORMAL MODE
 # ============================================================
 
 print_banner "Step 2: Generate Standby Config"
@@ -374,6 +433,16 @@ EOF
 
 log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
 
+fi  # end REGENERATE check
+
+# ############################################################
+# FILE GENERATION
+# ############################################################
+# Everything below runs in both normal and regenerate modes.
+# All required variables are set at this point, either from
+# the prompts (normal) or from the sourced config (regenerate).
+# ############################################################
+
 # ============================================================
 # Generate Standby Init Parameter File
 # ============================================================
@@ -673,31 +742,42 @@ else
         "Broker Config" "$DG_BROKER_CONFIG_NAME"
 fi
 
-print_list_block "Generated Files" \
-    "Standby config: $STANDBY_CONFIG_FILE" \
-    "Standby pfile: $STANDBY_PFILE" \
-    "TNS entries: $TNSNAMES_FILE" \
-    "Standby listener: $LISTENER_FILE" \
-    "Primary listener: $LISTENER_PRIMARY_FILE" \
-    "DGMGRL script: $DGMGRL_SCRIPT"
+if [[ "$REGENERATE" == "1" ]]; then
+    print_list_block "Regenerated Files" \
+        "Standby pfile: $STANDBY_PFILE" \
+        "TNS entries: $TNSNAMES_FILE" \
+        "Standby listener: $LISTENER_FILE" \
+        "Primary listener: $LISTENER_PRIMARY_FILE" \
+        "DGMGRL script: $DGMGRL_SCRIPT"
 
-# ============================================================
-# User Confirmation
-# ============================================================
+    print_summary "SUCCESS" "Files regenerated from $STANDBY_CONFIG_FILE"
+else
+    print_list_block "Generated Files" \
+        "Standby config: $STANDBY_CONFIG_FILE" \
+        "Standby pfile: $STANDBY_PFILE" \
+        "TNS entries: $TNSNAMES_FILE" \
+        "Standby listener: $LISTENER_FILE" \
+        "Primary listener: $LISTENER_PRIMARY_FILE" \
+        "DGMGRL script: $DGMGRL_SCRIPT"
 
-echo ""
-if ! confirm_proceed "Please review the configuration above."; then
-    log_warn "User cancelled. Configuration files have been saved for review."
+    # ============================================================
+    # User Confirmation
+    # ============================================================
+
     echo ""
-    echo "You can edit the configuration files manually and re-run, or"
-    echo "run this script again with different parameters."
-    exit 0
-fi
+    if ! confirm_proceed "Please review the configuration above."; then
+        log_warn "User cancelled. Configuration files have been saved for review."
+        echo ""
+        echo "You can edit the configuration files manually and re-run, or"
+        echo "run this script again with different parameters."
+        exit 0
+    fi
 
-print_summary "SUCCESS" "Standby configuration generated successfully"
-print_list_block "Next Steps" \
-    "On STANDBY, run ./standby/03_setup_standby_env.sh." \
-    "On PRIMARY, run ./primary/04_prepare_primary_dg.sh." \
-    "Back on STANDBY, run ./standby/05_clone_standby.sh." \
-    "On PRIMARY, run ./primary/06_configure_broker.sh." \
-    "On either server, run ./standby/07_verify_dataguard.sh."
+    print_summary "SUCCESS" "Standby configuration generated successfully"
+    print_list_block "Next Steps" \
+        "On STANDBY, run ./standby/03_setup_standby_env.sh." \
+        "On PRIMARY, run ./primary/04_prepare_primary_dg.sh." \
+        "Back on STANDBY, run ./standby/05_clone_standby.sh." \
+        "On PRIMARY, run ./primary/06_configure_broker.sh." \
+        "On either server, run ./standby/07_verify_dataguard.sh."
+fi
