@@ -1164,6 +1164,33 @@ select_or_restore_config() {
         done
     fi
 
+    # Count config files that have no matching session (new configs)
+    local session_configs=()
+    local sf_tmp
+    for sf_tmp in "${matching_sessions[@]}"; do
+        session_configs+=("$(_read_session_field "$sf_tmp" "SESSION_CONFIG_FILE")")
+    done
+
+    local new_config_count=0
+    local all_configs
+    all_configs=$(ls -1 $glob_pattern 2>/dev/null) || true
+    if [[ -n "$all_configs" ]]; then
+        local cf
+        while IFS= read -r cf; do
+            local has_session=0
+            local sc
+            for sc in "${session_configs[@]}"; do
+                if [[ "$cf" == "$sc" ]]; then
+                    has_session=1
+                    break
+                fi
+            done
+            if [[ $has_session -eq 0 ]]; then
+                new_config_count=$((new_config_count + 1))
+            fi
+        done <<< "$all_configs"
+    fi
+
     # If matching sessions exist, offer to restore one
     if [[ ${#matching_sessions[@]} -gt 0 ]]; then
         echo ""
@@ -1174,6 +1201,11 @@ select_or_restore_config() {
 
         local i=1
         local total=${#matching_sessions[@]}
+        local default_new=0
+        if [[ $new_config_count -gt 0 ]]; then
+            default_new=1
+        fi
+
         for sf in "${matching_sessions[@]}"; do
             local sid config last_used hostname
             sid=$(_read_session_field "$sf" "SESSION_ID")
@@ -1181,7 +1213,7 @@ select_or_restore_config() {
             last_used=$(_read_session_field "$sf" "SESSION_LAST_USED")
             hostname=$(_read_session_field "$sf" "SESSION_HOSTNAME")
 
-            if [[ $total -eq 1 ]]; then
+            if [[ $total -eq 1 && $default_new -eq 0 ]]; then
                 printf "  ${GREEN}%d) %-16s${NC} %s  [%s] (default)\n" "$i" "$sid" "$(basename "$config")" "$last_used"
             else
                 printf "  ${GREEN}%d) %-16s${NC} %s  [%s]\n" "$i" "$sid" "$(basename "$config")" "$last_used"
@@ -1190,20 +1222,35 @@ select_or_restore_config() {
         done
 
         echo ""
-        printf "  ${YELLOW}n) New session${NC} (select config file and start fresh)\n"
+        if [[ $default_new -eq 1 ]]; then
+            printf "  ${YELLOW}n) New session${NC} (select config file and start fresh) (default)\n"
+            printf "     ${YELLOW}^ %d new config file(s) found without a session${NC}\n" "$new_config_count"
+        else
+            printf "  ${YELLOW}n) New session${NC} (select config file and start fresh)\n"
+        fi
         echo ""
 
         local selection
-        if [[ $total -eq 1 ]]; then
+        if [[ $default_new -eq 1 ]]; then
+            if [[ $total -eq 1 ]]; then
+                printf "Select session [1, n, default=n]: "
+            else
+                printf "Select session [1-%d, n, default=n]: " "$total"
+            fi
+        elif [[ $total -eq 1 ]]; then
             printf "Select session [1, n, default=1]: "
         else
             printf "Select session [1-%d, n]: " "$total"
         fi
         read selection
 
-        # Default to 1 if only one session and empty input
-        if [[ -z "$selection" && $total -eq 1 ]]; then
-            selection=1
+        # Default handling based on whether new configs exist
+        if [[ -z "$selection" ]]; then
+            if [[ $default_new -eq 1 ]]; then
+                selection="n"
+            elif [[ $total -eq 1 ]]; then
+                selection=1
+            fi
         fi
 
         if [[ "$selection" != "n" && "$selection" != "N" ]]; then
