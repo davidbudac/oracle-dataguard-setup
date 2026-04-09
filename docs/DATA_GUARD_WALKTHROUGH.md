@@ -10,8 +10,7 @@ This document describes what each automation script does and shows the equivalen
 2. [NFS Setup](#nfs-setup)
 3. [Restartability](#restartability)
 4. [Common Flags](#common-flags)
-5. [Session Management](#session-management)
-6. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
+5. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
 7. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
 8. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
 9. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
@@ -41,7 +40,7 @@ Before beginning Data Guard setup, ensure:
 
 ## NFS Setup
 
-The NFS share at `/OINSTALL/_dataguard_setup` is used to exchange files (config files, password files, logs, sessions) between primary and standby servers. **Set this up before running any Data Guard scripts.**
+The NFS share at `/OINSTALL/_dataguard_setup` is used to exchange files (config files, password files, logs) between primary and standby servers. **Set this up before running any Data Guard scripts.**
 
 ### Step 0a: Setup NFS Server
 
@@ -171,8 +170,6 @@ All setup scripts (steps 1-11) support these flags:
 | `-v`, `--verbose` | Enable bash trace output (`set -x`) for debugging |
 | `-n`, `--check`, `--plan` | **Dry-run mode.** Script stops before making any changes and shows what would be done. |
 | `-a`, `--approval-mode`, `-s`, `--suspicious` | **Approval mode.** Every mutating action (database changes, file writes, etc.) requires interactive confirmation before execution. |
-| `-S <id>`, `--session <id>` | Restore a previously saved session (skips config file selection). See [Session Management](#session-management). |
-| `--list-sessions` | Display all available sessions and exit. |
 
 Flags can be combined:
 
@@ -180,11 +177,8 @@ Flags can be combined:
 # Dry-run with verbose output
 ./primary/04_prepare_primary_dg.sh -n -v
 
-# Approval mode with a restored session
-./standby/05_clone_standby.sh -a -S mydb_stb_a3f1
-
-# All together
-./primary/04_prepare_primary_dg.sh -v -a -n -S mydb_stb_a3f1
+# Approval mode with verbose
+./primary/04_prepare_primary_dg.sh -v -a -n
 ```
 
 ### Check/Plan Mode
@@ -204,51 +198,6 @@ When `-a` / `--approval-mode` is used, every mutating action displays a prompt s
 - **Command preview** (exact command to be executed)
 
 You must type `y` or `yes` to approve each action. Declining skips that action with a warning.
-
----
-
-## Session Management
-
-Sessions remember your config file selection so you don't have to re-select it on every script run. Sessions are stored on NFS (`${NFS_SHARE}/sessions/`) and work across both primary and standby servers.
-
-### How It Works
-
-1. When you run a script and select a config file, a session is automatically created
-2. The session ID is derived from the config filename plus a short random suffix (e.g., `standby_config_MYDB_STB.env` -> session `mydb_stb_a3f1`)
-3. On subsequent script runs, you can restore the session to skip file selection
-
-### Usage
-
-```bash
-# Run a script - session is created automatically after file selection
-./primary/04_prepare_primary_dg.sh
-
-# Restore a session directly (skips file selection)
-./primary/04_prepare_primary_dg.sh -S mydb_stb_a3f1
-./standby/05_clone_standby.sh -S mydb_stb_a3f1
-
-# List all sessions (from any script or standalone)
-./primary/04_prepare_primary_dg.sh --list-sessions
-./common/sessions.sh list
-
-# Delete a specific session
-./common/sessions.sh delete mydb_stb_a3f1
-
-# Delete all sessions
-./common/sessions.sh delete-all
-```
-
-### Session File Contents
-
-Each session file in `${NFS_SHARE}/sessions/` stores:
-
-```
-SESSION_ID="mydb_stb_a3f1"
-SESSION_CONFIG_FILE="/OINSTALL/_dataguard_setup/standby_config_MYDB_STB.env"
-SESSION_CREATED="2025-03-29 14:23:45"
-SESSION_LAST_USED="2025-03-29 15:10:22"
-SESSION_HOSTNAME="primary-host"
-```
 
 ---
 
@@ -347,8 +296,11 @@ cp $ORACLE_HOME/dbs/orapw$ORACLE_SID /OINSTALL/_dataguard_setup/
 
 1. Loads primary information from NFS share
 2. Prompts for standby hostname and DB_UNIQUE_NAME
-3. Generates path conversion parameters (DB_FILE_NAME_CONVERT, LOG_FILE_NAME_CONVERT)
-4. Creates standby parameter file (init.ora)
+3. Prompts for standby storage mode:
+   - **Traditional** (default): derives standby paths from primary via path substitution (`DB_FILE_NAME_CONVERT`)
+   - **OMF**: prompts for `db_create_file_dest` and `db_recovery_file_dest` — no FILE_NAME_CONVERT needed. Use this when the standby has a different storage layout (e.g., FRA) than the primary.
+4. Generates path conversion parameters (Traditional mode) or OMF configuration
+5. Creates standby parameter file (init.ora)
 5. Creates TNS entries for both databases
 6. Creates listener configuration with static registration (including _DGMGRL services)
 7. Creates DGMGRL script template
@@ -1202,7 +1154,6 @@ The script will discover current services and let you edit the list interactivel
 - AIX compatibility (printf instead of echo -e, sed instead of grep -P)
 - Comprehensive logging (all output saved to NFS)
 - Password security (prompted at runtime, never stored)
-- Session management (remember config selections across script runs)
 - Dry-run mode (review changes before applying)
 - Approval mode (gate every mutating action for high-security environments)
 

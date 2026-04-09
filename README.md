@@ -68,7 +68,6 @@ dataguard_setup/
 │   └── create_role_trigger.sh         # Role-aware service trigger (optional)
 ├── common/
 │   ├── dg_functions.sh                # Shared utility functions
-│   └── sessions.sh                    # Session management CLI
 ├── templates/
 │   ├── init_standby.ora.template      # Reference template
 │   ├── listener.ora.template          # Reference template

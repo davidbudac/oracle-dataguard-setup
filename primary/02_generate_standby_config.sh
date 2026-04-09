@@ -36,7 +36,7 @@ progress_step "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for primary info files - support unique naming
-if ! select_or_restore_config PRIMARY_INFO_FILE "primary database info" "${NFS_SHARE}/primary_info_*.env"; then
+if ! select_config_file PRIMARY_INFO_FILE "primary database info" "${NFS_SHARE}/primary_info_*.env"; then
     log_error "Please run 01_gather_primary_info.sh on the primary server first"
     exit 1
 fi
@@ -89,11 +89,90 @@ echo "The standby ORACLE_SID usually matches the primary unless you have a namin
 prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
 
 # ============================================================
+# Select Standby Storage Mode
+# ============================================================
+
+echo ""
+echo "Select the standby storage layout:"
+echo ""
+echo "  1) Traditional  - Standby uses file paths derived from primary"
+echo "                     (DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT)"
+echo "  2) OMF (Oracle Managed Files) - Standby uses db_create_file_dest"
+echo "                     and db_recovery_file_dest (no FILE_NAME_CONVERT)"
+echo ""
+prompt_with_default "Storage mode" "1" STORAGE_CHOICE
+
+case "$STORAGE_CHOICE" in
+    2|omf|OMF)
+        STANDBY_STORAGE_MODE="OMF"
+        log_info "Standby storage mode: OMF (Oracle Managed Files)"
+        ;;
+    *)
+        STANDBY_STORAGE_MODE="TRADITIONAL"
+        log_info "Standby storage mode: Traditional (path substitution)"
+        ;;
+esac
+
+# Initialize OMF-specific variables (empty for Traditional mode)
+STANDBY_DB_CREATE_FILE_DEST=""
+STANDBY_DB_RECOVERY_FILE_DEST=""
+STANDBY_DB_RECOVERY_FILE_DEST_SIZE=""
+
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    echo ""
+    echo "OMF mode: Oracle will automatically place datafiles, redo logs,"
+    echo "and control files under db_create_file_dest."
+    echo ""
+
+    prompt_with_default "Standby db_create_file_dest" "" STANDBY_DB_CREATE_FILE_DEST
+    if [[ -z "$STANDBY_DB_CREATE_FILE_DEST" ]]; then
+        log_error "db_create_file_dest cannot be empty in OMF mode"
+        exit 1
+    fi
+
+    # Default FRA path: use primary's value if set
+    _fra_default=""
+    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
+        _fra_default="$DB_RECOVERY_FILE_DEST"
+    fi
+    prompt_with_default "Standby db_recovery_file_dest" "$_fra_default" STANDBY_DB_RECOVERY_FILE_DEST
+    if [[ -z "$STANDBY_DB_RECOVERY_FILE_DEST" ]]; then
+        log_error "db_recovery_file_dest cannot be empty in OMF mode"
+        exit 1
+    fi
+
+    # Default size: use primary's value if set
+    _fra_size_default="50G"
+    if [[ -n "$DB_RECOVERY_FILE_DEST_SIZE" ]]; then
+        _fra_size_default="$DB_RECOVERY_FILE_DEST_SIZE"
+    fi
+    prompt_with_default "Standby db_recovery_file_dest_size" "$_fra_size_default" STANDBY_DB_RECOVERY_FILE_DEST_SIZE
+
+    log_info "OMF db_create_file_dest: $STANDBY_DB_CREATE_FILE_DEST"
+    log_info "OMF db_recovery_file_dest: $STANDBY_DB_RECOVERY_FILE_DEST"
+    log_info "OMF db_recovery_file_dest_size: $STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
+fi
+
+# ============================================================
 # Generate Path Conversions
 # ============================================================
 
 progress_step "Generating Path Conversions"
 
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    # OMF mode: paths are managed by Oracle, no FILE_NAME_CONVERT needed
+    STANDBY_DATA_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
+    STANDBY_REDO_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
+    STANDBY_FRA="${STANDBY_DB_RECOVERY_FILE_DEST}"
+    USE_FRA_FOR_STANDBY="YES"
+    STANDBY_ARCHIVE_DEST=""
+    DB_FILE_NAME_CONVERT=""
+    LOG_FILE_NAME_CONVERT=""
+
+    log_info "OMF mode: Oracle will manage file placement"
+    log_info "  db_create_file_dest:      $STANDBY_DB_CREATE_FILE_DEST"
+    log_info "  db_recovery_file_dest:    $STANDBY_DB_RECOVERY_FILE_DEST"
+else
 # Detect the actual directory name used in paths (may differ in case from DB_UNIQUE_NAME)
 # DB_UNIQUE_NAME might be 'testcdb' but directory might be 'TESTCDB'
 PRIMARY_DIR_NAME=""
@@ -164,6 +243,8 @@ log_info "Primary data path: $PRIMARY_DATA_PATH"
 log_info "Standby data path: $STANDBY_DATA_PATH"
 log_info "Primary redo path: $PRIMARY_REDO_PATH"
 log_info "Standby redo path: $STANDBY_REDO_PATH"
+
+fi  # end STANDBY_STORAGE_MODE check
 
 # ============================================================
 # Generate TNS Aliases
@@ -251,6 +332,12 @@ NLS_CHARACTERSET="$NLS_CHARACTERSET"
 DB_BLOCK_SIZE="$DB_BLOCK_SIZE"
 COMPATIBLE="$COMPATIBLE"
 
+# --- Storage Mode ---
+STANDBY_STORAGE_MODE="$STANDBY_STORAGE_MODE"
+STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
+STANDBY_DB_RECOVERY_FILE_DEST="$STANDBY_DB_RECOVERY_FILE_DEST"
+STANDBY_DB_RECOVERY_FILE_DEST_SIZE="$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
+
 # --- Path Conversions ---
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
 STANDBY_DATA_PATH="$STANDBY_DATA_PATH"
@@ -318,23 +405,35 @@ $(if [[ -n "$DB_DOMAIN" ]]; then echo "*.db_domain='${DB_DOMAIN}'"; fi)
 # --- Processes ---
 *.processes=300
 
-# --- Control Files ---
-*.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'
-
-# --- Archive Log Destination (local only) ---
-$(if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
+$(if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+echo "# --- OMF File Placement ---"
+echo "*.db_create_file_dest='${STANDBY_DB_CREATE_FILE_DEST}'"
+echo ""
+echo "# --- Archive Log Destination ---"
+echo "*.log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
+echo "*.db_recovery_file_dest='${STANDBY_DB_RECOVERY_FILE_DEST}'"
+echo "*.db_recovery_file_dest_size=${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}"
+else
+echo "# --- Control Files ---"
+echo "*.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'"
+echo ""
+echo "# --- Archive Log Destination (local only) ---"
+if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
 echo "*.log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
 echo "*.db_recovery_file_dest='${STANDBY_FRA}'"
 echo "*.db_recovery_file_dest_size=${DB_RECOVERY_FILE_DEST_SIZE}"
 else
 echo "*.log_archive_dest_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
+fi
+echo ""
+echo "# --- File Name Conversions ---"
+echo "*.db_file_name_convert=${DB_FILE_NAME_CONVERT}"
+echo "*.log_file_name_convert=${LOG_FILE_NAME_CONVERT}"
 fi)
 *.log_archive_dest_state_1=ENABLE
 *.log_archive_format='%t_%s_%r.arc'
 
-# --- File Name Conversions ---
-*.db_file_name_convert=${DB_FILE_NAME_CONVERT}
-*.log_file_name_convert=${LOG_FILE_NAME_CONVERT}
+# --- Standby File Management ---
 *.standby_file_management=AUTO
 
 # --- Data Guard Broker ---
@@ -542,19 +641,37 @@ print_status_block "Primary Database" \
     "TNS Alias" "$PRIMARY_TNS_ALIAS" \
     "Data Path" "$PRIMARY_DATA_PATH"
 
-print_status_block "Standby Database" \
-    "Hostname" "$STANDBY_HOSTNAME" \
-    "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
-    "ORACLE_SID" "$STANDBY_ORACLE_SID" \
-    "TNS Alias" "$STANDBY_TNS_ALIAS" \
-    "Data Path" "$STANDBY_DATA_PATH"
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    print_status_block "Standby Database (OMF)" \
+        "Hostname" "$STANDBY_HOSTNAME" \
+        "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+        "ORACLE_SID" "$STANDBY_ORACLE_SID" \
+        "TNS Alias" "$STANDBY_TNS_ALIAS" \
+        "Storage Mode" "OMF" \
+        "db_create_file_dest" "$STANDBY_DB_CREATE_FILE_DEST" \
+        "db_recovery_file_dest" "$STANDBY_DB_RECOVERY_FILE_DEST" \
+        "db_recovery_file_dest_size" "$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
 
-print_status_block "Key Conversions" \
-    "DB_FILE_NAME_CONVERT" "$DB_FILE_NAME_CONVERT" \
-    "LOG_FILE_NAME_CONVERT" "$LOG_FILE_NAME_CONVERT" \
-    "Redo Log Size" "${REDO_LOG_SIZE_MB} MB" \
-    "Standby Redo Groups" "$RECOMMENDED_STBY_GROUPS" \
-    "Broker Config" "$DG_BROKER_CONFIG_NAME"
+    print_status_block "Key Settings" \
+        "File Name Convert" "(not used - OMF mode)" \
+        "Redo Log Size" "${REDO_LOG_SIZE_MB} MB" \
+        "Standby Redo Groups" "$RECOMMENDED_STBY_GROUPS" \
+        "Broker Config" "$DG_BROKER_CONFIG_NAME"
+else
+    print_status_block "Standby Database" \
+        "Hostname" "$STANDBY_HOSTNAME" \
+        "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+        "ORACLE_SID" "$STANDBY_ORACLE_SID" \
+        "TNS Alias" "$STANDBY_TNS_ALIAS" \
+        "Data Path" "$STANDBY_DATA_PATH"
+
+    print_status_block "Key Conversions" \
+        "DB_FILE_NAME_CONVERT" "$DB_FILE_NAME_CONVERT" \
+        "LOG_FILE_NAME_CONVERT" "$LOG_FILE_NAME_CONVERT" \
+        "Redo Log Size" "${REDO_LOG_SIZE_MB} MB" \
+        "Standby Redo Groups" "$RECOMMENDED_STBY_GROUPS" \
+        "Broker Config" "$DG_BROKER_CONFIG_NAME"
+fi
 
 print_list_block "Generated Files" \
     "Standby config: $STANDBY_CONFIG_FILE" \

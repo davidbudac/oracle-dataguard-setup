@@ -287,7 +287,6 @@ if $CLEAN_NFS; then
         rm -f '${NFS_SHARE}'/*.sql 2>/dev/null
         rm -f '${NFS_SHARE}'/orapw* 2>/dev/null
         rm -f '${NFS_SHARE}'/fsfo_observer_* 2>/dev/null
-        rm -rf '${NFS_SHARE}/sessions/' 2>/dev/null
         rm -rf '${NFS_SHARE}/logs/' 2>/dev/null
         rm -rf '${NFS_SHARE}/state/' 2>/dev/null
         echo 'NFS_CLEANUP_OK'

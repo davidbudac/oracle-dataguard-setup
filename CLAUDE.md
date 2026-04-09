@@ -55,38 +55,8 @@ tests/         - Test scripts (unit tests and E2E test suite)
 - **Concurrent builds**: All generated files include DB_UNIQUE_NAME to support multiple DG setups
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)
+- **Storage mode choice**: Step 2 offers Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or OMF mode (`db_create_file_dest` + `db_recovery_file_dest`). OMF mode supports mixed-storage scenarios where primary uses regular file paths and standby uses FRA
 - **AIX 7.2 compatible**: Uses printf instead of echo -e, sed instead of grep -P
-
-## Session Management
-
-Sessions remember your config file selection so you don't need to re-select it on every script run. Sessions are stored on NFS (`${NFS_SHARE}/sessions/`) and work across both primary and standby servers.
-
-**How it works:**
-- Sessions are created automatically when you select a config file
-- Session ID is derived from the config filename plus a short random suffix (e.g., `standby_config_MYDB_STB.env` -> session `mydb_stb_a3f1`)
-- When sessions exist, scripts offer to restore one before falling back to file selection
-
-**Usage:**
-```bash
-# Run a script - session is created automatically after file selection
-./primary/04_prepare_primary_dg.sh
-
-# Restore a session directly (skips file selection)
-./primary/04_prepare_primary_dg.sh -S mydb_stb_a3f1
-./standby/05_clone_standby.sh -S mydb_stb_a3f1
-
-# List all sessions (from any script or standalone)
-./primary/04_prepare_primary_dg.sh --list-sessions
-./common/sessions.sh list
-
-# Manage sessions
-./common/sessions.sh delete MYDB_STB
-./common/sessions.sh delete-all
-```
-
-**Flags (available on all scripts):**
-- `-S <session_id>` / `--session <session_id>` - Restore a specific session
-- `--list-sessions` - List available sessions and exit
 
 ## Common Functions
 
@@ -95,8 +65,7 @@ Sessions remember your config file selection so you don't need to re-select it o
 - `run_sql`, `run_sql_with_header` - SQL execution helpers
 - `get_db_parameter` - Get Oracle parameter value
 - `check_oracle_env`, `check_nfs_mount`, `check_db_connection` - Validation functions
-- `select_or_restore_config` - Session-aware config file selection
-- `list_sessions`, `create_session`, `restore_session` - Session management
+- `select_config_file` - Config file selection (auto-selects when only one exists)
 
 ## Wallet Setup for Peer Connectivity
 
@@ -167,7 +136,6 @@ The test creates a database (DBCA, no OMF/FRA), runs all walkthrough steps, vali
 
 **Key gotchas for the test framework:**
 - Always run with `bash` explicitly (zsh breaks SSH_OPTS word splitting)
-- Sessions are cleared before each step to prevent menu interference with piped input
 - Config files auto-select when only one exists (no "1" needed in piped input)
 - RMAN uses `cmdfile` parameter instead of heredoc (heredoc consumes piped stdin)
 - `stty` calls in `prompt_password()` use `2>/dev/null || true` for piped stdin compatibility

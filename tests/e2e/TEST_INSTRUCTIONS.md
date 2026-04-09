@@ -167,11 +167,6 @@ updated. To debug: SSH to the host and run the script manually to see actual pro
   without reading stdin. Piped "1" selection was consumed by the next prompt.
 - **Fix:** Removed "1" from all piped inputs. Scripts auto-select single files.
 
-### Issue: Sessions accumulate and create unexpected menus
-- `select_or_restore_config()` checks for sessions before file selection
-- Sessions from prior steps show a menu that consumes piped input lines
-- **Fix:** `clear_sessions` is called before every step phase in `run_phase()`
-
 ### Issue: host command fails with non-zero exit when hostname not in DNS
 - `01_gather_primary_info.sh` runs `host "$PRIMARY_HOSTNAME"` which fails
   if the hostname isn't in DNS, triggering the ERR trap under `set -e`

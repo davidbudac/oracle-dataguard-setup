@@ -35,7 +35,7 @@ progress_step "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for standby config files - support unique naming
-if ! select_or_restore_config STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run 02_generate_standby_config.sh first"
     exit 1
 fi

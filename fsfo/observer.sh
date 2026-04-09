@@ -49,7 +49,7 @@ usage() {
 
 get_config() {
     # Find and load standby config file
-    if ! select_or_restore_config STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+    if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
         exit 1
     fi
 

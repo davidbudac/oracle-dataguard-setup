@@ -52,7 +52,7 @@ check_db_connection || exit 1
 log_section "Loading Configuration"
 
 # Find standby config file
-if ! select_or_restore_config STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run the Data Guard setup scripts first (Steps 1-7)"
     exit 1
 fi

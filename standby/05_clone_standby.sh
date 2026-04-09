@@ -35,7 +35,7 @@ progress_step "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for standby config files - support unique naming
-if ! select_or_restore_config STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run 02_generate_standby_config.sh first"
     exit 1
 fi
@@ -219,17 +219,46 @@ fi
 # Create RMAN script
 RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
 
-# Determine LOG_ARCHIVE_DEST_1 setting based on FRA usage
-if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
+# Determine LOG_ARCHIVE_DEST_1 setting based on storage mode and FRA usage
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" || "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
     LOG_ARCHIVE_DEST_1_SETTING="LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}"
-    FRA_SETTINGS="    SET DB_RECOVERY_FILE_DEST='${STANDBY_FRA}'
-    SET DB_RECOVERY_FILE_DEST_SIZE='${DB_RECOVERY_FILE_DEST_SIZE}'"
 else
     LOG_ARCHIVE_DEST_1_SETTING="LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}"
-    FRA_SETTINGS=""
 fi
 
-cat > "$RMAN_SCRIPT" <<EOF
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    # OMF mode: use db_create_file_dest, no FILE_NAME_CONVERT
+    cat > "$RMAN_SCRIPT" <<EOF
+# RMAN Duplicate for Standby (OMF Mode, Data Guard Broker Managed)
+# Generated: $(date)
+# Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
+#       configured by Data Guard Broker after duplication completes.
+
+DUPLICATE TARGET DATABASE
+  FOR STANDBY
+  FROM ACTIVE DATABASE
+  DORECOVER
+  SPFILE
+    SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'
+    SET DB_CREATE_FILE_DEST='${STANDBY_DB_CREATE_FILE_DEST}'
+    SET DB_RECOVERY_FILE_DEST='${STANDBY_DB_RECOVERY_FILE_DEST}'
+    SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}'
+    SET LOG_ARCHIVE_DEST_1='${LOG_ARCHIVE_DEST_1_SETTING}'
+    SET STANDBY_FILE_MANAGEMENT='AUTO'
+    SET DG_BROKER_START='TRUE'
+    SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
+  NOFILENAMECHECK;
+EOF
+else
+    # Traditional mode: use FILE_NAME_CONVERT (existing behavior)
+    if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
+        FRA_SETTINGS="    SET DB_RECOVERY_FILE_DEST='${STANDBY_FRA}'
+    SET DB_RECOVERY_FILE_DEST_SIZE='${DB_RECOVERY_FILE_DEST_SIZE}'"
+    else
+        FRA_SETTINGS=""
+    fi
+
+    cat > "$RMAN_SCRIPT" <<EOF
 # RMAN Duplicate for Standby (Data Guard Broker Managed)
 # Generated: $(date)
 # Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
@@ -251,6 +280,7 @@ ${FRA_SETTINGS}
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
 EOF
+fi
 
 log_info "RMAN script created: $RMAN_SCRIPT"
 log_detail "RMAN script contents:"

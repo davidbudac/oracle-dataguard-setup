@@ -171,11 +171,6 @@ _ssh_hop() {
 ssh_primary() { _ssh_hop "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "$1"; }
 ssh_standby() { _ssh_hop "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$1"; }
 
-# Clear sessions on NFS to prevent session selection menus interfering with piped input
-clear_sessions() {
-    ssh_primary "rm -rf '${NFS_SHARE}/sessions/' 2>/dev/null; true"
-}
-
 # Generic ssh_cmd - accepts "PRIMARY" or "STANDBY" as first arg
 ssh_cmd() {
     local target="$1"
@@ -565,7 +560,6 @@ cleanup_nfs() {
         rm -f '${NFS_SHARE}'/*.sql 2>/dev/null
         rm -f '${NFS_SHARE}'/orapw* 2>/dev/null
         rm -f '${NFS_SHARE}'/fsfo_observer_* 2>/dev/null
-        rm -rf '${NFS_SHARE}/sessions/' 2>/dev/null
         rm -rf '${NFS_SHARE}/logs/' 2>/dev/null
         rm -rf '${NFS_SHARE}/state/' 2>/dev/null
 
@@ -753,13 +747,13 @@ phase_step2() {
     log_phase "STEP 2: Generate Standby Configuration"
 
     local result
-    # Prompts: standby host, db_unique_name, SID (default), confirm
+    # Prompts: standby host, db_unique_name, SID (default), storage mode (default=Traditional), confirm
     # Note: config file is auto-selected when only one exists (no menu prompt)
     # Use STANDBY_ORACLE_HOSTNAME (the real network hostname) not STANDBY_HOST (SSH target)
     local standby_hn="${STANDBY_ORACLE_HOSTNAME:-${STANDBY_HOST}}"
     result=$(ssh_piped "PRIMARY" \
         "./primary/02_generate_standby_config.sh" \
-        "${standby_hn}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\ny")
+        "${standby_hn}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\n\ny")
 
     local exit_code=$?
     log_info "Step 2 output (last 10 lines):"
@@ -1379,8 +1373,6 @@ ALL_PHASES=(
 
 run_phase() {
     local phase="$1"
-    # Clear sessions before any step to prevent session menus from consuming piped input
-    case "$phase" in step*) clear_sessions ;; esac
     case "$phase" in
         preflight)       phase_preflight ;;
         deploy)          phase_deploy ;;

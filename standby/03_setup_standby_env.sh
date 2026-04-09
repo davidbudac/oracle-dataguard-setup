@@ -35,7 +35,7 @@ progress_step "Pre-flight Checks"
 check_nfs_mount || exit 1
 
 # Check for standby config files - support unique naming
-if ! select_or_restore_config STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
+if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
     log_error "Please run 02_generate_standby_config.sh first"
     exit 1
 fi
@@ -132,8 +132,13 @@ check_oracle_env || exit 1
 
 progress_step "Reviewing Planned Changes"
 
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    _dir_summary="Create any missing standby directories under ${STANDBY_DB_CREATE_FILE_DEST}, ${STANDBY_DB_RECOVERY_FILE_DEST}, and ${STANDBY_ADMIN_DIR}."
+else
+    _dir_summary="Create any missing standby directories under ${STANDBY_DATA_PATH}, ${STANDBY_REDO_PATH}, and ${STANDBY_ADMIN_DIR}."
+fi
 print_list_block "This Step Will Change" \
-    "Create any missing standby directories under ${STANDBY_DATA_PATH}, ${STANDBY_REDO_PATH}, and ${STANDBY_ADMIN_DIR}." \
+    "$_dir_summary" \
     "Install the standby password file at ${ORACLE_HOME}/dbs/orapw${STANDBY_ORACLE_SID}." \
     "Install the standby pfile at ${ORACLE_HOME}/dbs/init${STANDBY_ORACLE_SID}.ora." \
     "Update ${ORACLE_HOME}/network/admin/listener.ora and ${ORACLE_HOME}/network/admin/tnsnames.ora." \
@@ -168,32 +173,45 @@ fi
 
 progress_step "Creating Directory Structure"
 
-# Admin directories
+# Admin directories (always needed regardless of storage mode)
 DIRS_TO_CREATE=(
     "${STANDBY_ADMIN_DIR}/adump"
     "${STANDBY_ADMIN_DIR}/bdump"
     "${STANDBY_ADMIN_DIR}/cdump"
     "${STANDBY_ADMIN_DIR}/udump"
     "${STANDBY_ADMIN_DIR}/pfile"
-    "${STANDBY_DATA_PATH}"
-    "${STANDBY_REDO_PATH}"
 )
 
-# Add archive destination if configured (may be empty if using FRA)
-if [[ -n "$STANDBY_ARCHIVE_DEST" ]]; then
-    DIRS_TO_CREATE+=("$STANDBY_ARCHIVE_DEST")
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    # OMF mode: create base directories only; Oracle creates subdirs automatically
+    DIRS_TO_CREATE+=("${STANDBY_DB_CREATE_FILE_DEST}")
+    DIRS_TO_CREATE+=("${STANDBY_DB_RECOVERY_FILE_DEST}")
+    log_info "OMF mode: creating base OMF directories"
+    log_info "  db_create_file_dest:   ${STANDBY_DB_CREATE_FILE_DEST}"
+    log_info "  db_recovery_file_dest: ${STANDBY_DB_RECOVERY_FILE_DEST}"
 else
-    log_info "STANDBY_ARCHIVE_DEST not set - assuming FRA is used for archive logs"
-fi
+    # Traditional mode: create explicit data, redo, archive directories
+    DIRS_TO_CREATE+=(
+        "${STANDBY_DATA_PATH}"
+        "${STANDBY_REDO_PATH}"
+    )
 
-# Add FRA if configured (STANDBY_FRA is set in the config when using FRA)
-if [[ -n "$STANDBY_FRA" ]]; then
-    DIRS_TO_CREATE+=("$STANDBY_FRA")
-    log_info "Using Fast Recovery Area: $STANDBY_FRA"
-elif [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
-    # Fallback: calculate from DB_RECOVERY_FILE_DEST if STANDBY_FRA not set
-    STANDBY_FRA_CALC=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
-    DIRS_TO_CREATE+=("$STANDBY_FRA_CALC")
+    # Add archive destination if configured (may be empty if using FRA)
+    if [[ -n "$STANDBY_ARCHIVE_DEST" ]]; then
+        DIRS_TO_CREATE+=("$STANDBY_ARCHIVE_DEST")
+    else
+        log_info "STANDBY_ARCHIVE_DEST not set - assuming FRA is used for archive logs"
+    fi
+
+    # Add FRA if configured (STANDBY_FRA is set in the config when using FRA)
+    if [[ -n "$STANDBY_FRA" ]]; then
+        DIRS_TO_CREATE+=("$STANDBY_FRA")
+        log_info "Using Fast Recovery Area: $STANDBY_FRA"
+    elif [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
+        # Fallback: calculate from DB_RECOVERY_FILE_DEST if STANDBY_FRA not set
+        STANDBY_FRA_CALC=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+        DIRS_TO_CREATE+=("$STANDBY_FRA_CALC")
+    fi
 fi
 
 DIRS_MISSING=()
@@ -471,12 +489,22 @@ fi
 # ============================================================
 
 print_summary "SUCCESS" "Standby environment setup complete"
-print_status_block "Standby Environment" \
-    "Host" "$CURRENT_HOST" \
-    "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
-    "ORACLE_SID" "$STANDBY_ORACLE_SID" \
-    "Data Path" "$STANDBY_DATA_PATH" \
-    "Listener Port" "$STANDBY_LISTENER_PORT"
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    print_status_block "Standby Environment" \
+        "Host" "$CURRENT_HOST" \
+        "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+        "ORACLE_SID" "$STANDBY_ORACLE_SID" \
+        "Storage Mode" "OMF" \
+        "db_create_file_dest" "$STANDBY_DB_CREATE_FILE_DEST" \
+        "Listener Port" "$STANDBY_LISTENER_PORT"
+else
+    print_status_block "Standby Environment" \
+        "Host" "$CURRENT_HOST" \
+        "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
+        "ORACLE_SID" "$STANDBY_ORACLE_SID" \
+        "Data Path" "$STANDBY_DATA_PATH" \
+        "Listener Port" "$STANDBY_LISTENER_PORT"
+fi
 
 print_list_block "Completed Actions" \
     "Created the standby directory structure." \
