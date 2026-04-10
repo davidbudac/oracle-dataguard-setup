@@ -247,9 +247,57 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     MAX_GROUP=$(run_sql_query "get_max_redo_group.sql")
     MAX_GROUP=$(echo "$MAX_GROUP" | tr -d ' \n\r')
 
-    # Get redo log path for standby redo logs
-    REDO_PATH=$(run_sql_query "get_redo_member_path.sql")
-    REDO_PATH=$(echo "$REDO_PATH" | tr -d ' \n\r')
+    # Determine where to place SRLs on the primary.
+    # Prefer PRIMARY_SRL_PATH from the config (set at step 2, may differ
+    # from the ORL path for disk isolation). Fall back to querying the
+    # ORL member path for backward compatibility with older configs.
+    PRIMARY_SRL_PATH_FROM_CONFIG="NO"
+    if [[ -n "${PRIMARY_SRL_PATH:-}" ]]; then
+        REDO_PATH="$PRIMARY_SRL_PATH"
+        PRIMARY_SRL_PATH_FROM_CONFIG="YES"
+        log_info "Using PRIMARY_SRL_PATH from config: $REDO_PATH"
+    else
+        REDO_PATH=$(run_sql_query "get_redo_member_path.sql")
+        REDO_PATH=$(echo "$REDO_PATH" | tr -d ' \n\r')
+        log_info "PRIMARY_SRL_PATH not set in config, using queried ORL path: $REDO_PATH"
+    fi
+
+    # Ensure trailing slash since we concatenate the filename directly
+    [[ "$REDO_PATH" != */ ]] && REDO_PATH="${REDO_PATH}/"
+
+    # Verify the SRL directory exists and is writable by the Oracle user.
+    # When PRIMARY_SRL_PATH comes from the config it may point at a
+    # separate mount or freshly-provisioned directory that has never
+    # been touched. If it's missing, offer to create it rather than
+    # letting ALTER DATABASE ADD STANDBY LOGFILE fail mid-step.
+    if [[ ! -d "$REDO_PATH" ]]; then
+        log_warn "SRL directory does not exist: $REDO_PATH"
+        if [[ "$PRIMARY_SRL_PATH_FROM_CONFIG" == "YES" ]]; then
+            echo ""
+            echo "The primary SRL directory configured in step 2 does not exist."
+            echo "It must exist and be writable by the Oracle user before SRLs"
+            echo "can be created."
+            echo ""
+            confirm_approval_action "Create primary SRL directory" "mkdir -p $REDO_PATH" || exit 1
+            mkdir -p "$REDO_PATH" || {
+                log_error "Failed to create SRL directory: $REDO_PATH"
+                log_error "Check parent directory permissions and retry."
+                exit 1
+            }
+            log_info "Created SRL directory: $REDO_PATH"
+        else
+            log_error "Queried ORL member path does not exist: $REDO_PATH"
+            log_error "This indicates a broken database state - investigate manually."
+            exit 1
+        fi
+    fi
+
+    if [[ ! -w "$REDO_PATH" ]]; then
+        log_error "SRL directory is not writable: $REDO_PATH"
+        log_error "Fix permissions (owner should be the Oracle OS user) and retry."
+        exit 1
+    fi
+    log_info "SRL directory verified: $REDO_PATH (exists, writable)"
 
     # Calculate how many to create
     GROUPS_TO_CREATE=$((REQUIRED_STBY_GROUPS - CURRENT_STBY_GROUPS))

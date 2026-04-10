@@ -114,6 +114,68 @@ else
     log_warn "Skipping disk space validation - please verify manually"
 fi
 
+# ------------------------------------------------------------
+# Separate SRL Filesystem Check
+# ------------------------------------------------------------
+# If the operator configured STANDBY_SRL_PATH on a different
+# filesystem than STANDBY_DATA_PATH, the check above only sized
+# the data mount. Run a second df against the SRL path when it
+# lives on a distinct filesystem.
+# ------------------------------------------------------------
+if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
+   && [[ -n "${STANDBY_SRL_PATH:-}" ]] \
+   && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]] \
+   && [[ -n "${REDO_LOG_SIZE_MB:-}" ]] \
+   && [[ -n "${STANDBY_REDO_GROUPS:-}" ]]; then
+
+    # Find the closest existing parent for df (the SRL dir may not
+    # be created yet - step 3 creates it later in this script).
+    SRL_CHECK_PATH="$STANDBY_SRL_PATH"
+    while [[ ! -d "$SRL_CHECK_PATH" && "$SRL_CHECK_PATH" != "/" ]]; do
+        SRL_CHECK_PATH=$(dirname "$SRL_CHECK_PATH")
+    done
+
+    # Compute the data filesystem mount point independently (the
+    # earlier REQUIRED_SPACE_MB block may have been skipped).
+    DATA_CHECK_PATH="$STANDBY_DATA_PATH"
+    while [[ ! -d "$DATA_CHECK_PATH" && "$DATA_CHECK_PATH" != "/" ]]; do
+        DATA_CHECK_PATH=$(dirname "$DATA_CHECK_PATH")
+    done
+
+    # Determine whether SRL path is on a different filesystem than
+    # STANDBY_DATA_PATH. If the same filesystem, the earlier df
+    # already covered it (or REQUIRED_SPACE_MB was missing and the
+    # operator accepted the manual-verification warning).
+    DATA_FS=$(df -P "$DATA_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $NF}')
+    SRL_FS=$(df -P "$SRL_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $NF}')
+
+    if [[ -n "$DATA_FS" && "$DATA_FS" == "$SRL_FS" ]]; then
+        log_info "SRL path shares the data filesystem ($DATA_FS) - space already covered"
+    else
+        # SRL storage needed = redo group size x group count x 1.2 (safety margin)
+        SRL_REQUIRED_MB=$(( REDO_LOG_SIZE_MB * STANDBY_REDO_GROUPS * 12 / 10 ))
+        log_info "Checking available space on separate SRL filesystem: $SRL_CHECK_PATH"
+        log_info "SRL storage required: ${SRL_REQUIRED_MB} MB (${REDO_LOG_SIZE_MB} MB x ${STANDBY_REDO_GROUPS} groups + 20% buffer)"
+
+        SRL_AVAILABLE_KB=$(df -k "$SRL_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+        SRL_AVAILABLE_MB=$(( SRL_AVAILABLE_KB / 1024 ))
+        log_info "SRL filesystem available: ${SRL_AVAILABLE_MB} MB"
+
+        if [[ "$SRL_AVAILABLE_MB" -lt "$SRL_REQUIRED_MB" ]]; then
+            log_error "INSUFFICIENT SPACE ON SRL FILESYSTEM!"
+            log_error "  Path:      $SRL_CHECK_PATH"
+            log_error "  Available: ${SRL_AVAILABLE_MB} MB"
+            log_error "  Required:  ${SRL_REQUIRED_MB} MB"
+            log_error "  Shortfall: $(( SRL_REQUIRED_MB - SRL_AVAILABLE_MB )) MB"
+            log_error ""
+            log_error "Free up space on the SRL mount or reconfigure STANDBY_SRL_PATH."
+            exit 1
+        else
+            log_info "PASS: Sufficient space on SRL filesystem"
+        fi
+    fi
+fi
+
 # Check Oracle environment
 if [[ -z "$ORACLE_HOME" ]]; then
     # Try to set from config
@@ -136,6 +198,9 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     _dir_summary="Create any missing standby directories under ${STANDBY_DB_CREATE_FILE_DEST}, ${STANDBY_DB_RECOVERY_FILE_DEST}, and ${STANDBY_ADMIN_DIR}."
 else
     _dir_summary="Create any missing standby directories under ${STANDBY_DATA_PATH}, ${STANDBY_REDO_PATH}, and ${STANDBY_ADMIN_DIR}."
+    if [[ -n "${STANDBY_SRL_PATH:-}" ]] && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
+        _dir_summary="${_dir_summary} Also create a separate SRL directory at ${STANDBY_SRL_PATH}."
+    fi
 fi
 print_list_block "This Step Will Change" \
     "$_dir_summary" \
@@ -195,6 +260,12 @@ else
         "${STANDBY_DATA_PATH}"
         "${STANDBY_REDO_PATH}"
     )
+
+    # Add SRL directory if configured separately from ORL path
+    if [[ -n "${STANDBY_SRL_PATH:-}" ]] && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
+        DIRS_TO_CREATE+=("${STANDBY_SRL_PATH}")
+        log_info "Separate SRL directory configured: $STANDBY_SRL_PATH"
+    fi
 
     # Add archive destination if configured (may be empty if using FRA)
     if [[ -n "$STANDBY_ARCHIVE_DEST" ]]; then

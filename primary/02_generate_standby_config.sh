@@ -220,8 +220,12 @@ progress_step "Generating Path Conversions"
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: paths are managed by Oracle, no FILE_NAME_CONVERT needed
+    # Oracle places all redo logs (ORL and SRL) under db_create_file_dest,
+    # so SRL separation is not supported in OMF mode.
     STANDBY_DATA_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
     STANDBY_REDO_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
+    PRIMARY_SRL_PATH="${PRIMARY_REDO_PATH}"
+    STANDBY_SRL_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
     STANDBY_FRA="${STANDBY_DB_RECOVERY_FILE_DEST}"
     USE_FRA_FOR_STANDBY="YES"
     STANDBY_ARCHIVE_DEST=""
@@ -270,6 +274,41 @@ fi
 STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
 STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
 
+# ============================================================
+# Standby Redo Log (SRL) Path Separation
+# ============================================================
+# By default, SRLs live in the same directory as online redo logs
+# on both databases. You can optionally place SRLs in a separate
+# directory (e.g., a different disk) for performance isolation.
+# ============================================================
+echo ""
+echo "By default, standby redo logs (SRLs) live in the same directory"
+echo "as online redo logs (ORLs) on both databases:"
+echo "  Primary SRLs -> $PRIMARY_REDO_PATH"
+echo "  Standby SRLs -> $STANDBY_REDO_PATH"
+echo ""
+printf "Use a SEPARATE directory for standby redo logs? [y/N]: "
+read _separate_srl
+_separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d ' \n\r')
+
+if [[ "$_separate_srl" == "y" || "$_separate_srl" == "yes" ]]; then
+    prompt_with_default "Primary SRL directory" "$PRIMARY_REDO_PATH" PRIMARY_SRL_PATH
+    # Derive standby SRL default via directory-name substitution
+    _stby_srl_default=$(echo "$PRIMARY_SRL_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+    prompt_with_default "Standby SRL directory" "$_stby_srl_default" STANDBY_SRL_PATH
+
+    # Ensure trailing slash for LOG_FILE_NAME_CONVERT consistency
+    [[ "$PRIMARY_SRL_PATH" != */ ]] && PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH}/"
+    [[ "$STANDBY_SRL_PATH" != */ ]] && STANDBY_SRL_PATH="${STANDBY_SRL_PATH}/"
+
+    log_info "Primary SRL path: $PRIMARY_SRL_PATH"
+    log_info "Standby SRL path: $STANDBY_SRL_PATH"
+else
+    PRIMARY_SRL_PATH="$PRIMARY_REDO_PATH"
+    STANDBY_SRL_PATH="$STANDBY_REDO_PATH"
+    log_info "SRLs will share the ORL directory on both databases"
+fi
+
 # Handle archive destination - may use FRA
 if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
     # Use FRA for archiving on standby
@@ -289,19 +328,29 @@ else
 fi
 
 # Generate FILE_NAME_CONVERT parameters
+# Always include the ORL path conversion pair
 DB_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}'"
 LOG_FILE_NAME_CONVERT="'${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
 
-# If data and redo are in different paths with DB_UNIQUE_NAME, add both
+# If data and redo are in different paths with DB_UNIQUE_NAME, include both
 if [[ "$PRIMARY_DATA_PATH" != "$PRIMARY_REDO_PATH" ]]; then
     DB_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}','${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
     LOG_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}','${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
+fi
+
+# If SRL path differs from ORL path, append the SRL conversion pair so
+# RMAN DUPLICATE remaps standby redo logs to the separate directory.
+if [[ "$PRIMARY_SRL_PATH" != "$PRIMARY_REDO_PATH" ]]; then
+    LOG_FILE_NAME_CONVERT="${LOG_FILE_NAME_CONVERT},'${PRIMARY_SRL_PATH}','${STANDBY_SRL_PATH}'"
+    DB_FILE_NAME_CONVERT="${DB_FILE_NAME_CONVERT},'${PRIMARY_SRL_PATH}','${STANDBY_SRL_PATH}'"
 fi
 
 log_info "Primary data path: $PRIMARY_DATA_PATH"
 log_info "Standby data path: $STANDBY_DATA_PATH"
 log_info "Primary redo path: $PRIMARY_REDO_PATH"
 log_info "Standby redo path: $STANDBY_REDO_PATH"
+log_info "Primary SRL path:  $PRIMARY_SRL_PATH"
+log_info "Standby SRL path:  $STANDBY_SRL_PATH"
 
 fi  # end STANDBY_STORAGE_MODE check
 
@@ -400,13 +449,17 @@ STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
 
 # --- Path Conversions (Traditional mode only) ---
 # *_DATA_PATH = where datafiles live on each database
-# *_REDO_PATH = where redo log files live on each database
-#               (holds BOTH online redo logs AND standby redo logs -
-#                there is no separate directory for SRLs)
+# *_REDO_PATH = where ONLINE redo log files live on each database
+# *_SRL_PATH  = where STANDBY redo log files live on each database
+#               (defaults to *_REDO_PATH; can be separated for
+#                disk/performance isolation - see the SRL Path
+#                Separation prompt at step 2)
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
 STANDBY_DATA_PATH="$STANDBY_DATA_PATH"
 PRIMARY_REDO_PATH="$PRIMARY_REDO_PATH"
 STANDBY_REDO_PATH="$STANDBY_REDO_PATH"
+PRIMARY_SRL_PATH="$PRIMARY_SRL_PATH"
+STANDBY_SRL_PATH="$STANDBY_SRL_PATH"
 DB_FILE_NAME_CONVERT="${DB_FILE_NAME_CONVERT}"
 LOG_FILE_NAME_CONVERT="${LOG_FILE_NAME_CONVERT}"
 
@@ -468,9 +521,12 @@ USE_FRA_FOR_STANDBY="$USE_FRA_FOR_STANDBY"   # YES if STANDBY will archive to FR
 # Counts and sizes below apply to BOTH databases (symmetry is
 # required for role transitions). The physical LOCATION of the
 # redo log files is NOT set here - it lives in the Path
-# Conversions section above (PRIMARY_REDO_PATH / STANDBY_REDO_PATH
-# for Traditional mode, or STANDBY_DB_CREATE_FILE_DEST for OMF).
-# ORLs and SRLs share the same redo directory on each database.
+# Conversions section above:
+#   ORL path: PRIMARY_REDO_PATH / STANDBY_REDO_PATH
+#   SRL path: PRIMARY_SRL_PATH  / STANDBY_SRL_PATH
+# (In OMF mode everything goes under STANDBY_DB_CREATE_FILE_DEST.)
+# By default SRL_PATH == REDO_PATH, but SRLs can be placed in a
+# separate directory for disk/performance isolation.
 #
 # ------------------------------------------------------------
 # NAMING NOTE - the word "STANDBY" is overloaded:
@@ -504,6 +560,11 @@ EOF
 log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
 
 fi  # end REGENERATE check
+
+# Backward compatibility: older config files may not have SRL paths.
+# If unset, default to the ORL path (original behavior).
+PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH:-$PRIMARY_REDO_PATH}"
+STANDBY_SRL_PATH="${STANDBY_SRL_PATH:-$STANDBY_REDO_PATH}"
 
 # ############################################################
 # FILE GENERATION
