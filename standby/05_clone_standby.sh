@@ -4,6 +4,13 @@
 # ============================================================
 # Run this script on the STANDBY database server.
 # It performs RMAN duplicate to create the standby database.
+#
+# RMAN tuning flags:
+#   -c, --channels NUM   Number of parallel auxiliary channels (default: 1)
+#   -r, --rate RATE      Per-channel throughput limit (e.g. 200M, 1G)
+#                        Default: unlimited
+#
+# Example: bash ./standby/05_clone_standby.sh -c 4 -r 200M
 # ============================================================
 
 set -e
@@ -15,6 +22,34 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
 enable_verbose_mode "$@"
+
+# ============================================================
+# Parse RMAN tuning flags
+# ============================================================
+
+RMAN_CHANNELS=1
+RMAN_RATE=""
+
+_args=("$@")
+_i=0
+while [[ $_i -lt ${#_args[@]} ]]; do
+    case "${_args[$_i]}" in
+        -c|--channels)
+            _i=$((_i + 1))
+            RMAN_CHANNELS="${_args[$_i]:-}"
+            ;;
+        -r|--rate)
+            _i=$((_i + 1))
+            RMAN_RATE="${_args[$_i]:-}"
+            ;;
+    esac
+    _i=$((_i + 1))
+done
+
+if ! [[ "$RMAN_CHANNELS" =~ ^[1-9][0-9]*$ ]]; then
+    log_error "Invalid --channels value: '$RMAN_CHANNELS' (must be a positive integer)"
+    exit 1
+fi
 
 # ============================================================
 # Main Script
@@ -112,6 +147,10 @@ print_list_block "Files and Commands" \
     "Password file: ${PWD_FILE}" \
     "RMAN script: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.rcv" \
     "RMAN log: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.log"
+
+print_status_block "RMAN Tuning" \
+    "Auxiliary channels" "$RMAN_CHANNELS" \
+    "Per-channel rate" "${RMAN_RATE:-unlimited}"
 
 print_list_block "Recovery If This Step Fails" \
     "This step is not directly restartable once RMAN duplicate starts." \
@@ -226,6 +265,30 @@ else
     LOG_ARCHIVE_DEST_1_SETTING="LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}"
 fi
 
+# Build optional RUN { ... } wrapper with auxiliary channel allocation.
+# Allocated only when channels > 1 or rate is set; otherwise the bare
+# DUPLICATE statement is used (preserving the default behavior).
+RMAN_PROLOGUE=""
+RMAN_EPILOGUE=""
+if [[ "$RMAN_CHANNELS" -gt 1 || -n "$RMAN_RATE" ]]; then
+    _rate_clause=""
+    [[ -n "$RMAN_RATE" ]] && _rate_clause=" RATE $RMAN_RATE"
+
+    _channel_lines=""
+    _i=1
+    while [[ $_i -le $RMAN_CHANNELS ]]; do
+        _channel_lines="${_channel_lines}  ALLOCATE AUXILIARY CHANNEL aux${_i} TYPE DISK${_rate_clause};
+"
+        _i=$((_i + 1))
+    done
+
+    RMAN_PROLOGUE="RUN {
+${_channel_lines}"
+    RMAN_EPILOGUE="}"
+
+    log_info "RMAN tuning: ${RMAN_CHANNELS} auxiliary channel(s)${RMAN_RATE:+, rate ${RMAN_RATE} per channel}"
+fi
+
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: use db_create_file_dest, no FILE_NAME_CONVERT
     cat > "$RMAN_SCRIPT" <<EOF
@@ -234,6 +297,7 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
 # Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
 #       configured by Data Guard Broker after duplication completes.
 
+${RMAN_PROLOGUE}
 DUPLICATE TARGET DATABASE
   FOR STANDBY
   FROM ACTIVE DATABASE
@@ -248,6 +312,7 @@ DUPLICATE TARGET DATABASE
     SET DG_BROKER_START='TRUE'
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
+${RMAN_EPILOGUE}
 EOF
 else
     # Traditional mode: use FILE_NAME_CONVERT (existing behavior)
@@ -264,6 +329,7 @@ else
 # Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
 #       configured by Data Guard Broker after duplication completes.
 
+${RMAN_PROLOGUE}
 DUPLICATE TARGET DATABASE
   FOR STANDBY
   FROM ACTIVE DATABASE
@@ -279,6 +345,7 @@ ${FRA_SETTINGS}
     SET DG_BROKER_START='TRUE'
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
+${RMAN_EPILOGUE}
 EOF
 fi
 
