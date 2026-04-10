@@ -392,12 +392,17 @@ DB_BLOCK_SIZE="$DB_BLOCK_SIZE"
 COMPATIBLE="$COMPATIBLE"
 
 # --- Storage Mode ---
+# TRADITIONAL = path substitution via DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT
+# OMF         = Oracle Managed Files (db_create_file_dest + db_recovery_file_dest)
 STANDBY_STORAGE_MODE="$STANDBY_STORAGE_MODE"
+# OMF only: base directory for data, redo, and control files (empty in Traditional mode)
 STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
-STANDBY_DB_RECOVERY_FILE_DEST="$STANDBY_DB_RECOVERY_FILE_DEST"
-STANDBY_DB_RECOVERY_FILE_DEST_SIZE="$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
 
-# --- Path Conversions ---
+# --- Path Conversions (Traditional mode only) ---
+# *_DATA_PATH = where datafiles live on each database
+# *_REDO_PATH = where redo log files live on each database
+#               (holds BOTH online redo logs AND standby redo logs -
+#                there is no separate directory for SRLs)
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
 STANDBY_DATA_PATH="$STANDBY_DATA_PATH"
 PRIMARY_REDO_PATH="$PRIMARY_REDO_PATH"
@@ -405,22 +410,87 @@ STANDBY_REDO_PATH="$STANDBY_REDO_PATH"
 DB_FILE_NAME_CONVERT="${DB_FILE_NAME_CONVERT}"
 LOG_FILE_NAME_CONVERT="${LOG_FILE_NAME_CONVERT}"
 
-# --- Archive Log Configuration ---
+# --- Archive Log Destination ---
+# PRIMARY_ARCHIVE_DEST: primary's current log_archive_dest_1 (informational)
+# STANDBY_ARCHIVE_DEST: standby's archive dest; empty when standby archives to FRA
 PRIMARY_ARCHIVE_DEST="$PRIMARY_ARCHIVE_DEST"
 STANDBY_ARCHIVE_DEST="$STANDBY_ARCHIVE_DEST"
 
-# --- Recovery Area ---
+# ============================================================
+# Fast Recovery Area (FRA)
+# ============================================================
+# The FRA stores archived redo, flashback logs, and optionally backups.
+# There are THREE groups of variables below:
+#
+#   1. PRIMARY FRA (inherited from primary, informational only)
+#   2. STANDBY FRA (what actually gets applied to the standby)
+#   3. FLAGS (which side uses the FRA for archiving)
+#
+# Variable map by storage mode:
+#   Traditional + FRA archive:
+#     - STANDBY_FRA                      = derived from primary path
+#     - STANDBY_DB_RECOVERY_FILE_DEST    = (empty, not used)
+#     - USE_FRA_FOR_STANDBY              = YES
+#   Traditional + explicit archive dest:
+#     - STANDBY_FRA                      = (empty)
+#     - STANDBY_ARCHIVE_DEST             = set
+#     - USE_FRA_FOR_STANDBY              = NO
+#   OMF (always uses FRA):
+#     - STANDBY_DB_RECOVERY_FILE_DEST    = standby FRA path
+#     - STANDBY_FRA                      = same as above (mirror)
+#     - USE_FRA_FOR_STANDBY              = YES
+# ============================================================
+
+# 1. Primary FRA (informational - inherited from primary at step 1)
 DB_RECOVERY_FILE_DEST="$DB_RECOVERY_FILE_DEST"
 DB_RECOVERY_FILE_DEST_SIZE="$DB_RECOVERY_FILE_DEST_SIZE"
-USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"
-USE_FRA_FOR_STANDBY="$USE_FRA_FOR_STANDBY"
-STANDBY_FRA="$STANDBY_FRA"
 
-# --- Redo Log Configuration ---
-REDO_LOG_SIZE_MB="$REDO_LOG_SIZE_MB"
-ONLINE_REDO_GROUPS="$ONLINE_REDO_GROUPS"
-STANDBY_REDO_GROUPS="$RECOMMENDED_STBY_GROUPS"
-STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"
+# 2. Standby FRA (applied to the standby database)
+STANDBY_FRA="$STANDBY_FRA"
+STANDBY_DB_RECOVERY_FILE_DEST="$STANDBY_DB_RECOVERY_FILE_DEST"
+STANDBY_DB_RECOVERY_FILE_DEST_SIZE="$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
+
+# 3. Flags
+USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"   # YES if PRIMARY archives to FRA
+USE_FRA_FOR_STANDBY="$USE_FRA_FOR_STANDBY"   # YES if STANDBY will archive to FRA
+
+# ============================================================
+# Redo Logs
+# ============================================================
+# Oracle Data Guard uses two TYPES of redo logs, and BOTH
+# databases (primary and standby) get BOTH types so that either
+# side can take over after a switchover or failover:
+#
+#   - Online Redo Logs (ORLs)  : active redo on the PRIMARY role
+#   - Standby Redo Logs (SRLs) : receive shipped redo on the
+#                                STANDBY role
+#
+# Counts and sizes below apply to BOTH databases (symmetry is
+# required for role transitions). The physical LOCATION of the
+# redo log files is NOT set here - it lives in the Path
+# Conversions section above (PRIMARY_REDO_PATH / STANDBY_REDO_PATH
+# for Traditional mode, or STANDBY_DB_CREATE_FILE_DEST for OMF).
+# ORLs and SRLs share the same redo directory on each database.
+#
+# ------------------------------------------------------------
+# NAMING NOTE - the word "STANDBY" is overloaded:
+# ------------------------------------------------------------
+#   STANDBY_DB_UNIQUE_NAME, STANDBY_REDO_PATH, STANDBY_FRA, ...
+#     -> "STANDBY" means the STANDBY DATABASE (host / instance)
+#
+#   STANDBY_REDO_GROUPS, STANDBY_REDO_EXISTS
+#     -> "STANDBY" means the TYPE of redo log (SRL)
+#     -> These values describe BOTH databases, not just the
+#        standby side. Think of them as "SRL_GROUPS" /
+#        "SRL_EXISTS".
+# ------------------------------------------------------------
+# ============================================================
+
+# Applies to both databases (same size, same group counts)
+REDO_LOG_SIZE_MB="$REDO_LOG_SIZE_MB"            # Group size in MB (both ORLs and SRLs, both DBs)
+ONLINE_REDO_GROUPS="$ONLINE_REDO_GROUPS"        # ORL group count (same on primary and standby)
+STANDBY_REDO_GROUPS="$RECOMMENDED_STBY_GROUPS"  # SRL group count (same on primary and standby; typically ORL + 1)
+STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"      # YES if SRLs already existed on the primary at step 1 (pre-check, not per-database)
 
 # --- Admin Directories ---
 STANDBY_ADMIN_DIR="$STANDBY_ADMIN_DIR"
