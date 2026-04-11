@@ -4,7 +4,7 @@
 # ============================================================
 # Run this script directly on the database server.
 # Creates a new Oracle 19c database using DBCA (silent mode)
-# configured for Data Guard: ARCHIVELOG, no OMF, no FRA.
+# configured for Data Guard: non-CDB, ARCHIVELOG, no OMF, no FRA.
 #
 # Usage:
 #   bash tests/create_test_db.sh                       # Interactive prompts
@@ -156,6 +156,7 @@ dbca -silent -createDatabase \
     -gdbName "$DB_NAME" \
     -sid "$DB_NAME" \
     -templateName General_Purpose.dbc \
+    -createAsContainerDatabase false \
     -sysPassword "$SYS_PASSWORD" \
     -systemPassword "$SYS_PASSWORD" \
     -characterSet "$CHARSET" \
