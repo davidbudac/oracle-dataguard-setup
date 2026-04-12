@@ -225,7 +225,7 @@ print_event_block() {
             ts="${line:0:19}"
             msg="${line:21}"
         fi
-        if printf '%s' "$msg" | grep -qiE 'ORA-|error|fail'; then
+        if is_error_event "$msg"; then
             if [[ -n "$ts" ]]; then
                 printf "    ${DIM}%s${NC}  ${RED}%s${NC}\n" "$ts" "$msg"
             else
@@ -239,6 +239,14 @@ print_event_block() {
             fi
         fi
     done <<< "$entries"
+}
+
+is_error_event() {
+    local msg="$1"
+    if printf '%s' "$msg" | grep -qiE 'ORA-(00000|0([^0-9]|$))'; then
+        return 1
+    fi
+    printf '%s' "$msg" | grep -qiE 'ORA-|error|failed|failure'
 }
 
 add_summary_error() {
@@ -396,7 +404,7 @@ attempt_remote_connection() {
     if $LOCAL_ONLY; then
         REMOTE_CONNECTION_RESULT="remote SQL skipped by -L"
         REMOTE_DATA_SOURCE="local-only"
-        REMOTE_DATA_SOURCE_LABEL="local+broker only (-L)"
+        REMOTE_DATA_SOURCE_LABEL="local+broker (-L)"
         return
     fi
 
@@ -766,7 +774,7 @@ compute_fra_effective() {
 
 normalise_lag_value() {
     local value="$1"
-    if [[ "$value" == "+00 00:00:00" ]] || [[ "$value" == "0" ]] || [[ "$value" == "NONE" ]]; then
+    if [[ "$value" == "+00 00:00:00" ]] || [[ "$value" == "+00 00:00:00.000" ]] || [[ "$value" == "0" ]] || [[ "$value" == "NONE" ]]; then
         printf 'none'
     else
         printf '%s' "$value"
@@ -774,9 +782,10 @@ normalise_lag_value() {
 }
 
 assess_primary() {
-    PRI_OK=true
+    PRI_OK=unknown
 
     if [[ -n "${PRI_ROLE:-}" ]]; then
+        PRI_OK=true
         printf '%s' "$PRI_ROLE" | grep -qi "PRIMARY" || {
             PRI_OK=false
             add_summary_error "Primary role is ${PRI_ROLE:-unknown}"
@@ -838,10 +847,11 @@ assess_primary() {
 }
 
 assess_standby() {
-    STB_OK=true
+    STB_OK=unknown
     SEQ_LAG=""
 
     if [[ -n "${STB_ROLE:-}" ]]; then
+        STB_OK=true
         printf '%s' "$STB_ROLE" | grep -qi "PHYSICAL STANDBY" || {
             STB_OK=false
             add_summary_error "Standby role is ${STB_ROLE:-unknown}"
@@ -954,16 +964,16 @@ assess_broker() {
                 add_summary_warning "FSFO is enabled but observer is not present"
             fi
         else
-            add_summary_warning "Fast-Start Failover is ${FSFO_MODE}"
+            add_summary_warning "Fast-Start Failover disabled"
         fi
     fi
 }
 
 assess_data_source() {
     if [[ "$REMOTE_DATA_SOURCE" == "broker" ]]; then
-        add_summary_warning "Remote runtime unavailable; peer shown from broker only"
+        add_summary_warning "Peer runtime unavailable; broker view only"
     elif [[ "$REMOTE_DATA_SOURCE" == "local-only" ]]; then
-        add_summary_warning "Remote runtime skipped with -L; peer shown from broker only"
+        add_summary_warning "Peer runtime skipped (-L); broker view only"
     fi
 }
 
@@ -1010,7 +1020,9 @@ compute_state_labels() {
         PEER_SOURCE_STATE="${GREEN}RUNTIME SQL${NC}"
     fi
 
-    if [[ -n "${STB_TRANSPORT_LAG:-}" && "$(normalise_lag_value "$STB_TRANSPORT_LAG")" != "none" ]]; then
+    if $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
+        REPL_STATE="$PEER_SOURCE_STATE"
+    elif [[ -n "${STB_TRANSPORT_LAG:-}" && "$(normalise_lag_value "$STB_TRANSPORT_LAG")" != "none" ]]; then
         REPL_STATE="${YELLOW}LAGGING${NC}"
     elif [[ -n "${STB_APPLY_LAG:-}" && "$(normalise_lag_value "$STB_APPLY_LAG")" != "none" ]]; then
         REPL_STATE="${YELLOW}LAGGING${NC}"
@@ -1103,7 +1115,7 @@ render_primary_triage() {
             row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%)" "$icon"
         fi
     else
-        row "Peer View" "Runtime SQL unavailable; primary shown from broker"
+        row "Peer View" "Broker view only; runtime SQL unavailable"
         render_peer_broker_view "PRIMARY"
     fi
 }
@@ -1167,7 +1179,7 @@ render_standby_triage() {
             row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%)" "$icon"
         fi
     else
-        row "Peer View" "Runtime SQL unavailable; standby shown from broker"
+        row "Peer View" "Broker view only; runtime SQL unavailable"
         render_peer_broker_view "STANDBY"
     fi
 }
@@ -1211,7 +1223,7 @@ render_broker_triage() {
             row "Fast-Start Failover" "$FSFO_MODE" "$WARN"
         fi
     fi
-    [[ -n "${FSFO_TARGET:-}" ]] && row "Target" "${FSFO_TARGET}"
+    [[ -n "${FSFO_TARGET:-}" && "${FSFO_TARGET}" != "(none)" ]] && row "Target" "${FSFO_TARGET}"
     if [[ -n "${LOC_FSFO_OBSERVER_PRESENT:-}" ]]; then
         if [[ "${LOC_FSFO_OBSERVER_PRESENT}" == "YES" ]]; then
             row "Observer Present" "YES" "$CHK"
@@ -1230,13 +1242,25 @@ render_recent_events_triage() {
 }
 
 render_triage_output() {
+    local pri_summary_mode stb_summary_mode
+    if [[ -n "${PRI_OPEN:-}" ]]; then
+        pri_summary_mode="$PRI_OPEN"
+    else
+        pri_summary_mode="broker view"
+    fi
+    if [[ -n "${STB_MRP_STATUS:-}" ]]; then
+        stb_summary_mode="MRP ${STB_MRP_STATUS}"
+    else
+        stb_summary_mode="broker view"
+    fi
+
     print_title "Data Guard Triage"
     print_top_findings
 
     header "AT A GLANCE"
     row "Overall" "errors=${ERRORS} warnings=${WARNINGS}" "$OVERALL_STATE"
-    row "Primary" "${PRI_DBUNIQ:-?} / ${PRI_OPEN:-unknown}" "$PRIMARY_STATE"
-    row "Standby" "${STB_DBUNIQ:-?} / MRP ${STB_MRP_STATUS:-broker-only}" "$STANDBY_STATE"
+    row "Primary" "${PRI_DBUNIQ:-?} / ${pri_summary_mode}" "$PRIMARY_STATE"
+    row "Standby" "${STB_DBUNIQ:-?} / ${stb_summary_mode}" "$STANDBY_STATE"
     row "Broker" "${BROKER_CFG_NAME:-not configured}" "$BROKER_STATE"
     row "Redo Apply" "transport=${STB_TRANSPORT_LAG:-n/a}, apply=${STB_APPLY_LAG:-n/a}" "$REPL_STATE"
     row "Peer Data" "${REMOTE_DATA_SOURCE_LABEL}" "$PEER_SOURCE_STATE"
@@ -1347,7 +1371,9 @@ render_standby_diag() {
                 row "Apply Lag" "$STB_APPLY_LAG" "$WARN"
             fi
         fi
-        [[ -n "${STB_APPLY_FINISH:-}" ]] && row "Apply Finish Time" "${STB_APPLY_FINISH}"
+        if [[ -n "${STB_APPLY_FINISH:-}" ]] && [[ "$(normalise_lag_value "$STB_APPLY_FINISH")" != "none" ]]; then
+            row "Apply Finish Time" "${STB_APPLY_FINISH}"
+        fi
 
         if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "${STB_LAST_RECEIVED:-0}" -gt 0 ]]; then
             if [[ -n "${SEQ_LAG:-}" && "${SEQ_LAG}" -gt 5 ]]; then
@@ -1407,7 +1433,7 @@ render_broker_diag() {
             else
                 row "" "$line_trimmed" "$CHK"
             fi
-        elif printf '%s' "$line" | grep -qi 'ORA-'; then
+        elif is_error_event "$line_trimmed"; then
             printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
         fi
     done <<< "$DGMGRL_CONFIG"
@@ -1419,8 +1445,8 @@ render_broker_diag() {
             row "Fast-Start Failover" "$FSFO_MODE" "$WARN"
         fi
     fi
-    [[ -n "${FSFO_TARGET:-}" ]] && row "Target" "$FSFO_TARGET"
-    [[ -n "${FSFO_OBS:-}" ]] && row "Observer" "$FSFO_OBS"
+    [[ -n "${FSFO_TARGET:-}" && "${FSFO_TARGET}" != "(none)" ]] && row "Target" "$FSFO_TARGET"
+    [[ -n "${FSFO_OBS:-}" && "${FSFO_OBS}" != "(none)" ]] && row "Observer" "$FSFO_OBS"
     [[ -n "${FSFO_THRESHOLD:-}" ]] && row "Threshold" "$FSFO_THRESHOLD"
     if [[ -n "${LOC_FSFO_STATUS:-}" ]]; then
         row "Local FSFO Status" "$LOC_FSFO_STATUS"
@@ -1451,12 +1477,24 @@ render_interpretation_diag() {
 }
 
 render_diag_output() {
+    local pri_summary_mode stb_summary_mode
+    if [[ -n "${PRI_OPEN:-}" ]]; then
+        pri_summary_mode="$PRI_OPEN"
+    else
+        pri_summary_mode="broker view"
+    fi
+    if [[ -n "${STB_MRP_STATUS:-}" ]]; then
+        stb_summary_mode="MRP ${STB_MRP_STATUS}"
+    else
+        stb_summary_mode="broker view"
+    fi
+
     print_title "Data Guard Diagnostics"
 
     header "AT A GLANCE"
     row "Overall" "errors=${ERRORS} warnings=${WARNINGS}" "$OVERALL_STATE"
-    row "Primary" "${PRI_DBUNIQ:-?} / ${PRI_OPEN:-unknown}" "$PRIMARY_STATE"
-    row "Standby" "${STB_DBUNIQ:-?} / MRP ${STB_MRP_STATUS:-broker-only}" "$STANDBY_STATE"
+    row "Primary" "${PRI_DBUNIQ:-?} / ${pri_summary_mode}" "$PRIMARY_STATE"
+    row "Standby" "${STB_DBUNIQ:-?} / ${stb_summary_mode}" "$STANDBY_STATE"
     row "Broker" "${BROKER_CFG_NAME:-not configured}" "$BROKER_STATE"
     row "Redo Apply" "transport=${STB_TRANSPORT_LAG:-n/a}, apply=${STB_APPLY_LAG:-n/a}" "$REPL_STATE"
     row "Peer Data" "${REMOTE_DATA_SOURCE_LABEL}" "$PEER_SOURCE_STATE"
