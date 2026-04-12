@@ -973,7 +973,7 @@ assess_data_source() {
     if [[ "$REMOTE_DATA_SOURCE" == "broker" ]]; then
         add_summary_warning "Peer runtime unavailable; broker view only"
     elif [[ "$REMOTE_DATA_SOURCE" == "local-only" ]]; then
-        add_summary_warning "Peer runtime skipped (-L); broker view only"
+        add_summary_info "Peer runtime skipped by request (-L)"
     fi
 }
 
@@ -1015,7 +1015,7 @@ compute_state_labels() {
     if [[ "$REMOTE_DATA_SOURCE" == "broker" ]]; then
         PEER_SOURCE_STATE="${YELLOW}BROKER ONLY${NC}"
     elif [[ "$REMOTE_DATA_SOURCE" == "local-only" ]]; then
-        PEER_SOURCE_STATE="${YELLOW}LOCAL ONLY${NC}"
+        PEER_SOURCE_STATE="${CYAN}LOCAL ONLY${NC}"
     else
         PEER_SOURCE_STATE="${GREEN}RUNTIME SQL${NC}"
     fi
