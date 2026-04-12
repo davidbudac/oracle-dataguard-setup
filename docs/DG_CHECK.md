@@ -1,168 +1,152 @@
-# Data Guard Local Status Check
+# Local Data Guard Status Commands
 
-`dg_check_sid.sh` is a health check that runs directly on an Oracle database host -- no SSH or external config file required. It detects the local database role (primary or standby), queries local V$ views and DGMGRL, then automatically discovers and connects to the peer database over SQL*Net for a complete picture.
+The local status flow is now split into two commands that run directly on a DB host, using `sqlplus / as sysdba` locally and DGMGRL-based peer discovery:
+
+- `dg_triage_sid.sh` for fast operator triage
+- `dg_diag_sid.sh` for deeper diagnostics
+
+`dg_check_sid.sh` is kept as a deprecated compatibility wrapper. It forwards to `dg_triage_sid.sh`, prints a deprecation warning, and still exits with `0`.
 
 ## Quick Start
 
 ```bash
-# Run on any DG host - auto-detects everything
+# Fast triage - wallet only by default, non-blocking when remote runtime is unavailable
 export ORACLE_SID=cdb1
-bash dg_check_sid.sh
+bash dg_triage_sid.sh
 
-# Local + broker only (no remote SQL connection)
-bash dg_check_sid.sh -L
+# Deep diagnostics - prompts for SYS password if wallet auth fails
+bash dg_diag_sid.sh
 
-# Force password prompt for remote connection
-bash dg_check_sid.sh -P
+# Skip remote SQL entirely (local + broker view only)
+bash dg_triage_sid.sh -L
+bash dg_diag_sid.sh -L
+
+# Force password prompt for remote runtime checks
+bash dg_triage_sid.sh -P
+bash dg_diag_sid.sh -P
 ```
 
-## How It Works
+## Command Roles
 
-1. **Local detection** -- reads `$ORACLE_SID`, connects with `sqlplus / as sysdba`, queries `V$DATABASE` to determine role (PRIMARY or STANDBY)
-2. **Broker discovery** -- runs `SHOW CONFIGURATION` via `dgmgrl -silent /` to find the peer database name, then `SHOW DATABASE` to get its TNS connect identifier
-3. **Remote connection** -- tries wallet-based auth (`/@tns as sysdba`) first; if that fails, prompts for the SYS password; skipped entirely with `-L`
-4. **Display** -- shows both databases in primary-then-standby order regardless of which host the script runs on
+### `dg_triage_sid.sh`
 
-### Graceful Degradation
+Optimized for quick health confirmation:
 
-If the remote connection is unavailable (TNS error, no password, `-L` flag), the peer database section falls back to a **broker view** showing what DGMGRL knows: role, intended state, lag estimates, and any ORA errors. A hint directs the user to use `-P` for full remote checks.
+- leads with top findings
+- shows concise primary / standby / broker state
+- makes degraded peer visibility explicit
+- keeps recent DG events compressed to the newest few lines
 
-## What It Checks
+Default remote behavior:
 
-The checks are identical to [`dg_status.sh`](DG_STATUS.md) -- see that document for the full table of checks and thresholds. The only difference is the data source:
+1. try wallet authentication
+2. if wallet fails, do **not** prompt
+3. continue in broker-only degraded mode unless `-P` was specified
 
-| Data | `dg_status.sh` (SSH-based) | `dg_check_sid.sh` (local) |
-|---|---|---|
-| Local database | SSH + sqlplus | Direct sqlplus |
-| Peer database | SSH + sqlplus | SQL*Net via TNS |
-| Broker | SSH + dgmgrl | Direct dgmgrl |
-| Config source | `config.env` (SSH details) | `$ORACLE_SID` + auto-discovery |
-| Authentication | OS auth on both hosts | OS auth local, wallet/password remote |
+Exit codes:
 
-### Checks performed on each database
+- `0` healthy
+- `1` warning or degraded data source
+- `2` error
+- `64` usage or preflight failure
 
-- Database role, open mode, protection mode, switchover status
-- Force logging, flashback
-- DG broker enabled
-- Currently running services
-- Online redo log and standby redo log counts
-- Archive destination status and errors (primary)
+### `dg_diag_sid.sh`
+
+Optimized for deeper investigation:
+
+- keeps the same local collection path and broker discovery
+- shows richer runtime detail
+- includes more verbose log excerpts
+- includes connection provenance and peer-data interpretation
+
+Default remote behavior:
+
+1. try wallet authentication
+2. if wallet fails, prompt for SYS password unless `-L`
+
+Exit codes are the same as `dg_triage_sid.sh`.
+
+### `dg_check_sid.sh` (deprecated)
+
+Compatibility behavior:
+
+- prints `DEPRECATED: Use dg_triage_sid.sh` to stderr
+- forwards flags unchanged
+- always exits `0`
+
+## What The Scripts Check
+
+Both commands use the same shared collector and grading rules. The difference is presentation depth.
+
+### Primary-side checks
+
+- Database role and open mode
+- Protection mode
+- Switchover status
+- Force logging
+- Flashback
+- `dg_broker_start`
+- Services
+- Online redo and standby redo counts
+- Archive destination 2 status and peer target
 - Archive gaps
-- FRA usage with 80%/90% thresholds
-- MRP apply status and sequence (standby)
-- Transport lag, apply lag (standby)
-- Archived log sequence comparison (standby)
+- FRA usage and thresholds
 
-### Broker checks
+### Standby-side checks
 
-- Configuration name and overall status (SUCCESS/WARNING/ERROR)
-- Per-member status with ORA error details
-- Fast-Start Failover status (enabled/disabled, target, observer, threshold)
+- Database role and open mode
+- Protection mode
+- Switchover status
+- MRP status and sequence
+- Recovery mode
+- Transport lag
+- Apply lag
+- Apply finish time
+- Sequence lag
+- Standby redo count
+- Archive gaps
+- FRA usage and thresholds
+- Flashback state
 
-## Command-Line Options
+### Broker / FSFO checks
 
-| Flag | Description |
-|---|---|
-| `-P`, `--password` | Prompt for SYS password for remote connection |
-| `-L`, `--local` | Skip remote SQL checks (local + broker only) |
-| `-h`, `--help` | Show usage |
+- Configuration presence
+- Overall broker status
+- Member warnings / errors
+- Fast-Start Failover mode
+- FSFO target
+- Observer presence / host
 
-## Prerequisites
+## Data Source Modes
 
-- `ORACLE_HOME` and `ORACLE_SID` environment variables set
-- `sqlplus / as sysdba` working (OS authentication)
-- DG Broker running (`dg_broker_start = TRUE`)
-- For remote checks: TNS connectivity to peer database, plus either an Oracle Wallet or SYS password
+The scripts now make the peer data source explicit:
 
-## Remote Authentication
+- `remote runtime via wallet`
+- `remote runtime via password`
+- `broker-only degraded mode`
+- `local+broker only (-L)`
 
-The script tries to connect to the peer database in this order:
+When remote runtime SQL is unavailable, peer details fall back to broker data and the command is graded as a warning instead of appearing healthy.
 
-1. **Wallet** -- `sqlplus /@<tns_alias> as sysdba` (no password needed if a wallet is configured)
-2. **Password prompt** -- if the wallet fails, the script prompts for the SYS password interactively (press Enter to skip)
-3. **Skip** -- use `-L` to bypass remote checks entirely
+## Recent DG Events
 
-The `-P` flag forces the password prompt even if a wallet might work.
+Both commands inspect the local alert log and broker log:
 
-## Exit Code
+- `dg_triage_sid.sh` shows compressed recent events only
+- `dg_diag_sid.sh` shows longer excerpts
 
-The script always exits with 0. It is an informational tool -- the colour-coded indicators in the output show what needs attention.
+Set `DG_DEBUG=1` if you also want file paths printed in triage output.
 
-## Example Output
+## Wallet Usage
 
-### From Primary (with -L)
+These commands work best with wallet-based peer authentication configured via [WALLET_SETUP.md](WALLET_SETUP.md). With a wallet in place, peer runtime queries can use:
 
-```
- Data Guard Status Check  2026-04-02 12:07:59
- Local: poug-dg1 (SID: cdb1, role: PRIMARY)  |  Remote: skipped (-L)
-
- PRIMARY DATABASE  (cdb1)
- ────────────────────────────────────────────────────────────
-  Role                     PRIMARY                              OK
-  Open Mode                READ WRITE                           OK
-  Protection Mode          MAXIMUM AVAILABILITY
-  Switchover Status        TO STANDBY                           OK
-  Force Logging            YES                                  OK
-  Flashback                YES                                  OK
-  DG Broker                TRUE                                 OK
-  Running Services         MY_APP_SERVICE
-  Online Redo Logs         3 groups (150 MB total)
-  Standby Redo Logs        4 groups                             OK
-  Archive Dest 2 (Standby) VALID                                OK
-  FRA Usage                0.5/20 GB effective (2%), reclaimable 13.7 GB OK
-  FRA Location             /u01/app/oracle/fast_recovery_area (317 files)
-
- STANDBY DATABASE  (cdb1_stby)
- ────────────────────────────────────────────────────────────
-  Role                     PHYSICAL STANDBY                     OK
-  Intended State           APPLY-ON
-  Transport Lag            +00 00:00:00
-  Apply Lag                +00 00:00:00
-  (broker view only - use -P for full remote checks)
-
- DATA GUARD BROKER
- ────────────────────────────────────────────────────────────
-  Configuration            my_dg_config
-  Overall Status           SUCCESS                              OK
-  Fast-Start Failover      Disabled                             disabled
-
- ────────────────────────────────────────────────────────────
-  HEALTHY  No issues detected
+```bash
+sqlplus /@peer_tns_alias as sysdba
 ```
 
-### From Standby (with -L)
+## Relationship to `dg_status.sh`
 
-```
- Data Guard Status Check  2026-04-02 12:07:41
- Local: poug-dg2 (SID: cdb1, role: STANDBY)  |  Remote: skipped (-L)
+[`dg_status.sh`](DG_STATUS.md) remains the SSH-based dashboard run from a jump host or any host that can reach both databases over SSH.
 
- PRIMARY DATABASE  (cdb1)
- ────────────────────────────────────────────────────────────
-  Role                     PRIMARY                              OK
-  Intended State           TRANSPORT-ON
-  (broker view only - use -P for full remote checks)
-
- STANDBY DATABASE  (cdb1_stby)
- ────────────────────────────────────────────────────────────
-  Role                     PHYSICAL STANDBY                     OK
-  Open Mode                MOUNTED                              OK
-  Protection Mode          MAXIMUM AVAILABILITY
-  Switchover Status        NOT ALLOWED                          OK
-  Running Services         NONE
-  MRP Status               APPLYING_LOG (seq# 1295)             OK
-  Transport Lag            none                                 OK
-  Apply Lag                none                                 OK
-  Sequences                applied=1294  received=1294          OK
-  Standby Redo Logs        4 groups                             OK
-  FRA Usage                0.0/20 GB effective (0%), reclaimable .5 GB OK
-  FRA Location             /u01/app/oracle/fast_recovery_area (12 files)
-
- DATA GUARD BROKER
- ────────────────────────────────────────────────────────────
-  Configuration            my_dg_config
-  Overall Status           SUCCESS                              OK
-  Fast-Start Failover      Disabled                             disabled
-
- ────────────────────────────────────────────────────────────
-  HEALTHY  No issues detected
-```
+The local commands in this document are for running directly on one DB host without SSH to the peer.

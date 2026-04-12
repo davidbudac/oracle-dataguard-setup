@@ -1,6 +1,6 @@
 # Oracle Wallet Setup for Data Guard
 
-An Oracle auto-login wallet lets scripts like `dg_check_sid.sh` connect to the peer database without prompting for a password. This guide covers setting up wallet-based SYS authentication between primary and standby databases.
+An Oracle auto-login wallet lets scripts like `dg_triage_sid.sh` and `dg_diag_sid.sh` connect to the peer database without prompting for a password. This guide covers setting up wallet-based SYS authentication between primary and standby databases.
 
 ## Quick Start
 

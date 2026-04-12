@@ -66,8 +66,12 @@ dataguard_setup/
 │   └── observer.sh                    # Observer setup and lifecycle (setup/start/stop/status)
 ├── trigger/
 │   └── create_role_trigger.sh         # Role-aware service trigger (optional)
+├── dg_triage_sid.sh                   # Fast local DG health triage (run on DB host)
+├── dg_diag_sid.sh                     # Deep local DG diagnostics (run on DB host)
+├── dg_check_sid.sh                    # Deprecated wrapper to dg_triage_sid.sh
 ├── common/
 │   ├── dg_functions.sh                # Shared utility functions
+│   └── dg_local_status_common.sh      # Shared local DG status collection/rendering
 ├── templates/
 │   ├── init_standby.ora.template      # Reference template
 │   ├── listener.ora.template          # Reference template
@@ -224,6 +228,19 @@ dgmgrl / "validate database 'PRODSTBY'"
 # Perform switchover
 dgmgrl / "switchover to 'PRODSTBY'"
 ```
+
+### Local Status Commands
+
+For direct checks from a DB host:
+
+```bash
+bash dg_triage_sid.sh        # Fast operator triage, wallet-only by default
+bash dg_diag_sid.sh          # Deep diagnostics, prompts if wallet auth fails
+bash dg_triage_sid.sh -L     # Local + broker only
+bash dg_diag_sid.sh -P       # Force remote password prompt
+```
+
+`dg_check_sid.sh` still exists as a deprecated compatibility wrapper, but new usage should prefer `dg_triage_sid.sh` or `dg_diag_sid.sh`.
 
 ### Using SQL
 

@@ -5,8 +5,10 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 ## Project Structure
 
 ```
-dg_status.sh   - Quick Data Guard health dashboard (run from jump host)
-dg_check_sid.sh - Local Data Guard health check (run directly on DB host)
+dg_status.sh    - Quick Data Guard health dashboard (run from jump host)
+dg_triage_sid.sh - Fast local Data Guard triage (run directly on DB host)
+dg_diag_sid.sh   - Deep local Data Guard diagnostics (run directly on DB host)
+dg_check_sid.sh  - Deprecated wrapper to dg_triage_sid.sh
 nfs/           - NFS setup scripts (run before Data Guard setup)
 primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
 standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
@@ -69,7 +71,7 @@ tests/         - Test scripts (unit tests and E2E test suite)
 
 ## Wallet Setup for Peer Connectivity
 
-After Data Guard is configured, you can set up Oracle Wallet on each DB host so that scripts (like `dg_check_sid.sh`) can connect to the peer database without prompting for a password.
+After Data Guard is configured, you can set up Oracle Wallet on each DB host so that scripts like `dg_triage_sid.sh` and `dg_diag_sid.sh` can connect to the peer database without prompting for a password.
 
 ```bash
 bash common/setup_dg_wallet.sh              # Run on primary
@@ -103,15 +105,16 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 
 See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
 
-`dg_check_sid.sh` is the same dashboard but runs directly on a DB host (no SSH). It auto-detects the local database role and discovers the peer via DGMGRL.
+For local host checks without SSH, use the split commands:
 
 ```bash
-bash dg_check_sid.sh          # Auto-detect role, try wallet for remote
-bash dg_check_sid.sh -L       # Local + broker only (skip remote SQL)
-bash dg_check_sid.sh -P       # Prompt for SYS password for remote
+bash dg_triage_sid.sh         # Fast triage, wallet-only by default
+bash dg_diag_sid.sh           # Deep diagnostics, prompts if wallet auth fails
+bash dg_triage_sid.sh -L      # Local + broker only (skip remote SQL)
+bash dg_diag_sid.sh -P        # Force SYS password prompt for remote
 ```
 
-**Remote connection:** discovers the peer TNS alias from the broker, tries wallet auth first, then prompts for SYS password. Use `-L` to skip remote checks entirely (shows broker-view of the peer instead).
+`dg_check_sid.sh` is retained as a deprecated wrapper that forwards to `dg_triage_sid.sh` and always exits `0`.
 
 See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 
