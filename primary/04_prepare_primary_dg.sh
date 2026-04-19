@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 4: Prepare Primary for DG"
-init_progress 7
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "04_prepare_primary_dg"
@@ -100,8 +100,9 @@ fi
 if [[ -f "$TNSNAMES_ORA" ]]; then
     backup_file "$TNSNAMES_ORA"
 
-    # Check if entries already exist
-    if grep -q "$STANDBY_TNS_ALIAS" "$TNSNAMES_ORA"; then
+    # Check if entries already exist (-F = treat as fixed string so dots in
+    # qualified aliases aren't interpreted as regex wildcards)
+    if grep -qF "$STANDBY_TNS_ALIAS" "$TNSNAMES_ORA"; then
         log_info "TNS entry for standby already exists"
     else
         log_info "Adding TNS entries to tnsnames.ora"
@@ -221,6 +222,7 @@ if [[ "$FORCE_LOGGING" != "YES" ]]; then
     log_cmd "sqlplus / as sysdba:" "ALTER DATABASE FORCE LOGGING"
     run_sql_command "enable_force_logging.sql"
     log_info "FORCE LOGGING enabled"
+    FORCE_LOGGING="YES"  # keep summary in sync with actual state
 else
     log_info "FORCE LOGGING is already enabled"
 fi
@@ -349,6 +351,7 @@ if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH"
     run_sql_command "set_dg_broker_start.sql"
     log_info "DG_BROKER_START enabled"
+    DG_BROKER_START="TRUE"  # keep summary in sync with actual state
 
     # Wait for broker processes to start
     log_info "Waiting for Data Guard Broker processes to start..."

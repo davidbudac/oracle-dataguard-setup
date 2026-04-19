@@ -174,13 +174,14 @@ do_setup() {
             exit 1
         fi
 
-        # Create auto-login wallet
-        "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -create << EOF
+        # Create auto-login wallet. Use `if !` so set -e doesn't exit before
+        # the error message; a bare call followed by `[[ $? -ne 0 ]]` is dead
+        # code under set -e because the failing call aborts the script first.
+        if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -create << EOF
 ${WALLET_PASSWORD}
 ${WALLET_PASSWORD}
 EOF
-
-        if [[ $? -ne 0 ]]; then
+        then
             log_error "Failed to create wallet"
             exit 1
         fi
@@ -228,24 +229,22 @@ EOF
         exit 1
     fi
 
-    # Add credential for primary
+    # Add credential for primary (see note above about set -e and `if !`)
     log_info "Adding credential for $PRIMARY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         log_error "Failed to add credential for $PRIMARY_TNS_ALIAS"
         exit 1
     fi
 
     # Add credential for standby
     log_info "Adding credential for $STANDBY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         log_error "Failed to add credential for $STANDBY_TNS_ALIAS"
         exit 1
     fi

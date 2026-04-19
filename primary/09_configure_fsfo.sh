@@ -36,7 +36,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
-init_progress 14
+init_progress 13
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -424,9 +424,13 @@ log_info "Fast-Start Failover enabled"
 
 log_section "Preparing Files for Observer Server"
 
-# Check if password file already exists on NFS
+# Check if password file already exists on NFS.
+# Step 1 (01_gather_primary_info.sh) copies orapw${PRIMARY_ORACLE_SID},
+# so use the SID here too. Using PRIMARY_DB_NAME would miss the file
+# when SID differs from DB_NAME and would create a duplicate under a
+# second name.
 ORAPW_FILE="$ORACLE_HOME/dbs/orapw${ORACLE_SID}"
-NFS_ORAPW_FILE="${NFS_SHARE}/orapw${PRIMARY_DB_NAME}"
+NFS_ORAPW_FILE="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
 
 if [[ -f "$NFS_ORAPW_FILE" ]]; then
     log_info "Password file already exists on NFS share"

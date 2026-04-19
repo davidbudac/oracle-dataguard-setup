@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 1: Gather Primary Info"
-init_progress 10
+init_progress 11
 
 # ============================================================
 # NFS Share Configuration
@@ -74,16 +74,28 @@ log_info "DBID: $DBID"
 
 progress_step "Gathering Oracle Environment Information"
 
-# AIX-compatible hostname detection
-PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
-# Try to get FQDN if possible
-if command -v host >/dev/null 2>&1; then
-    FQDN=$(host "$PRIMARY_HOSTNAME" 2>/dev/null | awk '/has address/{print $1; exit}' || true)
-    [[ -n "$FQDN" ]] && PRIMARY_HOSTNAME="$FQDN"
+# Hostname detection - prefer FQDN. `hostname -f` works on both Linux and AIX.
+# Falls back to short hostname when FQDN resolution is unavailable.
+PRIMARY_HOSTNAME=$(hostname -f 2>/dev/null || true)
+if [[ -z "$PRIMARY_HOSTNAME" ]]; then
+    PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
 fi
+
 PRIMARY_ORACLE_HOME="$ORACLE_HOME"
-PRIMARY_ORACLE_BASE="${ORACLE_BASE:-$(dirname $(dirname $ORACLE_HOME))}"
 PRIMARY_ORACLE_SID="$ORACLE_SID"
+
+# Resolve ORACLE_BASE without making fragile assumptions about directory depth.
+# OFA layouts vary (e.g. $ORACLE_BASE/product/19c/dbhome_1 is 4 levels deep),
+# so prefer the env var, then $ORACLE_HOME/bin/orabase (authoritative).
+PRIMARY_ORACLE_BASE="${ORACLE_BASE:-}"
+if [[ -z "$PRIMARY_ORACLE_BASE" && -x "$ORACLE_HOME/bin/orabase" ]]; then
+    PRIMARY_ORACLE_BASE=$("$ORACLE_HOME/bin/orabase" 2>/dev/null || true)
+fi
+if [[ -z "$PRIMARY_ORACLE_BASE" ]]; then
+    log_error "Cannot determine ORACLE_BASE (env unset and orabase unavailable)"
+    log_error "Set ORACLE_BASE and re-run"
+    exit 1
+fi
 
 log_info "Hostname: $PRIMARY_HOSTNAME"
 log_info "ORACLE_HOME: $PRIMARY_ORACLE_HOME"
@@ -282,6 +294,22 @@ log_info "DB_RECOVERY_FILE_DEST: $DB_RECOVERY_FILE_DEST"
 log_info "DB_RECOVERY_FILE_DEST_SIZE: $DB_RECOVERY_FILE_DEST_SIZE"
 
 # ============================================================
+# Gather Extended Path Parameters
+# ============================================================
+# Path-like spfile parameters that live outside DATA/REDO/FRA and
+# typically need to be customized on the standby (e.g., diagnostic
+# ADR base, audit file destination).
+# ============================================================
+
+log_section "Gathering Extended Path Parameters"
+
+PRIMARY_DIAGNOSTIC_DEST=$(get_db_parameter "diagnostic_dest")
+PRIMARY_AUDIT_FILE_DEST=$(get_db_parameter "audit_file_dest")
+
+log_info "diagnostic_dest:  ${PRIMARY_DIAGNOSTIC_DEST:-<unset>}"
+log_info "audit_file_dest:  ${PRIMARY_AUDIT_FILE_DEST:-<unset>}"
+
+# ============================================================
 # Gather Network Configuration
 # ============================================================
 
@@ -315,12 +343,9 @@ fi
 if [[ -z "$LISTENER_PORT" ]]; then
     LOCAL_LISTENER=$(get_db_parameter "local_listener")
     if [[ -n "$LOCAL_LISTENER" ]]; then
-        # AIX-compatible: use sed to extract 4-5 digit port numbers
-        LISTENER_PORT=$(echo "$LOCAL_LISTENER" | sed -n 's/.*[^0-9]\([0-9]\{4,5\}\)[^0-9].*/\1/p' | head -1)
-        # If sed didn't match, try a simpler pattern
-        if [[ -z "$LISTENER_PORT" ]]; then
-            LISTENER_PORT=$(echo "$LOCAL_LISTENER" | tr -cs '0-9\n' '\n' | awk 'length>=4 && length<=5 {print; exit}')
-        fi
+        # Match within the PORT= token so a digit-bearing hostname (e.g. srv01234)
+        # cannot be mistaken for the port number.
+        LISTENER_PORT=$(echo "$LOCAL_LISTENER" | sed -n 's/.*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
         if [[ -n "$LISTENER_PORT" ]]; then
             log_info "Listener port from local_listener parameter: $LISTENER_PORT"
         fi
@@ -440,6 +465,11 @@ CONTROL_FILES="$CONTROL_FILES"
 DB_RECOVERY_FILE_DEST="$DB_RECOVERY_FILE_DEST"
 DB_RECOVERY_FILE_DEST_SIZE="$DB_RECOVERY_FILE_DEST_SIZE"
 USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"
+
+# --- Extended Path Parameters ---
+# Additional spfile paths customizable for the standby at step 2.
+PRIMARY_DIAGNOSTIC_DEST="$PRIMARY_DIAGNOSTIC_DEST"
+PRIMARY_AUDIT_FILE_DEST="$PRIMARY_AUDIT_FILE_DEST"
 
 # --- Redo Log Configuration ---
 REDO_LOG_SIZE_MB="$(strip_whitespace "$REDO_LOG_SIZE_MB")"

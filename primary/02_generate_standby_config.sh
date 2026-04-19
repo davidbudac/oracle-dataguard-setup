@@ -81,7 +81,7 @@ else
 # ============================================================
 
 print_banner "Step 2: Generate Standby Config"
-init_progress 7
+init_progress 9
 
 # Initialize logging (will reinitialize with DB names later)
 init_log "02_generate_standby_config"
@@ -270,9 +270,39 @@ else
     log_warn "Could not detect directory name case in path, using DB_UNIQUE_NAME directly"
 fi
 
+# ============================================================
+# Path substitution helper (traditional mode)
+# ============================================================
+# Replace a primary directory-name segment with the standby
+# directory-name segment, anchored by slashes so unrelated
+# matches elsewhere in the path are left alone:
+#   /u01/app/oracle/oradata/PROD/          -> /u01/app/oracle/oradata/STBY/
+#   /u01/app/oracle/oradata/PROD           -> /u01/app/oracle/oradata/STBY
+# Uses `|` as the sed delimiter so paths don't collide with the
+# delimiter. The $_subst_label argument is used only for warnings
+# when the substitution would leave the input unchanged.
+# ============================================================
+_substitute_dir_name() {
+    local input="$1"
+    local subst_label="$2"
+    local output
+
+    output=$(printf '%s' "$input" | sed \
+        -e "s|/${PRIMARY_DIR_NAME}/|/${STANDBY_DIR_NAME}/|g" \
+        -e "s|/${PRIMARY_DIR_NAME}\$|/${STANDBY_DIR_NAME}|")
+
+    if [[ "$output" == "$input" && -n "$input" ]]; then
+        log_warn "Path substitution for ${subst_label} produced no change: $input"
+        log_warn "  Primary '${PRIMARY_DIR_NAME}' not found as a path segment."
+        log_warn "  Primary and standby will share this location - edit the"
+        log_warn "  generated config (standby_config_*.env) before proceeding."
+    fi
+    printf '%s' "$output"
+}
+
 # Replace primary directory name with standby directory name in paths
-STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
-STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+STANDBY_DATA_PATH=$(_substitute_dir_name "$PRIMARY_DATA_PATH" "STANDBY_DATA_PATH")
+STANDBY_REDO_PATH=$(_substitute_dir_name "$PRIMARY_REDO_PATH" "STANDBY_REDO_PATH")
 
 # ============================================================
 # Standby Redo Log (SRL) Path Separation
@@ -294,7 +324,7 @@ _separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d ' \n\
 if [[ "$_separate_srl" == "y" || "$_separate_srl" == "yes" ]]; then
     prompt_with_default "Primary SRL directory" "$PRIMARY_REDO_PATH" PRIMARY_SRL_PATH
     # Derive standby SRL default via directory-name substitution
-    _stby_srl_default=$(echo "$PRIMARY_SRL_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+    _stby_srl_default=$(_substitute_dir_name "$PRIMARY_SRL_PATH" "STANDBY_SRL_PATH")
     prompt_with_default "Standby SRL directory" "$_stby_srl_default" STANDBY_SRL_PATH
 
     # Ensure trailing slash for LOG_FILE_NAME_CONVERT consistency
@@ -313,7 +343,7 @@ fi
 if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
     # Use FRA for archiving on standby
     if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-        STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+        STANDBY_FRA=$(_substitute_dir_name "$DB_RECOVERY_FILE_DEST" "STANDBY_FRA")
         STANDBY_ARCHIVE_DEST=""  # Will use USE_DB_RECOVERY_FILE_DEST
         USE_FRA_FOR_STANDBY="YES"
         log_info "Standby will use FRA for archive logs: $STANDBY_FRA"
@@ -323,7 +353,7 @@ if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
         exit 1
     fi
 else
-    STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+    STANDBY_ARCHIVE_DEST=$(_substitute_dir_name "$PRIMARY_ARCHIVE_DEST" "STANDBY_ARCHIVE_DEST")
     USE_FRA_FOR_STANDBY="NO"
 fi
 
@@ -387,6 +417,77 @@ STANDBY_ORACLE_HOME="$PRIMARY_ORACLE_HOME"
 STANDBY_ADMIN_DIR="${STANDBY_ORACLE_BASE}/admin/${STANDBY_DB_UNIQUE_NAME}"
 
 log_info "Standby admin directory: $STANDBY_ADMIN_DIR"
+
+# ============================================================
+# Extended Path Parameters (diagnostic_dest, audit_file_dest)
+# ============================================================
+# These are path-like spfile parameters that live outside the
+# DATA / REDO / FRA locations handled above. The primary value
+# is read at step 1; offer the user a chance to override each
+# one for the standby. Defaults are derived by substituting the
+# primary DB_UNIQUE_NAME for the standby DB_UNIQUE_NAME when the
+# primary value contains it.
+# ============================================================
+
+progress_step "Customizing Extended Path Parameters"
+
+# Substitution names work in both Traditional and OMF modes.
+# (PRIMARY_DIR_NAME/STANDBY_DIR_NAME are only set in Traditional
+# mode; fall back to DB_UNIQUE_NAME in OMF mode.)
+_ext_pri_name="${PRIMARY_DIR_NAME:-$DB_UNIQUE_NAME}"
+_ext_stby_name="${STANDBY_DIR_NAME:-$STANDBY_DB_UNIQUE_NAME}"
+
+# Derive a standby default for a path parameter by substituting
+# primary DB_UNIQUE_NAME -> standby DB_UNIQUE_NAME. If the primary
+# value is empty, return the supplied fallback. Substitution is
+# anchored by slashes (or end-of-string) so unrelated substrings
+# elsewhere in the path are not rewritten.
+_derive_ext_path() {
+    local primary_val="$1"
+    local fallback="$2"
+    local out
+
+    if [[ -z "$primary_val" ]]; then
+        printf "%s" "$fallback"
+        return
+    fi
+
+    out=$(printf '%s' "$primary_val" | sed \
+        -e "s|/${_ext_pri_name}/|/${_ext_stby_name}/|g" \
+        -e "s|/${_ext_pri_name}\$|/${_ext_stby_name}|")
+    printf '%s' "$out"
+}
+
+echo ""
+echo "The following path parameters will be written to the standby spfile."
+echo "Press ENTER to accept each default, or type a new value to override."
+echo ""
+
+# --- diagnostic_dest (ADR base) ---
+_diag_default=$(_derive_ext_path "$PRIMARY_DIAGNOSTIC_DEST" "$STANDBY_ORACLE_BASE")
+if [[ -n "$PRIMARY_DIAGNOSTIC_DEST" ]]; then
+    echo "  Primary diagnostic_dest: $PRIMARY_DIAGNOSTIC_DEST"
+fi
+prompt_with_default "Standby diagnostic_dest" "$_diag_default" STANDBY_DIAGNOSTIC_DEST
+if [[ -z "$STANDBY_DIAGNOSTIC_DEST" ]]; then
+    log_error "Standby diagnostic_dest cannot be empty"
+    exit 1
+fi
+echo ""
+
+# --- audit_file_dest (audit .aud files) ---
+_audit_default=$(_derive_ext_path "$PRIMARY_AUDIT_FILE_DEST" "${STANDBY_ADMIN_DIR}/adump")
+if [[ -n "$PRIMARY_AUDIT_FILE_DEST" ]]; then
+    echo "  Primary audit_file_dest: $PRIMARY_AUDIT_FILE_DEST"
+fi
+prompt_with_default "Standby audit_file_dest" "$_audit_default" STANDBY_AUDIT_FILE_DEST
+if [[ -z "$STANDBY_AUDIT_FILE_DEST" ]]; then
+    log_error "Standby audit_file_dest cannot be empty"
+    exit 1
+fi
+
+log_info "Standby diagnostic_dest: $STANDBY_DIAGNOSTIC_DEST"
+log_info "Standby audit_file_dest: $STANDBY_AUDIT_FILE_DEST"
 
 # ============================================================
 # Calculate Standby Redo Log Groups
@@ -548,8 +649,23 @@ ONLINE_REDO_GROUPS="$ONLINE_REDO_GROUPS"        # ORL group count (same on prima
 STANDBY_REDO_GROUPS="$RECOMMENDED_STBY_GROUPS"  # SRL group count (same on primary and standby; typically ORL + 1)
 STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"      # YES if SRLs already existed on the primary at step 1 (pre-check, not per-database)
 
+# --- Database Sizes (inherited from primary at step 1) ---
+# Used by the storage summary at end of step 2 and by the disk
+# space preflight at step 3.
+DATAFILE_SIZE_MB="$DATAFILE_SIZE_MB"
+TEMPFILE_SIZE_MB="$TEMPFILE_SIZE_MB"
+REDOLOG_SIZE_MB="$REDOLOG_SIZE_MB"
+REQUIRED_SPACE_MB="$REQUIRED_SPACE_MB"
+STANDBY_REDO_COUNT="$STANDBY_REDO_COUNT"
+
 # --- Admin Directories ---
 STANDBY_ADMIN_DIR="$STANDBY_ADMIN_DIR"
+
+# --- Extended Path Parameters ---
+# Path-like spfile parameters customizable for the standby.
+# Edit and run with --regenerate to update the pfile.
+STANDBY_DIAGNOSTIC_DEST="$STANDBY_DIAGNOSTIC_DEST"
+STANDBY_AUDIT_FILE_DEST="$STANDBY_AUDIT_FILE_DEST"
 
 # --- Data Guard Broker ---
 # Note: Data Guard parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.)
@@ -565,6 +681,12 @@ fi  # end REGENERATE check
 # If unset, default to the ORL path (original behavior).
 PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH:-$PRIMARY_REDO_PATH}"
 STANDBY_SRL_PATH="${STANDBY_SRL_PATH:-$STANDBY_REDO_PATH}"
+
+# Backward compatibility: older config files may not have the extended
+# path parameters. Fall back to the values that used to be hardcoded
+# in the pfile generation block below.
+STANDBY_DIAGNOSTIC_DEST="${STANDBY_DIAGNOSTIC_DEST:-$STANDBY_ORACLE_BASE}"
+STANDBY_AUDIT_FILE_DEST="${STANDBY_AUDIT_FILE_DEST:-${STANDBY_ADMIN_DIR}/adump}"
 
 # ############################################################
 # FILE GENERATION
@@ -641,8 +763,8 @@ fi)
 *.dg_broker_start=TRUE
 
 # --- Diagnostic Destinations ---
-*.audit_file_dest='${STANDBY_ADMIN_DIR}/adump'
-*.diagnostic_dest='${STANDBY_ORACLE_BASE}'
+*.audit_file_dest='${STANDBY_AUDIT_FILE_DEST}'
+*.diagnostic_dest='${STANDBY_DIAGNOSTIC_DEST}'
 
 # --- Block Size ---
 *.db_block_size=${DB_BLOCK_SIZE}
@@ -872,6 +994,162 @@ else
         "Standby Redo Groups" "$RECOMMENDED_STBY_GROUPS" \
         "Broker Config" "$DG_BROKER_CONFIG_NAME"
 fi
+
+# ============================================================
+# Storage Summary
+# ============================================================
+# Shows what will be stored where, with filesystem info for the
+# primary (the host this script runs on) and configured paths
+# for the standby (filesystems there are validated at step 3).
+# ============================================================
+
+# Helpers (local to this section)
+_mb_to_gb() {
+    local mb="${1:-0}"
+    [[ -z "$mb" || "$mb" == "0" ]] && { printf "0.0"; return; }
+    awk -v mb="$mb" 'BEGIN { printf "%.1f", mb/1024 }'
+}
+
+# Parse a size value (bytes, or "50G", "200M", etc.) to GB
+_size_to_gb() {
+    local val="${1:-}"
+    [[ -z "$val" ]] && { printf "N/A"; return; }
+    awk -v v="$val" 'BEGIN {
+        gsub(/[[:space:]]/, "", v)
+        if (v == "") { print "N/A"; exit }
+        suffix = toupper(substr(v, length(v), 1))
+        num = substr(v, 1, length(v) - 1)
+        if (suffix == "G")      { printf "%.1f", num }
+        else if (suffix == "T") { printf "%.1f", num * 1024 }
+        else if (suffix == "M") { printf "%.1f", num / 1024 }
+        else if (suffix == "K") { printf "%.1f", num / 1024 / 1024 }
+        else if (v ~ /^[0-9]+$/) { printf "%.1f", v / 1073741824 }
+        else                    { print "N/A" }
+    }'
+}
+
+# Look up filesystem mount point for a path (walks up to nearest
+# existing parent). Returns "-" if not found.
+_fs_mount() {
+    local path="${1:-}"
+    [[ -z "$path" ]] && { printf "-"; return; }
+    while [[ ! -d "$path" && "$path" != "/" ]]; do
+        path=$(dirname "$path")
+    done
+    local fs
+    fs=$(df -P "$path" 2>/dev/null | tail -1 | awk '{print $NF}')
+    printf "%s" "${fs:--}"
+}
+
+echo ""
+echo "============================================================"
+echo " STORAGE SUMMARY"
+echo "============================================================"
+echo ""
+
+# ---- Primary: newly added files ----
+# The only files the workflow CREATES on the primary are standby
+# redo logs (step 4). Everything else (datafiles, ORLs, FRA) is
+# pre-existing primary state.
+echo " Primary  (newly added files)"
+echo " ------------------------------------------------------------"
+
+_pri_srl_path="${PRIMARY_SRL_PATH:-$PRIMARY_REDO_PATH}"
+_pri_srl_fs=$(_fs_mount "$_pri_srl_path")
+
+# How many SRLs will actually be added?
+if [[ "${STANDBY_REDO_EXISTS:-NO}" == "YES" ]]; then
+    _srl_to_add=$(( STANDBY_REDO_GROUPS - ${STANDBY_REDO_COUNT:-0} ))
+    [[ $_srl_to_add -lt 0 ]] && _srl_to_add=0
+else
+    _srl_to_add=$STANDBY_REDO_GROUPS
+fi
+
+if [[ $_srl_to_add -gt 0 ]]; then
+    _pri_srl_new_mb=$(( REDO_LOG_SIZE_MB * _srl_to_add ))
+    _pri_srl_new_gb=$(_mb_to_gb "$_pri_srl_new_mb")
+    printf "  %-18s  %-36s  %-12s  %7s GB\n" "Standby Redo Logs" "$_pri_srl_path" "$_pri_srl_fs" "$_pri_srl_new_gb"
+    printf "  %-18s  %d group(s) x %d MB each\n" "" "$_srl_to_add" "$REDO_LOG_SIZE_MB"
+else
+    echo "  (no new files - standby redo logs already provisioned)"
+fi
+
+echo ""
+
+# ---- Standby: all files ----
+echo " Standby  (all files on the standby database)"
+echo " ------------------------------------------------------------"
+
+# Datafiles
+_stby_data_gb=$(_mb_to_gb "${DATAFILE_SIZE_MB:-0}")
+printf "  %-18s  %-50s  %7s GB\n" "Datafiles" "${STANDBY_DATA_PATH:-N/A}" "$_stby_data_gb"
+
+# Tempfiles (live under data path)
+_stby_temp_gb=$(_mb_to_gb "${TEMPFILE_SIZE_MB:-0}")
+printf "  %-18s  %-50s  %7s GB\n" "Tempfiles" "${STANDBY_DATA_PATH:-N/A}" "$_stby_temp_gb"
+
+# Online redo logs (size = per-group * group count)
+if [[ -n "${REDO_LOG_SIZE_MB:-}" && -n "${ONLINE_REDO_GROUPS:-}" ]]; then
+    _stby_orl_mb=$(( REDO_LOG_SIZE_MB * ONLINE_REDO_GROUPS ))
+    _stby_orl_gb=$(_mb_to_gb "$_stby_orl_mb")
+else
+    _stby_orl_gb="N/A"
+fi
+printf "  %-18s  %-50s  %7s GB\n" "Online Redo Logs" "${STANDBY_REDO_PATH:-N/A}" "$_stby_orl_gb"
+
+# Standby redo logs
+_stby_srl_path="${STANDBY_SRL_PATH:-$STANDBY_REDO_PATH}"
+if [[ -n "${REDO_LOG_SIZE_MB:-}" && -n "${STANDBY_REDO_GROUPS:-}" ]]; then
+    _stby_srl_mb=$(( REDO_LOG_SIZE_MB * STANDBY_REDO_GROUPS ))
+    _stby_srl_gb=$(_mb_to_gb "$_stby_srl_mb")
+else
+    _stby_srl_gb="N/A"
+fi
+printf "  %-18s  %-50s  %7s GB\n" "Standby Redo Logs" "$_stby_srl_path" "$_stby_srl_gb"
+
+# Archive logs
+if [[ "${USE_FRA_FOR_STANDBY:-NO}" == "YES" ]]; then
+    printf "  %-18s  %-50s  %7s\n" "Archive Logs" "(routed to FRA)" "-"
+else
+    printf "  %-18s  %-50s  %7s\n" "Archive Logs" "${STANDBY_ARCHIVE_DEST:-N/A}" "-"
+fi
+
+# Fast Recovery Area
+# In OMF mode the standby user entered a fresh size; otherwise
+# we mirror the primary's db_recovery_file_dest_size.
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    _fra_size_raw="$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
+else
+    _fra_size_raw="$DB_RECOVERY_FILE_DEST_SIZE"
+fi
+_fra_path="${STANDBY_FRA:-${STANDBY_DB_RECOVERY_FILE_DEST:-N/A}}"
+if [[ -n "$_fra_path" && "$_fra_path" != "N/A" ]]; then
+    _fra_gb=$(_size_to_gb "$_fra_size_raw")
+    printf "  %-18s  %-50s  %7s GB\n" "Fast Recovery Area" "$_fra_path" "$_fra_gb"
+fi
+
+# Admin directories (size is minimal / dump files grow slowly)
+printf "  %-18s  %-50s  %7s\n" "Admin (dumps)" "${STANDBY_ADMIN_DIR:-N/A}" "-"
+
+# Audit file destination (only shown if set outside the admin dir)
+if [[ -n "${STANDBY_AUDIT_FILE_DEST:-}" && "${STANDBY_AUDIT_FILE_DEST}" != "${STANDBY_ADMIN_DIR}/adump" ]]; then
+    printf "  %-18s  %-50s  %7s\n" "Audit files" "$STANDBY_AUDIT_FILE_DEST" "-"
+fi
+
+# Diagnostic destination (only shown if set outside the Oracle base)
+if [[ -n "${STANDBY_DIAGNOSTIC_DEST:-}" && "${STANDBY_DIAGNOSTIC_DEST}" != "${STANDBY_ORACLE_BASE}" ]]; then
+    printf "  %-18s  %-50s  %7s\n" "Diagnostic (ADR)" "$STANDBY_DIAGNOSTIC_DEST" "-"
+fi
+
+echo " ------------------------------------------------------------"
+if [[ -n "${REQUIRED_SPACE_MB:-}" ]]; then
+    _required_gb=$(_mb_to_gb "$REQUIRED_SPACE_MB")
+    printf "  %-18s  %-50s  %7s GB\n" "Clone footprint" "(datafiles + temp + redo, +20% buffer)" "$_required_gb"
+fi
+echo ""
+echo "  NOTE: Standby filesystems will be validated at step 3."
+echo "============================================================"
+echo ""
 
 if [[ "$REGENERATE" == "1" ]]; then
     print_list_block "Regenerated Files" \

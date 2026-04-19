@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
-init_progress 7
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -186,11 +186,12 @@ log_info "Primary database: $PRIMARY_DB_UNIQUE_NAME"
 log_info "Standby database: $STANDBY_DB_UNIQUE_NAME"
 
 # Create configuration
+# Use `if !` to suppress set -e around the DGMGRL call so we can emit a
+# targeted error before exiting. A bare `run_dgmgrl ... ; [[ $? -ne 0 ]]`
+# never reaches the check because set -e exits on the failing call first.
 log_info "Creating broker configuration..."
 log_cmd "dgmgrl /:" "CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}'"
-run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"
-
-if [[ $? -ne 0 ]]; then
+if ! run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"; then
     log_error "Failed to create broker configuration"
     exit 1
 fi
@@ -199,9 +200,7 @@ log_info "Configuration created successfully"
 # Add standby database
 log_info "Adding standby database to configuration..."
 log_cmd "dgmgrl /:" "ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL"
-run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"
-
-if [[ $? -ne 0 ]]; then
+if ! run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"; then
     log_error "Failed to add standby database"
     exit 1
 fi

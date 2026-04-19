@@ -204,6 +204,15 @@ if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
 fi
 log_info "Password verified successfully"
 
+# Confirm BEFORE starting the instance, so a decline doesn't leave
+# the standby in NOMOUNT with no cleanup.
+echo ""
+if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for ${STANDBY_DB_UNIQUE_NAME}." "${STANDBY_DB_UNIQUE_NAME}"; then
+    log_info "RMAN duplicate cancelled by user"
+    SYS_PASSWORD=""
+    exit 0
+fi
+
 # ============================================================
 # Start Instance in NOMOUNT
 # ============================================================
@@ -250,13 +259,11 @@ echo "Watch the RMAN output below for channel allocation, restore, and recovery 
 echo "================================================================"
 echo ""
 
-if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for ${STANDBY_DB_UNIQUE_NAME}." "${STANDBY_DB_UNIQUE_NAME}"; then
-    log_info "RMAN duplicate cancelled by user"
-    exit 0
-fi
+# Evaluate timestamp once so RMAN script and log filenames stay in sync
+RMAN_TS=$(date '+%Y%m%d_%H%M%S')
 
 # Create RMAN script
-RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
+RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_${RMAN_TS}.rcv"
 
 # Determine LOG_ARCHIVE_DEST_1 setting based on storage mode and FRA usage
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" || "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
@@ -311,7 +318,8 @@ DUPLICATE TARGET DATABASE
     SET STANDBY_FILE_MANAGEMENT='AUTO'
     SET DG_BROKER_START='TRUE'
     SET LOCAL_LISTENER='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))'
-    SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
+    SET AUDIT_FILE_DEST='${STANDBY_AUDIT_FILE_DEST:-${STANDBY_ADMIN_DIR}/adump}'
+    SET DIAGNOSTIC_DEST='${STANDBY_DIAGNOSTIC_DEST:-$STANDBY_ORACLE_BASE}'
   NOFILENAMECHECK;
 ${RMAN_EPILOGUE}
 EOF
@@ -345,7 +353,8 @@ ${FRA_SETTINGS}
     SET STANDBY_FILE_MANAGEMENT='AUTO'
     SET DG_BROKER_START='TRUE'
     SET LOCAL_LISTENER='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))'
-    SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
+    SET AUDIT_FILE_DEST='${STANDBY_AUDIT_FILE_DEST:-${STANDBY_ADMIN_DIR}/adump}'
+    SET DIAGNOSTIC_DEST='${STANDBY_DIAGNOSTIC_DEST:-$STANDBY_ORACLE_BASE}'
   NOFILENAMECHECK;
 ${RMAN_EPILOGUE}
 EOF
@@ -358,23 +367,27 @@ while IFS= read -r line; do
 done < "$RMAN_SCRIPT"
 record_artifact "rman_script:${RMAN_SCRIPT}"
 
-# Execute RMAN
-RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').log"
+# Execute RMAN (reuse RMAN_TS so script and log filenames match)
+RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_${RMAN_TS}.log"
 
 log_info "Starting RMAN duplicate (logging to: $RMAN_LOG)..."
 log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
 echo ""
 confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOME/bin/rman\" TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS} @${RMAN_SCRIPT}" || exit 1
 
-# Use tee to display output on screen AND write to log file
-# AIX compatible: use temp file to capture exit code instead of PIPESTATUS
+# Use tee to display output on screen AND write to log file.
+# AIX compatible: capture rman's exit code via a temp file instead of PIPESTATUS.
+# Disable set -e inside the subshell so rman's non-zero exit doesn't skip the
+# echo; append `|| true` to the pipeline so the outer pipefail doesn't abort
+# before we can inspect the captured exit code.
 RMAN_EXIT_FILE="/tmp/rman_exit_$$"
 (
-"$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
-    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" \
-    cmdfile "${RMAN_SCRIPT}"
-echo $? > "$RMAN_EXIT_FILE"
-) 2>&1 | tee "$RMAN_LOG"
+    set +e
+    "$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
+        AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" \
+        cmdfile "${RMAN_SCRIPT}"
+    echo $? > "$RMAN_EXIT_FILE"
+) 2>&1 | tee "$RMAN_LOG" || true
 
 RMAN_EXIT_CODE=$(cat "$RMAN_EXIT_FILE" 2>/dev/null || echo "1")
 rm -f "$RMAN_EXIT_FILE"

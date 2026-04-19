@@ -131,7 +131,7 @@ echo ""
 if [[ "$DB_ROLE" != "PHYSICALSTANDBY" && "$DB_ROLE" != "PHYSICAL STANDBY" ]]; then
     log_error "Database role is not PHYSICAL STANDBY (current: $DB_ROLE)"
     OVERALL_STATUS="ERROR"
-    ((ERRORS++))
+    ((++ERRORS))
 else
     log_info "PASS: Database role is PHYSICAL STANDBY"
 fi
@@ -139,7 +139,7 @@ fi
 # Validate open mode (handle space removal: "READONLY" or "READ ONLY")
 if [[ "$OPEN_MODE" != "MOUNTED" && "$OPEN_MODE" != *"READONLY"* && "$OPEN_MODE" != *"READ ONLY"* ]]; then
     log_warn "Unexpected open mode: $OPEN_MODE"
-    ((WARNINGS++))
+    ((++WARNINGS))
 else
     log_info "PASS: Database open mode is correct ($OPEN_MODE)"
 fi
@@ -156,7 +156,7 @@ if [[ -z "$MRP_INFO" || "$MRP_INFO" == *"no rows"* ]]; then
     log_error "Managed Recovery Process (MRP0) is NOT running"
     log_error "To start MRP: ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;"
     OVERALL_STATUS="ERROR"
-    ((ERRORS++))
+    ((++ERRORS))
 else
     # AIX-compatible: use awk instead of here-strings
     MRP_INFO_CLEAN=$(echo "$MRP_INFO" | tr -d ' \n\r')
@@ -174,7 +174,7 @@ else
         log_info "PASS: MRP is running and healthy"
     else
         log_warn "MRP status is: $MRP_STATUS"
-        ((WARNINGS++))
+        ((++WARNINGS))
     fi
 fi
 
@@ -198,7 +198,7 @@ if [[ "$GAP_COUNT" -gt 0 ]]; then
     echo "Gap Details:"
     run_sql_display "get_archive_gap_details.sql"
     OVERALL_STATUS="ERROR"
-    ((ERRORS++))
+    ((++ERRORS))
 else
     log_info "PASS: No archive log gaps detected"
 fi
@@ -229,7 +229,7 @@ if [[ "$LAST_APPLIED" -gt 0 ]]; then
 
     if [[ "$LAG" -gt 10 ]]; then
         log_warn "Significant apply lag detected: $LAG sequences behind"
-        ((WARNINGS++))
+        ((++WARNINGS))
     elif [[ "$LAG" -gt 0 ]]; then
         log_info "Minor apply lag: $LAG sequence(s) - this is normal during activity"
     else
@@ -237,7 +237,7 @@ if [[ "$LAST_APPLIED" -gt 0 ]]; then
     fi
 else
     log_warn "No applied archive logs found yet"
-    ((WARNINGS++))
+    ((++WARNINGS))
 fi
 
 # ============================================================
@@ -294,7 +294,7 @@ if [[ "$DEST_ERROR_COUNT" -gt 0 ]]; then
     log_error "Archive destination error detected"
     run_sql_display "get_archive_dest_errors.sql"
     OVERALL_STATUS="ERROR"
-    ((ERRORS++))
+    ((++ERRORS))
 fi
 
 # ============================================================
@@ -320,7 +320,7 @@ if "$ORACLE_HOME/bin/tnsping" "$PRIMARY_TNS_ALIAS" > /dev/null 2>&1; then
 else
     log_error "Cannot reach primary via tnsping"
     OVERALL_STATUS="ERROR"
-    ((ERRORS++))
+    ((++ERRORS))
 fi
 
 # ============================================================

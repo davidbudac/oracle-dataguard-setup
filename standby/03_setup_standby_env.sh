@@ -89,8 +89,8 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
 
     log_info "Checking available space on: $CHECK_PATH"
 
-    # Get available space in MB
-    AVAILABLE_SPACE_KB=$(df -k "$CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+    # Get available space in MB (df -Pk = POSIX, kilobyte blocks; column 4 = Available on Linux and AIX)
+    AVAILABLE_SPACE_KB=$(df -Pk "$CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
     AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
 
     log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
@@ -157,7 +157,7 @@ if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
         log_info "Checking available space on separate SRL filesystem: $SRL_CHECK_PATH"
         log_info "SRL storage required: ${SRL_REQUIRED_MB} MB (${REDO_LOG_SIZE_MB} MB x ${STANDBY_REDO_GROUPS} groups + 20% buffer)"
 
-        SRL_AVAILABLE_KB=$(df -k "$SRL_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+        SRL_AVAILABLE_KB=$(df -Pk "$SRL_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
         SRL_AVAILABLE_MB=$(( SRL_AVAILABLE_KB / 1024 ))
         log_info "SRL filesystem available: ${SRL_AVAILABLE_MB} MB"
 
@@ -246,6 +246,17 @@ DIRS_TO_CREATE=(
     "${STANDBY_ADMIN_DIR}/udump"
     "${STANDBY_ADMIN_DIR}/pfile"
 )
+
+# Extended path parameters (diagnostic_dest, audit_file_dest) - may
+# point outside the admin/base dirs if customized at step 2. mkdir -p
+# is idempotent so adding a dir that overlaps the admin layout above
+# is safe.
+if [[ -n "${STANDBY_AUDIT_FILE_DEST:-}" ]]; then
+    DIRS_TO_CREATE+=("$STANDBY_AUDIT_FILE_DEST")
+fi
+if [[ -n "${STANDBY_DIAGNOSTIC_DEST:-}" ]]; then
+    DIRS_TO_CREATE+=("$STANDBY_DIAGNOSTIC_DEST")
+fi
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: create base directories only; Oracle creates subdirs automatically
