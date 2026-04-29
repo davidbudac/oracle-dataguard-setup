@@ -36,6 +36,7 @@ tests/         - Test scripts (unit tests and E2E test suite)
 12. `fsfo/observer.sh setup` - Set up observer wallet (on observer server)
 13. `fsfo/observer.sh start` - Start observer (on observer server)
 14. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
+15. `primary/10_generate_handoff_report.sh` - Generate end-user handoff report with status snapshot and TNS/JDBC connection strings (on PRIMARY)
 
 ## Restartability
 
@@ -190,3 +191,20 @@ This discovers running user services, creates PL/SQL package `SYS.DG_SERVICE_MGR
 - `SYS.TRG_MANAGE_SERVICES_STARTUP` - Fires `AFTER STARTUP`
 
 Objects replicate to standby automatically via redo apply. The script is restartable - re-running replaces existing objects with the updated service list.
+
+## Handoff Report (End-User Documentation)
+
+After Data Guard is verified (and ideally after FSFO and the role-aware service trigger are in place), generate a Markdown handoff document for application teams that consume the database:
+
+**Step 15: Generate Handoff Report (on PRIMARY)**
+```bash
+./primary/10_generate_handoff_report.sh
+```
+
+The script collects a short status snapshot (roles, modes, MRP, apply lag, archive gaps, FSFO state, broker config) and emits per-service connection info in three flavors:
+
+- **Primary-only** TNS + JDBC — writes / admin
+- **Standby-only** TNS + JDBC — read-only reporting against an open standby
+- **Role-aware failover** TNS + JDBC — single descriptor with both hosts in `ADDRESS_LIST`. Recommended for the application tier when the step-14 service trigger is deployed: the service is only running on whichever side is primary, so clients automatically follow the active database after a switchover or failover
+
+User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the role trigger), with the default `<DB_UNIQUE_NAME>` service always included. Output: `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` plus stdout. Re-run after listener changes, new services, or topology changes to refresh the report.

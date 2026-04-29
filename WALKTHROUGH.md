@@ -100,6 +100,7 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 | 5 | STANDBY | `./standby/05_clone_standby.sh` |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` |
+| 10 | PRIMARY | `./primary/10_generate_handoff_report.sh` |
 
 ### Optional Runtime Modes
 
@@ -266,6 +267,32 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 
 ---
 
+## Step 10: Generate Handoff Report
+
+**Server:** PRIMARY
+
+```bash
+./primary/10_generate_handoff_report.sh
+```
+
+Generates a Markdown handoff document for application teams that consume the database. Run this once Data Guard is verified (and ideally after the optional FSFO and role-aware service trigger steps).
+
+**Contents:**
+- Topology table (primary/standby host, SID, listener port)
+- Status snapshot (role, modes, MRP, apply lag, archive gaps, FSFO state)
+- Connection strings per user-visible service in three flavors:
+  - **Primary-only** TNS + JDBC (writes / admin)
+  - **Standby-only** TNS + JDBC (read-only reporting)
+  - **Role-aware failover** TNS + JDBC (recommended for the app tier when the step-14 service trigger is deployed)
+- Verification snippets (`tnsping`, `sqlplus`)
+
+**Output file (on NFS):**
+- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` — share this with client teams.
+
+Re-run the script after listener changes, new services, or topology changes to refresh the report.
+
+---
+
 ## Post-Setup Commands
 
 ### DGMGRL (Recommended)
@@ -327,6 +354,7 @@ ALTER SYSTEM SWITCH LOGFILE;
 │  STANDBY:  ./standby/05_clone_standby.sh           ← ENTER PASSWORD     │
 │  PRIMARY:  ./primary/06_configure_broker.sh        ← ENABLES SHIPPING   │
 │  STANDBY:  ./standby/07_verify_dataguard.sh                             │
+│  PRIMARY:  ./primary/10_generate_handoff_report.sh ← HANDOFF DOC        │
 │                                                                         │
 │  KEY COMMANDS:                                                          │
 │  ═════════════                                                          │
