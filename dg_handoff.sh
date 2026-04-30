@@ -163,8 +163,9 @@ FSFO_OBSERVER=$(field      "$FSFO_RAW" 2)
 FSFO_OBSERVER_HOST=$(field "$FSFO_RAW" 3)
 
 # Listener port from V$LISTENER_NETWORK / local_listener
+# AIX-portable: avoid GNU `grep -o`; use POSIX BRE sed to extract the port digits.
 LOCAL_LISTENER_RAW=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;" | clean | head -1)
-DISCOVERED_PORT=$(echo "$LOCAL_LISTENER_RAW" | grep -oE 'PORT *= *[0-9]+' | head -1 | grep -oE '[0-9]+')
+DISCOVERED_PORT=$(echo "$LOCAL_LISTENER_RAW" | sed -n 's/.*PORT *= *\([0-9][0-9]*\).*/\1/p' | head -1)
 PORT="${PORT_OVERRIDE:-${DISCOVERED_PORT:-1521}}"
 
 # ============================================================
@@ -182,18 +183,26 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
         # SHOW DATABASE VERBOSE prints a "DGConnectIdentifier = '...'" line.
         # That value is either an easy-connect string (host:port/service) or
         # a TNS alias. Extract the first hostname-looking token.
+        # AIX-portable: avoid `sed -E` and `\s` (GNU extensions); use POSIX BRE
+        # with [[:space:]] character classes and `\(...\)` capture groups.
         local db="$1" out
         out=$(run_dgmgrl_cmd "SHOW DATABASE VERBOSE '${db}';" 2>/dev/null || true)
         # Try DGConnectIdentifier easy-connect form
         local dgci
-        dgci=$(echo "$out" | grep -i "DGConnectIdentifier" | head -1 | sed -E "s/.*=\s*'?([^']*)'?\s*$/\1/")
+        dgci=$(echo "$out" | grep -i "DGConnectIdentifier" | head -1 \
+            | sed -e "s/.*=[[:space:]]*//" \
+                  -e "s/^'//" \
+                  -e "s/'[[:space:]]*$//" \
+                  -e "s/[[:space:]]*$//")
         if [[ "$dgci" =~ ^([A-Za-z0-9._-]+)(:[0-9]+)?(/.*)?$ ]] && [[ "$dgci" == *.* || "$dgci" == *:* || "$dgci" == */* ]]; then
             echo "${BASH_REMATCH[1]}"
             return
         fi
         # Fallback: parse "Host Name:" or "(HOST = ...)" lines
-        echo "$out" | grep -iE "Host Name|HOST *=" | head -1 | \
-            sed -E "s/.*[Hh]ost *[Nn]ame[: ]*//; s/.*HOST *= *([A-Za-z0-9._-]+).*/\1/" | tr -d ' '
+        echo "$out" | grep -i -E "Host Name|HOST *=" | head -1 \
+            | sed -e "s/.*[Hh]ost *[Nn]ame[: ]*//" \
+                  -e "s/.*HOST *= *\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/" \
+            | tr -d ' '
     }
 
     [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]] && PRIMARY_HOSTNAME=$(extract_host_from_show_db "$PRIMARY_DB_UNIQUE_NAME")
