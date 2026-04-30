@@ -5,19 +5,21 @@ Automated scripts for setting up Oracle 19c Physical Standby databases using Dat
 ## Project Structure
 
 ```
-dg_status.sh    - Quick Data Guard health dashboard (run from jump host)
+dg_status.sh     - Quick Data Guard health dashboard (run from jump host)
 dg_triage_sid.sh - Fast local Data Guard triage (run directly on DB host)
 dg_diag_sid.sh   - Deep local Data Guard diagnostics (run directly on DB host)
 dg_check_sid.sh  - Deprecated wrapper to dg_triage_sid.sh
-nfs/           - NFS setup scripts (run before Data Guard setup)
-primary/       - Scripts to run on PRIMARY server (Steps 1,2,4,6,8,9)
-standby/       - Scripts to run on STANDBY server (Steps 3,5,7)
-fsfo/          - Observer scripts (run on observer server - standby or 3rd server)
-trigger/       - Role-aware service trigger (run on PRIMARY)
-common/        - Shared scripts and functions
-templates/     - Reference templates
-docs/          - Detailed walkthrough documentation
-tests/         - Test scripts (unit tests and E2E test suite)
+dg_handoff.sh    - Standalone handoff report generator (post-setup; no NFS/config dependencies)
+nfs/             - NFS setup scripts (run before Data Guard setup)
+primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10)
+standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
+fsfo/            - Observer scripts (run on observer server - standby or 3rd server)
+trigger/         - Role-aware service trigger (run on PRIMARY); two variants: SYS-owned and dedicated-user
+common/          - Shared scripts and functions, including setup_dg_wallet.sh
+templates/       - Reference templates (init.ora, listener, tnsnames)
+sql/             - SQL/RMAN/DGMGRL command snippets used by the workflow scripts
+docs/            - Detailed walkthrough and tool references (DG_STATUS, DG_CHECK, WALLET_SETUP)
+tests/           - Test scripts (unit tests and E2E test suite, including CDB variant)
 ```
 
 ## Execution Order
@@ -192,6 +194,12 @@ This discovers running user services, creates PL/SQL package `SYS.DG_SERVICE_MGR
 
 Objects replicate to standby automatically via redo apply. The script is restartable - re-running replaces existing objects with the updated service list.
 
+**Alternative variant: dedicated user**
+```bash
+./trigger/create_role_trigger_dedicated_user.sh
+```
+Same behavior, but creates a dedicated database user (`DG_ADMIN`, or `C##DG_ADMIN` for CDB) with only the privileges required, and places the package and triggers under that user instead of `SYS`. Use this variant when policy disallows adding objects to `SYS`.
+
 ## Handoff Report (End-User Documentation)
 
 After Data Guard is verified (and ideally after FSFO and the role-aware service trigger are in place), generate a Markdown handoff document for application teams that consume the database:
@@ -208,3 +216,11 @@ The script collects a short status snapshot (roles, modes, MRP, apply lag, archi
 - **Role-aware failover** TNS + JDBC — single descriptor with both hosts in `ADDRESS_LIST`. Recommended for the application tier when the step-14 service trigger is deployed: the service is only running on whichever side is primary, so clients automatically follow the active database after a switchover or failover
 
 User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the role trigger), with the default `<DB_UNIQUE_NAME>` service always included. Output: `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` plus stdout. Re-run after listener changes, new services, or topology changes to refresh the report.
+
+**Standalone variant: `dg_handoff.sh`** (root of repo)
+```bash
+./dg_handoff.sh
+./dg_handoff.sh -o /tmp/handoff.md
+./dg_handoff.sh --primary-host pri --standby-host stb --port 1521 --domain example.com
+```
+Produces the same Markdown report against any existing Data Guard configuration without depending on `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`. Use the `--*-host` / `--port` / `--domain` flags when broker is down or discovery returns the wrong value. Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`.

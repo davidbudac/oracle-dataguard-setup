@@ -154,8 +154,11 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 
 **Prompts:**
 - Standby server hostname
-- Standby DB_UNIQUE_NAME (e.g., `PRODSTBY`)
+- Standby DB_UNIQUE_NAME (e.g., `PRODSTBY`) — must differ from primary
 - Standby ORACLE_SID (default: same as primary)
+- Storage mode: `1` Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or `2` OMF (`db_create_file_dest` + `db_recovery_file_dest`)
+- If OMF: `db_create_file_dest`, `db_recovery_file_dest`, `db_recovery_file_dest_size`
+- If Traditional: optionally use a SEPARATE directory for standby redo logs; if yes, the primary and standby SRL paths
 
 **Review the generated summary and file list before confirming.**
 
@@ -293,6 +296,36 @@ Re-run the script after listener changes, new services, or topology changes to r
 
 ---
 
+## Standalone Handoff Report (Post-Setup)
+
+**Server:** PRIMARY
+
+```bash
+./dg_handoff.sh
+./dg_handoff.sh -o /tmp/handoff.md
+./dg_handoff.sh --primary-host pri.example.com \
+                --standby-host stb.example.com \
+                --port 1521
+```
+
+`dg_handoff.sh` produces the same Markdown handoff document as Step 10, but works against any existing Data Guard configuration without depending on the setup-time `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`.
+
+**Requirements:**
+- Run on the PRIMARY with `ORACLE_SID` and `ORACLE_HOME` set
+- `sqlplus '/ as sysdba'` and `dgmgrl` must work locally
+- Data Guard Broker should be started for full topology discovery (otherwise use the override flags)
+
+**Override flags** (use when broker is down or discovery returns the wrong value):
+- `--primary-host HOST` / `--standby-host HOST` — override hostnames in connect strings
+- `--port PORT` — override listener port (default: discover or 1521)
+- `--domain DOMAIN` — DB domain to append to the default service name
+
+**Output:** `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` (or the path passed via `-o`).
+
+Use this when you need to refresh handoff documentation on a system that wasn't built with these scripts, or after the NFS share has been retired.
+
+---
+
 ## Post-Setup Commands
 
 ### DGMGRL (Recommended)
@@ -335,8 +368,8 @@ ALTER SYSTEM SWITCH LOGFILE;
 |-------|----------|
 | tnsping fails | Check listener, hostname, firewall |
 | ORA-01017 during RMAN | Verify password file copied correctly |
-| MRP not running | Try restarting MRP: `dgmgrl / "edit database XXX set state=apply-off /on "` |
-| Archive gaps | Try restarting log shipping: `dgmgrl / "edit database XXX set state=transport-off / on"` |
+| MRP not running | Bounce apply on the standby: `dgmgrl / "edit database 'PRODSTBY' set state=apply-off"` then `dgmgrl / "edit database 'PRODSTBY' set state=apply-on"` |
+| Archive gaps | Bounce transport on the primary: `dgmgrl / "edit database 'PROD' set state=transport-off"` then `dgmgrl / "edit database 'PROD' set state=transport-on"` |
 | Broker shows WARNING | `dgmgrl / "show database 'PRODSTBY' 'StatusReport'"` |
 
 ---
@@ -355,6 +388,10 @@ ALTER SYSTEM SWITCH LOGFILE;
 │  PRIMARY:  ./primary/06_configure_broker.sh        ← ENABLES SHIPPING   │
 │  STANDBY:  ./standby/07_verify_dataguard.sh                             │
 │  PRIMARY:  ./primary/10_generate_handoff_report.sh ← HANDOFF DOC        │
+│                                                                         │
+│  POST-SETUP / STANDALONE:                                               │
+│  ════════════════════════                                               │
+│  PRIMARY:  ./dg_handoff.sh                         ← REFRESH HANDOFF    │
 │                                                                         │
 │  KEY COMMANDS:                                                          │
 │  ═════════════                                                          │

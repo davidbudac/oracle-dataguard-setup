@@ -1,379 +1,180 @@
 # Oracle 19c Data Guard Setup Scripts
 
-Automated scripts for setting up an Oracle 19c Physical Standby database in a Data Guard configuration.
+Automated scripts for building, verifying, and operating an Oracle 19c Physical Standby database with Data Guard Broker (DGMGRL).
 
-## Overview
+## What's Included
 
-These scripts automate the process of creating a physical standby database from an existing primary database using RMAN duplicate. They handle all the configuration, file copying, and validation steps required for a working Data Guard setup.
-
-## Features
-
-- **Automated Information Gathering** - Collects all required parameters from the primary database
-- **Single Source of Truth** - Generates a master configuration file (`standby_config_<name>.env`) for consistent setup
-- **Concurrent Build Support** - All generated files include DB_UNIQUE_NAME, allowing multiple DG setups simultaneously
-- **Clear Operator Feedback** - Numbered progress sections, compact summaries, and clearer next-step guidance
-- **Data Guard Broker (DGMGRL)** - Centralized management of Data Guard configuration
-- **Prerequisite Validation** - Checks archivelog mode, force logging, password files, etc.
-- **NFS-Based File Sharing** - Uses shared storage for configuration and file transfer
-- **Secure Password Handling** - Passwords prompted at runtime, never stored
-- **Comprehensive Logging** - All operations logged with timestamps
-- **Verbose Tracing** - Optional shell tracing for exact command visibility
-- **Approval Mode** - Optional confirmation before mutating actions
-- **Health Verification** - Post-setup validation with detailed status reporting
+- **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
+- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (step 9 + observer setup), role-aware service trigger (step 14).
+- **Handoff report** (step 15) — Markdown doc with topology, status, and per-service TNS/JDBC strings for application teams.
+- **Operational tools** — SSH dashboard, local triage/diagnostics, wallet setup for password-free peer access, standalone handoff regenerator.
 
 ## Prerequisites
 
-### Primary Server
-- Oracle 19c database running
-- Database in ARCHIVELOG mode
-- FORCE_LOGGING enabled (recommended)
-- Password file exists (`$ORACLE_HOME/dbs/orapw<SID>`)
-- `REMOTE_LOGIN_PASSWORDFILE = EXCLUSIVE`
+**Primary**
+- Oracle 19c, ARCHIVELOG mode, FORCE_LOGGING enabled
+- Password file at `$ORACLE_HOME/dbs/orapw<SID>`, `REMOTE_LOGIN_PASSWORDFILE = EXCLUSIVE`
 
-### Standby Server
-- Oracle 19c software installed (same version as primary)
-- Same `ORACLE_HOME` path as primary
-- Sufficient disk space for database files
+**Standby**
+- Oracle 19c installed, same `ORACLE_HOME` path as primary
+- Sufficient disk for database files
 
-### Shared Infrastructure
-- NFS mount accessible at `/OINSTALL/_dataguard_setup` on both servers
-  - Use `nfs/01_setup_nfs_server.sh` and `nfs/02_mount_nfs_client.sh` to set this up
-- Network connectivity between servers (port 1521)
+**Shared**
+- NFS mount at `/OINSTALL/_dataguard_setup` on both hosts (use `nfs/01_setup_nfs_server.sh` and `nfs/02_mount_nfs_client.sh`)
+- TCP 1521 reachable both ways
 
-## Directory Structure
+Filesystem storage only (no ASM); single-instance only (no RAC).
+
+## Project Structure
 
 ```
 dataguard_setup/
-├── README.md                          # This file
-├── CLAUDE.md                          # Project instructions for AI assistants
+├── README.md                    # This file
+├── WALKTHROUGH.md               # Concise step-by-step setup guide
+├── CLAUDE.md                    # Project notes for AI assistants
+│
+├── nfs/                         # NFS server + client setup (run first)
+├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 8, 9, 10)
+├── standby/                     # STANDBY-side steps (3, 5, 7)
+├── fsfo/                        # observer.sh - lifecycle for FSFO observer
+├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant)
+│
+├── common/                      # Shared functions, wallet setup, status helpers
+├── templates/                   # Reference templates (init, listener, tnsnames)
+├── sql/                         # SQL/RMAN/DGMGRL command snippets used by the scripts
+│
+├── dg_status.sh                 # SSH dashboard - run from jump host against both DBs
+├── dg_triage_sid.sh             # Fast local triage (run on DB host)
+├── dg_diag_sid.sh               # Deep local diagnostics (run on DB host)
+├── dg_check_sid.sh              # Deprecated wrapper - prefer triage/diag
+├── dg_handoff.sh                # Standalone handoff report (no setup-time deps)
+│
 ├── docs/
-│   └── DATA_GUARD_WALKTHROUGH.md      # Detailed step-by-step guide
-├── nfs/
-│   ├── 01_setup_nfs_server.sh         # Setup NFS server and export share
-│   └── 02_mount_nfs_client.sh         # Mount NFS share on client
-├── primary/
-│   ├── 01_gather_primary_info.sh      # Collect DB info from primary
-│   ├── 02_generate_standby_config.sh  # Generate standby configuration
-│   ├── 04_prepare_primary_dg.sh       # Configure primary for Data Guard
-│   ├── 06_configure_broker.sh         # Configure Data Guard Broker (DGMGRL)
-│   ├── 08_security_hardening.sh       # Lock SYS account (optional)
-│   └── 09_configure_fsfo.sh           # Configure Fast-Start Failover (optional)
-├── standby/
-│   ├── 03_setup_standby_env.sh        # Prepare standby environment
-│   ├── 05_clone_standby.sh            # RMAN duplicate execution
-│   └── 07_verify_dataguard.sh         # Validation and health check
-├── fsfo/
-│   └── observer.sh                    # Observer setup and lifecycle (setup/start/stop/status)
-├── trigger/
-│   └── create_role_trigger.sh         # Role-aware service trigger (optional)
-├── dg_triage_sid.sh                   # Fast local DG health triage (run on DB host)
-├── dg_diag_sid.sh                     # Deep local DG diagnostics (run on DB host)
-├── dg_check_sid.sh                    # Deprecated wrapper to dg_triage_sid.sh
-├── common/
-│   ├── dg_functions.sh                # Shared utility functions
-│   └── dg_local_status_common.sh      # Shared local DG status collection/rendering
-├── templates/
-│   ├── init_standby.ora.template      # Reference template
-│   ├── listener.ora.template          # Reference template
-│   └── tnsnames.ora.template          # Reference template
-└── tests/
-    ├── test_add_sid_to_listener.sh    # Unit tests for listener functions
-    └── e2e/
-        ├── config.env.template        # Test environment configuration template
-        ├── config.env                 # Test environment configuration (fill in)
-        ├── run_e2e_test.sh            # E2E test orchestrator
-        └── TEST_INSTRUCTIONS.md       # Runbook for executing E2E tests
+│   ├── DATA_GUARD_WALKTHROUGH.md   # Detailed walkthrough with manual equivalents
+│   ├── DG_STATUS.md                # dg_status.sh reference
+│   ├── DG_CHECK.md                 # dg_triage / dg_diag reference
+│   └── WALLET_SETUP.md             # Oracle Wallet for peer connectivity
+│
+└── tests/                       # Unit tests + E2E test suite
+    └── e2e/                     # SSH-orchestrated end-to-end tests
 ```
 
 ## Quick Start
 
-### Execution Order
+| Step | Server | Command | Notes |
+|------|--------|---------|-------|
+| 1  | PRIMARY  | `./primary/01_gather_primary_info.sh`    | Restartable |
+| 2  | PRIMARY  | `./primary/02_generate_standby_config.sh`| Review config before continuing |
+| 3  | STANDBY  | `./standby/03_setup_standby_env.sh`      | |
+| 4  | PRIMARY  | `./primary/04_prepare_primary_dg.sh`     | |
+| 5  | STANDBY  | `./standby/05_clone_standby.sh`          | RMAN duplicate; **not directly restartable** |
+| 6  | PRIMARY  | `./primary/06_configure_broker.sh`       | |
+| 7  | STANDBY  | `./standby/07_verify_dataguard.sh`       | Health check |
+| 8  | PRIMARY  | `./primary/08_security_hardening.sh`     | Optional: lock SYS |
+| 9  | PRIMARY  | `./primary/09_configure_fsfo.sh`         | Optional: enable FSFO |
+| —  | OBSERVER | `./fsfo/observer.sh setup` then `start`  | Optional: required for FSFO |
+| 14 | PRIMARY  | `./trigger/create_role_trigger.sh`       | Optional: role-aware service start/stop |
+| 15 | PRIMARY  | `./primary/10_generate_handoff_report.sh`| Markdown handoff for app teams |
 
-| Step | Server | Command | Restartable |
-|------|--------|---------|-------------|
-| 1 | PRIMARY | `./primary/01_gather_primary_info.sh` | Yes |
-| 2 | PRIMARY | `./primary/02_generate_standby_config.sh` | Yes |
-| 3 | STANDBY | `./standby/03_setup_standby_env.sh` | Yes |
-| 4 | PRIMARY | `./primary/04_prepare_primary_dg.sh` | Yes |
-| 5 | STANDBY | `./standby/05_clone_standby.sh` | No* |
-| 6 | PRIMARY | `./primary/06_configure_broker.sh` | Yes |
-| 7 | STANDBY | `./standby/07_verify_dataguard.sh` | Yes |
-| 8 | PRIMARY | `./primary/08_security_hardening.sh` | Yes** |
-| 9 | PRIMARY | `./primary/09_configure_fsfo.sh` | Yes*** |
-| 10 | OBSERVER | `./fsfo/observer.sh setup` then `start` | Yes*** |
-| 11 | PRIMARY | `./trigger/create_role_trigger.sh` | Yes |
+`./trigger/create_role_trigger_dedicated_user.sh` is an alternative to step 14 that puts trigger objects under a dedicated user instead of `SYS`.
 
-**\*** Step 5 requires cleanup before restart (see [Restartability](#restartability)).
-
-**\*\*** Step 8 is optional. Locks SYS account after setup is verified.
-
-**\*\*\*** Steps 9-10 are optional. Configures Fast-Start Failover for automatic failover.
-
-Step 11 is optional. Deploys role-aware service triggers for automatic service management on switchover/failover.
-
-### Workflow Diagram
-
-```
-PRIMARY SERVER                              STANDBY SERVER
-══════════════                              ══════════════
-
-Step 1: Gather Info
-    │
-    ▼
-Step 2: Generate Config ──────────────────► Step 3: Setup Environment
-    │                        (NFS)                    │
-    │                                                 │
-Step 4: Prepare Primary ◄─────────────────────────────┘
-    │
-    └────────────────────────────────────► Step 5: RMAN Clone
-                                                      │
-Step 6: Configure Broker ◄────────────────────────────┘
-    │
-    └────────────────────────────────────► Step 7: Verify Setup
-
-Step 8: Security Hardening (optional)
-
-                        OBSERVER SERVER (optional - can be standby or 3rd server)
-                        ══════════════════════════════════════════════════════
-Step 9: Configure FSFO ─────────────────► Step 10: Observer Setup & Start
-    (creates SYSDG user,                    (wallet setup, start observer)
-     enables FSFO)
-
-Step 11: Service Trigger (optional)
-    (auto-start/stop services
-     on role change/startup)
-```
+See [`WALKTHROUGH.md`](WALKTHROUGH.md) for prompts, outputs, and verification per step. See [`docs/DATA_GUARD_WALKTHROUGH.md`](docs/DATA_GUARD_WALKTHROUGH.md) for the manual-equivalent commands.
 
 ### Restartability
 
-**Steps 1-4 are fully restartable** - these scripts are idempotent and can be re-run from step 1 if needed.
-
-**Step 5 is NOT directly restartable** - once RMAN duplicate starts, cleanup is required:
-1. Shut down standby instance: `SHUTDOWN ABORT`
-2. Remove standby data files, control files, and redo logs
-3. Re-run step 5
-
-Step 5 now requires typing the standby `DB_UNIQUE_NAME` before RMAN duplicate starts, to reduce accidental execution.
-
-**Steps 6-7 are restartable** - broker config can be removed with `REMOVE CONFIGURATION` in DGMGRL.
+- **Steps 1-4** — idempotent, re-runnable.
+- **Step 5** — once RMAN duplicate starts, you must shut down the standby instance and remove its data files / control files / redo logs before re-running. The script requires you to retype the standby `DB_UNIQUE_NAME` before starting, to reduce accidental execution.
+- **Steps 6-7** — re-runnable; remove the broker config with `REMOVE CONFIGURATION` first if needed.
+- **Step 15** — re-run any time; refreshes the handoff doc.
 
 ## Runtime Modes
 
-All common-based workflow scripts support the following optional flags:
+All workflow scripts that source `common/dg_functions.sh` accept:
+
+| Flag | Env var | Effect |
+|------|---------|--------|
+| `--check`, `--plan`     | —              | Preflight only; print plan and exit before changes |
+| `--verbose`             | `VERBOSE=1`    | Trace shell commands (suppressed around password prompts) |
+| `--approval-mode`       | `APPROVAL_MODE=1` | Pause before mutating actions with action/impact/log preview |
+| `--suspicious`          | `SUSPICIOUS=1` | Backward-compatible alias for `--approval-mode` |
 
 ```bash
 ./standby/03_setup_standby_env.sh --check
-./primary/06_configure_broker.sh --verbose
 ./standby/05_clone_standby.sh --approval-mode
 APPROVAL_MODE=1 VERBOSE=1 ./primary/09_configure_fsfo.sh
 ```
 
-- `--check` or `--plan`
-  Runs a preflight-only pass for steps 3-9. The script resolves paths, selected config files, planned changes, touched files, and recovery guidance, then exits before making changes.
-- `--verbose` or `VERBOSE=1`
-  Prints the exact shell commands being executed, with tracing temporarily suppressed around password entry and password-based connections.
-- `--approval-mode` or `APPROVAL_MODE=1`
-  Pauses before mutating actions, shows a structured approval block with the action, impact, log file, and command preview, and asks for confirmation.
-- `--suspicious` and `SUSPICIOUS=1`
-  Still work as backward-compatible aliases for `approval mode`.
+Each step writes a state file under `${NFS_SHARE}/state/` alongside logs in `${NFS_SHARE}/logs/`. The state file records current step, final status, generated artifacts, and the suggested next step.
 
-Each workflow step also writes a companion state file under `${NFS_SHARE}/state/` alongside the log files in `${NFS_SHARE}/logs/`. The state file captures the current step, final status, generated artifacts, and the suggested next step.
+## Operational Tools
 
-## Configuration
-
-### Environment Assumptions
-
-- **Storage**: Filesystem-based (not ASM)
-- **Architecture**: Single Instance (not RAC)
-- **Protection Mode**: Maximum Performance (async redo transport)
-- **Path Differences**: DB_UNIQUE_NAME embedded in paths
-
-### Key Configuration File
-
-After running Step 2, review `/OINSTALL/_dataguard_setup/standby_config_<STANDBY_DB_UNIQUE_NAME>.env`:
+After Data Guard is running, use these to monitor and document the configuration.
 
 ```bash
-# Primary Database Info
-PRIMARY_HOSTNAME="primary-server"
-PRIMARY_DB_UNIQUE_NAME="PROD"
+# Cross-host dashboard from a jump host (or anywhere with SSH to both DBs)
+bash dg_status.sh                # Auto-detects SID from $ORACLE_SID or pmon
+bash dg_status.sh -s cdb1        # Explicit primary SID
+bash dg_status.sh -c myconfig    # Custom SSH config
 
-# Standby Database Info
-STANDBY_HOSTNAME="standby-server"
-STANDBY_DB_UNIQUE_NAME="PRODSTBY"
+# Local checks on a DB host
+bash dg_triage_sid.sh            # Fast triage (wallet-only by default)
+bash dg_diag_sid.sh              # Deep diagnostics (prompts if wallet auth fails)
+bash dg_triage_sid.sh -L         # Skip remote SQL
+bash dg_diag_sid.sh -P           # Force SYS password prompt for remote
 
-# Path Conversions
-DB_FILE_NAME_CONVERT="'/u01/oradata/PROD','/u01/oradata/PRODSTBY'"
+# Wallet setup for password-free peer connections (run on each host)
+bash common/setup_dg_wallet.sh
+
+# Handoff report regeneration (no NFS / no setup config required)
+./dg_handoff.sh
+./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
 ```
 
-## Documentation
+References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/DG_CHECK.md), [`docs/WALLET_SETUP.md`](docs/WALLET_SETUP.md).
 
-For a detailed walkthrough with explanations, diagrams, and troubleshooting:
-
-**See [docs/DATA_GUARD_WALKTHROUGH.md](docs/DATA_GUARD_WALKTHROUGH.md)**
-
-## Post-Setup Monitoring
-
-### Using DGMGRL (Recommended)
+## Common DGMGRL Commands
 
 ```bash
-# Show overall configuration status
 dgmgrl / "show configuration"
-
-# Show detailed status of standby
 dgmgrl / "show database 'PRODSTBY'"
-
-# Validate configuration (comprehensive check)
 dgmgrl / "validate database 'PRODSTBY'"
-
-# Perform switchover
 dgmgrl / "switchover to 'PRODSTBY'"
-```
-
-### Local Status Commands
-
-For direct checks from a DB host:
-
-```bash
-bash dg_triage_sid.sh        # Fast operator triage, wallet-only by default
-bash dg_diag_sid.sh          # Deep diagnostics, prompts if wallet auth fails
-bash dg_triage_sid.sh -L     # Local + broker only
-bash dg_diag_sid.sh -P       # Force remote password prompt
-```
-
-`dg_check_sid.sh` still exists as a deprecated compatibility wrapper, but new usage should prefer `dg_triage_sid.sh` or `dg_diag_sid.sh`.
-
-### Using SQL
-
-```sql
--- Check MRP status (on standby)
-SELECT PROCESS, STATUS, SEQUENCE# FROM V$MANAGED_STANDBY;
-
--- Check for archive gaps (on standby)
-SELECT * FROM V$ARCHIVE_GAP;
-
--- Check apply lag (on standby)
-SELECT NAME, VALUE FROM V$DATAGUARD_STATS WHERE NAME LIKE '%lag%';
-
--- Force log switch for testing (on primary)
-ALTER SYSTEM SWITCH LOGFILE;
-```
-
-## Fast-Start Failover (Optional)
-
-After Data Guard setup is complete and verified (Steps 1-8), you can optionally configure Fast-Start Failover (FSFO) for automatic failover capability.
-
-### Step 9: Configure FSFO
-
-Run on the **PRIMARY** server after Step 7 verification passes:
-
-```bash
-./primary/09_configure_fsfo.sh
-# Optional runtime modes:
-./primary/09_configure_fsfo.sh --verbose --approval-mode
-```
-
-This configures:
-- Creates observer user with SYSDG privilege (username is configurable)
-- Protection mode: MAXIMUM AVAILABILITY
-- LogXptMode: FASTSYNC
-- FSFO threshold: 30 seconds (configurable via FSFO_THRESHOLD)
-- Enables Fast-Start Failover
-
-### Step 10: Observer Setup
-
-The observer can run on the **standby server** or a **dedicated 3rd server**. On the observer server:
-
-```bash
-# Set up Oracle Wallet for secure authentication
-./fsfo/observer.sh setup
-
-# Start the observer
-./fsfo/observer.sh start
-
-# Check observer status
-./fsfo/observer.sh status
-
-# Stop the observer (before maintenance)
-./fsfo/observer.sh stop
-
-# Restart the observer
-./fsfo/observer.sh restart
-```
-
-The wallet provides secure authentication without storing passwords. When running `setup`, you will be prompted for the observer user password created in Step 9.
-
-### FSFO Commands (DGMGRL)
-
-```bash
-# Show FSFO status
 dgmgrl / "show fast_start failover"
-
-# Disable FSFO (if needed)
-dgmgrl / "disable fast_start failover"
-
-# Re-enable FSFO
-dgmgrl / "enable fast_start failover"
 ```
 
-## End-to-End Testing
-
-A comprehensive E2E test suite validates the entire Data Guard setup workflow on real Oracle hosts. The test creates a database from scratch, runs every step, validates results, and cleans up.
-
-### Running the Tests
+Bounce apply / transport when MRP stalls or gaps appear:
 
 ```bash
-# 1. Configure test environment
-cp tests/e2e/config.env.template tests/e2e/config.env
-# Edit config.env with your host details (jump host, DB hosts, Oracle paths)
+dgmgrl / "edit database 'PRODSTBY' set state=apply-off"
+dgmgrl / "edit database 'PRODSTBY' set state=apply-on"
 
-# 2. Run all tests (~20 minutes)
-bash ./tests/e2e/run_e2e_test.sh
-
-# 3. Run individual phases
-bash ./tests/e2e/run_e2e_test.sh --only preflight    # Verify connectivity
-bash ./tests/e2e/run_e2e_test.sh --only create_db    # Just create test DB
-bash ./tests/e2e/run_e2e_test.sh --from step5         # Resume from a phase
-bash ./tests/e2e/run_e2e_test.sh --only cleanup       # Drop DBs, clean files
+dgmgrl / "edit database 'PROD' set state=transport-off"
+dgmgrl / "edit database 'PROD' set state=transport-on"
 ```
 
-### What the Tests Cover
+## Testing
 
-| Phase | Validates |
-|-------|-----------|
-| create_db | DBCA creates DB with no OMF/FRA, ARCHIVELOG enabled |
-| step1-step2 | Config files generated correctly on NFS |
-| step3 | Standby dirs, password file, listener, tnsnames, oratab |
-| step4 | FORCE_LOGGING, standby redo logs, DG_BROKER_START, tnsping |
-| step5 | RMAN duplicate, PHYSICAL STANDBY role, MRP running |
-| step6 | Broker configuration enabled, both databases registered |
-| step7 | Health report HEALTHY, no archive log gaps |
-| step11 | PL/SQL package VALID, triggers ENABLED |
+```bash
+# Unit tests
+bash tests/test_add_sid_to_listener.sh
 
-### Architecture
+# End-to-end (creates a test DB, runs steps 1-7, validates, cleans up; ~20 min)
+cp tests/e2e/config.env.template tests/e2e/config.env   # then edit
+bash ./tests/e2e/run_e2e_test.sh
+bash ./tests/e2e/run_e2e_test.sh --from step5
+bash ./tests/e2e/run_e2e_test.sh --only cleanup
+```
 
-The test uses SSH with ProxyJump through a jump host to reach both DB servers. Interactive script prompts are automated via piped stdin. See `tests/e2e/TEST_INSTRUCTIONS.md` for the full runbook.
-
-## Troubleshooting
-
-Common issues are documented in [docs/DATA_GUARD_WALKTHROUGH.md](docs/DATA_GUARD_WALKTHROUGH.md), including:
-
-- TNS connectivity failures
-- RMAN duplicate errors
-- MRP not running
-- Archive log gaps
-- Archive destination errors
+`tests/e2e/run_e2e_test_cdb.sh` is the CDB variant. See `tests/e2e/TEST_INSTRUCTIONS.md` for the full runbook and known issues.
 
 ## Requirements
 
 - Oracle Database 19c
-- Bash shell
-- `sqlplus`, `rman`, `lsnrctl`, `dgmgrl` in PATH
+- Bash
+- `sqlplus`, `rman`, `lsnrctl`, `dgmgrl` on `PATH`
 - NFS mount at `/OINSTALL/_dataguard_setup`
+- AIX 7.2 / Linux compatible (uses `printf` and POSIX `sed`)
 
 ## License
 
-MIT License - See LICENSE file for details.
-
-## Contributing
-
-Contributions welcome. Please test changes in a non-production environment first.
+MIT — see [`LICENSE`](LICENSE).
