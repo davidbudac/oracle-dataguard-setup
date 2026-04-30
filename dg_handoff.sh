@@ -287,7 +287,7 @@ render_tns_ha() {
     cat <<EOF
 ${alias} =
   (DESCRIPTION =
-    (CONNECT_TIMEOUT = 10)(RETRY_COUNT = 3)(RETRY_DELAY = 3)
+    (CONNECT_TIMEOUT = 3)(RETRY_COUNT = 10)
     (ADDRESS_LIST =
       (LOAD_BALANCE = OFF)
       (ADDRESS = (PROTOCOL = TCP)(HOST = ${phost})(PORT = ${port}))
@@ -296,7 +296,6 @@ ${alias} =
     (CONNECT_DATA =
       (SERVER = DEDICATED)
       (SERVICE_NAME = ${service})
-      (FAILOVER_MODE = (TYPE = SELECT)(METHOD = BASIC)(RETRIES = 30)(DELAY = 5))
     )
   )
 EOF
@@ -308,7 +307,7 @@ render_jdbc_single() {
 
 render_jdbc_ha() {
     local phost="$1" shost="$2" port="$3" service="$4"
-    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=10)(RETRY_COUNT=3)(RETRY_DELAY=3)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)(FAILOVER_MODE=(TYPE=SELECT)(METHOD=BASIC)(RETRIES=30)(DELAY=5))))\n' \
+    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=3)(RETRY_COUNT=10)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)))\n' \
         "$phost" "$port" "$shost" "$port" "$service"
 }
 
@@ -399,51 +398,20 @@ GEN_HOST=$(hostname 2>/dev/null)
     echo ""
     echo "## 3. Connection Strings"
     echo ""
-    echo "Three flavors are provided per service:"
-    echo ""
-    echo "- **Primary-only** — points directly at the primary host. Use for"
-    echo "  workloads that must always hit the primary (writes, admin)."
-    echo "- **Standby-only** — points directly at the standby host. Use for"
-    echo "  read-only reporting workloads against an open standby."
-    echo "- **Role-aware (failover)** — single descriptor with both hosts. Best"
-    echo "  for the application tier *when a role-aware service trigger is"
-    echo "  deployed*: the service is only up on whichever side is primary, so"
-    echo "  clients automatically follow the active database after a switchover"
-    echo "  or failover."
+    echo "Role-aware descriptor with both hosts. Best for the application tier"
+    echo "*when a role-aware service trigger is deployed*: the service is only"
+    echo "up on whichever side is primary, so clients automatically follow the"
+    echo "active database after a switchover or failover."
     echo ""
 
     for svc in "${SERVICE_LIST[@]}"; do
         local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
-        ALIAS_PRI="${local_safe}_PRIMARY"
-        ALIAS_STB="${local_safe}_STANDBY"
         ALIAS_HA="${local_safe}_HA"
 
         echo "### Service: \`${svc}\`"
         echo ""
-        echo "#### Primary-only"
-        echo ""
-        echo '```'
-        render_tns_single "$ALIAS_PRI" "$PRIMARY_HOSTNAME" "$PORT" "$svc"
-        echo '```'
-        echo ""
-        echo '```'
-        echo "JDBC: $(render_jdbc_single "$PRIMARY_HOSTNAME" "$PORT" "$svc")"
-        echo '```'
-        echo ""
 
         if [[ -n "$STANDBY_HOSTNAME" ]]; then
-            echo "#### Standby-only"
-            echo ""
-            echo '```'
-            render_tns_single "$ALIAS_STB" "$STANDBY_HOSTNAME" "$PORT" "$svc"
-            echo '```'
-            echo ""
-            echo '```'
-            echo "JDBC: $(render_jdbc_single "$STANDBY_HOSTNAME" "$PORT" "$svc")"
-            echo '```'
-            echo ""
-            echo "#### Role-aware (failover)"
-            echo ""
             echo '```'
             render_tns_ha "$ALIAS_HA" "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
             echo '```'
@@ -455,17 +423,7 @@ GEN_HOST=$(hostname 2>/dev/null)
         fi
     done
 
-    echo "## 4. Notes for Client Teams"
-    echo ""
-    echo "- The role-aware descriptor relies on the service being **stopped on"
-    echo "  the standby**. Without a role-aware service trigger, clients may"
-    echo "  attach to a read-only standby and receive ORA-16000 on writes."
-    echo "- TAF settings (\`FAILOVER_MODE\`) reconnect *select* cursors after a"
-    echo "  failover. Active transactions still need application-level retry."
-    echo "- After a switchover, the primary/standby hostnames swap at the"
-    echo "  database layer; the role-aware descriptor keeps working unchanged."
-    echo ""
-    echo "## 5. Quick Verification"
+    echo "## 4. Quick Verification"
     echo ""
     echo '```bash'
     echo "sqlplus app_user/<pwd>@${SERVICE_LIST[0]}"
