@@ -29,7 +29,6 @@ OUTPUT_FILE=""
 PRIMARY_HOST_OVERRIDE=""
 STANDBY_HOST_OVERRIDE=""
 PORT_OVERRIDE=""
-DB_DOMAIN=""
 
 usage() {
     cat <<EOF
@@ -43,7 +42,6 @@ Options:
       --primary-host HOST   Override primary hostname in connect strings
       --standby-host HOST   Override standby hostname in connect strings
       --port PORT           Override listener port (default: discover or 1521)
-      --domain DOMAIN       DB domain to append to default service name
   -h, --help                Show this help
 
 Topology (DB_UNIQUE_NAMEs, peer hostnames, listener ports) is discovered from
@@ -59,7 +57,6 @@ while [[ $# -gt 0 ]]; do
         --primary-host)     PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
         --standby-host)     STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
         --port)             PORT_OVERRIDE="$2"; shift 2 ;;
-        --domain)           DB_DOMAIN="$2"; shift 2 ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
@@ -236,13 +233,15 @@ fi
 
 SERVICE_OUTPUT=$(run_sql "
 SELECT NAME FROM V\$ACTIVE_SERVICES
-WHERE NAME NOT IN (
-    SELECT DB_UNIQUE_NAME FROM V\$DATABASE
-    UNION ALL SELECT NAME FROM V\$DATABASE
-    UNION ALL SELECT INSTANCE_NAME FROM V\$INSTANCE
+WHERE UPPER(NAME) NOT IN (
+    SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE
+    UNION ALL SELECT UPPER(NAME) FROM V\$DATABASE
+    UNION ALL SELECT UPPER(INSTANCE_NAME) FROM V\$INSTANCE
 )
 AND NAME NOT LIKE 'SYS\$%'
 AND UPPER(NAME) NOT LIKE '%XDB%'
+AND UPPER(NAME) NOT LIKE '%\_CFG' ESCAPE '\'
+AND UPPER(NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
 ORDER BY NAME;
 " | clean)
 
@@ -250,17 +249,6 @@ SERVICE_LIST=()
 while IFS= read -r line; do
     [[ -n "$line" ]] && SERVICE_LIST+=("$line")
 done <<< "$SERVICE_OUTPUT"
-
-DEFAULT_SVC="$PRIMARY_DB_UNIQUE_NAME"
-[[ -n "$DB_DOMAIN" ]] && DEFAULT_SVC="${PRIMARY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
-
-found_default=0
-for s in "${SERVICE_LIST[@]}"; do
-    [[ "$s" == "$DEFAULT_SVC" ]] && found_default=1
-done
-if [[ $found_default -eq 0 ]]; then
-    SERVICE_LIST=("$DEFAULT_SVC" "${SERVICE_LIST[@]}")
-fi
 
 info "Services in report: ${SERVICE_LIST[*]}"
 
@@ -398,11 +386,6 @@ GEN_HOST=$(hostname 2>/dev/null)
     echo ""
     echo "## 3. Connection Strings"
     echo ""
-    echo "Role-aware descriptor with both hosts. Best for the application tier"
-    echo "*when a role-aware service trigger is deployed*: the service is only"
-    echo "up on whichever side is primary, so clients automatically follow the"
-    echo "active database after a switchover or failover."
-    echo ""
 
     for svc in "${SERVICE_LIST[@]}"; do
         local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
@@ -423,12 +406,6 @@ GEN_HOST=$(hostname 2>/dev/null)
         fi
     done
 
-    echo "## 4. Quick Verification"
-    echo ""
-    echo '```bash'
-    echo "sqlplus app_user/<pwd>@${SERVICE_LIST[0]}"
-    echo '```'
-    echo ""
 } > "$OUTPUT_FILE"
 
 info "Report written: $OUTPUT_FILE"
