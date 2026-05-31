@@ -155,11 +155,22 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
     log_info "Removing existing configuration..."
     log_cmd "dgmgrl /:" "REMOVE CONFIGURATION"
     REMOVE_OUTPUT=$(run_dgmgrl "remove_configuration.dgmgrl" 2>&1)
-    if echo "$REMOVE_OUTPUT" | grep -qi "ORA-\|error"; then
+    # DGMGRL routinely emits 'Warning: ORA-16620: one or more members
+    # could not be reached for a remove operation' when the standby
+    # instance is fenced off (e.g. mid-rebuild). The config is still
+    # removed locally, so authoritative success is 'Removed configuration'
+    # in the output rather than absence of any ORA- string.
+    if ! echo "$REMOVE_OUTPUT" | grep -qi "Removed configuration"; then
         log_error "Failed to remove the existing broker configuration"
         echo ""
         echo "$REMOVE_OUTPUT"
         exit 1
+    fi
+    if echo "$REMOVE_OUTPUT" | grep -qi "Warning:"; then
+        log_warn "REMOVE CONFIGURATION emitted a warning (proceeding):"
+        echo "$REMOVE_OUTPUT" | grep -i "Warning:" | while IFS= read -r _line; do
+            log_warn "  $_line"
+        done
     fi
 
     POST_REMOVE_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
