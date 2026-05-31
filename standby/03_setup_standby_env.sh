@@ -259,12 +259,12 @@ else
     # Cover EVERY distinct directory the convert params remap to - not
     # just the first one - so datafiles spread across multiple primary
     # directories land on existing standby directories.
-    if [[ ${#STANDBY_DATA_PATHS[@]:-0} -gt 0 ]]; then
+    if [[ -n "${STANDBY_DATA_PATHS+x}" && ${#STANDBY_DATA_PATHS[@]} -gt 0 ]]; then
         DIRS_TO_CREATE+=( "${STANDBY_DATA_PATHS[@]}" )
     else
         DIRS_TO_CREATE+=( "${STANDBY_DATA_PATH}" )
     fi
-    if [[ ${#STANDBY_REDO_PATHS[@]:-0} -gt 0 ]]; then
+    if [[ -n "${STANDBY_REDO_PATHS+x}" && ${#STANDBY_REDO_PATHS[@]} -gt 0 ]]; then
         DIRS_TO_CREATE+=( "${STANDBY_REDO_PATHS[@]}" )
     else
         DIRS_TO_CREATE+=( "${STANDBY_REDO_PATH}" )

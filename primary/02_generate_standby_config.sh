@@ -302,10 +302,10 @@ progress_step "Generating Path Conversions"
 # Fallback: if step 1 did not write the *_PATHS arrays (older config
 # files), populate from the singular *_PATH so the new code still
 # works end-to-end.
-if [[ ${#PRIMARY_DATA_PATHS[@]:-0} -eq 0 ]]; then
+if [[ -z "${PRIMARY_DATA_PATHS+x}" || ${#PRIMARY_DATA_PATHS[@]} -eq 0 ]]; then
     PRIMARY_DATA_PATHS=("$PRIMARY_DATA_PATH")
 fi
-if [[ ${#PRIMARY_REDO_PATHS[@]:-0} -eq 0 ]]; then
+if [[ -z "${PRIMARY_REDO_PATHS+x}" || ${#PRIMARY_REDO_PATHS[@]} -eq 0 ]]; then
     PRIMARY_REDO_PATHS=("$PRIMARY_REDO_PATH")
 fi
 
