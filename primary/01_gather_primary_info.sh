@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 1: Gather Primary Info"
-init_progress 10
+init_progress 11
 
 # ============================================================
 # NFS Share Configuration
@@ -42,6 +42,25 @@ progress_step "Pre-flight Checks"
 check_oracle_env || exit 1
 check_nfs_mount || exit 1
 check_db_connection || exit 1
+
+# ============================================================
+# Verify SYS Password
+# ============================================================
+# Fail fast: if the SYS password is wrong, RMAN duplicate at
+# step 5 cannot authenticate. Catching it here saves the user
+# from running through six steps before discovering it.
+# ============================================================
+
+progress_step "Verifying SYS Password"
+
+prompt_and_verify_local_sys_password \
+    "Enter SYS password for the primary database (will be re-prompted at clone time)" \
+    || exit 1
+# We only used the password for live verification; do not keep
+# it around or write it anywhere. Step 5 prompts again at the
+# point RMAN actually needs it.
+SYS_PASSWORD=""
+unset SYS_PASSWORD
 
 # ============================================================
 # Gather Database Identity Information
@@ -128,10 +147,22 @@ ONLINE_REDO_GROUPS=$(echo "$ONLINE_REDO_GROUPS" | tr -d ' \n\r')
 log_info "Redo log size: ${REDO_LOG_SIZE_MB}MB"
 log_info "Online redo groups: $ONLINE_REDO_GROUPS"
 
-# Redo log members/paths
-REDO_LOG_PATHS=$(run_sql_query "get_redo_log_paths.sql")
-REDO_LOG_PATH=$(echo "$REDO_LOG_PATHS" | head -1 | tr -d ' \n\r')
-log_info "Redo log path: $REDO_LOG_PATH"
+# Redo log members/paths - capture ALL distinct directories
+REDO_LOG_PATHS_RAW=$(run_sql_query "get_redo_log_paths.sql")
+PRIMARY_REDO_PATHS=()
+while IFS= read -r _line; do
+    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    [[ -z "$_line" ]] && continue
+    PRIMARY_REDO_PATHS+=("$_line")
+done <<< "$REDO_LOG_PATHS_RAW"
+REDO_LOG_PATH="${PRIMARY_REDO_PATHS[0]:-}"
+log_info "Redo log path (primary): $REDO_LOG_PATH"
+if [[ ${#PRIMARY_REDO_PATHS[@]} -gt 1 ]]; then
+    log_info "  Additional redo log directories detected: ${#PRIMARY_REDO_PATHS[@]} total"
+    for _p in "${PRIMARY_REDO_PATHS[@]}"; do
+        log_info "    $_p"
+    done
+fi
 
 # ============================================================
 # Check Standby Redo Logs
@@ -158,11 +189,24 @@ fi
 
 progress_step "Gathering Data File Locations"
 
-# Get unique data file directories
+# Get unique data file directories - capture ALL distinct directories
 DATAFILE_DIRS=$(run_sql_query "get_datafile_dirs.sql")
 
-PRIMARY_DATA_PATH=$(echo "$DATAFILE_DIRS" | head -1 | tr -d ' \n\r')
+PRIMARY_DATA_PATHS=()
+while IFS= read -r _line; do
+    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    [[ -z "$_line" ]] && continue
+    PRIMARY_DATA_PATHS+=("$_line")
+done <<< "$DATAFILE_DIRS"
+
+PRIMARY_DATA_PATH="${PRIMARY_DATA_PATHS[0]:-}"
 log_info "Primary data path: $PRIMARY_DATA_PATH"
+if [[ ${#PRIMARY_DATA_PATHS[@]} -gt 1 ]]; then
+    log_info "  Additional datafile directories detected: ${#PRIMARY_DATA_PATHS[@]} total"
+    for _p in "${PRIMARY_DATA_PATHS[@]}"; do
+        log_info "    $_p"
+    done
+fi
 
 # Show all data files
 echo "Data files:"
@@ -431,8 +475,19 @@ DB_BLOCK_SIZE="$(strip_whitespace "$DB_BLOCK_SIZE")"
 COMPATIBLE="$COMPATIBLE"
 
 # --- Storage Paths ---
+# *_PATH is the FIRST directory and stays for backward compatibility.
+# *_PATHS is the FULL list of distinct directories (bash array literal)
+# - step 2 uses it to build a full DB_FILE_NAME_CONVERT covering every
+# primary directory, and step 3 uses the standby equivalent to create
+# all required directories.
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
+PRIMARY_DATA_PATHS=(
+$(printf '    "%s"\n' "${PRIMARY_DATA_PATHS[@]}")
+)
 PRIMARY_REDO_PATH="$REDO_LOG_PATH"
+PRIMARY_REDO_PATHS=(
+$(printf '    "%s"\n' "${PRIMARY_REDO_PATHS[@]}")
+)
 PRIMARY_ARCHIVE_DEST="$ARCHIVE_DEST_PATH"
 CONTROL_FILES="$CONTROL_FILES"
 

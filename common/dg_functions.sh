@@ -681,6 +681,58 @@ verify_sys_password() {
 }
 
 # ============================================================
+# Prompt for a SYS password and verify it against the LOCAL
+# database via the listener (TCP). This exercises the password
+# file the same way RMAN duplicate will later, so a bad password
+# fails fast at step 1 rather than deep into step 5.
+#
+# On success: exports SYS_PASSWORD with the verified password.
+# On failure (after _max_attempts attempts): exits non-zero.
+# ============================================================
+prompt_and_verify_local_sys_password() {
+    local prompt_text="${1:-Enter SYS password for the local primary database}"
+    local max_attempts="${2:-3}"
+
+    # Discover the running listener port. Auto-derived from lsnrctl,
+    # falling back to 1521 if that fails. This is local only.
+    local probe_port=""
+    if [[ -x "${ORACLE_HOME}/bin/lsnrctl" ]]; then
+        probe_port=$("${ORACLE_HOME}/bin/lsnrctl" status 2>/dev/null \
+            | sed -n 's/.*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+            | head -1)
+    fi
+    probe_port="${probe_port:-1521}"
+
+    # Build a SID-based descriptor so we don't depend on knowing the
+    # registered service name (PMON registers <SID> via the static
+    # entry on most setups).
+    local probe_target
+    probe_target="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=${probe_port}))(CONNECT_DATA=(SID=${ORACLE_SID})))"
+
+    log_info "Verifying SYS password against local instance (port ${probe_port}, SID ${ORACLE_SID})..."
+
+    local attempt=1
+    local pw=""
+    while [[ $attempt -le $max_attempts ]]; do
+        pw=$(prompt_password "$prompt_text")
+        if [[ -z "$pw" ]]; then
+            log_warn "SYS password cannot be empty (attempt ${attempt}/${max_attempts})"
+        elif verify_sys_password "$pw" "$probe_target"; then
+            log_success "SYS password verified against the local primary database"
+            export SYS_PASSWORD="$pw"
+            return 0
+        else
+            log_error "SYS password verification failed (attempt ${attempt}/${max_attempts})"
+        fi
+        attempt=$((attempt + 1))
+    done
+
+    log_error "Could not verify SYS password after ${max_attempts} attempts"
+    log_error "Confirm REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE and that orapw${ORACLE_SID} contains a valid SYS entry"
+    return 1
+}
+
+# ============================================================
 # File Operations
 # ============================================================
 

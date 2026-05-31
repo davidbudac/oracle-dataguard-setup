@@ -142,22 +142,25 @@ if [[ "$STANDBY_DB_UNIQUE_NAME" == "$DB_UNIQUE_NAME" ]]; then
     exit 1
 fi
 
-# Standby Oracle SID (default same as primary)
+# Standby Oracle SID
 echo ""
-echo "The standby ORACLE_SID usually matches the primary unless you have a naming reason to change it."
 prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
 
 # ============================================================
 # Select Standby Storage Mode
 # ============================================================
+# Two orthogonal questions are asked here:
+#   Q1 - Storage layout (Traditional vs OMF)
+#   Q2 - Where archived redo logs land (FRA vs explicit path)
+# These are independent: Traditional + FRA is a valid combination
+# and is the simplest way to put FRA on the standby even when the
+# primary does NOT use FRA.
+# ============================================================
 
 echo ""
-echo "Select the standby storage layout:"
-echo ""
-echo "  1) Traditional  - Standby uses file paths derived from primary"
-echo "                     (DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT)"
-echo "  2) OMF (Oracle Managed Files) - Standby uses db_create_file_dest"
-echo "                     and db_recovery_file_dest (no FILE_NAME_CONVERT)"
+echo "Q1) Storage layout for standby datafiles, redo, control files:"
+echo "  1) Traditional  - paths derived from primary (DB_FILE_NAME_CONVERT)"
+echo "  2) OMF          - Oracle Managed Files (db_create_file_dest)"
 echo ""
 prompt_with_default "Storage mode" "1" STORAGE_CHOICE
 
@@ -172,15 +175,19 @@ case "$STORAGE_CHOICE" in
         ;;
 esac
 
-# Initialize OMF-specific variables (empty for Traditional mode)
+# Initialize storage-related variables
 STANDBY_DB_CREATE_FILE_DEST=""
 STANDBY_DB_RECOVERY_FILE_DEST=""
 STANDBY_DB_RECOVERY_FILE_DEST_SIZE=""
+STANDBY_FRA=""
+STANDBY_ARCHIVE_DEST=""
+USE_FRA_FOR_STANDBY=""
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     echo ""
-    echo "OMF mode: Oracle will automatically place datafiles, redo logs,"
-    echo "and control files under db_create_file_dest."
+    echo "OMF mode: Oracle will place datafiles, redo logs, and control"
+    echo "files under db_create_file_dest. A FRA is required for archived"
+    echo "redo - choose its path and size below."
     echo ""
 
     prompt_with_default "Standby db_create_file_dest" "" STANDBY_DB_CREATE_FILE_DEST
@@ -188,35 +195,119 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
         log_error "db_create_file_dest cannot be empty in OMF mode"
         exit 1
     fi
-
-    # Default FRA path: use primary's value if set
-    _fra_default=""
-    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-        _fra_default="$DB_RECOVERY_FILE_DEST"
-    fi
-    prompt_with_default "Standby db_recovery_file_dest" "$_fra_default" STANDBY_DB_RECOVERY_FILE_DEST
-    if [[ -z "$STANDBY_DB_RECOVERY_FILE_DEST" ]]; then
-        log_error "db_recovery_file_dest cannot be empty in OMF mode"
-        exit 1
-    fi
-
-    # Default size: use primary's value if set
-    _fra_size_default="50G"
-    if [[ -n "$DB_RECOVERY_FILE_DEST_SIZE" ]]; then
-        _fra_size_default="$DB_RECOVERY_FILE_DEST_SIZE"
-    fi
-    prompt_with_default "Standby db_recovery_file_dest_size" "$_fra_size_default" STANDBY_DB_RECOVERY_FILE_DEST_SIZE
-
-    log_info "OMF db_create_file_dest: $STANDBY_DB_CREATE_FILE_DEST"
-    log_info "OMF db_recovery_file_dest: $STANDBY_DB_RECOVERY_FILE_DEST"
-    log_info "OMF db_recovery_file_dest_size: $STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
 fi
+
+# ============================================================
+# Q2 - Archive log destination on standby
+# ============================================================
+# Available combinations:
+#   Traditional + FRA       -> USE_FRA_FOR_STANDBY=YES (works regardless
+#                              of whether primary uses FRA)
+#   Traditional + explicit  -> USE_FRA_FOR_STANDBY=NO  (explicit dir)
+#   OMF                     -> FRA only (Oracle requires it for OMF apply)
+# ============================================================
+
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    _archive_choice_default="1"
+    _archive_choice_locked="YES"   # OMF requires FRA
+else
+    # In Traditional mode, default to FRA when the primary already uses
+    # it (matches the operator's mental model) - otherwise default to
+    # explicit so the operator who has no FRA today doesn't get one by
+    # surprise. Either choice is fully supported.
+    if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" ]]; then
+        _archive_choice_default="1"
+    else
+        _archive_choice_default="2"
+    fi
+    _archive_choice_locked="NO"
+fi
+
+if [[ "$_archive_choice_locked" == "YES" ]]; then
+    log_info "OMF mode: archive logs land in the Fast Recovery Area"
+    _archive_choice="1"
+else
+    echo ""
+    echo "Q2) Where should archived redo logs land on the standby?"
+    echo "  1) Fast Recovery Area (FRA) - Oracle manages cleanup"
+    echo "  2) Explicit filesystem directory"
+    echo ""
+    prompt_with_default "Archive destination" "$_archive_choice_default" _archive_choice
+fi
+
+case "$_archive_choice" in
+    1|fra|FRA)
+        USE_FRA_FOR_STANDBY="YES"
+
+        # Default FRA path priority: primary FRA (re-mapped to standby
+        # DB_UNIQUE_NAME) -> derived from primary archive dest -> empty
+        _fra_default=""
+        if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
+            _fra_default=$(echo "$DB_RECOVERY_FILE_DEST" \
+                | sed "s|/${DB_UNIQUE_NAME}/|/${STANDBY_DB_UNIQUE_NAME}/|g; s|/${DB_UNIQUE_NAME}$|/${STANDBY_DB_UNIQUE_NAME}|")
+            # If no substitution happened, keep primary path (FRA dirs
+            # in many setups are not DB_UNIQUE_NAME-scoped at the path
+            # level - Oracle creates subdirs under it).
+            if [[ "$_fra_default" == "$DB_RECOVERY_FILE_DEST" ]]; then
+                _fra_default="$DB_RECOVERY_FILE_DEST"
+            fi
+        fi
+        prompt_with_default "Standby FRA path (db_recovery_file_dest)" "$_fra_default" STANDBY_FRA
+        if [[ -z "$STANDBY_FRA" ]]; then
+            log_error "FRA path cannot be empty when using FRA"
+            exit 1
+        fi
+
+        _fra_size_default="${DB_RECOVERY_FILE_DEST_SIZE:-50G}"
+        prompt_with_default "Standby FRA size (db_recovery_file_dest_size)" "$_fra_size_default" STANDBY_DB_RECOVERY_FILE_DEST_SIZE
+
+        # Mirror into the OMF-named variable so downstream code that
+        # used STANDBY_DB_RECOVERY_FILE_DEST keeps working unchanged.
+        STANDBY_DB_RECOVERY_FILE_DEST="$STANDBY_FRA"
+
+        log_info "Standby will archive to FRA: $STANDBY_FRA (${STANDBY_DB_RECOVERY_FILE_DEST_SIZE})"
+        ;;
+    *)
+        USE_FRA_FOR_STANDBY="NO"
+        STANDBY_FRA=""
+        STANDBY_DB_RECOVERY_FILE_DEST=""
+        STANDBY_DB_RECOVERY_FILE_DEST_SIZE=""
+
+        _arch_default=""
+        if [[ -n "$PRIMARY_ARCHIVE_DEST" ]]; then
+            _arch_default=$(echo "$PRIMARY_ARCHIVE_DEST" \
+                | sed "s|/${DB_UNIQUE_NAME}|/${STANDBY_DB_UNIQUE_NAME}|g")
+        fi
+        prompt_with_default "Standby archive log directory" "$_arch_default" STANDBY_ARCHIVE_DEST
+        if [[ -z "$STANDBY_ARCHIVE_DEST" ]]; then
+            log_error "Archive log directory cannot be empty"
+            exit 1
+        fi
+        log_info "Standby will archive to explicit path: $STANDBY_ARCHIVE_DEST"
+        ;;
+esac
 
 # ============================================================
 # Generate Path Conversions
 # ============================================================
 
 progress_step "Generating Path Conversions"
+
+# Multi-path discovery: derive the FULL set of standby data and redo
+# directories from PRIMARY_DATA_PATHS / PRIMARY_REDO_PATHS (collected
+# at step 1). Each primary directory needs its own pair in the
+# DB_FILE_NAME_CONVERT - without that, datafiles outside the first
+# directory get the wrong path and step 5 fails.
+
+# Fallback: if step 1 did not write the *_PATHS arrays (older config
+# files), populate from the singular *_PATH so the new code still
+# works end-to-end.
+if [[ ${#PRIMARY_DATA_PATHS[@]:-0} -eq 0 ]]; then
+    PRIMARY_DATA_PATHS=("$PRIMARY_DATA_PATH")
+fi
+if [[ ${#PRIMARY_REDO_PATHS[@]:-0} -eq 0 ]]; then
+    PRIMARY_REDO_PATHS=("$PRIMARY_REDO_PATH")
+fi
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: paths are managed by Oracle, no FILE_NAME_CONVERT needed
@@ -226,60 +317,63 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     STANDBY_REDO_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
     PRIMARY_SRL_PATH="${PRIMARY_REDO_PATH}"
     STANDBY_SRL_PATH="${STANDBY_DB_CREATE_FILE_DEST}"
-    STANDBY_FRA="${STANDBY_DB_RECOVERY_FILE_DEST}"
-    USE_FRA_FOR_STANDBY="YES"
-    STANDBY_ARCHIVE_DEST=""
     DB_FILE_NAME_CONVERT=""
     LOG_FILE_NAME_CONVERT=""
+    STANDBY_DATA_PATHS=("$STANDBY_DB_CREATE_FILE_DEST")
+    STANDBY_REDO_PATHS=("$STANDBY_DB_CREATE_FILE_DEST")
 
     log_info "OMF mode: Oracle will manage file placement"
     log_info "  db_create_file_dest:      $STANDBY_DB_CREATE_FILE_DEST"
     log_info "  db_recovery_file_dest:    $STANDBY_DB_RECOVERY_FILE_DEST"
 else
-# Detect the actual directory name used in paths (may differ in case from DB_UNIQUE_NAME)
-# DB_UNIQUE_NAME might be 'testcdb' but directory might be 'TESTCDB'
-PRIMARY_DIR_NAME=""
+# Detect the actual directory-name token used in PRIMARY paths so we
+# can substitute it for STANDBY (case-preserving). The token is
+# usually DB_UNIQUE_NAME but may differ in case ('TESTCDB' vs
+# 'testcdb') or be entirely custom.
 DB_UNIQUE_NAME_UPPER=$(echo "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
 DB_UNIQUE_NAME_LOWER=$(echo "$DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
 
-# Check for uppercase version in path
+PRIMARY_DIR_NAME=""
 if echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_UPPER}"; then
     PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_UPPER"
-# Check for lowercase version in path
 elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_LOWER}"; then
     PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_LOWER"
-# Check for exact match (mixed case)
 elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME}/"; then
     PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
 fi
 
-# Generate the standby directory name (preserve case pattern from primary)
 if [[ -n "$PRIMARY_DIR_NAME" ]]; then
-    # Match the case pattern of the primary
     if [[ "$PRIMARY_DIR_NAME" == "$DB_UNIQUE_NAME_UPPER" ]]; then
         STANDBY_DIR_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
     else
         STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
     fi
-    log_info "Primary directory name in path: $PRIMARY_DIR_NAME"
-    log_info "Standby directory name for path: $STANDBY_DIR_NAME"
+    log_info "Primary directory token in paths: $PRIMARY_DIR_NAME"
+    log_info "Standby directory token in paths: $STANDBY_DIR_NAME"
 else
-    # Fallback: use DB_UNIQUE_NAME as-is
     PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
     STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
-    log_warn "Could not detect directory name case in path, using DB_UNIQUE_NAME directly"
+    log_warn "Could not detect DB_UNIQUE_NAME token in path - using DB_UNIQUE_NAME literally"
 fi
 
-# Replace primary directory name with standby directory name in paths
-STANDBY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
-STANDBY_REDO_PATH=$(echo "$PRIMARY_REDO_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+# Derive matching standby paths for each primary directory.
+STANDBY_DATA_PATHS=()
+for _p in "${PRIMARY_DATA_PATHS[@]}"; do
+    STANDBY_DATA_PATHS+=("$(echo "$_p" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")")
+done
+STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
+
+STANDBY_REDO_PATHS=()
+for _p in "${PRIMARY_REDO_PATHS[@]}"; do
+    STANDBY_REDO_PATHS+=("$(echo "$_p" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")")
+done
+STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
 
 # ============================================================
 # Standby Redo Log (SRL) Path Separation
 # ============================================================
 # By default, SRLs live in the same directory as online redo logs
-# on both databases. You can optionally place SRLs in a separate
-# directory (e.g., a different disk) for performance isolation.
+# on both databases. Optionally place SRLs on a different filesystem.
 # ============================================================
 echo ""
 echo "By default, standby redo logs (SRLs) live in the same directory"
@@ -293,11 +387,9 @@ _separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d ' \n\
 
 if [[ "$_separate_srl" == "y" || "$_separate_srl" == "yes" ]]; then
     prompt_with_default "Primary SRL directory" "$PRIMARY_REDO_PATH" PRIMARY_SRL_PATH
-    # Derive standby SRL default via directory-name substitution
     _stby_srl_default=$(echo "$PRIMARY_SRL_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
     prompt_with_default "Standby SRL directory" "$_stby_srl_default" STANDBY_SRL_PATH
 
-    # Ensure trailing slash for LOG_FILE_NAME_CONVERT consistency
     [[ "$PRIMARY_SRL_PATH" != */ ]] && PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH}/"
     [[ "$STANDBY_SRL_PATH" != */ ]] && STANDBY_SRL_PATH="${STANDBY_SRL_PATH}/"
 
@@ -309,46 +401,56 @@ else
     log_info "SRLs will share the ORL directory on both databases"
 fi
 
-# Handle archive destination - may use FRA
-if [[ "$USE_FRA_FOR_ARCHIVE" == "YES" || -z "$PRIMARY_ARCHIVE_DEST" ]]; then
-    # Use FRA for archiving on standby
-    if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-        STANDBY_FRA=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
-        STANDBY_ARCHIVE_DEST=""  # Will use USE_DB_RECOVERY_FILE_DEST
-        USE_FRA_FOR_STANDBY="YES"
-        log_info "Standby will use FRA for archive logs: $STANDBY_FRA"
+# Build FILE_NAME_CONVERT covering EVERY primary directory.
+# Convention: pairs are 'primary','standby' repeated. Order doesn't
+# matter to Oracle as long as the pair counts are even.
+_convert_pairs=""
+_seen_pairs=" "  # space-bounded list so we can grep for membership
+
+_emit_pair() {
+    local primary="$1" standby="$2" key=" ${primary}=>${standby} "
+    [[ -z "$primary" || -z "$standby" ]] && return 0
+    case "$_seen_pairs" in
+        *"$key"*) return 0 ;;
+    esac
+    _seen_pairs="${_seen_pairs}${key#? }"
+    if [[ -z "$_convert_pairs" ]]; then
+        _convert_pairs="'${primary}','${standby}'"
     else
-        log_error "FRA is used for archiving but DB_RECOVERY_FILE_DEST is not set"
-        log_error "Please configure archive destination manually"
-        exit 1
+        _convert_pairs="${_convert_pairs},'${primary}','${standby}'"
     fi
-else
-    STANDBY_ARCHIVE_DEST=$(echo "$PRIMARY_ARCHIVE_DEST" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
-    USE_FRA_FOR_STANDBY="NO"
-fi
+}
 
-# Generate FILE_NAME_CONVERT parameters
-# Always include the ORL path conversion pair
-DB_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}'"
-LOG_FILE_NAME_CONVERT="'${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
+# Datafile pairs - one per distinct primary datafile directory
+_idx=0
+for _p in "${PRIMARY_DATA_PATHS[@]}"; do
+    _emit_pair "$_p" "${STANDBY_DATA_PATHS[$_idx]}"
+    _idx=$((_idx + 1))
+done
 
-# If data and redo are in different paths with DB_UNIQUE_NAME, include both
-if [[ "$PRIMARY_DATA_PATH" != "$PRIMARY_REDO_PATH" ]]; then
-    DB_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}','${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
-    LOG_FILE_NAME_CONVERT="'${PRIMARY_DATA_PATH}','${STANDBY_DATA_PATH}','${PRIMARY_REDO_PATH}','${STANDBY_REDO_PATH}'"
-fi
+# Redo log pairs - one per distinct primary redo directory
+_idx=0
+for _p in "${PRIMARY_REDO_PATHS[@]}"; do
+    _emit_pair "$_p" "${STANDBY_REDO_PATHS[$_idx]}"
+    _idx=$((_idx + 1))
+done
 
-# If SRL path differs from ORL path, append the SRL conversion pair so
-# RMAN DUPLICATE remaps standby redo logs to the separate directory.
+# Separate SRL pair when configured
 if [[ "$PRIMARY_SRL_PATH" != "$PRIMARY_REDO_PATH" ]]; then
-    LOG_FILE_NAME_CONVERT="${LOG_FILE_NAME_CONVERT},'${PRIMARY_SRL_PATH}','${STANDBY_SRL_PATH}'"
-    DB_FILE_NAME_CONVERT="${DB_FILE_NAME_CONVERT},'${PRIMARY_SRL_PATH}','${STANDBY_SRL_PATH}'"
+    _emit_pair "$PRIMARY_SRL_PATH" "$STANDBY_SRL_PATH"
 fi
 
-log_info "Primary data path: $PRIMARY_DATA_PATH"
-log_info "Standby data path: $STANDBY_DATA_PATH"
-log_info "Primary redo path: $PRIMARY_REDO_PATH"
-log_info "Standby redo path: $STANDBY_REDO_PATH"
+DB_FILE_NAME_CONVERT="$_convert_pairs"
+LOG_FILE_NAME_CONVERT="$_convert_pairs"
+
+log_info "Primary data paths:"
+for _p in "${PRIMARY_DATA_PATHS[@]}"; do log_info "    $_p"; done
+log_info "Standby data paths:"
+for _p in "${STANDBY_DATA_PATHS[@]}"; do log_info "    $_p"; done
+log_info "Primary redo paths:"
+for _p in "${PRIMARY_REDO_PATHS[@]}"; do log_info "    $_p"; done
+log_info "Standby redo paths:"
+for _p in "${STANDBY_REDO_PATHS[@]}"; do log_info "    $_p"; done
 log_info "Primary SRL path:  $PRIMARY_SRL_PATH"
 log_info "Standby SRL path:  $STANDBY_SRL_PATH"
 
@@ -448,16 +550,32 @@ STANDBY_STORAGE_MODE="$STANDBY_STORAGE_MODE"
 STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
 
 # --- Path Conversions (Traditional mode only) ---
-# *_DATA_PATH = where datafiles live on each database
-# *_REDO_PATH = where ONLINE redo log files live on each database
-# *_SRL_PATH  = where STANDBY redo log files live on each database
-#               (defaults to *_REDO_PATH; can be separated for
+# *_DATA_PATH  = primary/standby's FIRST datafile directory (backward compat)
+# *_DATA_PATHS = FULL list of distinct datafile directories (one pair
+#                per directory is emitted into DB_FILE_NAME_CONVERT so
+#                datafiles in multiple directories all map correctly)
+# *_REDO_PATH  = primary/standby's FIRST online redo directory
+# *_REDO_PATHS = FULL list of distinct online redo directories
+# *_SRL_PATH   = where STANDBY redo log files live on each database
+#                (defaults to *_REDO_PATH; can be separated for
 #                disk/performance isolation - see the SRL Path
 #                Separation prompt at step 2)
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
+PRIMARY_DATA_PATHS=(
+$(printf '    "%s"\n' "${PRIMARY_DATA_PATHS[@]}")
+)
 STANDBY_DATA_PATH="$STANDBY_DATA_PATH"
+STANDBY_DATA_PATHS=(
+$(printf '    "%s"\n' "${STANDBY_DATA_PATHS[@]}")
+)
 PRIMARY_REDO_PATH="$PRIMARY_REDO_PATH"
+PRIMARY_REDO_PATHS=(
+$(printf '    "%s"\n' "${PRIMARY_REDO_PATHS[@]}")
+)
 STANDBY_REDO_PATH="$STANDBY_REDO_PATH"
+STANDBY_REDO_PATHS=(
+$(printf '    "%s"\n' "${STANDBY_REDO_PATHS[@]}")
+)
 PRIMARY_SRL_PATH="$PRIMARY_SRL_PATH"
 STANDBY_SRL_PATH="$STANDBY_SRL_PATH"
 DB_FILE_NAME_CONVERT="${DB_FILE_NAME_CONVERT}"
@@ -479,18 +597,23 @@ STANDBY_ARCHIVE_DEST="$STANDBY_ARCHIVE_DEST"
 #   2. STANDBY FRA (what actually gets applied to the standby)
 #   3. FLAGS (which side uses the FRA for archiving)
 #
-# Variable map by storage mode:
+# Variable map by storage mode + Q2 archive choice:
 #   Traditional + FRA archive:
-#     - STANDBY_FRA                      = derived from primary path
-#     - STANDBY_DB_RECOVERY_FILE_DEST    = (empty, not used)
+#     - STANDBY_FRA                      = chosen FRA path
+#     - STANDBY_DB_RECOVERY_FILE_DEST    = mirrors STANDBY_FRA
+#     - STANDBY_DB_RECOVERY_FILE_DEST_SIZE = chosen FRA size
+#     - STANDBY_ARCHIVE_DEST             = (empty)
 #     - USE_FRA_FOR_STANDBY              = YES
+#     (NOTE: this combination is valid even when primary does NOT use FRA)
 #   Traditional + explicit archive dest:
 #     - STANDBY_FRA                      = (empty)
-#     - STANDBY_ARCHIVE_DEST             = set
+#     - STANDBY_DB_RECOVERY_FILE_DEST    = (empty)
+#     - STANDBY_ARCHIVE_DEST             = chosen dir
 #     - USE_FRA_FOR_STANDBY              = NO
 #   OMF (always uses FRA):
 #     - STANDBY_DB_RECOVERY_FILE_DEST    = standby FRA path
 #     - STANDBY_FRA                      = same as above (mirror)
+#     - STANDBY_DB_RECOVERY_FILE_DEST_SIZE = chosen FRA size
 #     - USE_FRA_FOR_STANDBY              = YES
 # ============================================================
 

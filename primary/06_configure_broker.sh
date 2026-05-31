@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
-init_progress 7
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -206,6 +206,36 @@ if [[ $? -ne 0 ]]; then
     exit 1
 fi
 log_info "Standby database added successfully"
+
+# ============================================================
+# Set Explicit StaticConnectIdentifier
+# ============================================================
+# DGMGRL auto-derives StaticConnectIdentifier from the local
+# listener entries, but in setups where DGMGRL guesses the wrong
+# hostname, port, or domain the resulting descriptor will not
+# resolve at switchover/FSFO time. Set it explicitly here so the
+# broker uses the same host+port+_DGMGRL service registered in
+# listener.ora (see 03_setup_standby_env.sh static SID_LIST).
+# ============================================================
+
+progress_step "Setting StaticConnectIdentifier on Both Databases"
+
+_primary_dgmgrl_service="${PRIMARY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+_standby_dgmgrl_service="${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+
+PRIMARY_STATIC_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${PRIMARY_HOSTNAME})(PORT=${PRIMARY_LISTENER_PORT}))(CONNECT_DATA=(SERVICE_NAME=${_primary_dgmgrl_service})(INSTANCE_NAME=${PRIMARY_ORACLE_SID})(SERVER=DEDICATED)))"
+STANDBY_STATIC_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))(CONNECT_DATA=(SERVICE_NAME=${_standby_dgmgrl_service})(INSTANCE_NAME=${STANDBY_ORACLE_SID})(SERVER=DEDICATED)))"
+
+log_info "Primary StaticConnectIdentifier:"
+log_info "  $PRIMARY_STATIC_CONNECT"
+log_info "Standby StaticConnectIdentifier:"
+log_info "  $STANDBY_STATIC_CONNECT"
+
+log_cmd "dgmgrl /:" "EDIT DATABASE '${PRIMARY_DB_UNIQUE_NAME}' SET PROPERTY StaticConnectIdentifier='...'"
+run_dgmgrl "set_static_connect_identifier.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_STATIC_CONNECT"
+
+log_cmd "dgmgrl /:" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY StaticConnectIdentifier='...'"
+run_dgmgrl "set_static_connect_identifier.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_STATIC_CONNECT"
 
 # ============================================================
 # Enable Configuration

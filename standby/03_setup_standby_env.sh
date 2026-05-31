@@ -255,11 +255,20 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     log_info "  db_create_file_dest:   ${STANDBY_DB_CREATE_FILE_DEST}"
     log_info "  db_recovery_file_dest: ${STANDBY_DB_RECOVERY_FILE_DEST}"
 else
-    # Traditional mode: create explicit data, redo, archive directories
-    DIRS_TO_CREATE+=(
-        "${STANDBY_DATA_PATH}"
-        "${STANDBY_REDO_PATH}"
-    )
+    # Traditional mode: create explicit data, redo, archive directories.
+    # Cover EVERY distinct directory the convert params remap to - not
+    # just the first one - so datafiles spread across multiple primary
+    # directories land on existing standby directories.
+    if [[ ${#STANDBY_DATA_PATHS[@]:-0} -gt 0 ]]; then
+        DIRS_TO_CREATE+=( "${STANDBY_DATA_PATHS[@]}" )
+    else
+        DIRS_TO_CREATE+=( "${STANDBY_DATA_PATH}" )
+    fi
+    if [[ ${#STANDBY_REDO_PATHS[@]:-0} -gt 0 ]]; then
+        DIRS_TO_CREATE+=( "${STANDBY_REDO_PATHS[@]}" )
+    else
+        DIRS_TO_CREATE+=( "${STANDBY_REDO_PATH}" )
+    fi
 
     # Add SRL directory if configured separately from ORL path
     if [[ -n "${STANDBY_SRL_PATH:-}" ]] && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then

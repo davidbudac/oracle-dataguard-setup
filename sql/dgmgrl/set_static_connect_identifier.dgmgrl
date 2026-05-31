@@ -1,0 +1,12 @@
+-- ============================================================
+-- Set StaticConnectIdentifier on a database in the broker config.
+-- This property tells the broker which TNS descriptor to use when
+-- the database is not started (NOMOUNT) - it must resolve to the
+-- _DGMGRL static service registered in the listener.
+--
+-- Args:
+--   &1 = DB_UNIQUE_NAME of the database being edited
+--   &2 = full TNS descriptor (DESCRIPTION=(ADDRESS=...)(CONNECT_DATA=...))
+-- ============================================================
+EDIT DATABASE '&1' SET PROPERTY StaticConnectIdentifier='&2';
+EXIT;
