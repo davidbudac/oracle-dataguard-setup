@@ -29,7 +29,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 clean_field() {
-    echo "$1" | tr -d ' \n\r'
+    echo "$1" | tr -d ' \t\n\r'
 }
 
 field_at() {

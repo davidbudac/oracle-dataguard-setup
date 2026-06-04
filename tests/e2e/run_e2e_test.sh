@@ -698,11 +698,13 @@ phase_step1() {
     log_phase "STEP 1: Gather Primary Information"
 
     local result
-    # Prompts: NFS share path confirmation (Enter for default)
-    # No config file selection needed for step 1
+    # Prompts:
+    #   1. NFS share path confirmation (Enter for default)
+    #   2. SYS password (verified against the running primary instance)
+    #   3. Approval to copy password file to NFS (Enter for default Y)
     result=$(ssh_piped "PRIMARY" \
         "./primary/01_gather_primary_info.sh" \
-        "")
+        "\n${TEST_SYS_PASSWORD}\n")
 
     local exit_code=$?
     log_info "Step 1 output (last 10 lines):"
@@ -747,13 +749,21 @@ phase_step2() {
     log_phase "STEP 2: Generate Standby Configuration"
 
     local result
-    # Prompts: standby host, db_unique_name, SID (default), storage mode (default=Traditional), confirm
+    # Prompts (Traditional + primary not using FRA path):
+    #   1. standby hostname
+    #   2. standby DB_UNIQUE_NAME
+    #   3. standby ORACLE_SID (default = primary SID)
+    #   4. storage mode (default = 1 Traditional)
+    #   5. Q2 archive choice (default = 2 explicit when primary does not use FRA)
+    #   6. standby archive log directory (default = derived from primary)
+    #   7. separate SRL directory? (default = N)
+    #   8. confirm proceed (y)
     # Note: config file is auto-selected when only one exists (no menu prompt)
     # Use STANDBY_ORACLE_HOSTNAME (the real network hostname) not STANDBY_HOST (SSH target)
     local standby_hn="${STANDBY_ORACLE_HOSTNAME:-${STANDBY_HOST}}"
     result=$(ssh_piped "PRIMARY" \
         "./primary/02_generate_standby_config.sh" \
-        "${standby_hn}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\n\ny")
+        "${standby_hn}\n${TEST_STANDBY_DB_UNIQUE_NAME}\n\n\n\n\n\ny")
 
     local exit_code=$?
     log_info "Step 2 output (last 10 lines):"
