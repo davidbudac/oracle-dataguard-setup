@@ -408,12 +408,18 @@ _convert_pairs=""
 _seen_pairs=" "  # space-bounded list so we can grep for membership
 
 _emit_pair() {
-    local primary="$1" standby="$2" key=" ${primary}=>${standby} "
+    # NOTE: separate `local` statements - declaring on one line as
+    # `local a="$1" b="$2" key="...${a}...${b}..."` evaluates ${a}
+    # and ${b} BEFORE local assigns them, so key would be empty and
+    # the dedup membership check would collapse every pair into one.
+    local primary="$1"
+    local standby="$2"
+    local key=" ${primary}=>${standby} "
     [[ -z "$primary" || -z "$standby" ]] && return 0
     case "$_seen_pairs" in
         *"$key"*) return 0 ;;
     esac
-    _seen_pairs="${_seen_pairs}${key#? }"
+    _seen_pairs="${_seen_pairs}${primary}=>${standby} "
     if [[ -z "$_convert_pairs" ]]; then
         _convert_pairs="'${primary}','${standby}'"
     else
