@@ -190,7 +190,12 @@ EXIT;
 EOSQL
 )
 PDB_ACTUAL_NAME=$(echo "$PDB_INFO" | sed -n 's/.*PDBNAME=\([^|]*\)|.*/\1/p' | tr -d ' \n\r')
-PDB_OPEN_MODE=$(echo "$PDB_INFO" | sed -n 's/.*OPENMODE=//p' | tr -d ' \n\r')
+# OPEN_MODE contains an internal space ("READ WRITE", "READ ONLY") that must
+# be preserved for display. Strip CR/LF, then trim leading/trailing spaces
+# with literal-space BRE (AIX 7.2 sed has no PCRE / \s).
+PDB_OPEN_MODE=$(echo "$PDB_INFO" | sed -n 's/.*OPENMODE=//p' | tr -d '\r\n' | sed 's/^ *//;s/ *$//')
+# Space-normalized form for a robust comparison (avoids the internal-space trap).
+PDB_OPEN_MODE_NORM=$(echo "$PDB_OPEN_MODE" | tr -d ' \r\n')
 
 if [[ -z "$PDB_ACTUAL_NAME" ]]; then
     log_error "PDB '$PDB_NAME' not found in this CDB"
@@ -205,7 +210,7 @@ fi
 
 log_info "Found PDB: $PDB_ACTUAL_NAME (open mode: $PDB_OPEN_MODE)"
 
-if [[ "$PDB_OPEN_MODE" != "READ WRITE" ]]; then
+if [[ "$PDB_OPEN_MODE_NORM" != "READWRITE" ]]; then
     log_error "PDB $PDB_ACTUAL_NAME is not OPEN READ WRITE (current: $PDB_OPEN_MODE)"
     log_error "Open it first:  ALTER PLUGGABLE DATABASE ${PDB_ACTUAL_NAME} OPEN READ WRITE;"
     exit 1
