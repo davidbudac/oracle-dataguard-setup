@@ -273,12 +273,19 @@ fi
 # Build the PL/SQL Action Block
 # ============================================================
 
-PLSQL_CREATE=""
-if [[ "$CREATE_SERVICE" == "true" ]]; then
-    PLSQL_CREATE="    DBMS_SERVICE.CREATE_SERVICE(
-        service_name => '${SERVICE_NAME}',
-        network_name => '${SERVICE_NAME}');"
-fi
+# All actions are check-then-act so the block is idempotent and safe to
+# re-run: create only if the service is not already defined, start only if it
+# is not already active. This avoids relying on exact ORA- codes and prevents
+# "already exists / already running" from turning into a hard failure under
+# WHENEVER SQLERROR EXIT. Any genuine error still propagates.
+
+# CREATE (always attempted; no-op if the service already exists)
+PLSQL_CREATE="    SELECT COUNT(*) INTO l_cnt FROM dba_services WHERE name = '${SERVICE_NAME}';
+    IF l_cnt = 0 THEN
+        DBMS_SERVICE.CREATE_SERVICE(
+            service_name => '${SERVICE_NAME}',
+            network_name => '${SERVICE_NAME}');
+    END IF;"
 
 PLSQL_TAF=""
 if [[ "$ENABLE_TAF" == "true" ]]; then
@@ -292,7 +299,10 @@ fi
 
 PLSQL_START=""
 if [[ "$DO_START" == "true" ]]; then
-    PLSQL_START="    DBMS_SERVICE.START_SERVICE('${SERVICE_NAME}');"
+    PLSQL_START="    SELECT COUNT(*) INTO l_cnt FROM v\$active_services WHERE name = '${SERVICE_NAME}';
+    IF l_cnt = 0 THEN
+        DBMS_SERVICE.START_SERVICE('${SERVICE_NAME}');
+    END IF;"
 fi
 
 # ============================================================
@@ -313,6 +323,8 @@ WHENEVER SQLERROR EXIT SQL.SQLCODE
 
 ALTER SESSION SET CONTAINER = "${PDB_ACTUAL_NAME}";
 
+DECLARE
+    l_cnt NUMBER;
 BEGIN
 ${PLSQL_CREATE}
 ${PLSQL_TAF}
