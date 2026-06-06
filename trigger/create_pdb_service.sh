@@ -225,17 +225,20 @@ log_section "Checking for Existing Service"
 SVC_EXISTS=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 ALTER SESSION SET CONTAINER = "${PDB_ACTUAL_NAME}";
-SELECT COUNT(*) FROM DBA_SERVICES WHERE NAME = '${SERVICE_NAME}';
+SELECT 'SVCCOUNT=' || COUNT(*) FROM DBA_SERVICES WHERE NAME = '${SERVICE_NAME}';
 EXIT;
 EOSQL
 )
-SVC_EXISTS=$(echo "$SVC_EXISTS" | tr -d ' \n\r')
+# Extract only the tagged count, ignoring any noise from ALTER SESSION etc.
+SVC_EXISTS=$(echo "$SVC_EXISTS" | sed -n 's/.*SVCCOUNT=//p' | tr -dc '0-9')
 
-if [[ "$SVC_EXISTS" == "0" ]]; then
+if [[ -z "$SVC_EXISTS" || "$SVC_EXISTS" == "0" ]]; then
     log_info "Service '$SERVICE_NAME' does not exist in $PDB_ACTUAL_NAME - it will be created"
     CREATE_SERVICE=true
 else
-    log_warn "Service '$SERVICE_NAME' already exists in $PDB_ACTUAL_NAME"
+    # Not an error: the create/start step below is idempotent and will simply
+    # ensure the service is defined and (unless --no-start) running.
+    log_info "Service '$SERVICE_NAME' is already defined in $PDB_ACTUAL_NAME - will ensure it is started"
     CREATE_SERVICE=false
 fi
 
