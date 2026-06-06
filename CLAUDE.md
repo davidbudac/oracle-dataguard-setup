@@ -200,6 +200,25 @@ Objects replicate to standby automatically via redo apply. The script is restart
 ```
 Same behavior, but creates a dedicated database user (`DG_ADMIN`, or `C##DG_ADMIN` for CDB) with only the privileges required, and places the package and triggers under that user instead of `SYS`. Use this variant when policy disallows adding objects to `SYS`.
 
+**Alternative variant: CDB / PDB-aware**
+```bash
+./trigger/create_role_trigger_cdb.sh
+```
+SYS-owned variant for **multitenant (CDB)** databases that manages services living inside PDBs as well as user services at the `CDB$ROOT` level. The base `create_role_trigger.sh` only manages services in the current container, which is insufficient when application services belong to PDBs.
+
+Key differences from the base script:
+- Verifies `V$DATABASE.CDB = YES` (errors and points to the base script otherwise).
+- Discovers services as `(container, service)` pairs via `sql/queries/get_user_services_cdb.sql` (`V$ACTIVE_SERVICES` joined to `V$CONTAINERS`), excluding `PDB$SEED`, system services, and each container's default service.
+- The `SYS.DG_SERVICE_MGR` package stores the pairs as records; `MANAGE_SERVICES` switches into the owning PDB (`ALTER SESSION SET CONTAINER`) before calling `DBMS_SERVICE`, then returns to `CDB$ROOT`. Per-service failures (e.g. a PDB only MOUNTED on the standby) are written to the alert log and never abort the others.
+- Triggers (`AFTER DB_ROLE_CHANGE` / `AFTER STARTUP ON DATABASE`) still fire in `CDB$ROOT`; the role transition is CDB-wide. A PDB service only starts if the PDB is OPEN, so ensure PDBs auto-open (`SAVE STATE` or an open trigger). Generated SQL: `${NFS_SHARE}/dg_service_mgr_cdb_<PRIMARY_DB_UNIQUE_NAME>.sql`.
+
+**Create a role-aware PDB service**
+```bash
+./trigger/create_pdb_service.sh --pdb <PDB_NAME> --service <SERVICE_NAME> [--no-start] [--taf]
+./trigger/create_pdb_service.sh <PDB_NAME> <SERVICE_NAME>          # positional form
+```
+Creates a service *inside* a PDB to be used as a Data Guard switchover/failover service (runs only on the side currently holding the PRIMARY role). Must run on the PRIMARY of a CDB; verifies the target PDB exists and is OPEN READ WRITE, then creates the service via `DBMS_SERVICE.CREATE_SERVICE` (idempotent — skips if it already exists) and starts it. `--taf` adds basic TAF attributes (`FAILOVER_TYPE=SELECT`, `FAILOVER_METHOD=BASIC`); `--no-start` creates without starting. The service definition replicates to the standby via redo. It does **not** save PDB state, so role-awareness comes from the `DG_SERVICE_MGR` trigger — after creating, (re-)run `create_role_trigger_cdb.sh` so the service is started on PRIMARY and stopped on STANDBY automatically. Note: `-s` is reserved (approval mode) by the shared arg parser, so the service flag is the long `--service` only.
+
 ## Handoff Report (End-User Documentation)
 
 After Data Guard is verified (and ideally after FSFO and the role-aware service trigger are in place), generate a Markdown handoff document for application teams that consume the database:
