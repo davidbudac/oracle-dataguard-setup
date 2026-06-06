@@ -303,6 +303,10 @@ log_section "Configuring Service in PDB"
 
 confirm_approval_action "Create/start service ${SERVICE_NAME} in PDB ${PDB_ACTUAL_NAME}" "sqlplus -s / as sysdba <DBMS_SERVICE in ${PDB_ACTUAL_NAME}>" || exit 1
 
+# Disable set -e around the call: WHENEVER SQLERROR EXIT makes sqlplus return
+# a non-zero code on any ORA- error, which would otherwise abort the script at
+# this assignment before we can capture and display the actual error.
+set +e
 DEPLOY_RESULT=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -325,6 +329,7 @@ EXIT;
 EOSQL
 )
 DEPLOY_RC=$?
+set -e
 
 echo "$DEPLOY_RESULT" | while IFS= read -r line; do
     [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
@@ -332,6 +337,7 @@ done
 
 if [[ $DEPLOY_RC -ne 0 ]] || echo "$DEPLOY_RESULT" | grep -q "^ORA-"; then
     log_error "Failed to create/configure the service"
+    log_error "SQL output:"
     echo "$DEPLOY_RESULT"
     exit 1
 fi
