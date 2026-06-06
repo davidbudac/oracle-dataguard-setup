@@ -6,6 +6,13 @@
 # Run this script on the PRIMARY database server after
 # Data Guard setup is complete (Step 7 verification passes).
 #
+# Standalone: this script does NOT require the setup-time
+# standby_config_*.env file or the NFS share. It discovers the
+# topology (primary/standby DB_UNIQUE_NAME) from the database
+# itself. The generated SQL is written to the NFS share when one
+# is available, otherwise to the current directory (override with
+# -o/--output).
+#
 # This is the CDB-aware counterpart of create_role_trigger.sh.
 # It manages services that live INSIDE pluggable databases as
 # well as user services at the CDB$ROOT level.
@@ -38,6 +45,42 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 source "${COMMON_DIR}/dg_functions.sh"
 enable_verbose_mode "$@"
 
+usage() {
+    cat <<USAGE
+Usage:
+  bash trigger/create_role_trigger_cdb.sh [options]
+
+Deploys the CDB / PDB-aware role-change service trigger on the PRIMARY of a
+multitenant database. Standalone: no standby_config_*.env file or NFS share
+is required - the topology is discovered from the database itself.
+
+Options:
+  -o, --output FILE   Write the generated SQL to FILE
+                      (default: \${NFS_SHARE}/dg_service_mgr_cdb_<DB>.sql, or
+                      ./dg_service_mgr_cdb_<DB>.sql when NFS is unavailable)
+  -v, --verbose       Verbose output
+  -h, --help          Show this help
+USAGE
+}
+
+# ============================================================
+# Parse Arguments
+# ============================================================
+
+OUTPUT_FILE=""
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -o|--output)  OUTPUT_FILE="$2"; shift 2 ;;
+        -h|--help)    usage; exit 0 ;;
+        # Global flags consumed by enable_verbose_mode - accept as no-ops
+        -v|--verbose|--no-verbose|-a|--approval-mode|--no-approval-mode) shift ;;
+        -s|--suspicious|--no-suspicious|-n|--check|--plan|--execute)     shift ;;
+        -*)           printf "Unknown option: %s\n\n" "$1"; usage; exit 1 ;;
+        *)            printf "Unexpected argument: %s\n\n" "$1"; usage; exit 1 ;;
+    esac
+done
+
 # ============================================================
 # Main Script
 # ============================================================
@@ -54,25 +97,7 @@ init_log "create_role_trigger_cdb"
 log_section "Pre-flight Checks"
 
 check_oracle_env || exit 1
-check_nfs_mount || exit 1
 check_db_connection || exit 1
-
-# ============================================================
-# Load Configuration
-# ============================================================
-
-log_section "Loading Configuration"
-
-# Find standby config file
-if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
-    log_error "Please run the Data Guard setup scripts first (Steps 1-7)"
-    exit 1
-fi
-
-source "$STANDBY_CONFIG_FILE"
-
-# Re-initialize log with DB name
-init_log "create_role_trigger_cdb_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Verify Database Role
@@ -112,6 +137,48 @@ if [[ "$IS_CDB" != "YES" ]]; then
 fi
 
 log_info "Confirmed: Container Database (CDB)"
+
+# ============================================================
+# Discover Topology (standalone - no config file needed)
+# ============================================================
+
+log_section "Discovering Data Guard Topology"
+
+# This script runs on the PRIMARY, so the local DB_UNIQUE_NAME is the
+# primary's. The peer (standby) name comes from V$DATAGUARD_CONFIG and is
+# used only to label the generated SQL file, so it is optional.
+PRIMARY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V$DATABASE;
+EXIT;
+EOSQL
+)
+PRIMARY_DB_UNIQUE_NAME=$(echo "$PRIMARY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+if [[ -z "$PRIMARY_DB_UNIQUE_NAME" ]]; then
+    log_error "Could not determine the primary DB_UNIQUE_NAME from V\$DATABASE"
+    exit 1
+fi
+
+STANDBY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << EOSQL
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG
+WHERE DB_UNIQUE_NAME <> '${PRIMARY_DB_UNIQUE_NAME}' AND ROWNUM = 1;
+EXIT;
+EOSQL
+)
+STANDBY_DB_UNIQUE_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+log_info "Primary DB_UNIQUE_NAME: $PRIMARY_DB_UNIQUE_NAME"
+if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
+    log_info "Standby DB_UNIQUE_NAME: $STANDBY_DB_UNIQUE_NAME"
+else
+    log_warn "No peer found in V\$DATAGUARD_CONFIG - standby will be labelled UNKNOWN in the generated SQL"
+    STANDBY_DB_UNIQUE_NAME="UNKNOWN"
+fi
+
+# Re-initialize log now that the DB name is known
+init_log "create_role_trigger_cdb_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Discover User-Defined Services (per container)
@@ -615,7 +682,16 @@ fi
 
 log_section "Saving Generated SQL"
 
-SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
+# Default the output location to the NFS share when one is available (keeps
+# parity with the config-driven workflow); otherwise fall back to the current
+# directory so the script stays fully standalone. -o/--output overrides both.
+if [[ -n "$OUTPUT_FILE" ]]; then
+    SQL_OUTPUT_FILE="$OUTPUT_FILE"
+elif [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
+fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
