@@ -276,6 +276,45 @@ else
         log_info "Separate SRL directory configured: $STANDBY_SRL_PATH"
     fi
 
+    # ------------------------------------------------------------
+    # Authoritative redo/data coverage from the *_FILE_NAME_CONVERT
+    # pairs.
+    # ------------------------------------------------------------
+    # LOG_FILE_NAME_CONVERT and DB_FILE_NAME_CONVERT hold the EXACT
+    # path prefixes Oracle uses to place the standby's datafiles and
+    # its online + standby redo logs during RMAN DUPLICATE. The
+    # STANDBY_*_PATHS arrays above are derived by token substitution
+    # in step 2, which silently leaves a path unmapped when it does
+    # not contain the DB-name token (common when redo logs live on a
+    # separate mount). Creating the standby side of every convert
+    # pair guarantees the target directories exist regardless of how
+    # they were derived - this is what prevents RMAN DUPLICATE from
+    # failing with ORA-17502 / ORA-19504 on the redo logs.
+    add_convert_standby_dirs() {
+        # $1 = a *_FILE_NAME_CONVERT value: 'pri1','stby1','pri2','stby2'
+        local _convert="$1"
+        [[ -z "$_convert" ]] && return 0
+        local _i=0 _tok
+        # Split on commas, strip the surrounding single quotes. Tokens at
+        # odd indices (0-based) are the standby destinations.
+        while IFS= read -r _tok; do
+            _tok="${_tok#\'}"; _tok="${_tok%\'}"
+            _tok="$(strip_whitespace "$_tok")"
+            if [[ $(( _i % 2 )) -eq 1 && -n "$_tok" ]]; then
+                DIRS_TO_CREATE+=("$_tok")
+            fi
+            _i=$(( _i + 1 ))
+        done <<EOF
+$(printf '%s' "$_convert" | tr ',' '\n')
+EOF
+    }
+    add_convert_standby_dirs "$LOG_FILE_NAME_CONVERT"
+    add_convert_standby_dirs "$DB_FILE_NAME_CONVERT"
+
+    # The standby pfile points control_files at the standby data path,
+    # so ensure that directory is covered even if no convert pair did.
+    [[ -n "${STANDBY_DATA_PATH:-}" ]] && DIRS_TO_CREATE+=("${STANDBY_DATA_PATH}")
+
     # Add archive destination if configured (may be empty if using FRA)
     if [[ -n "$STANDBY_ARCHIVE_DEST" ]]; then
         DIRS_TO_CREATE+=("$STANDBY_ARCHIVE_DEST")
@@ -293,6 +332,26 @@ else
         DIRS_TO_CREATE+=("$STANDBY_FRA_CALC")
     fi
 fi
+
+# Deduplicate. The path arrays and the convert pairs intentionally
+# overlap, and redo vs datafile directories can differ only by a
+# trailing slash ('/x' vs '/x/') while naming the same directory.
+# Collapse both so the approval prompt and creation log list each
+# real directory once.
+DIRS_DEDUPED=()
+_seen_dirs=$'\n'
+for dir in "${DIRS_TO_CREATE[@]}"; do
+    [[ -z "$dir" ]] && continue
+    _key="$dir"
+    # Strip a single trailing slash for comparison, but never reduce "/".
+    [[ "$_key" != "/" ]] && _key="${_key%/}"
+    case "$_seen_dirs" in
+        *$'\n'"$_key"$'\n'*) continue ;;
+    esac
+    _seen_dirs="${_seen_dirs}${_key}"$'\n'
+    DIRS_DEDUPED+=("$dir")
+done
+DIRS_TO_CREATE=( "${DIRS_DEDUPED[@]}" )
 
 DIRS_MISSING=()
 for dir in "${DIRS_TO_CREATE[@]}"; do

@@ -370,6 +370,47 @@ done
 STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
 
 # ============================================================
+# Confirm / repair any path the token substitution could not remap
+# ============================================================
+# The substitution above only rewrites paths that contain the detected
+# DB-name token (PRIMARY_DIR_NAME). Datafiles or - more commonly - redo
+# logs that live on a SEPARATE MOUNT without the token in their path
+# come back unchanged, which silently points the standby at the
+# PRIMARY's directory. That is correct when both hosts share an
+# identical mount layout, but wrong when the standby uses a different
+# path, and it makes RMAN DUPLICATE fail later (ORA-17502 / ORA-19504)
+# because the redo directory never gets created on the standby.
+#
+# Surface each unmapped path and let the operator confirm (accept the
+# identical default) or override it with the correct standby directory.
+# Uses eval-based array indirection for bash 3.2 / AIX compatibility.
+_confirm_unmapped_paths() {
+    # $1 = human label, $2 = primary array name, $3 = standby array name
+    local _label="$1" _pri_arr="$2" _stby_arr="$3"
+    local _n _i=0 _pri _stby _ans
+    eval "_n=\${#${_pri_arr}[@]}"
+    while [[ $_i -lt $_n ]]; do
+        eval "_pri=\${${_pri_arr}[$_i]}"
+        eval "_stby=\${${_stby_arr}[$_i]}"
+        if [[ -n "$_pri" && "$_stby" == "$_pri" ]]; then
+            echo ""
+            log_warn "Standby ${_label} directory could not be auto-derived from: $_pri"
+            echo "  This path does not contain the primary DB-name token"
+            echo "  ('${PRIMARY_DIR_NAME}'), so it was left unchanged. If the standby"
+            echo "  host uses the SAME path, accept the default. If it differs, enter"
+            echo "  the correct standby directory now (RMAN will fail later otherwise)."
+            prompt_with_default "Standby ${_label} directory for '$_pri'" "$_pri" _ans
+            eval "${_stby_arr}[$_i]=\"\$_ans\""
+        fi
+        _i=$(( _i + 1 ))
+    done
+}
+_confirm_unmapped_paths "datafile" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS
+_confirm_unmapped_paths "redo log" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
+STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
+STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
+
+# ============================================================
 # Standby Redo Log (SRL) Path Separation
 # ============================================================
 # By default, SRLs live in the same directory as online redo logs
