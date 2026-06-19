@@ -125,6 +125,8 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 
 ### Unit Tests
 - `tests/test_add_sid_to_listener.sh` - Tests the `add_sid_to_listener()` function
+- `tests/test_file_name_convert.sh` - Tests `DB_FILE_NAME_CONVERT` / `LOG_FILE_NAME_CONVERT` pair generation (multi-directory coverage, dedup)
+- `tests/test_path_token_remap.sh` - Tests step 2's per-path, case-aware, substring-safe DB-name token remapping
 
 ### End-to-End Tests
 - `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator

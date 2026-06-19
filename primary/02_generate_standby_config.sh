@@ -326,55 +326,87 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     log_info "  db_create_file_dest:      $STANDBY_DB_CREATE_FILE_DEST"
     log_info "  db_recovery_file_dest:    $STANDBY_DB_RECOVERY_FILE_DEST"
 else
-# Detect the actual directory-name token used in PRIMARY paths so we
-# can substitute it for STANDBY (case-preserving). The token is
-# usually DB_UNIQUE_NAME but may differ in case ('TESTCDB' vs
-# 'testcdb') or be entirely custom.
+# ============================================================
+# Per-path token remapping (case-aware, substring-safe)
+# ============================================================
+# Primary file directories normally embed the DB-name as a path
+# COMPONENT (e.g. /u01/oradata/DGNONC). The standby equivalent is the
+# same path with that component swapped to the standby DB name.
+#
+# Each path is remapped INDEPENDENTLY: a datafile mount using one case
+# (.../DGNONC) and a redo mount using another (.../dgnonc) both remap
+# correctly. The previous logic detected a single token from the
+# datafile path only and applied it to every path, so a case-mismatched
+# redo path came back unchanged and fell to the operator-confirm step.
+#
+# Replacement is bounded to whole, slash-delimited path components, so a
+# token that also appears as a SUBSTRING of a mount name (e.g. token
+# PROD inside /prod_archive/) is never corrupted - the old unbounded
+# `sed s/tok/rep/g` would have rewritten it.
 DB_UNIQUE_NAME_UPPER=$(echo "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
 DB_UNIQUE_NAME_LOWER=$(echo "$DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+STANDBY_DIR_NAME_UPPER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+STANDBY_DIR_NAME_LOWER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
 
-PRIMARY_DIR_NAME=""
-if echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_UPPER}"; then
-    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_UPPER"
-elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME_LOWER}"; then
-    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME_LOWER"
-elif echo "$PRIMARY_DATA_PATH" | grep -q "/${DB_UNIQUE_NAME}/"; then
-    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
-fi
+# True when $2 occurs as a whole, slash-delimited component of path $1.
+# Wrapping in slashes makes the first/last components match the same
+# `/token/` pattern as interior ones.
+_path_has_component() {
+    case "/$1/" in
+        *"/$2/"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
-if [[ -n "$PRIMARY_DIR_NAME" ]]; then
-    if [[ "$PRIMARY_DIR_NAME" == "$DB_UNIQUE_NAME_UPPER" ]]; then
-        STANDBY_DIR_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+# Echo path $1 with every whole-component occurrence of token $2 swapped
+# to $3. Components are slash-delimited, so a token embedded inside a
+# larger directory name is left untouched. Two sed passes (interior
+# `/tok/`, then a trailing `/tok` at end of string) keep this portable
+# to AIX / bash 3.2 - no GNU regex alternation.
+_replace_path_component() {
+    local _p="$1" _tok="$2" _rep="$3"
+    _p=$(printf '%s' "$_p" | sed "s|/${_tok}/|/${_rep}/|g")
+    _p=$(printf '%s' "$_p" | sed "s|/${_tok}\$|/${_rep}|")
+    printf '%s' "$_p"
+}
+
+# Echo the standby path for a primary path by swapping whichever case
+# variant of DB_UNIQUE_NAME appears as a path component (upper, then
+# lower, then the literal mixed case). A path containing no token
+# variant is echoed unchanged so the operator-confirm step below can
+# surface it instead of silently mis-mapping it.
+remap_path_token() {
+    local _p="$1"
+    if   _path_has_component "$_p" "$DB_UNIQUE_NAME_UPPER"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME_UPPER" "$STANDBY_DIR_NAME_UPPER"
+    elif _path_has_component "$_p" "$DB_UNIQUE_NAME_LOWER"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME_LOWER" "$STANDBY_DIR_NAME_LOWER"
+    elif _path_has_component "$_p" "$DB_UNIQUE_NAME"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"
     else
-        STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
+        printf '%s' "$_p"
     fi
-    log_info "Primary directory token in paths: $PRIMARY_DIR_NAME"
-    log_info "Standby directory token in paths: $STANDBY_DIR_NAME"
-else
-    PRIMARY_DIR_NAME="$DB_UNIQUE_NAME"
-    STANDBY_DIR_NAME="$STANDBY_DB_UNIQUE_NAME"
-    log_warn "Could not detect DB_UNIQUE_NAME token in path - using DB_UNIQUE_NAME literally"
-fi
+}
 
 # Derive matching standby paths for each primary directory.
 STANDBY_DATA_PATHS=()
 for _p in "${PRIMARY_DATA_PATHS[@]}"; do
-    STANDBY_DATA_PATHS+=("$(echo "$_p" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")")
+    STANDBY_DATA_PATHS+=("$(remap_path_token "$_p")")
 done
 STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
 
 STANDBY_REDO_PATHS=()
 for _p in "${PRIMARY_REDO_PATHS[@]}"; do
-    STANDBY_REDO_PATHS+=("$(echo "$_p" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")")
+    STANDBY_REDO_PATHS+=("$(remap_path_token "$_p")")
 done
 STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
 
 # ============================================================
 # Confirm / repair any path the token substitution could not remap
 # ============================================================
-# The substitution above only rewrites paths that contain the detected
-# DB-name token (PRIMARY_DIR_NAME). Datafiles or - more commonly - redo
-# logs that live on a SEPARATE MOUNT without the token in their path
+# The substitution above only rewrites paths that contain a case
+# variant of DB_UNIQUE_NAME as a path component. Datafiles or - more
+# commonly - redo logs that live on a SEPARATE MOUNT without the token
 # come back unchanged, which silently points the standby at the
 # PRIMARY's directory. That is correct when both hosts share an
 # identical mount layout, but wrong when the standby uses a different
@@ -395,9 +427,9 @@ _confirm_unmapped_paths() {
         if [[ -n "$_pri" && "$_stby" == "$_pri" ]]; then
             echo ""
             log_warn "Standby ${_label} directory could not be auto-derived from: $_pri"
-            echo "  This path does not contain the primary DB-name token"
-            echo "  ('${PRIMARY_DIR_NAME}'), so it was left unchanged. If the standby"
-            echo "  host uses the SAME path, accept the default. If it differs, enter"
+            echo "  This path has no '${DB_UNIQUE_NAME}' directory component (in any"
+            echo "  case), so it was left unchanged. If the standby host uses the"
+            echo "  SAME path, accept the default. If it differs, enter"
             echo "  the correct standby directory now (RMAN will fail later otherwise)."
             prompt_with_default "Standby ${_label} directory for '$_pri'" "$_pri" _ans
             eval "${_stby_arr}[$_i]=\"\$_ans\""
@@ -428,11 +460,15 @@ _separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d ' \n\
 
 if [[ "$_separate_srl" == "y" || "$_separate_srl" == "yes" ]]; then
     prompt_with_default "Primary SRL directory" "$PRIMARY_REDO_PATH" PRIMARY_SRL_PATH
-    _stby_srl_default=$(echo "$PRIMARY_SRL_PATH" | sed "s/${PRIMARY_DIR_NAME}/${STANDBY_DIR_NAME}/g")
+    _stby_srl_default=$(remap_path_token "$PRIMARY_SRL_PATH")
     prompt_with_default "Standby SRL directory" "$_stby_srl_default" STANDBY_SRL_PATH
 
-    [[ "$PRIMARY_SRL_PATH" != */ ]] && PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH}/"
-    [[ "$STANDBY_SRL_PATH" != */ ]] && STANDBY_SRL_PATH="${STANDBY_SRL_PATH}/"
+    # Strip any trailing slash so SRL paths follow the same
+    # no-trailing-slash convention as every other directory path.
+    # Step 4 and dg_check_srl.sh re-add the slash when they build a
+    # member filename, and FILE_NAME_CONVERT prefix-matches either way.
+    [[ "$PRIMARY_SRL_PATH" != "/" ]] && PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH%/}"
+    [[ "$STANDBY_SRL_PATH" != "/" ]] && STANDBY_SRL_PATH="${STANDBY_SRL_PATH%/}"
 
     log_info "Primary SRL path: $PRIMARY_SRL_PATH"
     log_info "Standby SRL path: $STANDBY_SRL_PATH"

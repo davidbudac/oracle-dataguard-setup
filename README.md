@@ -157,6 +157,8 @@ dgmgrl / "edit database 'PROD' set state=transport-on"
 ```bash
 # Unit tests
 bash tests/test_add_sid_to_listener.sh
+bash tests/test_file_name_convert.sh
+bash tests/test_path_token_remap.sh
 
 # End-to-end (creates a test DB, runs steps 1-7, validates, cleans up; ~20 min)
 cp tests/e2e/config.env.template tests/e2e/config.env   # then edit

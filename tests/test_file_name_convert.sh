@@ -74,14 +74,19 @@ build_convert_pairs() {
     done
 }
 
-echo "Test 1: single data path (baseline)"
+# NOTE: redo directories now share the no-trailing-slash convention with
+# datafile directories (get_redo_log_paths.sql strips the slash, matching
+# get_datafile_dirs.sql), so a redo dir that names the same directory as a
+# datafile dir collapses to one convert pair instead of two near-duplicates.
+
+echo "Test 1: single data path + redo on a distinct directory"
 PRIMARY_DATA=("/u01/app/oracle/oradata/DGNONC")
 STANDBY_DATA=("/u01/app/oracle/oradata/DGNONC_S")
-PRIMARY_REDO=("/u01/app/oracle/oradata/DGNONC/")
-STANDBY_REDO=("/u01/app/oracle/oradata/DGNONC_S/")
+PRIMARY_REDO=("/u02/redo/DGNONC")
+STANDBY_REDO=("/u02/redo/DGNONC_S")
 build_convert_pairs PRIMARY_DATA[@] STANDBY_DATA[@] PRIMARY_REDO[@] STANDBY_REDO[@]
-assert_eq "single data + matching redo (slash differs)" \
-    "'/u01/app/oracle/oradata/DGNONC','/u01/app/oracle/oradata/DGNONC_S','/u01/app/oracle/oradata/DGNONC/','/u01/app/oracle/oradata/DGNONC_S/'" \
+assert_eq "single data + redo on a separate mount = two pairs" \
+    "'/u01/app/oracle/oradata/DGNONC','/u01/app/oracle/oradata/DGNONC_S','/u02/redo/DGNONC','/u02/redo/DGNONC_S'" \
     "$_convert_pairs"
 
 echo "Test 2: three distinct data paths"
@@ -118,7 +123,11 @@ assert_eq "duplicate pair collapsed to one" \
     "'/u01/oradata/DGNONC','/u01/oradata/DGNONC_S'" \
     "$_convert_pairs"
 
-echo "Test 4: data + redo with overlap and new dirs"
+echo "Test 4: data + redo where one redo dir coincides with a data dir"
+# The first redo directory names the same directory as the first data
+# directory. Under the no-trailing-slash convention the two are now
+# byte-identical, so the dedup collapses them and only the genuinely
+# new redo directory (/u04/redo/DGNONC) adds a pair.
 PRIMARY_DATA=(
     "/u01/oradata/DGNONC"
     "/u02/oradata/DGNONC"
@@ -128,16 +137,16 @@ STANDBY_DATA=(
     "/u02/oradata/DGNONC_S"
 )
 PRIMARY_REDO=(
-    "/u01/oradata/DGNONC/"
-    "/u04/redo/DGNONC/"
+    "/u01/oradata/DGNONC"
+    "/u04/redo/DGNONC"
 )
 STANDBY_REDO=(
-    "/u01/oradata/DGNONC_S/"
-    "/u04/redo/DGNONC_S/"
+    "/u01/oradata/DGNONC_S"
+    "/u04/redo/DGNONC_S"
 )
 build_convert_pairs PRIMARY_DATA[@] STANDBY_DATA[@] PRIMARY_REDO[@] STANDBY_REDO[@]
-assert_eq "data (2) + redo (2 distinct) = 4 pairs" \
-    "'/u01/oradata/DGNONC','/u01/oradata/DGNONC_S','/u02/oradata/DGNONC','/u02/oradata/DGNONC_S','/u01/oradata/DGNONC/','/u01/oradata/DGNONC_S/','/u04/redo/DGNONC/','/u04/redo/DGNONC_S/'" \
+assert_eq "data (2) + redo (1 collapses, 1 new) = 3 pairs" \
+    "'/u01/oradata/DGNONC','/u01/oradata/DGNONC_S','/u02/oradata/DGNONC','/u02/oradata/DGNONC_S','/u04/redo/DGNONC','/u04/redo/DGNONC_S'" \
     "$_convert_pairs"
 
 echo ""
