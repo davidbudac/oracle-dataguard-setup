@@ -25,12 +25,14 @@
 # - Creates trigger TRG_MANAGE_SERVICES_ROLE_CHG (AFTER DB_ROLE_CHANGE)
 # - Creates trigger TRG_MANAGE_SERVICES_STARTUP (AFTER STARTUP)
 #
-# The role-change / startup triggers fire in CDB$ROOT. For each
-# managed service the package switches into the owning PDB
-# (ALTER SESSION SET CONTAINER) before calling DBMS_SERVICE, then
-# returns to CDB$ROOT. Services are STARTED on PRIMARY, STOPPED on
-# STANDBY. Per-service failures (e.g. a PDB only MOUNTED on the
-# standby) are logged to the alert log and never abort the others.
+# The role-change / startup triggers fire in CDB$ROOT. A system
+# trigger cannot switch containers (ORA-65123), so the trigger
+# defers to a one-time Scheduler job that runs in a normal session;
+# that job switches into each owning PDB (ALTER SESSION SET
+# CONTAINER) before calling DBMS_SERVICE, then returns to CDB$ROOT.
+# Services are STARTED on PRIMARY, STOPPED on STANDBY. Per-service
+# failures (e.g. a PDB only MOUNTED on the standby) are logged to
+# the alert log and never abort the others.
 #
 # Objects are created on PRIMARY and replicate to standby via redo.
 # ============================================================
@@ -482,10 +484,20 @@ CREATE OR REPLACE PACKAGE SYS.DG_SERVICE_MGR AS
     -- DG_SERVICE_MGR: Manages database services based on role.
     -- CDB / PDB-aware: switches into the owning container before
     -- starting/stopping each service. Services are started on
-    -- PRIMARY, stopped on STANDBY. Called by database triggers
-    -- on role change and startup.
+    -- PRIMARY, stopped on STANDBY.
+    --
+    -- MANAGE_SERVICES is the trigger entry point: it submits a
+    -- one-time Scheduler job that runs APPLY_SERVICES. The work is
+    -- deferred because a system trigger (AFTER STARTUP /
+    -- AFTER DB_ROLE_CHANGE) runs in a context where ALTER SESSION
+    -- SET CONTAINER is disallowed (ORA-65123). A Scheduler job runs
+    -- in a normal session, where the container switch is permitted.
+    --
+    -- APPLY_SERVICES does the actual work and can be run directly
+    -- for manual testing: EXEC SYS.DG_SERVICE_MGR.APPLY_SERVICES;
     -- --------------------------------------------------------
     PROCEDURE MANAGE_SERVICES;
+    PROCEDURE APPLY_SERVICES;
 END DG_SERVICE_MGR;
 /
 
@@ -538,7 +550,8 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     -- --------------------------------------------------------
     -- manage_one: start/stop a single service in its container.
     -- For PDB services, switches container, acts, then returns
-    -- to CDB\$ROOT. Failures are logged, never raised.
+    -- to CDB\$ROOT. Idempotent (checks current state first); any
+    -- failure is logged, never raised.
     -- --------------------------------------------------------
     PROCEDURE manage_one(
         p_pdb   IN VARCHAR2,
@@ -547,21 +560,24 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     ) IS
         l_action VARCHAR2(10) := CASE WHEN p_start THEN 'START' ELSE 'STOP' END;
         l_label  VARCHAR2(200) := NVL(p_pdb, 'CDB\$ROOT') || '.' || p_svc;
+        l_active NUMBER;
     BEGIN
         IF p_pdb IS NULL OR UPPER(p_pdb) = 'CDB\$ROOT' THEN
             -- Root-level service: act in the current (root) container.
-            IF p_start THEN
+            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+            IF p_start AND l_active = 0 THEN
                 DBMS_SERVICE.START_SERVICE(p_svc);
-            ELSE
+            ELSIF NOT p_start AND l_active > 0 THEN
                 DBMS_SERVICE.STOP_SERVICE(p_svc);
             END IF;
         ELSE
             -- PDB service: switch in, act, switch back.
             EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = "' || p_pdb || '"';
             BEGIN
-                IF p_start THEN
+                SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+                IF p_start AND l_active = 0 THEN
                     DBMS_SERVICE.START_SERVICE(p_svc);
-                ELSE
+                ELSIF NOT p_start AND l_active > 0 THEN
                     DBMS_SERVICE.STOP_SERVICE(p_svc);
                 END IF;
             EXCEPTION
@@ -582,9 +598,12 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     END manage_one;
 
     -- --------------------------------------------------------
-    -- MANAGE_SERVICES: Start or stop services based on role
+    -- APPLY_SERVICES: the worker. Reads the current role and
+    -- starts (PRIMARY) or stops (STANDBY) every managed service.
+    -- Runs from a Scheduler job (a normal session) so the per-PDB
+    -- ALTER SESSION SET CONTAINER is permitted. Safe to run by hand.
     -- --------------------------------------------------------
-    PROCEDURE MANAGE_SERVICES IS
+    PROCEDURE APPLY_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
         l_start    BOOLEAN;
@@ -596,6 +615,27 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         FOR i IN 1..l_services.COUNT LOOP
             manage_one(l_services(i).pdb, l_services(i).svc, l_start);
         END LOOP;
+    END APPLY_SERVICES;
+
+    -- --------------------------------------------------------
+    -- MANAGE_SERVICES: trigger entry point. A system trigger
+    -- cannot switch containers (ORA-65123), so it defers to a
+    -- one-time auto-drop Scheduler job that runs APPLY_SERVICES
+    -- in a normal session.
+    -- --------------------------------------------------------
+    PROCEDURE MANAGE_SERVICES IS
+    BEGIN
+        DBMS_SCHEDULER.CREATE_JOB(
+            job_name   => DBMS_SCHEDULER.GENERATE_JOB_NAME('DG_SVC_MGR_'),
+            job_type   => 'PLSQL_BLOCK',
+            job_action => 'BEGIN SYS.DG_SERVICE_MGR.APPLY_SERVICES; END;',
+            start_date => SYSTIMESTAMP,
+            enabled    => TRUE,
+            auto_drop  => TRUE,
+            comments   => 'DG role-aware service management (deferred from trigger)');
+    EXCEPTION
+        WHEN OTHERS THEN
+            log_service_issue('SCHEDULE', 'DG_SERVICE_MGR', SQLERRM);
     END MANAGE_SERVICES;
 
 END DG_SERVICE_MGR;
@@ -711,7 +751,8 @@ cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 
 -- Package Specification
 CREATE OR REPLACE PACKAGE SYS.DG_SERVICE_MGR AS
-    PROCEDURE MANAGE_SERVICES;
+    PROCEDURE MANAGE_SERVICES;   -- trigger entry: defers to a Scheduler job
+    PROCEDURE APPLY_SERVICES;    -- worker: starts/stops services by role
 END DG_SERVICE_MGR;
 /
 
@@ -753,19 +794,22 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     ) IS
         l_action VARCHAR2(10) := CASE WHEN p_start THEN 'START' ELSE 'STOP' END;
         l_label  VARCHAR2(200) := NVL(p_pdb, 'CDB\$ROOT') || '.' || p_svc;
+        l_active NUMBER;
     BEGIN
         IF p_pdb IS NULL OR UPPER(p_pdb) = 'CDB\$ROOT' THEN
-            IF p_start THEN
+            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+            IF p_start AND l_active = 0 THEN
                 DBMS_SERVICE.START_SERVICE(p_svc);
-            ELSE
+            ELSIF NOT p_start AND l_active > 0 THEN
                 DBMS_SERVICE.STOP_SERVICE(p_svc);
             END IF;
         ELSE
             EXECUTE IMMEDIATE 'ALTER SESSION SET CONTAINER = "' || p_pdb || '"';
             BEGIN
-                IF p_start THEN
+                SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+                IF p_start AND l_active = 0 THEN
                     DBMS_SERVICE.START_SERVICE(p_svc);
-                ELSE
+                ELSIF NOT p_start AND l_active > 0 THEN
                     DBMS_SERVICE.STOP_SERVICE(p_svc);
                 END IF;
             EXCEPTION
@@ -784,7 +828,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
             log_service_issue(l_action, l_label, SQLERRM);
     END manage_one;
 
-    PROCEDURE MANAGE_SERVICES IS
+    -- Worker: starts/stops every managed service based on role.
+    -- Runs from a Scheduler job (a normal session) so SET CONTAINER
+    -- is permitted; also safe to run by hand for testing.
+    PROCEDURE APPLY_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
         l_start    BOOLEAN;
@@ -796,6 +843,23 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         FOR i IN 1..l_services.COUNT LOOP
             manage_one(l_services(i).pdb, l_services(i).svc, l_start);
         END LOOP;
+    END APPLY_SERVICES;
+
+    -- Trigger entry point: a system trigger cannot switch containers
+    -- (ORA-65123), so defer the work to a one-time Scheduler job.
+    PROCEDURE MANAGE_SERVICES IS
+    BEGIN
+        DBMS_SCHEDULER.CREATE_JOB(
+            job_name   => DBMS_SCHEDULER.GENERATE_JOB_NAME('DG_SVC_MGR_'),
+            job_type   => 'PLSQL_BLOCK',
+            job_action => 'BEGIN SYS.DG_SERVICE_MGR.APPLY_SERVICES; END;',
+            start_date => SYSTIMESTAMP,
+            enabled    => TRUE,
+            auto_drop  => TRUE,
+            comments   => 'DG role-aware service management (deferred from trigger)');
+    EXCEPTION
+        WHEN OTHERS THEN
+            log_service_issue('SCHEDULE', 'DG_SERVICE_MGR', SQLERRM);
     END MANAGE_SERVICES;
 
 END DG_SERVICE_MGR;
@@ -854,7 +918,10 @@ echo "  - On switchover/failover: trigger fires and starts/stops services"
 echo "  - On database startup: trigger fires and starts/stops services"
 echo "  - PRIMARY role: services are STARTED"
 echo "  - STANDBY role: services are STOPPED"
-echo "  - PDB services: the package switches into the owning container"
+echo "  - The trigger does not act directly: a system trigger cannot switch"
+echo "    containers (ORA-65123), so MANAGE_SERVICES submits a one-time"
+echo "    Scheduler job (DG_SVC_MGR_*) that runs APPLY_SERVICES moments later."
+echo "  - PDB services: APPLY_SERVICES switches into the owning container"
 echo "    (ALTER SESSION SET CONTAINER) before start/stop, then returns"
 echo "    to CDB\$ROOT. Per-service failures are written to the alert log."
 echo ""
@@ -884,6 +951,9 @@ echo ""
 echo "TEST MANUALLY"
 echo "============="
 echo ""
+echo "    -- Run the worker directly (synchronous; SET CONTAINER allowed here):"
+echo "    EXEC SYS.DG_SERVICE_MGR.APPLY_SERVICES;"
+echo "    -- Or exercise the trigger path (asynchronous via a Scheduler job):"
 echo "    EXEC SYS.DG_SERVICE_MGR.MANAGE_SERVICES;"
 echo "    -- Check per container, e.g.:"
 echo "    ALTER SESSION SET CONTAINER = <PDB>;"
