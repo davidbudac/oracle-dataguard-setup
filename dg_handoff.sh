@@ -81,7 +81,10 @@ command -v sqlplus >/dev/null || die "sqlplus not on PATH ($ORACLE_HOME/bin/sqlp
 run_sql() {
     # Pipe SQL to sqlplus / as sysdba and strip whitespace from each line
     local sql="$1"
-    sqlplus -s -L / as sysdba <<EOF 2>/dev/null
+    # Heredoc supplies stdin (no terminal-hang risk). Do not discard stderr:
+    # WHENEVER SQLERROR EXIT 1 keeps it silent when healthy, so any ORA- error
+    # is surfaced rather than swallowed into a blank field in the report.
+    sqlplus -s -L / as sysdba <<EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 WHENEVER SQLERROR EXIT 1
 ${sql}

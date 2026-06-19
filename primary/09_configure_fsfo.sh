@@ -125,7 +125,9 @@ progress_step "Checking Synchronization Status"
 
 log_info "Querying transport and apply lag..."
 
-SYNC_STATUS=$(run_sql_query "check_sync_status.sql" 2>/dev/null || true)
+# Keep stderr visible: $(...) captures only stdout, so a missing-script
+# (SP2-0310) or ORA- error surfaces instead of an empty result.
+SYNC_STATUS=$(run_sql_query "check_sync_status.sql" || true)
 
 if [[ -z "$SYNC_STATUS" ]]; then
     log_warn "Could not query synchronization status"

@@ -190,7 +190,11 @@ log_section "Discovering User-Defined Services"
 
 log_info "Querying active services across all containers (excluding system services)..."
 
-SERVICE_OUTPUT=$(run_sql_query "get_user_services_cdb.sql" 2>/dev/null || true)
+# Do NOT discard stderr here: command substitution already captures stdout
+# (the parsed CONTAINER|SERVICE rows), so letting stderr through surfaces any
+# SP2-0310 (missing script) / ORA- error on the terminal instead of hiding it
+# behind a silent, empty result.
+SERVICE_OUTPUT=$(run_sql_query "get_user_services_cdb.sql" || true)
 
 # Parse "CONTAINER|SERVICE" pairs into two parallel arrays.
 # (AIX-compatible: no associative arrays.)

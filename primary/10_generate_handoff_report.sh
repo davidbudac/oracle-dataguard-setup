@@ -163,7 +163,9 @@ PORT="${PRIMARY_LISTENER_PORT:-${STANDBY_LISTENER_PORT:-1521}}"
 # ---- Discover user-visible services ----
 progress_step "Discovering User Services"
 
-SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" 2>/dev/null || true)
+# Keep stderr visible: $(...) captures only stdout (the service names), so a
+# missing-script (SP2-0310) or ORA- error surfaces instead of an empty result.
+SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" || true)
 SERVICE_LIST=()
 while IFS= read -r line; do
     line=$(clean_field "$line")

@@ -153,7 +153,9 @@ EOF
 # run_sql_script <sid> <script-path>
 run_sql_script() {
     local sid="$1"; local path="$2"
-    ORACLE_SID="$sid" sqlplus -s -L / as sysdba @"$path"
+    # </dev/null: if the script errors before EXIT, sqlplus must get EOF and
+    # exit rather than fall through to its SQL> prompt and hang on the terminal.
+    ORACLE_SID="$sid" sqlplus -s -L / as sysdba @"$path" </dev/null
 }
 
 # Run a one-line scalar query and trim whitespace

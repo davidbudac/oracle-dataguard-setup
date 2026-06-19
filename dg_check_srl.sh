@@ -82,7 +82,10 @@ command -v sqlplus >/dev/null || die "sqlplus not on PATH."
 run_sql() {
     # $1 = connect string, $2 = SQL text
     local cs="$1" sql="$2"
-    sqlplus -s -L "$cs" <<EOF 2>/dev/null
+    # Heredoc supplies stdin and -L avoids reconnect prompts (no hang risk).
+    # Do not discard stderr: WHENEVER SQLERROR EXIT 1 keeps it silent when
+    # healthy, so any connection/ORA- error is surfaced rather than swallowed.
+    sqlplus -s -L "$cs" <<EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 WHENEVER SQLERROR EXIT 1
 ${sql}

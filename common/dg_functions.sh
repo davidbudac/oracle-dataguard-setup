@@ -450,7 +450,7 @@ check_db_connection() {
     log_info "Checking database connection..."
 
     local result
-    result=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/check_connection.sql")
+    result=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/check_connection.sql" </dev/null)
 
     if echo "$result" | grep -q "CONNECTED"; then
         log_info "Successfully connected to database"
@@ -472,7 +472,7 @@ run_sql_script() {
     local script="$1"
     shift
     confirm_approval_action "Run SQL script" "sqlplus -s / as sysdba @$script $(shell_join "$@")" || return 1
-    sqlplus -s / as sysdba @"$script" "$@"
+    sqlplus -s / as sysdba @"$script" "$@" </dev/null
 }
 
 # Run a SQL query script and return clean output
@@ -481,7 +481,11 @@ run_sql_script() {
 run_sql_query() {
     local script_name="$1"
     shift
-    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@"
+    # Redirect stdin from /dev/null: these query scripts are non-interactive,
+    # so if sqlplus ever falls through to its SQL> prompt (e.g. SP2-0310 when
+    # the script file is missing, or a statement that errors before EXIT) it
+    # gets EOF and exits instead of blocking forever reading the terminal.
+    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
 }
 
 # Run a SQL command script
@@ -491,7 +495,7 @@ run_sql_command() {
     local script_name="$1"
     shift
     confirm_approval_action "Run SQL command script" "sqlplus -s / as sysdba @${SQL_DIR}/commands/${script_name} $(shell_join "$@")" || return 1
-    sqlplus -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@"
+    sqlplus -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@" </dev/null
 }
 
 # Run a SQL query script with headers (for display)
@@ -499,7 +503,7 @@ run_sql_command() {
 run_sql_display() {
     local script_name="$1"
     shift
-    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@"
+    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
 }
 
 # Get a database parameter value
@@ -665,7 +669,10 @@ verify_sys_password() {
 
     local result
     pause_verbose_trace
-    result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" @"${SQL_DIR}/queries/check_connection.sql" 2>&1)
+    # </dev/null so a bad password makes sqlplus exit on EOF rather than
+    # re-prompting for credentials and hanging on the terminal. 2>&1 is kept
+    # deliberately: the connection test inspects the error text in $result.
+    result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" @"${SQL_DIR}/queries/check_connection.sql" 2>&1 </dev/null)
     local rc=$?
     resume_verbose_trace
 

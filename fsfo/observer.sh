@@ -522,7 +522,9 @@ do_status() {
     echo "Database Observer Info"
     echo "----------------------"
     if [[ -n "$ORACLE_SID" && -x "$ORACLE_HOME/bin/sqlplus" ]]; then
-        FSFO_INFO=$(run_sql_query "get_fsfo_status.sql" 2>/dev/null || true)
+        # Keep stderr visible: $(...) captures only stdout, so a missing-script
+        # (SP2-0310) or ORA- error surfaces instead of an empty result.
+        FSFO_INFO=$(run_sql_query "get_fsfo_status.sql" || true)
     else
         FSFO_INFO=""
     fi

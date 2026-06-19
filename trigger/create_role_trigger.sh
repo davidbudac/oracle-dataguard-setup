@@ -87,7 +87,10 @@ log_section "Discovering User-Defined Services"
 
 log_info "Querying active services (excluding system services)..."
 
-SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" 2>/dev/null || true)
+# Keep stderr visible: $(...) captures only stdout (the service names), so a
+# missing-script (SP2-0310) or ORA- error now shows on the terminal instead of
+# being silently swallowed into an empty result.
+SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" || true)
 
 # Parse services into an array
 SERVICE_LIST=()
