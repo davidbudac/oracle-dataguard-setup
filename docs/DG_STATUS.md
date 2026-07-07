@@ -13,6 +13,10 @@ bash dg_status.sh -s cdb1
 
 # Custom SSH config
 bash dg_status.sh -c /path/to/config.env
+
+# Disable colored output (for logs/pipes; NO_COLOR is also honored,
+# and color is off automatically when stdout is not a terminal)
+bash dg_status.sh --no-color
 ```
 
 ## What It Checks
@@ -109,9 +113,31 @@ The Oracle SID is resolved in this order:
 
 The standby SID is always auto-detected from its own pmon process (it may differ from the primary SID).
 
-## Exit Code
+## Exit Codes
 
-The script always exits with 0. It is an informational tool -- the colour-coded indicators in the output show what needs attention.
+Monitoring-friendly, matching `dg_triage_sid.sh` / `dg_diag_sid.sh`:
+
+- `0` -- healthy (no errors, no warnings)
+- `1` -- warnings only
+- `2` -- one or more errors (including an unreachable host)
+
+This lets cron/monitoring wrappers alert on the exit status instead of scraping the text output.
+
+## Thresholds
+
+The warning/critical cutoffs are env-overridable (defaults shown):
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `DG_FRA_WARN_PCT` | `80` | FRA usage % that triggers a warning |
+| `DG_FRA_CRIT_PCT` | `90` | FRA usage % that triggers an error |
+| `DG_SEQ_GAP_WARN` | `1` | Archived-sequence lag (sequences) above which to warn |
+| `DG_SEQ_GAP_CRIT` | `5` | Archived-sequence lag above which to flag an error |
+| `DG_LAG_WARN_SECONDS` | `60` | Transport/apply lag (seconds, parsed from `+DD HH:MM:SS`) above which to warn |
+
+Example: `DG_FRA_WARN_PCT=70 DG_LAG_WARN_SECONDS=30 bash dg_status.sh`
+
+These same variables are honored by `dg_triage_sid.sh` and `dg_diag_sid.sh` (shared via `common/dg_render_common.sh`).
 
 ## How It Works
 

@@ -361,10 +361,15 @@ if [[ "$CURRENT_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then
     log_info "Protection mode is already MAXIMUM AVAILABILITY"
 else
     log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY"
-    DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl" 2>&1)
-    DGMGRL_RC=$?
+    if ! DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl" 2>&1); then
+        log_error "DGMGRL command failed:"
+        echo ""
+        echo "$DGMGRL_OUTPUT"
+        echo ""
+        exit 1
+    fi
 
-    if [[ $DGMGRL_RC -ne 0 ]] || echo "$DGMGRL_OUTPUT" | grep -qi "error\|ORA-"; then
+    if echo "$DGMGRL_OUTPUT" | grep -qiE "error|ORA-"; then
         log_error "DGMGRL command failed:"
         echo ""
         echo "$DGMGRL_OUTPUT"
@@ -411,7 +416,7 @@ progress_step "Enabling Fast-Start Failover"
 log_cmd "dgmgrl / :" "ENABLE FAST_START FAILOVER"
 ENABLE_RESULT=$(run_dgmgrl "enable_fsfo.dgmgrl" 2>&1 || true)
 
-if echo "$ENABLE_RESULT" | grep -qi "error\|fail"; then
+if echo "$ENABLE_RESULT" | grep -qiE "error|fail"; then
     log_error "Failed to enable Fast-Start Failover"
     echo ""
     echo "$ENABLE_RESULT"
@@ -435,9 +440,13 @@ if [[ -f "$NFS_ORAPW_FILE" ]]; then
 else
     if [[ -f "$ORAPW_FILE" ]]; then
         log_info "Copying password file to NFS share..."
-        confirm_approval_action "Copy primary password file for observer" "cp $ORAPW_FILE $NFS_ORAPW_FILE && chmod 640 $NFS_ORAPW_FILE" || exit 1
+        # chmod 600 (owner-only): this file contains the SYS password hash
+        # and the share is group-readable, so don't leave it group-readable
+        # too. Run common/cleanup_nfs_artifacts.sh once the observer is
+        # configured to remove it from the share entirely.
+        confirm_approval_action "Copy primary password file for observer" "cp $ORAPW_FILE $NFS_ORAPW_FILE && chmod 600 $NFS_ORAPW_FILE" || exit 1
         cp "$ORAPW_FILE" "$NFS_ORAPW_FILE"
-        chmod 640 "$NFS_ORAPW_FILE"
+        chmod 600 "$NFS_ORAPW_FILE"
         log_info "Password file copied to: $NFS_ORAPW_FILE"
     else
         log_warn "Password file not found: $ORAPW_FILE"

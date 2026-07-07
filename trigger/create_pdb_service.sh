@@ -119,10 +119,11 @@ if [[ -z "$PDB_NAME" ]] || [[ -z "$SERVICE_NAME" ]]; then
     exit 1
 fi
 
-# Service names: letters, numbers, underscore, dot, dollar
-if ! echo "$SERVICE_NAME" | grep -q '^[A-Za-z0-9_.$]*$'; then
+# Service names: must start with a letter; letters, numbers, underscore,
+# dot, dollar thereafter
+if ! echo "$SERVICE_NAME" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
     log_error "Invalid service name: $SERVICE_NAME"
-    log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
     exit 1
 fi
 if [[ ${#SERVICE_NAME} -gt 64 ]]; then
@@ -130,9 +131,11 @@ if [[ ${#SERVICE_NAME} -gt 64 ]]; then
     exit 1
 fi
 
-# Container names: letters, numbers, underscore, dollar, hash
-if ! echo "$PDB_NAME" | grep -q '^[A-Za-z0-9_$#]*$'; then
+# Container/PDB names: must start with a letter; letters, numbers,
+# underscore, dot, dollar thereafter (e.g. CDB$ROOT)
+if ! echo "$PDB_NAME" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
     log_error "Invalid PDB name: $PDB_NAME"
+    log_error "PDB names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
     exit 1
 fi
 

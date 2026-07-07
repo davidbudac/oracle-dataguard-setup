@@ -20,7 +20,11 @@ done
 
 # Configuration
 NFS_SHARE_PATH="/OINSTALL/_dataguard_setup"
-NFS_EXPORT_OPTIONS="rw,sync,no_subtree_check,no_root_squash"
+# no_root_squash intentionally NOT used: everything in this workflow runs
+# as the oracle OS user (never root), so root on a client gains nothing
+# from squashing being disabled, and leaving it enabled (the default)
+# keeps root-owned writes mapped down to the anonymous user.
+NFS_EXPORT_OPTIONS="rw,sync,no_subtree_check"
 
 # Colors for output
 RED='\033[0;31m'
@@ -73,8 +77,23 @@ if [ -z "$PRIMARY_HOST" ] || [ -z "$STANDBY_HOST" ]; then
 fi
 
 echo ""
+echo "Enter the OS user:group that should own the NFS share."
+echo "This is normally the Oracle software owner (oracle:oinstall). Its"
+echo "UID and GID must be identical on this server and on both DB hosts -"
+echo "NFS maps ownership by numeric UID/GID, not by name, so a mismatch"
+echo "means the oracle user on a DB host will not be able to read/write"
+echo "files another host wrote even though the names match."
+echo ""
+
+DEFAULT_NFS_OWNER="oracle:oinstall"
+printf "Owner user:group for the NFS share [%s]: " "$DEFAULT_NFS_OWNER"
+read -r NFS_OWNER
+NFS_OWNER="${NFS_OWNER:-$DEFAULT_NFS_OWNER}"
+
+echo ""
 log_info "NFS share path: $NFS_SHARE_PATH"
 log_info "Allowed hosts: $PRIMARY_HOST, $STANDBY_HOST"
+log_info "Share owner: $NFS_OWNER"
 echo ""
 
 # ============================================================
@@ -106,12 +125,21 @@ log_info "Creating NFS share directory: $NFS_SHARE_PATH"
 mkdir -p "$NFS_SHARE_PATH"
 mkdir -p "$NFS_SHARE_PATH/logs"
 
-# Set permissions (oracle user typically has UID 54321)
-# Adjust ownership as needed for your environment
-chmod 775 "$NFS_SHARE_PATH"
-chmod 775 "$NFS_SHARE_PATH/logs"
+# Set ownership and permissions. The share carries password file copies
+# and other Data Guard setup artifacts, so it is owned exclusively by the
+# Oracle software owner and not group/world-writable or -readable.
+if chown "$NFS_OWNER" "$NFS_SHARE_PATH" "$NFS_SHARE_PATH/logs" 2>/dev/null; then
+    log_info "Ownership set to $NFS_OWNER"
+else
+    log_warn "Could not chown $NFS_SHARE_PATH to $NFS_OWNER"
+    log_warn "The '$NFS_OWNER' user/group may not exist on this host - create it (matching the"
+    log_warn "UID/GID used on the DB hosts) or chown the share manually before continuing."
+fi
 
-log_info "Directory created with permissions 775"
+chmod 750 "$NFS_SHARE_PATH"
+chmod 750 "$NFS_SHARE_PATH/logs"
+
+log_info "Directory created with owner $NFS_OWNER and permissions 750"
 
 # ============================================================
 # Configure /etc/exports
@@ -222,6 +250,7 @@ echo "     SUCCESS: NFS Server Setup Complete"
 echo "============================================================"
 echo ""
 echo "NFS Share: $NFS_SHARE_PATH"
+echo "Owner: $NFS_OWNER (permissions 750)"
 echo "Allowed hosts: $PRIMARY_HOST, $STANDBY_HOST"
 echo ""
 echo "NEXT STEPS:"

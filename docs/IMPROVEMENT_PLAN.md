@@ -4,11 +4,22 @@ Findings from a full repo review (2026-07). Organized into workstreams ordered b
 
 Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1 and WS2 are independent of each other internally and can be done in any order within the workstream.
 
+## Implementation status (2026-07-07)
+
+Headings are marked ✅ (implemented) or ⏭️ (deliberately skipped). Summary:
+
+- **Implemented:** all of WS1 (1.1–1.8), WS2 (2.1–2.6), WS3 (3.1–3.4), WS4.1–4.6, WS4.8, WS5, and WS6.1 (four new unit-test suites in `tests/`).
+- **⏭️ 4.7 JSON output mode:** deferred — the plan itself says "discuss before building".
+- **⏭️ 6.2–6.4 E2E additions (switchover assertion, observer lifecycle, CDB trigger coverage):** skipped at the user's request ("skip the e2e tests for now"). WS1.8's observer-grep fix (a prerequisite for 6.3) *is* in.
+- **Verification performed:** all `tests/test_*.sh` pass; `bash -n` clean on every `*.sh` in the repo; static scan confirms no password-bearing process argv, no `grep -P`, no `\s`/`\|` grep patterns, no `((VAR++))` (the latter three enforced by the new `tests/test_grep_portability.sh` / `tests/test_counter_increment.sh` sweeps).
+- **Verification still outstanding:** full E2E runs (non-CDB + CDB), the AIX spot checks (need the real box), live NFS permission checks, and a live `ps -ef` scan during clone/diag — see "Verification (overall)" below.
+- Extras done during the sweep (beyond the itemized plan): same-class grep/portability fixes in `migrate_noncdb_to_pdb/`, `tests/e2e/run_e2e_test_cdb.sh`, and `dg_check_srl.sh` (including its password-on-argv); `nfs/02_mount_nfs_client.sh` no longer re-widens the share to 775.
+
 ---
 
 ## Workstream 1 — Critical bug fixes
 
-### 1.1 Add `WHENEVER SQLERROR EXIT` to all SQL command scripts
+### ✅ 1.1 Add `WHENEVER SQLERROR EXIT` to all SQL command scripts
 
 **Problem:** No script in `sql/commands/` sets `WHENEVER SQLERROR EXIT SQL.SQLCODE`, so sqlplus exits 0 even when a statement raises ORA-. `run_sql_command`/`run_sql_script` in `common/dg_functions.sh` report success on failed `MOUNT STANDBY DATABASE`, `ADD STANDBY LOGFILE`, `ALTER SYSTEM SET`, `ALTER DATABASE FORCE LOGGING`, etc. `set -e` and the ERR trap never fire on SQL failure — steps silently continue half-done.
 
@@ -23,7 +34,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** unit-style test: run a command script against a deliberately failing statement (e.g. bad parameter name) and assert non-zero sqlplus exit. Then full E2E (`bash tests/e2e/run_e2e_test.sh`).
 
-### 1.2 Fix `((VAR++))` aborts under `set -e` in the verifier
+### ✅ 1.2 Fix `((VAR++))` aborts under `set -e` in the verifier
 
 **Problem:** `standby/07_verify_dataguard.sh` lines 134, 142, 159, 177, 201, 232, 240, 297, 323 use `((ERRORS++))`/`((WARNINGS++))`. `((x++))` returns status 1 when x is 0, so under `set -e` + ERR trap the *first* recorded problem kills the whole health check instead of tallying.
 
@@ -31,7 +42,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** run step 7 against a config with a known warning (e.g. flashback off) and confirm the full report prints with the summary tally.
 
-### 1.3 Fix AIX `df` column parsing in step 3
+### ✅ 1.3 Fix AIX `df` column parsing in step 3
 
 **Problem:** `standby/03_setup_standby_env.sh:93,160` parse free space with `df -k ... | awk '{print $4}'`. On AIX 7.2, `df -k` field 4 is `%Used` (free KB is field 3), so `AVAILABLE_SPACE_KB` becomes e.g. `50%` and the arithmetic aborts the script. (The filesystem detection two lines up already uses `df -P` correctly.)
 
@@ -39,7 +50,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** on Linux, confirm identical values before/after; sanity-check `df -Pk` output columns on the real AIX box.
 
-### 1.4 Step 8 hardening: propagate the new password file to the standby
+### ✅ 1.4 Step 8 hardening: propagate the new password file to the standby
 
 **Problem:** `primary/08_security_hardening.sh:149-170` randomizes the SYS password but never copies the regenerated `orapw<SID>` to the standby. In 19c redo transport authenticates via the password file → ORA-16191 / transport failure on next reconnect or restart. It also silently makes a future re-clone (step 5) impossible.
 
@@ -50,7 +61,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** E2E: run step 8, restart transport (defer/enable via DGMGRL), confirm no ORA-16191 and logs still ship.
 
-### 1.5 Replace AIX-missing `base64`/`head -c` in password generation
+### ✅ 1.5 Replace AIX-missing `base64`/`head -c` in password generation
 
 **Problem:** `primary/08_security_hardening.sh:149`: `dd ... | base64 | ... | head -c 32`. AIX 7.2 base install has no `base64`, and AIX `head` has no `-c`.
 
@@ -58,7 +69,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** run the generator snippet standalone on Linux; check `command -v base64 head cut od` expectations on the AIX box.
 
-### 1.6 Fix AIX-incompatible grep patterns in the status/diag stack
+### ✅ 1.6 Fix AIX-incompatible grep patterns in the status/diag stack
 
 **Problem:**
 - `\|` alternation in BRE (GNU extension, literal on AIX): `dg_status.sh:727`, `common/dg_local_status_common.sh:931`, `common/setup_dg_wallet.sh:142`. Broker-not-configured detection never fires on AIX.
@@ -68,7 +79,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** unit test the specific patterns against captured DGMGRL output samples (both "configured" and "ORA-16532" cases); confirm identical behavior on Linux.
 
-### 1.7 Harden SID auto-detection and add SSH failure detection in `dg_status.sh`
+### ✅ 1.7 Harden SID auto-detection and add SSH failure detection in `dg_status.sh`
 
 **Problem:** `dg_status.sh:242-252`:
 - `grep ora_pmon_` matches `ora_pmon_+ASM`; `head -1` may pick it.
@@ -82,7 +93,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** run against config with a bogus standby host → expect explicit UNREACHABLE + non-zero errors; run normal case unchanged.
 
-### 1.8 Fix case-sensitive observer greps in E2E
+### ✅ 1.8 Fix case-sensitive observer greps in E2E
 
 **Problem:** `tests/e2e/run_e2e_test.sh:422` (`pkill -f 'dgmgrl.*observer'`) and `:1255` (`grep -q 'dgmgrl.*observer'`) never match the real process (`dgmgrl /@... "START OBSERVER"`). Cleanup leaves zombie observers; the running-assertion can only fail. Masked because `SKIP_OBSERVER` defaults `true`.
 
@@ -94,7 +105,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 ## Workstream 2 — Robustness
 
-### 2.1 Remove dead `$?` error handlers under `set -e`
+### ✅ 2.1 Remove dead `$?` error handlers under `set -e`
 
 **Problem:** With `set -e`, a failing bare command aborts before the following `if [[ $? -ne 0 ]]` runs — the hand-written error messages are dead code:
 - `primary/09_configure_fsfo.sh:364-365` (`DGMGRL_OUTPUT=$(run_dgmgrl ...)` then `$?` check)
@@ -105,7 +116,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** force a dgmgrl failure (bad credentials) and confirm the tailored message now appears instead of the raw ERR-trap line.
 
-### 2.2 Observer pidfile validation
+### ✅ 2.2 Observer pidfile validation
 
 **Problem:** `fsfo/observer.sh:73-81` trusts the PID from the NFS pidfile with only `kill -0`. After a reboot, a recycled PID belonging to an unrelated process makes `status` report running, `start` refuse, and `stop` kill the wrong process.
 
@@ -113,7 +124,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** write a pidfile with the PID of a live non-dgmgrl process; `observer.sh status` must report NOT RUNNING and clean the stale file; `start` must proceed.
 
-### 2.3 Safe wallet recreation (copy-then-replace)
+### ✅ 2.3 Safe wallet recreation (copy-then-replace)
 
 **Problem:**
 - `fsfo/observer.sh:139-142`: `backup_directory` *moves* the live wallet away before `mkstore -create`; if creation fails, no working wallet remains.
@@ -123,7 +134,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** simulate mkstore failure (bad wallet password on an existing wallet) and confirm the original wallet is untouched.
 
-### 2.4 Degrade gracefully in `dg_handoff.sh`
+### ✅ 2.4 Degrade gracefully in `dg_handoff.sh`
 
 **Problem:** `set -e` (line 25) + `WHENEVER SQLERROR EXIT 1` (lines 87-92) on ~15 `VAR=$(run_sql …)` assignments — one transient ORA- error kills the whole report.
 
@@ -131,7 +142,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** run with broker down (`SHOW DATABASE VERBOSE` failing) — report should still emit TNS/JDBC sections using the `--*-host` fallbacks with a warning.
 
-### 2.5 Remote timeout without GNU `timeout`
+### ✅ 2.5 Remote timeout without GNU `timeout`
 
 **Problem:** `common/dg_local_status_common.sh:340-351` falls back to no timeout when `timeout` is absent (AIX default), so the wallet probe at `:418` can hang for the full TNS timeout.
 
@@ -139,7 +150,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** point `PEER_TNS` at a non-routable IP (drops packets) and confirm the probe returns within ~REMOTE_TEST_TIMEOUT seconds on a box without `timeout`.
 
-### 2.6 Small robustness fixes (one batch commit)
+### ✅ 2.6 Small robustness fixes (one batch commit)
 
 - `sql/queries/get_fsfo_status.sql:5`: add `SET PAGESIZE 0` (parsers in `fsfo/observer.sh:533` assume no blank lines).
 - `common/dg_functions.sh:636`: `read password` → `read -r password` (backslash-safe; matches the fixed copies in `setup_dg_wallet.sh` and `dg_local_status_common.sh`).
@@ -154,7 +165,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 ## Workstream 3 — Security
 
-### 3.1 Remove passwords from process argv
+### ✅ 3.1 Remove passwords from process argv
 
 **Problem:** SYS/observer passwords visible in `ps -ef` for the duration of the call:
 - `standby/05_clone_standby.sh:373-374`: `rman TARGET sys/${SYS_PASSWORD}@... AUXILIARY sys/${SYS_PASSWORD}@...`
@@ -170,7 +181,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** while step 5/diag runs, `ps -ef | grep -c 'sys/'` must be 0; E2E still passes.
 
-### 3.2 NFS artifact cleanup script
+### ✅ 3.2 NFS artifact cleanup script
 
 **Problem:** `primary/01:528-534` and `primary/09:431-441` copy `orapw*` files (SYS hash) to the group-readable NFS share; nothing ever removes them. RMAN scripts/logs and pfiles also persist.
 
@@ -182,7 +193,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** run after E2E; assert no `orapw*` remains on the share; re-run walkthrough steps that read the share to confirm nothing needed was deleted.
 
-### 3.3 Tighten NFS export and share permissions
+### ✅ 3.3 Tighten NFS export and share permissions
 
 **Problem:** `nfs/01_setup_nfs_server.sh:23`: `rw,sync,no_subtree_check,no_root_squash`; share created 775 (`:111-114`) and never chowned.
 
@@ -190,7 +201,7 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 **Verify:** re-run NFS setup + `nfs/02_mount_nfs_client.sh` on both hosts; oracle can read/write, others cannot; steps 1-2 still function.
 
-### 3.4 Narrow the dedicated-user grant
+### ✅ 3.4 Narrow the dedicated-user grant
 
 **Problem:** `trigger/create_role_trigger_dedicated_user.sh:204,233` grants `EXECUTE ON DBMS_SYSTEM` only for alert-log writes (`KSDWRT`) — contradicts the least-privilege purpose.
 
@@ -202,21 +213,21 @@ Suggested implementation order: WS1 → WS2 → WS3 → WS4 → WS5 → WS6. WS1
 
 ## Workstream 4 — UX / functionality
 
-### 4.1 Monitoring-friendly exit codes for `dg_status.sh`
+### ✅ 4.1 Monitoring-friendly exit codes for `dg_status.sh`
 
 `dg_status.sh` computes ERRORS/WARNINGS but always exits 0. Mirror the 0/1/2 convention from `dg_local_status_common.sh:1536-1544` (`0` healthy, `1` warnings, `2` errors). Update `docs/DG_STATUS.md`. Fix the deprecated `dg_check_sid.sh` shim note: document that it forces exit 0 (keep behavior — it's the documented contract — but say so).
 
-### 4.2 TTY-aware colors
+### ✅ 4.2 TTY-aware colors
 
 No script guards color on `[ -t 1 ]`. Add a shared helper (in `dg_functions.sh` and `dg_local_status_common.sh`): enable color only when stdout is a tty and `NO_COLOR` is unset; add `--no-color` flag to `dg_status.sh`, `dg_triage_sid.sh`, `dg_diag_sid.sh`, `dg_handoff.sh`. `dg_functions.sh` already strips color for LOG_FILE — keep that.
 
 **Verify:** `bash dg_status.sh | cat` shows no escape codes; interactive run unchanged.
 
-### 4.3 Configurable thresholds
+### ✅ 4.3 Configurable thresholds
 
 Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-841,917-921`), sequence-gap 1/5 (`:892-896`), and any-nonzero-lag=WARN (`:882-888`). Introduce env-overridable defaults in one place (`DG_FRA_WARN_PCT=80`, `DG_FRA_CRIT_PCT=90`, `DG_SEQ_GAP_WARN=1`, `DG_SEQ_GAP_CRIT=5`, `DG_LAG_WARN_SECONDS=60`); parse the `+HH:MM:SS` lag format into seconds for comparison. Document in `docs/DG_STATUS.md` / `docs/DG_CHECK.md`.
 
-### 4.4 Deduplicate `dg_status.sh` against `dg_local_status_common.sh`
+### ✅ 4.4 Deduplicate `dg_status.sh` against `dg_local_status_common.sh`
 
 `dg_status.sh:112-233,478-491` re-implements ~400 lines of the common library (rendering helpers, status assessment, the awk alert-log filter — duplicated 4× within dg_status.sh alone — and the SQL column blocks). This is why the AIX grep bugs exist in two places.
 
@@ -224,11 +235,11 @@ Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-84
 
 **Verify:** byte-compare dashboard output before/after on the same live config (modulo timestamps); E2E status phase.
 
-### 4.5 Trigger scripts: self-discovery for the non-CDB variants
+### ✅ 4.5 Trigger scripts: self-discovery for the non-CDB variants
 
 `trigger/create_role_trigger.sh` and `create_role_trigger_dedicated_user.sh` hard-require `standby_config_*.env` + NFS mount, but only use them for a filename label and service discovery the CDB variant already does from `V$DATABASE`/`V$ACTIVE_SERVICES`. Align: attempt self-discovery first (DB_UNIQUE_NAME from `V$DATABASE`), fall back to config file if present; write generated SQL to NFS when mounted, else to `$PWD` with a notice.
 
-### 4.6 Small UX batch
+### ✅ 4.6 Small UX batch
 
 - `primary/10_generate_handoff_report.sh:13,277,326`: replace "step 14" references with "the role-aware service trigger (`trigger/create_role_trigger.sh`)".
 - Remove dead code: `LISTENER_PRIMARY_FILE` in `primary/04:131` (and stop generating `listener_primary_*.ora` in step 2 if truly unused — confirm first); `render_tns_single`/`render_jdbc_single` in `dg_handoff.sh:262-297`.
@@ -237,11 +248,11 @@ Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-84
 - Approval mode: print the active mode in each script's banner ("approval prompts: OFF (use -a to enable)") so the default is visible.
 - Non-interactive safety: in prompts (`dg_local_status_common.sh:431-436`, `dg_functions.sh:435,657,1003,1033`), when `! [ -t 0 ]`, skip the prompt and take the safe default instead of blocking.
 
-### 4.7 (Optional, discuss before building) JSON output mode
+### ⏭️ 4.7 (Optional, discuss before building) JSON output mode
 
 `--json` flag for `dg_triage_sid.sh` / `dg_status.sh` emitting a flat JSON object (role, modes, lag seconds, gaps, fra_pct, errors[], warnings[], exit_code) for monitoring ingestion. Pure printf-generated JSON (no jq dependency). Defer until 4.3/4.4 land.
 
-### 4.8 Application-facing handoff report enhancements
+### ✅ 4.8 Application-facing handoff report enhancements
 
 **Problem:** The handoff report (`primary/10_generate_handoff_report.sh`, `dg_handoff.sh`) gives application teams connection strings but little of the information that actually determines how their application behaves against a Data Guard pair. It states facts a DBA cares about (apply lag, gaps) but not their application consequences (RPO, brownout duration, standby readability). The companion briefing `docs/DG_APPLICATION_IMPACT.html` covers the behavioral side but is generic and not linked from the generated report.
 
@@ -263,7 +274,7 @@ Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-84
 
 ---
 
-## Workstream 5 — Documentation
+## ✅ Workstream 5 — Documentation
 
 - Document the ADG caveat: the CDB trigger's stop-on-standby uses `DBMS_SCHEDULER.CREATE_JOB`, which cannot run on a read-only standby; the failure is swallowed into the alert log by design. Add to `trigger/create_role_trigger_cdb.sh` header + CLAUDE.md trigger section.
 - Document the post-hardening re-clone limitation (SYS locked/randomized) and the recovery procedure (temporary unlock + password reset + password-file re-sync), referenced from step 5's restart instructions and step 8's output.
@@ -274,7 +285,7 @@ Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-84
 
 ## Workstream 6 — Test coverage
 
-### 6.1 Unit tests for the WS1 shell fixes
+### ✅ 6.1 Unit tests for the WS1 shell fixes
 
 New tests alongside the existing ones in `tests/`:
 - `tests/test_df_parsing.sh` — feed captured Linux `df -Pk` and AIX-format `df -k` output through the extraction function (factor the parsing into a small function in step 3 or `dg_functions.sh` so it's testable).
@@ -282,15 +293,15 @@ New tests alongside the existing ones in `tests/`:
 - `tests/test_counter_increment.sh` — regression for the `((x++))`/`set -e` pattern (sweep: no `((VAR++))` in repo).
 - `tests/test_sid_detection.sh` — feed pmon-line fixtures (normal, +ASM present, SSH error text) through the extraction logic.
 
-### 6.2 E2E: switchover assertion for the role trigger
+### ⏭️ 6.2 E2E: switchover assertion for the role trigger
 
 Extend `tests/e2e/run_e2e_test.sh` step 11: after deploying the trigger, perform `SWITCHOVER` via DGMGRL, assert via `V$ACTIVE_SERVICES` on both sides that the managed service moved (running on new primary, stopped on new standby), then switch back. Gate behind a flag (`SKIP_SWITCHOVER_TEST:-false`) since it doubles runtime.
 
-### 6.3 E2E: observer lifecycle
+### ⏭️ 6.3 E2E: observer lifecycle
 
 Flip `SKIP_OBSERVER` default to `false` (after WS1.8 fixes the greps). Add assertions for `observer.sh start` → `status` (running) → `stop` (stopped, pidfile removed) → stale-pidfile handling (write bogus pidfile, expect `start` to succeed).
 
-### 6.4 E2E: CDB variant trigger coverage
+### ⏭️ 6.4 E2E: CDB variant trigger coverage
 
 The CDB E2E config exists (`tests/e2e/` CDB variant). Add a phase that deploys `trigger/create_role_trigger_cdb.sh` + `create_pdb_service.sh`, asserts package validity, and (reusing 6.2) asserts a PDB service follows a switchover. Also run `create_role_trigger_dedicated_user.sh` in the non-CDB run and assert `DG_ADMIN` owns the objects and has no DBMS_SYSTEM grant (after WS3.4).
 
@@ -305,7 +316,7 @@ The CDB E2E config exists (`tests/e2e/` CDB variant). Add a phase that deploys `
 
 ## Verification (overall)
 
-1. `shellcheck` (informational) + the new unit tests on every changed script: `for t in tests/test_*.sh; do bash "$t"; done`
-2. Full E2E on the Linux test pair: `bash tests/e2e/run_e2e_test.sh` (non-CDB) and the CDB variant, including the new switchover/observer phases.
-3. AIX spot checks (manual, on the real box): `df -Pk` columns, `command -v base64 timeout openssl`, the grep patterns against captured broker output, `ps -p PID -o args=`.
-4. Security checks: `ps -ef | grep 'sys/'` during clone/diag shows nothing; NFS share perms 750/oracle:oinstall; no `orapw*` left after cleanup script.
+1. ✅ The unit tests pass: `for t in tests/test_*.sh; do bash "$t"; done` (7 suites, all green). `shellcheck` was not available in the implementation environment — worth a one-off informational run where it is installed. `bash -n` passes on every `*.sh`.
+2. ⬜ Full E2E on the Linux test pair: `bash tests/e2e/run_e2e_test.sh` (non-CDB) and the CDB variant — **not run yet** (skipped with WS6.2–6.4). Strongly recommended before production use; the step 5 RMAN cmdfile flow and the step 8 password-file propagation especially want a live pass.
+3. ⬜ AIX spot checks (manual, on the real box): `df -Pk` columns, `command -v base64 timeout openssl`, the grep patterns against captured broker output, `ps -p PID -o args=` — **not run** (no AIX box in the implementation environment).
+4. ◐ Security checks: static scan confirms no `sys/<password>` ever reaches a process argv (live `ps -ef` check during clone/diag still worth doing); NFS share perms 750/oracle:oinstall and the cleanup script's `orapw*` removal are implemented but **not yet verified against a live share**.

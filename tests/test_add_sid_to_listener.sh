@@ -37,10 +37,10 @@ run_test() {
 
     if [[ "$actual_result" -eq "$expected_result" ]]; then
         echo "PASS"
-        ((PASS++))
+        PASS=$((PASS + 1))
     else
         echo "FAIL (expected $expected_result, got $actual_result)"
-        ((FAIL++))
+        FAIL=$((FAIL + 1))
     fi
 }
 

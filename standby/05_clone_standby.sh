@@ -145,7 +145,7 @@ print_list_block "This Step Will Not Change" \
 print_list_block "Files and Commands" \
     "PFILE: ${PFILE}" \
     "Password file: ${PWD_FILE}" \
-    "RMAN script: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.rcv" \
+    "RMAN cmdfile: local private temp dir (mode 600, holds SYS connect strings, deleted after run)" \
     "RMAN log: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.log"
 
 print_status_block "RMAN Tuning" \
@@ -199,7 +199,39 @@ SYS_PASSWORD=$(prompt_password "Enter SYS password for primary database")
 # Verify password against primary
 log_info "Verifying SYS password against primary..."
 if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
-    log_error "Invalid SYS password or cannot connect to primary"
+    # verify_sys_password() only reports pass/fail. Make a direct connection
+    # attempt here so we can inspect the actual error text and distinguish a
+    # locked SYS account (ORA-28000, typically left behind by
+    # primary/08_security_hardening.sh) from a plain bad password or
+    # connectivity failure, and point the operator at the right fix.
+    # CONNECT is fed on stdin (sqlplus -s /nolog), not the sqlplus command
+    # line, so SYS_PASSWORD never appears in `ps -ef`. WHENEVER SQLERROR EXIT
+    # makes a failed CONNECT end the session immediately (error text still
+    # lands in $VERIFY_ERROR_TEXT) instead of falling through to
+    # check_connection.sql.
+    pause_verbose_trace
+    VERIFY_ERROR_TEXT=$(sqlplus -s /nolog <<SQL 2>&1
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
+@${SQL_DIR}/queries/check_connection.sql
+SQL
+) || true
+    resume_verbose_trace
+    if echo "$VERIFY_ERROR_TEXT" | grep -q "ORA-28000"; then
+        log_error "SYS account on the primary is LOCKED (ORA-28000)"
+        log_error ""
+        log_error "This is expected if primary/08_security_hardening.sh has already run on the primary."
+        log_error "To proceed with this clone, temporarily unlock and reset SYS on the PRIMARY:"
+        log_error "  sqlplus / as sysdba"
+        log_error "  ALTER USER SYS ACCOUNT UNLOCK;"
+        log_error "  ALTER USER SYS IDENTIFIED BY <temporary_password>;"
+        log_error ""
+        log_error "After this clone completes, re-run primary/08_security_hardening.sh to re-harden SYS"
+        log_error "(it generates a fresh random password, locks the account again, and re-propagates"
+        log_error "the refreshed password file to this standby)."
+    else
+        log_error "Invalid SYS password or cannot connect to primary"
+    fi
     exit 1
 fi
 log_info "Password verified successfully"
@@ -255,8 +287,24 @@ if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for
     exit 0
 fi
 
-# Create RMAN script
-RMAN_SCRIPT="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
+# Create RMAN script (cmdfile). It will hold the CONNECT TARGET/AUXILIARY
+# lines (see below) needed to authenticate to primary and standby, so SYS
+# credentials never appear on the rman process argv (visible via `ps -ef`
+# for the life of the call). Because it briefly holds those credentials it
+# must live in a local, private, mode-600 temp directory - never on the
+# shared NFS share - and be removed on every exit path. RMAN runs locally
+# against the local RMAN client, so a local temp dir works fine; only the
+# RMAN log (unchanged, below) still goes to the NFS share.
+# Private temp dir + EXIT-trap cleanup: create_temp_dir prefers `mktemp -d`,
+# falling back to a mode-700 directory on AIX images without mktemp - safer
+# than a predictable /tmp/..._$$ filename. No pre-existing EXIT trap in this
+# script, so it is safe to install one here.
+RMAN_TMP_DIR=$(create_temp_dir) || { log_error "Could not create temp directory"; exit 1; }
+trap 'rm -rf "$RMAN_TMP_DIR"' EXIT
+RMAN_SCRIPT="${RMAN_TMP_DIR}/rman_duplicate_$(date '+%Y%m%d_%H%M%S').rcv"
+# Create the file and lock down permissions BEFORE any credential is written to it.
+: > "$RMAN_SCRIPT"
+chmod 600 "$RMAN_SCRIPT"
 
 # Determine LOG_ARCHIVE_DEST_1 setting based on storage mode and FRA usage
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" || "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
@@ -291,7 +339,7 @@ fi
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: use db_create_file_dest, no FILE_NAME_CONVERT
-    cat > "$RMAN_SCRIPT" <<EOF
+    RMAN_BODY=$(cat <<EOF
 # RMAN Duplicate for Standby (OMF Mode, Data Guard Broker Managed)
 # Generated: $(date)
 # Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
@@ -315,6 +363,7 @@ DUPLICATE TARGET DATABASE
   NOFILENAMECHECK;
 ${RMAN_EPILOGUE}
 EOF
+)
 else
     # Traditional mode: use FILE_NAME_CONVERT (existing behavior)
     if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
@@ -324,7 +373,7 @@ else
         FRA_SETTINGS=""
     fi
 
-    cat > "$RMAN_SCRIPT" <<EOF
+    RMAN_BODY=$(cat <<EOF
 # RMAN Duplicate for Standby (Data Guard Broker Managed)
 # Generated: $(date)
 # Note: DG parameters (LOG_ARCHIVE_DEST_2, FAL_SERVER, etc.) will be
@@ -349,35 +398,56 @@ ${FRA_SETTINGS}
   NOFILENAMECHECK;
 ${RMAN_EPILOGUE}
 EOF
+)
 fi
 
+# Write the CONNECT lines first (RMAN requires TARGET/AUXILIARY connected
+# before DUPLICATE can run), then the duplicate statement body. The file
+# was created with chmod 600 above, before either password was written.
+{
+    printf 'CONNECT TARGET SYS/%s@%s;\n' "${SYS_PASSWORD}" "${PRIMARY_TNS_ALIAS}"
+    printf 'CONNECT AUXILIARY SYS/%s@%s;\n' "${SYS_PASSWORD}" "${STANDBY_TNS_ALIAS}"
+    printf '%s\n' "$RMAN_BODY"
+} >> "$RMAN_SCRIPT"
+
 log_info "RMAN script created: $RMAN_SCRIPT"
-log_detail "RMAN script contents:"
+# RMAN masks credentials in its own echo of a script-embedded CONNECT
+# command (it prints "connect target *" / "connect auxiliary *", never the
+# literal connect string), so the RMAN_LOG produced below does not capture
+# the password either. As a second layer, the diagnostic dump below only
+# ever logs the non-credential DUPLICATE body - never the CONNECT lines.
+log_detail "RMAN script contents (CONNECT lines redacted):"
+log_detail "  CONNECT TARGET sys/***@${PRIMARY_TNS_ALIAS};"
+log_detail "  CONNECT AUXILIARY sys/***@${STANDBY_TNS_ALIAS};"
 while IFS= read -r line; do
     log_detail "  $line"
-done < "$RMAN_SCRIPT"
-record_artifact "rman_script:${RMAN_SCRIPT}"
+done <<< "$RMAN_BODY"
+record_artifact "rman_script:${RMAN_SCRIPT} (transient - deleted after this run)"
 
 # Execute RMAN
 RMAN_LOG="${NFS_SHARE}/logs/rman_duplicate_$(date '+%Y%m%d_%H%M%S').log"
 
 log_info "Starting RMAN duplicate (logging to: $RMAN_LOG)..."
-log_cmd "rman" "TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
+log_cmd "rman" "cmdfile ${RMAN_SCRIPT}  # CONNECT TARGET sys/***@${PRIMARY_TNS_ALIAS}, CONNECT AUXILIARY sys/***@${STANDBY_TNS_ALIAS}"
 echo ""
-confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOME/bin/rman\" TARGET sys/***@${PRIMARY_TNS_ALIAS} AUXILIARY sys/***@${STANDBY_TNS_ALIAS} @${RMAN_SCRIPT}" || exit 1
+confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOME/bin/rman\" cmdfile ${RMAN_SCRIPT}  # cmdfile opens with CONNECT TARGET sys/***@${PRIMARY_TNS_ALIAS} and CONNECT AUXILIARY sys/***@${STANDBY_TNS_ALIAS}" || exit 1
 
 # Use tee to display output on screen AND write to log file
-# AIX compatible: use temp file to capture exit code instead of PIPESTATUS
-RMAN_EXIT_FILE="/tmp/rman_exit_$$"
+# AIX compatible: use temp file to capture exit code instead of PIPESTATUS.
+# Reuse RMAN_TMP_DIR (created above, mode 700, already covered by the
+# EXIT-trap installed above) for the exit-code file too.
+RMAN_EXIT_FILE="${RMAN_TMP_DIR}/rman_exit.$$"
 (
-"$ORACLE_HOME/bin/rman" TARGET "sys/${SYS_PASSWORD}@${PRIMARY_TNS_ALIAS}" \
-    AUXILIARY "sys/${SYS_PASSWORD}@${STANDBY_TNS_ALIAS}" \
-    cmdfile "${RMAN_SCRIPT}"
+"$ORACLE_HOME/bin/rman" cmdfile "${RMAN_SCRIPT}"
 echo $? > "$RMAN_EXIT_FILE"
 ) 2>&1 | tee "$RMAN_LOG"
 
 RMAN_EXIT_CODE=$(cat "$RMAN_EXIT_FILE" 2>/dev/null || echo "1")
-rm -f "$RMAN_EXIT_FILE"
+
+# Remove the cmdfile (and exit-code file) now that RMAN is done with them -
+# the cmdfile held SYS credentials. The EXIT trap above remains the safety
+# net for early/abnormal exits; this is the prompt cleanup on the normal path.
+rm -rf "$RMAN_TMP_DIR"
 
 # Clear password from memory
 SYS_PASSWORD=""
@@ -425,7 +495,18 @@ log_info "Starting managed recovery process (MRP)..."
 log_cmd "sqlplus / as sysdba:" "ALTER DATABASE MOUNT STANDBY DATABASE"
 log_cmd "sqlplus / as sysdba:" "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION"
 
-run_sql_command "mount_standby.sql"
+# RMAN DUPLICATE ... FOR STANDBY normally leaves the auxiliary instance
+# already MOUNTED once the duplicate completes, so re-issuing MOUNT STANDBY
+# DATABASE here would raise ORA-01100 (database already mounted) now that
+# mount_standby.sql aborts on SQL errors. Only mount if it isn't already.
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
+
+if [[ "$INSTANCE_STATUS" == "MOUNTED" ]]; then
+    log_info "Standby instance is already mounted (left MOUNTED by RMAN duplicate) - skipping MOUNT STANDBY DATABASE"
+else
+    run_sql_command "mount_standby.sql"
+fi
 run_sql_command "start_mrp.sql"
 
 # Verify MRP is running

@@ -236,7 +236,11 @@ ORACLE_UID=$(id -u oracle 2>/dev/null || echo "")
 
 if [ -n "$ORACLE_UID" ]; then
     chown oracle:oinstall "$NFS_MOUNT_PATH" 2>/dev/null || chown oracle:dba "$NFS_MOUNT_PATH" 2>/dev/null || true
-    chmod 775 "$NFS_MOUNT_PATH"
+    # 750 (not 775): the mount point IS the exported share directory, so a
+    # wider mode here would silently undo the 750 set by
+    # nfs/01_setup_nfs_server.sh for every client that mounts it. The share
+    # holds password-file copies and generated configs - keep others out.
+    chmod 750 "$NFS_MOUNT_PATH"
     log_info "Permissions set for oracle user"
 else
     log_warn "Oracle user not found on this system"

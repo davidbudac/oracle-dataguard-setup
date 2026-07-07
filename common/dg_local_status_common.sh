@@ -9,35 +9,15 @@ DG_LOCAL_STATUS_COMMON_SH_LOADED=1
 DG_LOCAL_STATUS_COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DG_LOCAL_STATUS_ROOT="$(dirname "$DG_LOCAL_STATUS_COMMON_DIR")"
 
-# -- Colors & layout ----------------------------------------------------------
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-BOLD='\033[1m'
-DIM='\033[2m'
-NC='\033[0m'
+# Colors, layout, configurable thresholds, lag parsing, and the generic
+# text/box rendering primitives (repeat_char/fit_text/wrap_text/row/header/
+# subheader/status_icon/warn_icon/short_hostname/extract_first_status/
+# format_services/compute_fra_*) all live in dg_render_common.sh now -
+# shared with dg_status.sh (WS4.2/4.3/4.4). NO_COLOR_FLAG below is wired
+# through parse_args and re-invokes dg_render_init_colors before any output.
+source "${DG_LOCAL_STATUS_COMMON_DIR}/dg_render_common.sh"
 
-CHK="${GREEN}OK${NC}"
-WARN="${YELLOW}!!${NC}"
-FAIL="${RED}XX${NC}"
-
-if command -v tput >/dev/null 2>&1; then
-    TERM_WIDTH=$(tput cols 2>/dev/null || printf '100')
-else
-    TERM_WIDTH=100
-fi
-[[ "$TERM_WIDTH" =~ ^[0-9]+$ ]] || TERM_WIDTH=100
-(( TERM_WIDTH < 80 )) && TERM_WIDTH=80
-
-LABEL_W=24
-STATUS_W=4
-ROW_VALUE_W=$((TERM_WIDTH - LABEL_W - STATUS_W - 6))
-(( ROW_VALUE_W < 28 )) && ROW_VALUE_W=28
-
-HLINE=$(printf '%*s' $((TERM_WIDTH - 2)) '')
-HLINE=${HLINE// /─}
+NO_COLOR_FLAG=false
 
 # -- Shared state -------------------------------------------------------------
 declare -a SUMMARY_ERRORS=()
@@ -76,110 +56,12 @@ LOC_LABEL=""
 PEER_LABEL=""
 
 # -- Generic helpers ----------------------------------------------------------
-repeat_char() {
-    local char="$1" count="$2" out=""
-    while (( count > 0 )); do
-        out="${out}${char}"
-        count=$((count - 1))
-    done
-    printf '%s' "$out"
-}
-
-strip_ansi() {
-    printf '%b' "$1" | sed $'s/\033\\[[0-9;]*m//g'
-}
-
-fit_text() {
-    local text="$1" width="$2" plain
-    plain=$(strip_ansi "$text")
-    if [[ ${#plain} -le $width ]]; then
-        printf '%s' "$text"
-    elif (( width > 3 )); then
-        printf '%s...' "${plain:0:$((width - 3))}"
-    else
-        printf '%s' "${plain:0:$width}"
-    fi
-}
-
-wrap_text() {
-    local text="$1" width="$2"
-    text=$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
-    [[ -z "$text" ]] && text="-"
-    printf '%s\n' "$text" | fold -s -w "$width"
-}
-
-row() {
-    local label="$1" value="$2" status="${3:-}"
-    local first=true line
-    while IFS= read -r line || [[ -n "$line" ]]; do
-        if $first; then
-            printf "  ${DIM}%-*s${NC} %-*s %b\n" "$LABEL_W" "$label" "$ROW_VALUE_W" "$line" "$status"
-            first=false
-        else
-            printf "  ${DIM}%-*s${NC} %-*s\n" "$LABEL_W" "" "$ROW_VALUE_W" "$line"
-        fi
-    done < <(wrap_text "$value" "$ROW_VALUE_W")
-}
-
-header() {
-    printf "\n ${BOLD}${BLUE}%s${NC}\n" "$1"
-    printf " ${DIM}%s${NC}\n" "$HLINE"
-}
-
-subheader() {
-    printf " ${BOLD}${CYAN}%s${NC}\n" "$1"
-}
-
-short_hostname() {
-    local host
-    host=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
-    printf '%s' "${host%%.*}"
-}
-
-extract_first_status() {
-    awk '
-        match($0, /(SUCCESS|WARNING|ERROR)/) {
-            print substr($0, RSTART, RLENGTH)
-            exit
-        }
-    '
-}
-
-status_icon() {
-    local value="$1"
-    shift
-    local pattern
-    for pattern in "$@"; do
-        if printf '%s' "$value" | grep -qi "$pattern"; then
-            printf '%b' "$CHK"
-            return
-        fi
-    done
-    printf '%b' "$FAIL"
-}
-
-warn_icon() {
-    local value="$1"
-    shift
-    local pattern
-    for pattern in "$@"; do
-        if printf '%s' "$value" | grep -qi "$pattern"; then
-            printf '%b' "$CHK"
-            return
-        fi
-    done
-    printf '%b' "$WARN"
-}
-
-format_services() {
-    local input="$1" formatted
-    formatted=$(printf '%s\n' "$input" | sed '/^$/d' | awk 'BEGIN{ORS=""} {if (NR>1) printf ", "; printf "%s", $0}')
-    if [[ -n "$formatted" ]]; then
-        printf '%s' "$formatted"
-    else
-        printf 'NONE'
-    fi
-}
+# repeat_char/strip_ansi/fit_text/wrap_text/row/header/subheader/
+# short_hostname/extract_first_status/status_icon/warn_icon/format_services
+# now live in dg_render_common.sh (sourced above), shared with dg_status.sh.
+# format_event_limit/print_event_block/is_error_event stay here: dg_status.sh
+# renders alert/broker log entries differently (no "N matched, newest M
+# shown" heading), so these are not genuinely shared - see WS4.4 notes.
 
 format_event_limit() {
     local raw="$1" limit="$2"
@@ -268,9 +150,10 @@ add_summary_info() {
 
 show_usage() {
     local script_name="$1"
-    printf "Usage: bash %s [-P] [-L]\n" "$script_name"
+    printf "Usage: bash %s [-P] [-L] [--no-color]\n" "$script_name"
     printf "  -P, --password   Prompt for SYS password for remote connection\n"
     printf "  -L, --local      Skip remote SQL checks (local + broker only)\n"
+    printf "  --no-color       Disable colored output (also honors NO_COLOR)\n"
     printf "  -h, --help       Show this help\n"
 }
 
@@ -280,6 +163,7 @@ parse_args() {
     PROMPT_PASSWORD=false
     LOCAL_ONLY=false
     SHOW_HELP=false
+    NO_COLOR_FLAG=false
 
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -289,6 +173,10 @@ parse_args() {
                 ;;
             -L|--local)
                 LOCAL_ONLY=true
+                shift
+                ;;
+            --no-color)
+                NO_COLOR_FLAG=true
                 shift
                 ;;
             -h|--help)
@@ -302,6 +190,11 @@ parse_args() {
                 ;;
         esac
     done
+
+    # Re-initialize colors now that --no-color has been parsed, and BEFORE
+    # any output is produced (show_usage below is the first possible output
+    # in this call path) - satisfies WS4.2's "before any output" requirement.
+    $NO_COLOR_FLAG && dg_render_init_colors 1
 
     if $SHOW_HELP; then
         show_usage "$script_name"
@@ -330,17 +223,79 @@ SQL
 
 run_remote_sql() {
     local connect="$1" query="$2"
-    sqlplus -s "${connect}" as sysdba <<SQL
+    # CONNECT is fed via stdin (sqlplus -s /nolog) rather than on the
+    # sqlplus command line, so a password-based connect string (sys/pw@tns)
+    # never appears in `ps -ef`. Works the same for wallet-based connects
+    # (/@tns) - no password involved there either way.
+    sqlplus -s /nolog <<SQL
+CONNECT ${connect} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
 ${query}
 EXIT;
 SQL
 }
 
+# Inject CONNECT_TIMEOUT/TRANSPORT_CONNECT_TIMEOUT/RETRY_COUNT into a TNS
+# connect identifier (a full DESCRIPTION, or a plain tnsnames.ora alias) so
+# the network connect itself is time-bounded at the SQL*Net layer. This is
+# the ONLY timeout mechanism on hosts without the GNU `timeout` binary
+# (stock AIX has none), which is why it does not simply defer to the
+# `timeout`-binary fast path in run_remote_sql_timeout below.
+# Usage: identifier=$(build_timeout_connect_string 5 "$PEER_TNS")
+build_timeout_connect_string() {
+    local timeout_secs="$1" identifier="$2" resolved
+
+    if printf '%s' "$identifier" | grep -qi 'DESCRIPTION[[:space:]]*='; then
+        # Already a full descriptor - inject the timeout params right after
+        # the opening DESCRIPTION=(
+        # Note: real TNS descriptors have exactly one paren pair enclosing
+        # "DESCRIPTION=" together with all its children - there is no
+        # separate opening paren strictly for "DESCRIPTION" itself, so the
+        # match/replace below must only consume "DESCRIPTION[ ]*=" and leave
+        # the following "(" (the first child's own opening paren) untouched.
+        printf '%s' "$identifier" | sed "s/DESCRIPTION[[:space:]]*=/DESCRIPTION=(CONNECT_TIMEOUT=${timeout_secs})(TRANSPORT_CONNECT_TIMEOUT=3)(RETRY_COUNT=0)/"
+        return
+    fi
+
+    # Plain TNS alias - resolve it to a descriptor via tnsping so the timeout
+    # params can be embedded. If tnsping is unavailable or resolution fails,
+    # fall back to the bare alias (no descriptor-level timeout in that case;
+    # the `timeout`-binary fast path, when present, is the only guard).
+    if command -v tnsping >/dev/null 2>&1; then
+        resolved=$(tnsping "$identifier" 2>/dev/null | sed -n 's/^Attempting to contact[[:space:]]*//p' | tail -1)
+        if [[ "$resolved" == *DESCRIPTION* ]]; then
+            printf '%s' "$resolved" | sed "s/DESCRIPTION[[:space:]]*=/DESCRIPTION=(CONNECT_TIMEOUT=${timeout_secs})(TRANSPORT_CONNECT_TIMEOUT=3)(RETRY_COUNT=0)/"
+            return
+        fi
+    fi
+
+    printf '%s' "$identifier"
+}
+
 run_remote_sql_timeout() {
     local timeout_secs="$1" connect="$2" query="$3"
+    local auth identifier
+
+    # Embed connect-time timeouts in the connect identifier itself (see
+    # build_timeout_connect_string) - this protects the connect regardless
+    # of whether the `timeout` binary exists. When `timeout` IS present we
+    # additionally wrap the whole sqlplus call with it as a second layer,
+    # since it also catches non-network hangs (e.g. sqlplus blocking on an
+    # unexpected prompt) that a connect-time parameter cannot cover.
+    if [[ "$connect" == *@* ]]; then
+        auth="${connect%@*}"
+        identifier="${connect##*@}"
+        connect="${auth}@$(build_timeout_connect_string "$timeout_secs" "$identifier")"
+    fi
+
+    # CONNECT is fed via stdin (sqlplus -s /nolog), not the sqlplus command
+    # line, so a password-based connect string never appears in `ps -ef`.
+    # identifier may be a full (DESCRIPTION=...) descriptor produced by
+    # build_timeout_connect_string above - CONNECT accepts that the same way
+    # a command-line logon does.
     if command -v timeout >/dev/null 2>&1; then
-        timeout "${timeout_secs}"s sqlplus -s "${connect}" as sysdba <<SQL
+        timeout "${timeout_secs}"s sqlplus -s /nolog <<SQL
+CONNECT ${connect} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
 ${query}
 EXIT;
@@ -431,12 +386,24 @@ SELECT 'WALLET_OK' FROM DUAL;
     if $PROMPT_PASSWORD || $REMOTE_DEFAULT_PROMPT; then
         printf " Enter SYS password for remote connection (or press Enter to skip): "
         stty -echo 2>/dev/null || true
-        read -r SYS_PASS
+        # WS4.6: on EOF/closed stdin, `read` fails and SYS_PASS is left
+        # empty - `|| SYS_PASS=""` makes that explicit rather than relying
+        # on read's implicit-empty-on-EOF behavior. An empty SYS_PASS falls
+        # straight into the "skipped" branch below (safe default: continue
+        # in broker-only degraded mode, never block waiting for input).
+        # This deliberately does NOT gate on `[ -t 0 ]`: the E2E suite pipes
+        # real answers into these scripts over a non-tty stdin, and that
+        # must keep working exactly as before.
+        read -r SYS_PASS || SYS_PASS=""
         stty echo 2>/dev/null || true
         printf "\n"
 
         if [[ -n "$SYS_PASS" ]]; then
-            REMOTE_CONNECT="sys/${SYS_PASS}@${PEER_TNS}"
+            # Quote the password inside the connect string (handles most
+            # special characters an operator might type); run_remote_sql
+            # and run_remote_sql_timeout feed this whole string to sqlplus
+            # via a CONNECT statement on stdin, never on the command line.
+            REMOTE_CONNECT="sys/\"${SYS_PASS}\"@${PEER_TNS}"
             PASS_TEST=$(run_remote_sql_timeout "$REMOTE_TEST_TIMEOUT" "$REMOTE_CONNECT" "SELECT 'PASS_OK' FROM DUAL;" 2>&1)
             if printf '%s' "$PASS_TEST" | grep -q 'PASS_OK'; then
                 REMOTE_CONNECTED=true
@@ -464,48 +431,34 @@ collect_remote_sql() {
     fi
 
     REMOTE_SQL=$(run_remote_sql "$REMOTE_CONNECT" "
-SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
-SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
-SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
-SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
-SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
-SELECT 'SERVICE|' || NAME
-  FROM (
-    SELECT NAME
-      FROM V\$ACTIVE_SERVICES
-     WHERE NAME NOT LIKE 'SYS$%'
-       AND UPPER(NAME) NOT LIKE '%XDB%'
-     ORDER BY NAME
-  );
-SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
-SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
-SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
-SELECT 'RECMODE|' || RECOVERY_MODE FROM V\$ARCHIVE_DEST_STATUS WHERE TYPE = 'LOCAL' AND STATUS = 'VALID' AND ROWNUM = 1;
+${DG_SQL_SELECT_DBSTATUS_FULL}
+${DG_SQL_SELECT_REDOLOG}
+${DG_SQL_SELECT_SRLCOUNT}
+${DG_SQL_SELECT_ARCHGAP}
+${DG_SQL_SELECT_FRA}
+${DG_SQL_SELECT_SERVICE}
+${DG_SQL_SELECT_MRP}
+${DG_SQL_SELECT_DGSTATS}
+${DG_SQL_SELECT_APPLYINFO}
+${DG_SQL_SELECT_RECMODE}
 " 2>&1)
 }
 
 collect_local_sql() {
     LOCAL_SQL=$(run_local_sql "
-SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || FORCE_LOGGING || '|' || FLASHBACK_ON || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
-SELECT 'DGPARAMS|' || NAME || '|' || VALUE FROM V\$PARAMETER WHERE NAME IN ('dg_broker_start') ORDER BY NAME;
-SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/1024/1024) FROM V\$LOG;
-SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;
-SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;
+${DG_SQL_SELECT_DBSTATUS_FULL}
+${DG_SQL_SELECT_DGPARAMS}
+${DG_SQL_SELECT_REDOLOG}
+${DG_SQL_SELECT_SRLCOUNT}
+${DG_SQL_SELECT_ARCHGAP}
 SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
-SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;
-SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;
-SELECT 'SERVICE|' || NAME
-  FROM (
-    SELECT NAME
-      FROM V\$ACTIVE_SERVICES
-     WHERE NAME NOT LIKE 'SYS$%'
-       AND UPPER(NAME) NOT LIKE '%XDB%'
-     ORDER BY NAME
-  );
-SELECT 'MRP|' || PROCESS || '|' || STATUS || '|' || SEQUENCE# FROM V\$MANAGED_STANDBY WHERE PROCESS = 'MRP0';
-SELECT 'DGSTATS|' || NAME || '|' || VALUE FROM V\$DATAGUARD_STATS WHERE NAME IN ('transport lag','apply lag','apply finish time');
-SELECT 'APPLYINFO|' || NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0) || '|' || NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;
-SELECT 'RECMODE|' || RECOVERY_MODE FROM V\$ARCHIVE_DEST_STATUS WHERE TYPE = 'LOCAL' AND STATUS = 'VALID' AND ROWNUM = 1;
+${DG_SQL_SELECT_FSFODB}
+${DG_SQL_SELECT_FRA}
+${DG_SQL_SELECT_SERVICE}
+${DG_SQL_SELECT_MRP}
+${DG_SQL_SELECT_DGSTATS}
+${DG_SQL_SELECT_APPLYINFO}
+${DG_SQL_SELECT_RECMODE}
 ")
 }
 
@@ -638,22 +591,12 @@ collect_log_matches() {
     LOC_DRC_MATCH_COUNT=0
 
     if [[ -f "$LOC_ALERT_FILE" ]]; then
-        LOC_ALERT_MATCHES=$(tail -2000 "$LOC_ALERT_FILE" | awk '
-/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
-{ low = tolower($0) }
-low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag|unsynchronized|synchronized|maximum availability|maximum performance|maximum protection|redo transport|log shipping|media recovery|recovery stopped|recovery paused|catching up|incomplete/ {
-    if (ts != "") printf "%s  %s\n", ts, $0; else print $0
-}' 2>/dev/null)
+        LOC_ALERT_MATCHES=$(tail -2000 "$LOC_ALERT_FILE" | awk "$DG_ALERT_LOG_AWK_FILTER" 2>/dev/null)
         LOC_ALERT_MATCH_COUNT=$(printf '%s\n' "$LOC_ALERT_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
     fi
 
     if [[ -f "$LOC_DRC_FILE" ]]; then
-        LOC_DRC_MATCHES=$(tail -500 "$LOC_DRC_FILE" | awk '
-/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
-{ low = tolower($0) }
-low ~ /ora-|error|warning|fail|switchover|failover|role change|fsfo|reinstate|disable|enable|nsv|broker/ {
-    if (ts != "") printf "%s  %s\n", ts, $0; else print $0
-}' 2>/dev/null)
+        LOC_DRC_MATCHES=$(tail -500 "$LOC_DRC_FILE" | awk "$DG_BROKER_LOG_AWK_FILTER" 2>/dev/null)
         LOC_DRC_MATCH_COUNT=$(printf '%s\n' "$LOC_DRC_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
     fi
 }
@@ -762,24 +705,11 @@ assign_role_views() {
     fi
 }
 
-compute_fra_pct() {
-    local size="$1" used="$2" reclaim="$3"
-    awk "BEGIN {if (${size:-0} > 0) {effective=${used:-0}-${reclaim:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${size})*100} else print 0}"
-}
-
-compute_fra_effective() {
-    local used="$1" reclaim="$2"
-    awk "BEGIN {effective=${used:-0}-${reclaim:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}"
-}
-
-normalise_lag_value() {
-    local value="$1"
-    if [[ "$value" == "+00 00:00:00" ]] || [[ "$value" == "+00 00:00:00.000" ]] || [[ "$value" == "0" ]] || [[ "$value" == "NONE" ]]; then
-        printf 'none'
-    else
-        printf '%s' "$value"
-    fi
-}
+# compute_fra_pct/compute_fra_effective now live in dg_render_common.sh.
+# Lag display text uses the shared dg_display_lag_value ("none" for a
+# truly-zero lag, raw value otherwise); the WARN/OK *decision* uses
+# dg_parse_lag_seconds against DG_LAG_WARN_SECONDS instead of an
+# any-nonzero check (WS4.3). See dg_render_common.sh.
 
 assess_primary() {
     PRI_OK=unknown
@@ -834,10 +764,10 @@ assess_primary() {
     if [[ -n "${PRI_FRA_SIZE:-}" ]]; then
         PRI_FRA_PCT=$(compute_fra_pct "$PRI_FRA_SIZE" "$PRI_FRA_USED" "$PRI_FRA_RECLAIM")
         PRI_FRA_EFFECTIVE_USED=$(compute_fra_effective "$PRI_FRA_USED" "$PRI_FRA_RECLAIM")
-        if [[ "$PRI_FRA_PCT" -ge 90 ]]; then
+        if [[ "$PRI_FRA_PCT" -ge "$DG_FRA_CRIT_PCT" ]]; then
             PRI_OK=false
             add_summary_error "Primary FRA usage is ${PRI_FRA_PCT}%"
-        elif [[ "$PRI_FRA_PCT" -ge 80 ]]; then
+        elif [[ "$PRI_FRA_PCT" -ge "$DG_FRA_WARN_PCT" ]]; then
             add_summary_warning "Primary FRA usage is ${PRI_FRA_PCT}%"
         fi
     else
@@ -879,20 +809,20 @@ assess_standby() {
         add_summary_warning "Standby recovery mode is ${STB_RECOVERY_MODE}"
     fi
 
-    if [[ -n "${STB_TRANSPORT_LAG:-}" ]] && [[ "$(normalise_lag_value "$STB_TRANSPORT_LAG")" != "none" ]]; then
+    if [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
         add_summary_warning "Standby transport lag is ${STB_TRANSPORT_LAG}"
     fi
 
-    if [[ -n "${STB_APPLY_LAG:-}" ]] && [[ "$(normalise_lag_value "$STB_APPLY_LAG")" != "none" ]]; then
+    if [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
         add_summary_warning "Standby apply lag is ${STB_APPLY_LAG}"
     fi
 
     if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "${STB_LAST_RECEIVED:-0}" -gt 0 ]]; then
         SEQ_LAG=$((STB_LAST_RECEIVED - STB_LAST_APPLIED))
-        if (( SEQ_LAG > 5 )); then
+        if (( SEQ_LAG > DG_SEQ_GAP_CRIT )); then
             STB_OK=false
             add_summary_error "Standby sequence lag is ${SEQ_LAG}"
-        elif (( SEQ_LAG > 1 )); then
+        elif (( SEQ_LAG > DG_SEQ_GAP_WARN )); then
             add_summary_warning "Standby sequence lag is ${SEQ_LAG}"
         fi
     fi
@@ -914,10 +844,10 @@ assess_standby() {
     if [[ -n "${STB_FRA_SIZE:-}" ]]; then
         STB_FRA_PCT=$(compute_fra_pct "$STB_FRA_SIZE" "$STB_FRA_USED" "$STB_FRA_RECLAIM")
         STB_FRA_EFFECTIVE_USED=$(compute_fra_effective "$STB_FRA_USED" "$STB_FRA_RECLAIM")
-        if [[ "$STB_FRA_PCT" -ge 90 ]]; then
+        if [[ "$STB_FRA_PCT" -ge "$DG_FRA_CRIT_PCT" ]]; then
             STB_OK=false
             add_summary_error "Standby FRA usage is ${STB_FRA_PCT}%"
-        elif [[ "$STB_FRA_PCT" -ge 80 ]]; then
+        elif [[ "$STB_FRA_PCT" -ge "$DG_FRA_WARN_PCT" ]]; then
             add_summary_warning "Standby FRA usage is ${STB_FRA_PCT}%"
         fi
     else
@@ -928,7 +858,7 @@ assess_standby() {
 
 assess_broker() {
     BROKER_CONFIGURED=true
-    if printf '%s' "$DGMGRL_CONFIG" | grep -q "ORA-16532\|not yet available\|not exist"; then
+    if printf '%s' "$DGMGRL_CONFIG" | grep -qE "ORA-16532|not yet available|not exist"; then
         BROKER_CONFIGURED=false
         add_summary_error "Broker configuration is not configured"
         return
@@ -944,7 +874,7 @@ assess_broker() {
 
     while IFS= read -r line; do
         line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-        if printf '%s' "$line" | grep -qE '^\s+\S+\s+-\s+'; then
+        if printf '%s' "$line" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'; then
             if printf '%s' "$line_trimmed" | grep -qi "Error"; then
                 add_summary_error "Broker member issue: $line_trimmed"
             elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
@@ -1022,13 +952,13 @@ compute_state_labels() {
 
     if $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
         REPL_STATE="$PEER_SOURCE_STATE"
-    elif [[ -n "${STB_TRANSPORT_LAG:-}" && "$(normalise_lag_value "$STB_TRANSPORT_LAG")" != "none" ]]; then
+    elif [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
         REPL_STATE="${YELLOW}LAGGING${NC}"
-    elif [[ -n "${STB_APPLY_LAG:-}" && "$(normalise_lag_value "$STB_APPLY_LAG")" != "none" ]]; then
+    elif [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
         REPL_STATE="${YELLOW}LAGGING${NC}"
-    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt 5 ]]; then
+    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_CRIT" ]]; then
         REPL_STATE="${RED}BEHIND${NC}"
-    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt 1 ]]; then
+    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_WARN" ]]; then
         REPL_STATE="${YELLOW}BEHIND${NC}"
     else
         REPL_STATE="${GREEN}IN SYNC${NC}"
@@ -1064,16 +994,20 @@ print_top_findings() {
         return
     fi
 
-    for item in "${SUMMARY_ERRORS[@]}"; do
-        row "Error" "$item" "$FAIL"
-        count=$((count + 1))
-        (( count >= limit )) && return
-    done
-    for item in "${SUMMARY_WARNINGS[@]}"; do
-        row "Warning" "$item" "$WARN"
-        count=$((count + 1))
-        (( count >= limit )) && return
-    done
+    if [[ ${#SUMMARY_ERRORS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_ERRORS[@]}"; do
+            row "Error" "$item" "$FAIL"
+            count=$((count + 1))
+            (( count >= limit )) && return
+        done
+    fi
+    if [[ ${#SUMMARY_WARNINGS[@]} -gt 0 ]]; then
+        for item in "${SUMMARY_WARNINGS[@]}"; do
+            row "Warning" "$item" "$WARN"
+            count=$((count + 1))
+            (( count >= limit )) && return
+        done
+    fi
 }
 
 render_primary_triage() {
@@ -1106,13 +1040,7 @@ render_primary_triage() {
             row "Standby Redo" "${PRI_SRL:-0} groups" "$WARN"
         fi
         if [[ -n "${PRI_FRA_PATH:-}" ]]; then
-            local icon="$CHK"
-            if [[ "${PRI_FRA_PCT:-0}" -ge 90 ]]; then
-                icon="$FAIL"
-            elif [[ "${PRI_FRA_PCT:-0}" -ge 80 ]]; then
-                icon="$WARN"
-            fi
-            row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%)" "$icon"
+            row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%)" "$(dg_fra_icon "${PRI_FRA_PCT:-0}")"
         fi
     else
         row "Peer View" "Broker view only; runtime SQL unavailable"
@@ -1136,29 +1064,19 @@ render_standby_triage() {
         fi
 
         if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
-            if [[ "$(normalise_lag_value "$STB_TRANSPORT_LAG")" == "none" ]]; then
-                row "Transport Lag" "none" "$CHK"
-            else
-                row "Transport Lag" "${STB_TRANSPORT_LAG}" "$WARN"
-            fi
+            row "Transport Lag" "$(dg_display_lag_value "$STB_TRANSPORT_LAG")" "$(dg_lag_icon "$STB_TRANSPORT_LAG")"
         fi
         if [[ -n "${STB_APPLY_LAG:-}" ]]; then
-            if [[ "$(normalise_lag_value "$STB_APPLY_LAG")" == "none" ]]; then
-                row "Apply Lag" "none" "$CHK"
-            else
-                row "Apply Lag" "${STB_APPLY_LAG}" "$WARN"
-                if [[ -n "${STB_APPLY_FINISH:-}" ]]; then
-                    row "Apply Finish ETA" "${STB_APPLY_FINISH}"
-                fi
+            row "Apply Lag" "$(dg_display_lag_value "$STB_APPLY_LAG")" "$(dg_lag_icon "$STB_APPLY_LAG")"
+            if [[ -n "${STB_APPLY_FINISH:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
+                row "Apply Finish ETA" "${STB_APPLY_FINISH}"
             fi
         fi
         if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "${STB_LAST_RECEIVED:-0}" -gt 0 ]]; then
-            if [[ -n "${SEQ_LAG:-}" && "${SEQ_LAG}" -gt 5 ]]; then
-                row "Sequences" "applied=${STB_LAST_APPLIED} received=${STB_LAST_RECEIVED} (lag ${SEQ_LAG})" "$FAIL"
-            elif [[ -n "${SEQ_LAG:-}" && "${SEQ_LAG}" -gt 1 ]]; then
-                row "Sequences" "applied=${STB_LAST_APPLIED} received=${STB_LAST_RECEIVED} (lag ${SEQ_LAG})" "$WARN"
+            if [[ -n "${SEQ_LAG:-}" ]] && (( SEQ_LAG > DG_SEQ_GAP_WARN )); then
+                row "Sequences" "applied=${STB_LAST_APPLIED} received=${STB_LAST_RECEIVED} (lag ${SEQ_LAG})" "$(dg_seq_gap_icon "${SEQ_LAG:-0}")"
             else
-                row "Sequences" "applied=${STB_LAST_APPLIED} received=${STB_LAST_RECEIVED}" "$CHK"
+                row "Sequences" "applied=${STB_LAST_APPLIED} received=${STB_LAST_RECEIVED}" "$(dg_seq_gap_icon "${SEQ_LAG:-0}")"
             fi
         fi
         if [[ -n "${STB_SRL:-}" ]] && [[ "${STB_SRL:-0}" -gt 0 ]]; then
@@ -1170,13 +1088,7 @@ render_standby_triage() {
             row "Archive Gaps" "${STB_ARCHGAP} gap(s)" "$FAIL"
         fi
         if [[ -n "${STB_FRA_PATH:-}" ]]; then
-            local icon="$CHK"
-            if [[ "${STB_FRA_PCT:-0}" -ge 90 ]]; then
-                icon="$FAIL"
-            elif [[ "${STB_FRA_PCT:-0}" -ge 80 ]]; then
-                icon="$WARN"
-            fi
-            row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%)" "$icon"
+            row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%)" "$(dg_fra_icon "${STB_FRA_PCT:-0}")"
         fi
     else
         row "Peer View" "Broker view only; runtime SQL unavailable"
@@ -1318,13 +1230,7 @@ render_primary_diag() {
 
         subheader "Recovery Area"
         if [[ -n "${PRI_FRA_PATH:-}" ]]; then
-            local icon="$CHK"
-            if [[ "${PRI_FRA_PCT:-0}" -ge 90 ]]; then
-                icon="$FAIL"
-            elif [[ "${PRI_FRA_PCT:-0}" -ge 80 ]]; then
-                icon="$WARN"
-            fi
-            row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$icon"
+            row "FRA Usage" "${PRI_FRA_EFFECTIVE_USED}/${PRI_FRA_SIZE} GB effective (${PRI_FRA_PCT}%), reclaimable ${PRI_FRA_RECLAIM} GB" "$(dg_fra_icon "${PRI_FRA_PCT:-0}")"
             row "FRA Location" "${PRI_FRA_PATH} (${PRI_FRA_FILES:-0} files)"
         fi
     else
@@ -1358,30 +1264,20 @@ render_standby_diag() {
         fi
 
         if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
-            if [[ "$(normalise_lag_value "$STB_TRANSPORT_LAG")" == "none" ]]; then
-                row "Transport Lag" "none" "$CHK"
-            else
-                row "Transport Lag" "$STB_TRANSPORT_LAG" "$WARN"
-            fi
+            row "Transport Lag" "$(dg_display_lag_value "$STB_TRANSPORT_LAG")" "$(dg_lag_icon "$STB_TRANSPORT_LAG")"
         fi
         if [[ -n "${STB_APPLY_LAG:-}" ]]; then
-            if [[ "$(normalise_lag_value "$STB_APPLY_LAG")" == "none" ]]; then
-                row "Apply Lag" "none" "$CHK"
-            else
-                row "Apply Lag" "$STB_APPLY_LAG" "$WARN"
-            fi
+            row "Apply Lag" "$(dg_display_lag_value "$STB_APPLY_LAG")" "$(dg_lag_icon "$STB_APPLY_LAG")"
         fi
-        if [[ -n "${STB_APPLY_FINISH:-}" ]] && [[ "$(normalise_lag_value "$STB_APPLY_FINISH")" != "none" ]]; then
+        if [[ -n "${STB_APPLY_FINISH:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
             row "Apply Finish Time" "${STB_APPLY_FINISH}"
         fi
 
         if [[ -n "${STB_LAST_APPLIED:-}" ]] && [[ -n "${STB_LAST_RECEIVED:-}" ]] && [[ "${STB_LAST_RECEIVED:-0}" -gt 0 ]]; then
-            if [[ -n "${SEQ_LAG:-}" && "${SEQ_LAG}" -gt 5 ]]; then
-                row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$FAIL"
-            elif [[ -n "${SEQ_LAG:-}" && "${SEQ_LAG}" -gt 1 ]]; then
-                row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$WARN"
+            if [[ -n "${SEQ_LAG:-}" ]] && (( SEQ_LAG > DG_SEQ_GAP_WARN )); then
+                row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}  (lag: ${SEQ_LAG})" "$(dg_seq_gap_icon "${SEQ_LAG:-0}")"
             else
-                row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}" "$CHK"
+                row "Sequences" "applied=${STB_LAST_APPLIED}  received=${STB_LAST_RECEIVED}" "$(dg_seq_gap_icon "${SEQ_LAG:-0}")"
             fi
         fi
 
@@ -1397,13 +1293,7 @@ render_standby_diag() {
 
         subheader "Recovery Area"
         if [[ -n "${STB_FRA_PATH:-}" ]]; then
-            local icon="$CHK"
-            if [[ "${STB_FRA_PCT:-0}" -ge 90 ]]; then
-                icon="$FAIL"
-            elif [[ "${STB_FRA_PCT:-0}" -ge 80 ]]; then
-                icon="$WARN"
-            fi
-            row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$icon"
+            row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%), reclaimable ${STB_FRA_RECLAIM} GB" "$(dg_fra_icon "${STB_FRA_PCT:-0}")"
             row "FRA Location" "${STB_FRA_PATH} (${STB_FRA_FILES:-0} files)"
         fi
     else
@@ -1425,7 +1315,7 @@ render_broker_diag() {
 
     while IFS= read -r line; do
         line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-        if printf '%s' "$line" | grep -qE '^\s+\S+\s+-\s+'; then
+        if printf '%s' "$line" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'; then
             if printf '%s' "$line_trimmed" | grep -qi "Error"; then
                 row "" "$line_trimmed" "$FAIL"
             elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
@@ -1510,12 +1400,16 @@ render_diag_output() {
         row "Status" "No problems detected" "$CHK"
     else
         local item
-        for item in "${SUMMARY_ERRORS[@]}"; do
-            row "Error" "$item" "$FAIL"
-        done
-        for item in "${SUMMARY_WARNINGS[@]}"; do
-            row "Warning" "$item" "$WARN"
-        done
+        if [[ ${#SUMMARY_ERRORS[@]} -gt 0 ]]; then
+            for item in "${SUMMARY_ERRORS[@]}"; do
+                row "Error" "$item" "$FAIL"
+            done
+        fi
+        if [[ ${#SUMMARY_WARNINGS[@]} -gt 0 ]]; then
+            for item in "${SUMMARY_WARNINGS[@]}"; do
+                row "Warning" "$item" "$WARN"
+            done
+        fi
     fi
     printf "\n"
 }
