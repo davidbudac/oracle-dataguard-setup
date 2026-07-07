@@ -9,6 +9,15 @@
 # This is an alternative to create_role_trigger.sh that creates
 # a dedicated database user instead of placing objects in SYS.
 #
+# Standalone: this script does NOT require the setup-time
+# standby_config_*.env file or the NFS share. It discovers the
+# topology (primary/standby DB_UNIQUE_NAME) from the database itself,
+# the same way trigger/create_role_trigger_cdb.sh does. If a
+# standby_config_*.env file happens to be present on the NFS share it
+# is used only as a fallback label when self-discovery cannot find a
+# peer. The generated SQL is written to the NFS share when one is
+# available, otherwise to the current directory.
+#
 # This script:
 # - Creates a dedicated user (DG_ADMIN or C##DG_ADMIN for CDB)
 # - Grants only the required privileges
@@ -20,6 +29,22 @@
 #
 # Services are automatically started on PRIMARY and stopped
 # on STANDBY. Objects replicate to standby via redo.
+#
+# ALERT LOG WRITES (least-privilege trade-off):
+# DG_SERVICE_MGR needs to record failures (e.g. a service that
+# would not start) in the alert log. The only supported way to do
+# that is SYS.DBMS_SYSTEM.KSDWRT - an undocumented package with
+# broad, unrelated capabilities. Granting EXECUTE on DBMS_SYSTEM
+# directly to the dedicated user would defeat the least-privilege
+# purpose of this script variant. Instead, this script creates a
+# single-purpose, SYS-owned, definer-rights wrapper procedure,
+# SYS.DG_ALERT_LOG_MSG(p_msg VARCHAR2), whose body only calls
+# SYS.DBMS_SYSTEM.KSDWRT(2, p_msg), and grants EXECUTE on that
+# narrow wrapper (not on DBMS_SYSTEM) to the dedicated user. If
+# SYS.DG_ALERT_LOG_MSG is ever dropped, service start/stop still
+# works, but log_service_issue's WHEN OTHERS THEN NULL handler
+# silently swallows the resulting error - failed attempts would
+# then leave no alert log trail.
 # ============================================================
 
 set -e
@@ -48,25 +73,7 @@ init_log "create_role_trigger_dedicated"
 log_section "Pre-flight Checks"
 
 check_oracle_env || exit 1
-check_nfs_mount || exit 1
 check_db_connection || exit 1
-
-# ============================================================
-# Load Configuration
-# ============================================================
-
-log_section "Loading Configuration"
-
-# Find standby config file
-if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
-    log_error "Please run the Data Guard setup scripts first (Steps 1-7)"
-    exit 1
-fi
-
-source "$STANDBY_CONFIG_FILE"
-
-# Re-initialize log with DB name
-init_log "create_role_trigger_dedicated_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Verify Database Role
@@ -84,6 +91,60 @@ if [[ "$DB_ROLE" != "PRIMARY" ]]; then
 fi
 
 log_info "Confirmed: Running on PRIMARY database"
+
+# ============================================================
+# Discover Topology (standalone - no config file required)
+# ============================================================
+
+log_section "Discovering Data Guard Topology"
+
+PRIMARY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V$DATABASE;
+EXIT;
+EOSQL
+)
+PRIMARY_DB_UNIQUE_NAME=$(echo "$PRIMARY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+if [[ -z "$PRIMARY_DB_UNIQUE_NAME" ]]; then
+    log_error "Could not determine the primary DB_UNIQUE_NAME from V\$DATABASE"
+    exit 1
+fi
+
+# The peer (standby) name comes from V$DATAGUARD_CONFIG and is used only to
+# label the generated SQL file, so it is optional.
+STANDBY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << EOSQL
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG
+WHERE DB_UNIQUE_NAME <> '${PRIMARY_DB_UNIQUE_NAME}' AND ROWNUM = 1;
+EXIT;
+EOSQL
+)
+STANDBY_DB_UNIQUE_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
+    # Self-discovery could not find a peer in V$DATAGUARD_CONFIG. Fall back to
+    # a setup-time standby_config_*.env file if one happens to exist on the
+    # NFS share - purely for this label; nothing else in this script depends
+    # on it. Quiet and non-interactive: this is a best-effort label only.
+    CONFIG_CANDIDATE=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null | head -1) || true
+    if [[ -n "$CONFIG_CANDIDATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_CANDIDATE"
+        log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME:-UNKNOWN}"
+    fi
+fi
+
+log_info "Primary DB_UNIQUE_NAME: $PRIMARY_DB_UNIQUE_NAME"
+if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
+    log_info "Standby DB_UNIQUE_NAME: $STANDBY_DB_UNIQUE_NAME"
+else
+    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
+    STANDBY_DB_UNIQUE_NAME="UNKNOWN"
+fi
+
+# Re-initialize log now that the DB name is known
+init_log "create_role_trigger_dedicated_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Detect CDB and Determine Schema Name
@@ -124,6 +185,25 @@ fi
 # Validate CDB naming
 if [[ "$IS_CDB" == "YES" ]] && [[ "$USER_SCHEMA" != C##* ]]; then
     log_error "CDB requires common user prefix C## (e.g., C##DG_ADMIN)"
+    exit 1
+fi
+
+# Validate schema name format: this value is interpolated directly into
+# CREATE USER / GRANT statements and package/trigger DDL below, so it must
+# be a well-formed Oracle identifier before it ever reaches sqlplus. Strip
+# an already-verified C## common-user prefix first, then apply the same
+# leading-alpha identifier rule used for service/container names.
+SCHEMA_NAME_TO_CHECK="$USER_SCHEMA"
+if [[ "$IS_CDB" == "YES" ]]; then
+    SCHEMA_NAME_TO_CHECK="${USER_SCHEMA#C##}"
+fi
+if ! echo "$SCHEMA_NAME_TO_CHECK" | grep -q '^[A-Za-z][A-Za-z0-9_$]*$'; then
+    log_error "Invalid schema name: $USER_SCHEMA"
+    log_error "Schema names must start with a letter and contain only letters, numbers, underscore, and dollar sign"
+    exit 1
+fi
+if [[ ${#USER_SCHEMA} -gt 128 ]]; then
+    log_error "Schema name too long (max 128 chars): $USER_SCHEMA"
     exit 1
 fi
 
@@ -172,6 +252,55 @@ EOSQL
 fi
 
 # ============================================================
+# Create/Replace SYS Alert Log Helper Procedure
+# ============================================================
+# Narrow, single-purpose, definer-rights wrapper around
+# SYS.DBMS_SYSTEM.KSDWRT so the dedicated user only ever needs
+# EXECUTE on this procedure, never on DBMS_SYSTEM itself. Created
+# idempotently (CREATE OR REPLACE) on every run, in the current
+# container (CDB$ROOT for a CDB), matching where the triggers run.
+
+log_section "SYS Alert Log Helper Procedure"
+
+log_info "Creating/replacing SYS.DG_ALERT_LOG_MSG (idempotent)..."
+confirm_approval_action "Create/replace SYS.DG_ALERT_LOG_MSG helper procedure" "sqlplus -s / as sysdba <create SYS.DG_ALERT_LOG_MSG>" || exit 1
+
+# Capture status explicitly: under `set -e` a bare assignment followed by a
+# `$?` check would abort before the check ever ran.
+HELPER_RC=0
+HELPER_RESULT=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+
+CREATE OR REPLACE PROCEDURE SYS.DG_ALERT_LOG_MSG (p_msg IN VARCHAR2) AS
+BEGIN
+    SYS.DBMS_SYSTEM.KSDWRT(2, p_msg);
+END DG_ALERT_LOG_MSG;
+/
+
+SELECT 'HELPER_STATUS=' || STATUS FROM DBA_OBJECTS WHERE OBJECT_NAME = 'DG_ALERT_LOG_MSG' AND OBJECT_TYPE = 'PROCEDURE' AND OWNER = 'SYS';
+
+EXIT;
+EOSQL
+) || HELPER_RC=$?
+echo "$HELPER_RESULT" | while IFS= read -r line; do
+    [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
+done
+if [[ $HELPER_RC -ne 0 ]] || echo "$HELPER_RESULT" | grep -q "^ORA-"; then
+    log_error "Failed to create SYS.DG_ALERT_LOG_MSG helper procedure"
+    echo "$HELPER_RESULT"
+    exit 1
+fi
+
+HELPER_STATUS=$(echo "$HELPER_RESULT" | grep "HELPER_STATUS=" | sed 's/HELPER_STATUS=//' | tr -d ' \n\r')
+if [[ "$HELPER_STATUS" == "VALID" ]]; then
+    log_info "SYS.DG_ALERT_LOG_MSG: VALID"
+else
+    log_error "SYS.DG_ALERT_LOG_MSG: ${HELPER_STATUS:-NOT FOUND}"
+    exit 1
+fi
+
+# ============================================================
 # Create User and Grant Privileges
 # ============================================================
 
@@ -201,7 +330,7 @@ GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SYSTEM TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 
 EXIT;
 EOSQL
@@ -230,7 +359,7 @@ GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SYSTEM TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 
 EXIT;
 EOSQL
@@ -327,12 +456,12 @@ while true; do
             new_svc=$(echo "$new_svc" | tr -d ' \n\r')
             if [[ -n "$new_svc" ]]; then
                 # Validate service name
-                if echo "$new_svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
                     SERVICE_LIST+=("$new_svc")
                     log_info "Added service: $new_svc"
                 else
                     log_error "Invalid service name: $new_svc"
-                    log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
                 fi
             fi
             echo ""
@@ -393,12 +522,12 @@ while true; do
                 if [[ -z "$new_svc" ]]; then
                     break
                 fi
-                if echo "$new_svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
                     SERVICE_LIST+=("$new_svc")
                     log_info "Added service: $new_svc"
                 else
                     log_error "Invalid service name: $new_svc"
-                    log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
                 fi
             done
             echo ""
@@ -429,9 +558,9 @@ fi
 
 # Final validation of all service names
 for svc in "${SERVICE_LIST[@]}"; do
-    if ! echo "$svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+    if ! echo "$svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
         log_error "Invalid service name: $svc"
-        log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+        log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
         exit 1
     fi
     if [[ ${#svc} -gt 64 ]]; then
@@ -481,9 +610,13 @@ echo "  Package : ${USER_SCHEMA}.DG_SERVICE_MGR"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_ROLE_CHG (AFTER DB_ROLE_CHANGE)"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_STARTUP  (AFTER STARTUP)"
 echo ""
+echo "  (SYS.DG_ALERT_LOG_MSG - a narrow alert-log helper procedure - was"
+echo "   created/replaced as SYS earlier in this run; see above.)"
+echo ""
 echo "  Privileges granted:"
 echo "    CREATE SESSION, CREATE PROCEDURE, ADMINISTER DATABASE TRIGGER,"
-echo "    EXECUTE ON DBMS_SERVICE, SELECT ON V_\$DATABASE, EXECUTE ON DBMS_SYSTEM"
+echo "    EXECUTE ON DBMS_SERVICE, SELECT ON V_\$DATABASE,"
+echo "    EXECUTE ON SYS.DG_ALERT_LOG_MSG (not DBMS_SYSTEM)"
 echo ""
 echo "Services managed (started on PRIMARY, stopped on STANDBY):"
 echo ""
@@ -569,8 +702,7 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
         p_error   IN VARCHAR2
     ) IS
     BEGIN
-        SYS.DBMS_SYSTEM.KSDWRT(
-            2,
+        SYS.DG_ALERT_LOG_MSG(
             'DG_SERVICE_MGR ' || p_action || ' failed for service ' || p_service || ': ' || SUBSTR(p_error, 1, 300)
         );
     EXCEPTION
@@ -695,7 +827,15 @@ fi
 
 log_section "Saving Generated SQL"
 
-SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
+# Write to the NFS share when one is mounted and writable (keeps parity with
+# the previous config-driven workflow); otherwise fall back to the current
+# directory with a clear notice, since this script no longer requires NFS.
+if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
+    log_warn "NFS share (${NFS_SHARE}) not available/writable - writing generated SQL to the current directory instead"
+fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
@@ -719,12 +859,20 @@ cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 --     TEMPORARY TABLESPACE TEMP
 --     QUOTA 0 ON SYSTEM${CONTAINER_CLAUSE};
 
+-- SYS-owned, definer-rights alert-log helper (idempotent). Lets the
+-- dedicated user log to the alert log without EXECUTE on DBMS_SYSTEM.
+CREATE OR REPLACE PROCEDURE SYS.DG_ALERT_LOG_MSG (p_msg IN VARCHAR2) AS
+BEGIN
+    SYS.DBMS_SYSTEM.KSDWRT(2, p_msg);
+END DG_ALERT_LOG_MSG;
+/
+
 GRANT CREATE SESSION TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SYSTEM TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 
 -- Package Specification
 CREATE OR REPLACE PACKAGE ${USER_SCHEMA}.DG_SERVICE_MGR AS
@@ -751,8 +899,7 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
         p_error   IN VARCHAR2
     ) IS
     BEGIN
-        SYS.DBMS_SYSTEM.KSDWRT(
-            2,
+        SYS.DG_ALERT_LOG_MSG(
             'DG_SERVICE_MGR ' || p_action || ' failed for service ' || p_service || ': ' || SUBSTR(p_error, 1, 300)
         );
     EXCEPTION
@@ -813,6 +960,9 @@ END;
 -- DROP TRIGGER ${USER_SCHEMA}.TRG_MANAGE_SERVICES_STARTUP;
 -- DROP PACKAGE ${USER_SCHEMA}.DG_SERVICE_MGR;
 -- DROP USER ${USER_SCHEMA};
+-- Note: SYS.DG_ALERT_LOG_MSG may be shared by other DG deployments
+-- on this database. Only drop it if this is the last consumer:
+-- DROP PROCEDURE SYS.DG_ALERT_LOG_MSG;
 -- ============================================================
 EOSQLFILE
 
@@ -832,6 +982,7 @@ echo "  Schema  : ${USER_SCHEMA}"
 echo "  Package : ${USER_SCHEMA}.DG_SERVICE_MGR           (VALID)"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_ROLE_CHG (ENABLED)"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_STARTUP  (ENABLED)"
+echo "  Helper  : SYS.DG_ALERT_LOG_MSG                    (VALID)"
 echo ""
 echo "  Services managed:"
 for svc in "${SERVICE_LIST[@]}"; do
@@ -851,12 +1002,13 @@ echo ""
 echo "PRIVILEGES GRANTED"
 echo "==================="
 echo ""
-echo "  CREATE SESSION              - Allow login"
-echo "  CREATE PROCEDURE            - Package compilation"
-echo "  ADMINISTER DATABASE TRIGGER - Database event triggers"
-echo "  EXECUTE ON DBMS_SERVICE     - Start/stop services"
-echo "  SELECT ON V_\$DATABASE       - Read database role"
-echo "  EXECUTE ON DBMS_SYSTEM      - Alert log writes"
+echo "  CREATE SESSION                - Allow login"
+echo "  CREATE PROCEDURE              - Package compilation"
+echo "  ADMINISTER DATABASE TRIGGER   - Database event triggers"
+echo "  EXECUTE ON DBMS_SERVICE       - Start/stop services"
+echo "  SELECT ON V_\$DATABASE         - Read database role"
+echo "  EXECUTE ON SYS.DG_ALERT_LOG_MSG - Alert log writes (narrow wrapper,"
+echo "                                  NOT DBMS_SYSTEM itself)"
 echo ""
 echo "MODIFY SERVICE LIST"
 echo "==================="

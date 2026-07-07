@@ -22,6 +22,13 @@
 #   - TNS entries for both databases in tnsnames.ora
 #   - mkstore available in $ORACLE_HOME/bin
 #
+# Note on mkstore and `ps -ef`: mkstore has no stdin-based way to pass the
+# credential password to -createCredential (only the wallet password itself
+# can be fed via stdin/heredoc). The SYS password therefore appears briefly
+# on the mkstore process argv at the -createCredential call sites below.
+# This is a short, one-time exposure at setup time (not a long-lived service
+# argv), and is called out with a comment at each call site.
+#
 # Usage:
 #   bash common/setup_dg_wallet.sh              # Default wallet location
 #   bash common/setup_dg_wallet.sh -w /path     # Custom wallet directory
@@ -139,7 +146,7 @@ fi
 # Get broker configuration
 DGMGRL_CONFIG=$(dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1)
 
-if printf '%s' "$DGMGRL_CONFIG" | grep -q "ORA-16532\|not yet available\|not exist"; then
+if printf '%s' "$DGMGRL_CONFIG" | grep -qE "ORA-16532|not yet available|not exist"; then
     error "No broker configuration found"
     error "Configure the broker first (primary/06_configure_broker.sh)"
     exit 1
@@ -187,8 +194,15 @@ if [[ -z "$SYS_PASSWORD" ]]; then
 fi
 
 info "Testing connection to ${PEER_LABEL} (${PEER_TNS})..."
-PEER_TEST=$(printf "SET HEADING OFF FEEDBACK OFF\nSELECT 'PEER_OK' FROM DUAL;\nEXIT;\n" | \
-    sqlplus -s "sys/${SYS_PASSWORD}@${PEER_TNS} as sysdba" 2>&1)
+# CONNECT is fed via stdin (sqlplus -s /nolog) instead of on the sqlplus
+# command line, so SYS_PASSWORD never appears in `ps -ef` output.
+PEER_TEST=$(sqlplus -s /nolog <<EOF 2>&1
+CONNECT sys/"${SYS_PASSWORD}"@${PEER_TNS} AS SYSDBA
+SET HEADING OFF FEEDBACK OFF
+SELECT 'PEER_OK' FROM DUAL;
+EXIT;
+EOF
+)
 
 if ! printf '%s' "$PEER_TEST" | grep -q 'PEER_OK'; then
     error "Cannot connect to ${PEER_LABEL} via sys@${PEER_TNS}"
@@ -202,8 +216,15 @@ info "Connection to ${PEER_LABEL} verified"
 # Also test local TNS alias if available
 if [[ -n "${LOC_TNS:-}" ]]; then
     info "Testing connection to local TNS alias (${LOC_TNS})..."
-    LOC_TEST=$(printf "SET HEADING OFF FEEDBACK OFF\nSELECT 'LOC_OK' FROM DUAL;\nEXIT;\n" | \
-        sqlplus -s "sys/${SYS_PASSWORD}@${LOC_TNS} as sysdba" 2>&1)
+    # CONNECT is fed via stdin (sqlplus -s /nolog) instead of on the sqlplus
+    # command line, so SYS_PASSWORD never appears in `ps -ef` output.
+    LOC_TEST=$(sqlplus -s /nolog <<EOF 2>&1
+CONNECT sys/"${SYS_PASSWORD}"@${LOC_TNS} AS SYSDBA
+SET HEADING OFF FEEDBACK OFF
+SELECT 'LOC_OK' FROM DUAL;
+EXIT;
+EOF
+)
 
     if ! printf '%s' "$LOC_TEST" | grep -q 'LOC_OK'; then
         warn "Cannot connect via local TNS alias (${LOC_TNS})"
@@ -220,38 +241,57 @@ step "Setting up wallet"
 
 WALLET_PASSWORD=""
 
+# CREATE_NEW_WALLET=true means the wallet is being (re)built from scratch in
+# a temporary staging directory (WORK_WALLET_DIR) and only swapped into
+# WALLET_DIR after every step below succeeds - a failure never leaves the
+# live wallet missing, half-written, or silently replaced.
 CREATE_NEW_WALLET=false
 
 if [[ -f "${WALLET_DIR}/ewallet.p12" ]]; then
     info "Existing wallet found at: ${WALLET_DIR}"
+    info "Credentials will be added/updated in the existing wallet"
 
-    if $AUTO_PASSWORD; then
-        info "Auto-password mode: recreating wallet (existing wallet requires its password)"
-        BACKUP_DIR="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')"
-        mv "$WALLET_DIR" "$BACKUP_DIR"
-        info "Backed up existing wallet to: ${BACKUP_DIR}"
-        CREATE_NEW_WALLET=true
-    else
-        info "Credentials will be added/updated in the existing wallet"
+    WALLET_PASSWORD=$(prompt_password "Enter existing wallet password")
 
-        WALLET_PASSWORD=$(prompt_password "Enter existing wallet password")
-
-        if [[ -z "$WALLET_PASSWORD" ]]; then
-            error "Wallet password cannot be empty"
-            unset SYS_PASSWORD
-            exit 1
-        fi
-
-        # Verify wallet password by listing contents
-        VERIFY_OUT=$("$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -listCredential <<EOF 2>&1
+    # A wallet created by an earlier -A run has an auto-generated password
+    # that was never displayed, so the operator may legitimately be unable
+    # to answer the prompt above. In -A mode, therefore, any failure to open
+    # the existing wallet offers a confirmed recreate instead of a dead end;
+    # without -A it stays fatal as before.
+    WALLET_OPEN_FAILED=""
+    VERIFY_OUT=""
+    if [[ -z "$WALLET_PASSWORD" ]]; then
+        WALLET_OPEN_FAILED="Wallet password cannot be empty"
+    elif ! VERIFY_OUT=$("$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -listCredential <<EOF 2>&1
 ${WALLET_PASSWORD}
 EOF
-        )
-        if printf '%s' "$VERIFY_OUT" | grep -qi "error\|failed\|incorrect\|denied"; then
-            error "Invalid wallet password"
+    ); then
+        WALLET_OPEN_FAILED="Failed to open wallet with the supplied password (mkstore -listCredential)"
+    elif printf '%s' "$VERIFY_OUT" | grep -qiE "error|failed|incorrect|denied"; then
+        WALLET_OPEN_FAILED="Invalid wallet password"
+    fi
+
+    if [[ -n "$WALLET_OPEN_FAILED" ]]; then
+        if $AUTO_PASSWORD; then
+            warn "$WALLET_OPEN_FAILED"
+            warn "The existing wallet cannot be opened (a previous -A run generates a random password that is never shown)."
+            warn "Recreating it discards ALL credentials it currently holds."
+            printf " ${YELLOW}Type 'RECREATE WALLET' to replace it, or press Enter to abort: ${NC}"
+            read -r RECREATE_CONFIRM
+            if [[ "$RECREATE_CONFIRM" == "RECREATE WALLET" ]]; then
+                info "Recreating wallet as confirmed"
+                CREATE_NEW_WALLET=true
+            else
+                error "Aborted - existing wallet left untouched"
+                unset SYS_PASSWORD WALLET_PASSWORD
+                exit 1
+            fi
+        else
+            error "$WALLET_OPEN_FAILED"
             unset SYS_PASSWORD WALLET_PASSWORD
             exit 1
         fi
+    else
         info "Wallet password verified"
 
         # Show existing credentials
@@ -259,16 +299,36 @@ EOF
         printf '%s\n' "$VERIFY_OUT" | grep -i 'oracle.security.client.connect_string' | while IFS= read -r line; do
             printf "   ${DIM}%s${NC}\n" "$line"
         done
+
+        if $AUTO_PASSWORD; then
+            printf "\n"
+            warn "Auto-password mode was requested, but the wallet above already holds credentials."
+            warn "Recreating it discards anything not listed above."
+            printf " ${YELLOW}Type 'RECREATE WALLET' to replace it, or press Enter to add/update credentials in place: ${NC}"
+            read -r RECREATE_CONFIRM
+            if [[ "$RECREATE_CONFIRM" == "RECREATE WALLET" ]]; then
+                info "Recreating wallet as confirmed"
+                CREATE_NEW_WALLET=true
+            else
+                info "Keeping existing wallet; credentials will be added/updated in place"
+            fi
+        fi
     fi
 else
     CREATE_NEW_WALLET=true
 fi
 
 if $CREATE_NEW_WALLET; then
-    info "Creating new auto-login wallet"
+    info "Building new auto-login wallet in a staging directory"
 
-    mkdir -p "$WALLET_DIR"
-    chmod 700 "$WALLET_DIR"
+    if command -v mktemp >/dev/null 2>&1; then
+        WORK_WALLET_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_wallet_staging.XXXXXX")
+    else
+        WORK_WALLET_DIR="${TMPDIR:-/tmp}/dg_wallet_staging.$$"
+        mkdir -p "$WORK_WALLET_DIR"
+    fi
+    chmod 700 "$WORK_WALLET_DIR"
+    info "Staging directory: ${WORK_WALLET_DIR}"
 
     if $AUTO_PASSWORD; then
         WALLET_PASSWORD=$(generate_random_password)
@@ -278,6 +338,7 @@ if $CREATE_NEW_WALLET; then
         WALLET_PASSWORD=$(prompt_password "Enter new wallet password (protects the wallet file)")
         if [[ -z "$WALLET_PASSWORD" ]]; then
             error "Wallet password cannot be empty"
+            rm -rf "$WORK_WALLET_DIR"
             unset SYS_PASSWORD
             exit 1
         fi
@@ -285,6 +346,7 @@ if $CREATE_NEW_WALLET; then
         WALLET_PASSWORD_CONFIRM=$(prompt_password "Confirm wallet password")
         if [[ "$WALLET_PASSWORD" != "$WALLET_PASSWORD_CONFIRM" ]]; then
             error "Passwords do not match"
+            rm -rf "$WORK_WALLET_DIR"
             unset SYS_PASSWORD WALLET_PASSWORD WALLET_PASSWORD_CONFIRM
             exit 1
         fi
@@ -292,23 +354,31 @@ if $CREATE_NEW_WALLET; then
     fi
 
     # Create the wallet (ewallet.p12)
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -create <<EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -create <<EOF
 ${WALLET_PASSWORD}
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         error "Failed to create wallet"
+        rm -rf "$WORK_WALLET_DIR"
         unset SYS_PASSWORD WALLET_PASSWORD
         exit 1
     fi
 
     # Enable auto-login (creates cwallet.sso — no password needed at connect time)
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createSSO <<EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createSSO <<EOF
 ${WALLET_PASSWORD}
 EOF
+    then
+        error "Failed to enable auto-login (createSSO) for wallet"
+        rm -rf "$WORK_WALLET_DIR"
+        unset SYS_PASSWORD WALLET_PASSWORD
+        exit 1
+    fi
 
-    info "Auto-login wallet created at: ${WALLET_DIR}"
+    info "New wallet staged at: ${WORK_WALLET_DIR}"
+else
+    WORK_WALLET_DIR="$WALLET_DIR"
 fi
 
 # =============================================================================
@@ -320,16 +390,22 @@ add_credential() {
     local tns_alias="$1" username="$2" password="$3" label="$4"
 
     # Try to delete existing entry (ignore errors if it doesn't exist)
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -deleteCredential "$tns_alias" <<EOF 2>/dev/null
+    "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -deleteCredential "$tns_alias" <<EOF 2>/dev/null
 ${WALLET_PASSWORD}
 EOF
 
     # Add the credential
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$tns_alias" "$username" "$password" <<EOF
+    # NOTE: mkstore has no stdin-based way to supply the credential password
+    # to -createCredential (only the wallet password above can be piped in),
+    # so $password is briefly visible on this process's argv (`ps -ef`) for
+    # the short lifetime of this one mkstore invocation. This is a known
+    # limitation of the mkstore CLI, not something this script can route
+    # around; the exposure is a one-time setup event, not a persistent
+    # service argv.
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$tns_alias" "$username" "$password" <<EOF
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         error "Failed to add credential for ${tns_alias}"
         return 1
     fi
@@ -338,6 +414,7 @@ EOF
 
 # Add peer credential
 add_credential "$PEER_TNS" "sys" "$SYS_PASSWORD" "${PEER_LABEL}" || {
+    $CREATE_NEW_WALLET && rm -rf "$WORK_WALLET_DIR"
     unset SYS_PASSWORD WALLET_PASSWORD
     exit 1
 }
@@ -345,9 +422,44 @@ add_credential "$PEER_TNS" "sys" "$SYS_PASSWORD" "${PEER_LABEL}" || {
 # Add local credential (if TNS alias is available and different from peer)
 if [[ -n "${LOC_TNS:-}" ]] && [[ "$LOC_TNS" != "$PEER_TNS" ]]; then
     add_credential "$LOC_TNS" "sys" "$SYS_PASSWORD" "local" || {
+        $CREATE_NEW_WALLET && rm -rf "$WORK_WALLET_DIR"
         unset SYS_PASSWORD WALLET_PASSWORD
         exit 1
     }
+fi
+
+# =============================================================================
+# Activate staged wallet
+# =============================================================================
+# Everything above succeeded, so it is now safe to swap the fully built
+# wallet into place. The original wallet (if any) is moved aside as a
+# timestamped backup rather than deleted.
+if $CREATE_NEW_WALLET; then
+    step "Activating new wallet"
+
+    if [[ -d "$WALLET_DIR" ]]; then
+        WALLET_SWAP_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
+        if ! mv "$WALLET_DIR" "$WALLET_SWAP_BACKUP"; then
+            error "Failed to move existing wallet out of the way: ${WALLET_DIR}"
+            error "New wallet remains staged (not activated) at: ${WORK_WALLET_DIR}"
+            unset SYS_PASSWORD WALLET_PASSWORD
+            exit 1
+        fi
+        info "Previous wallet backed up to: ${WALLET_SWAP_BACKUP}"
+    fi
+
+    if ! mv "$WORK_WALLET_DIR" "$WALLET_DIR"; then
+        error "Failed to move staged wallet into place: ${WALLET_DIR}"
+        if [[ -n "${WALLET_SWAP_BACKUP:-}" ]]; then
+            error "Restoring previous wallet from backup: ${WALLET_SWAP_BACKUP}"
+            mv "$WALLET_SWAP_BACKUP" "$WALLET_DIR" 2>/dev/null || error "Restore failed - previous wallet backup left at: ${WALLET_SWAP_BACKUP}"
+        fi
+        error "Staged wallet left at: ${WORK_WALLET_DIR} for manual recovery"
+        unset SYS_PASSWORD WALLET_PASSWORD
+        exit 1
+    fi
+
+    info "New wallet activated at: ${WALLET_DIR}"
 fi
 
 # Clear passwords from memory

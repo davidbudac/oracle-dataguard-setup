@@ -89,8 +89,9 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
 
     log_info "Checking available space on: $CHECK_PATH"
 
-    # Get available space in MB
-    AVAILABLE_SPACE_KB=$(df -k "$CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+    # Get available space in MB (AIX-compatible: df -Pk normalizes the
+    # column layout so field 4 is always available KB, not %Used)
+    AVAILABLE_SPACE_KB=$(get_available_space_kb "$CHECK_PATH")
     AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
 
     log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
@@ -157,7 +158,7 @@ if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
         log_info "Checking available space on separate SRL filesystem: $SRL_CHECK_PATH"
         log_info "SRL storage required: ${SRL_REQUIRED_MB} MB (${REDO_LOG_SIZE_MB} MB x ${STANDBY_REDO_GROUPS} groups + 20% buffer)"
 
-        SRL_AVAILABLE_KB=$(df -k "$SRL_CHECK_PATH" 2>/dev/null | tail -1 | awk '{print $4}')
+        SRL_AVAILABLE_KB=$(get_available_space_kb "$SRL_CHECK_PATH")
         SRL_AVAILABLE_MB=$(( SRL_AVAILABLE_KB / 1024 ))
         log_info "SRL filesystem available: ${SRL_AVAILABLE_MB} MB"
 
@@ -447,7 +448,13 @@ if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
 fi
 
 # Static services required for RMAN duplicate and broker switchover
-TEMP_SID_DESC="/tmp/dg_sid_desc_standby_$$.tmp"
+# Private temp dir + EXIT-trap cleanup: create_temp_dir prefers `mktemp -d`,
+# falling back to a mode-700 directory on AIX images without mktemp - safer
+# than a predictable /tmp/..._$$ filename. No pre-existing EXIT trap in this
+# script, so it is safe to install one here.
+TEMP_SID_DESC_DIR=$(create_temp_dir) || { log_error "Could not create temp directory"; exit 1; }
+trap 'rm -rf "$TEMP_SID_DESC_DIR"' EXIT
+TEMP_SID_DESC="${TEMP_SID_DESC_DIR}/dg_sid_desc_standby.$$"
 STANDBY_STATIC_GLOBAL_NAME="${STANDBY_DB_UNIQUE_NAME}${DB_DOMAIN:+.${DB_DOMAIN}}"
 STANDBY_DGMGRL_GLOBAL_NAME="${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
 MISSING_GLOBAL_NAMES=()
@@ -518,7 +525,7 @@ EOF
     log_info "listener.ora created successfully"
 fi
 
-rm -f "$TEMP_SID_DESC"
+rm -rf "$TEMP_SID_DESC_DIR"
 record_artifact "listener:${LISTENER_ORA}"
 
 # ============================================================

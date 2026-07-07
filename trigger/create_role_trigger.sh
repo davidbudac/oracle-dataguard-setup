@@ -5,6 +5,15 @@
 # Run this script on the PRIMARY database server after
 # Data Guard setup is complete (Step 7 verification passes).
 #
+# Standalone: this script does NOT require the setup-time
+# standby_config_*.env file or the NFS share. It discovers the
+# topology (primary/standby DB_UNIQUE_NAME) from the database itself,
+# the same way trigger/create_role_trigger_cdb.sh does. If a
+# standby_config_*.env file happens to be present on the NFS share it
+# is used only as a fallback label when self-discovery cannot find a
+# peer. The generated SQL is written to the NFS share when one is
+# available, otherwise to the current directory.
+#
 # This script:
 # - Discovers user-defined services running on the database
 # - Allows you to review/edit the service list
@@ -42,25 +51,7 @@ init_log "create_role_trigger"
 log_section "Pre-flight Checks"
 
 check_oracle_env || exit 1
-check_nfs_mount || exit 1
 check_db_connection || exit 1
-
-# ============================================================
-# Load Configuration
-# ============================================================
-
-log_section "Loading Configuration"
-
-# Find standby config file
-if ! select_config_file STANDBY_CONFIG_FILE "standby configuration" "${NFS_SHARE}/standby_config_*.env"; then
-    log_error "Please run the Data Guard setup scripts first (Steps 1-7)"
-    exit 1
-fi
-
-source "$STANDBY_CONFIG_FILE"
-
-# Re-initialize log with DB name
-init_log "create_role_trigger_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Verify Database Role
@@ -78,6 +69,60 @@ if [[ "$DB_ROLE" != "PRIMARY" ]]; then
 fi
 
 log_info "Confirmed: Running on PRIMARY database"
+
+# ============================================================
+# Discover Topology (standalone - no config file required)
+# ============================================================
+
+log_section "Discovering Data Guard Topology"
+
+PRIMARY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V$DATABASE;
+EXIT;
+EOSQL
+)
+PRIMARY_DB_UNIQUE_NAME=$(echo "$PRIMARY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+if [[ -z "$PRIMARY_DB_UNIQUE_NAME" ]]; then
+    log_error "Could not determine the primary DB_UNIQUE_NAME from V\$DATABASE"
+    exit 1
+fi
+
+# The peer (standby) name comes from V$DATAGUARD_CONFIG and is used only to
+# label the generated SQL file, so it is optional.
+STANDBY_DB_UNIQUE_NAME=$(sqlplus -s / as sysdba << EOSQL
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG
+WHERE DB_UNIQUE_NAME <> '${PRIMARY_DB_UNIQUE_NAME}' AND ROWNUM = 1;
+EXIT;
+EOSQL
+)
+STANDBY_DB_UNIQUE_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+
+if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
+    # Self-discovery could not find a peer in V$DATAGUARD_CONFIG. Fall back to
+    # a setup-time standby_config_*.env file if one happens to exist on the
+    # NFS share - purely for this label; nothing else in this script depends
+    # on it. Quiet and non-interactive: this is a best-effort label only.
+    CONFIG_CANDIDATE=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null | head -1) || true
+    if [[ -n "$CONFIG_CANDIDATE" ]]; then
+        # shellcheck disable=SC1090
+        source "$CONFIG_CANDIDATE"
+        log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME:-UNKNOWN}"
+    fi
+fi
+
+log_info "Primary DB_UNIQUE_NAME: $PRIMARY_DB_UNIQUE_NAME"
+if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
+    log_info "Standby DB_UNIQUE_NAME: $STANDBY_DB_UNIQUE_NAME"
+else
+    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
+    STANDBY_DB_UNIQUE_NAME="UNKNOWN"
+fi
+
+# Re-initialize log now that the DB name is known
+init_log "create_role_trigger_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
 # Discover User-Defined Services
@@ -159,12 +204,12 @@ while true; do
             new_svc=$(echo "$new_svc" | tr -d ' \n\r')
             if [[ -n "$new_svc" ]]; then
                 # Validate service name
-                if echo "$new_svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
                     SERVICE_LIST+=("$new_svc")
                     log_info "Added service: $new_svc"
                 else
                     log_error "Invalid service name: $new_svc"
-                    log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
                 fi
             fi
             echo ""
@@ -225,12 +270,12 @@ while true; do
                 if [[ -z "$new_svc" ]]; then
                     break
                 fi
-                if echo "$new_svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
                     SERVICE_LIST+=("$new_svc")
                     log_info "Added service: $new_svc"
                 else
                     log_error "Invalid service name: $new_svc"
-                    log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
                 fi
             done
             echo ""
@@ -261,9 +306,9 @@ fi
 
 # Final validation of all service names
 for svc in "${SERVICE_LIST[@]}"; do
-    if ! echo "$svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+    if ! echo "$svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
         log_error "Invalid service name: $svc"
-        log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
+        log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
         exit 1
     fi
     if [[ ${#svc} -gt 64 ]]; then
@@ -523,7 +568,15 @@ fi
 
 log_section "Saving Generated SQL"
 
-SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
+# Write to the NFS share when one is mounted and writable (keeps parity with
+# the previous config-driven workflow); otherwise fall back to the current
+# directory with a clear notice, since this script no longer requires NFS.
+if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
+    log_warn "NFS share (${NFS_SHARE}) not available/writable - writing generated SQL to the current directory instead"
+fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================

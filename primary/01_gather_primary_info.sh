@@ -524,12 +524,15 @@ EOF
 
 log_info "Primary info written to: $OUTPUT_FILE"
 
-# Copy password file to NFS share
+# Copy password file to NFS share. chmod 600 (owner-only): this file
+# contains the SYS password hash and the share is group-readable, so
+# don't leave it group-readable too. Run common/cleanup_nfs_artifacts.sh
+# once Data Guard setup is verified to remove it from the share entirely.
 PWD_DEST="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
 if [[ -f "$PWD_FILE" ]]; then
-    confirm_approval_action "Copy primary password file to NFS share" "cp $PWD_FILE $PWD_DEST && chmod 640 $PWD_DEST" || exit 1
+    confirm_approval_action "Copy primary password file to NFS share" "cp $PWD_FILE $PWD_DEST && chmod 600 $PWD_DEST" || exit 1
     cp "$PWD_FILE" "$PWD_DEST"
-    chmod 640 "$PWD_DEST"
+    chmod 600 "$PWD_DEST"
     log_success "Password file copied to: $PWD_DEST"
 fi
 

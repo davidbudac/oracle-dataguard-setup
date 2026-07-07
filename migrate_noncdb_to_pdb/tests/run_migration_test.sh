@@ -167,7 +167,7 @@ SELECT 'NONC|'||name||'|'||open_mode||'|'||database_role||'|'||cdb FROM v\\\$dat
 EXIT;
 SQL
     ")
-    if echo "$out" | grep -qE "^NONC\|${SOURCE_DB_NAME^^}\|READ WRITE\|PRIMARY\|NO"; then
+    if echo "$out" | grep -qE "^NONC[|]${SOURCE_DB_NAME^^}[|]READ WRITE[|]PRIMARY[|]NO"; then
         log_pass "Source non-CDB ${SOURCE_DB_NAME} is PRIMARY READ WRITE"
     else
         log_fail "Source non-CDB ${SOURCE_DB_NAME} not in expected state"
@@ -183,7 +183,7 @@ SELECT 'CDB|'||name||'|'||open_mode||'|'||database_role||'|'||cdb FROM v\\\$data
 EXIT;
 SQL
     ")
-    if echo "$out" | grep -qE "^CDB\|${TARGET_CDB_NAME^^}\|READ WRITE\|PRIMARY\|YES"; then
+    if echo "$out" | grep -qE "^CDB[|]${TARGET_CDB_NAME^^}[|]READ WRITE[|]PRIMARY[|]YES"; then
         log_pass "Target CDB ${TARGET_CDB_NAME} is PRIMARY READ WRITE"
     else
         log_fail "Target CDB ${TARGET_CDB_NAME} not in expected state"

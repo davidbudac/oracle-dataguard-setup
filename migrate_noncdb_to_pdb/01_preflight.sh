@@ -158,13 +158,13 @@ fi
 log_info "Checking source non-CDB Data Guard ..."
 SRC_DG="$(run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW CONFIGURATION;")" || true
 echo "$SRC_DG" | tee_into_log
-echo "$SRC_DG" | grep -qi "ORA-\|Error" && fail "Source DG broker has errors"
+echo "$SRC_DG" | grep -qiE "ORA-|Error" && fail "Source DG broker has errors"
 echo "$SRC_DG" | grep -qi "SUCCESS" || log_warn "Source DG status not SUCCESS"
 
 log_info "Checking target CDB Data Guard ..."
 TGT_DG="$(run_dgmgrl "$TARGET_CDB_ORACLE_SID" "SHOW CONFIGURATION;")" || true
 echo "$TGT_DG" | tee_into_log
-echo "$TGT_DG" | grep -qi "ORA-\|Error" && fail "Target DG broker has errors"
+echo "$TGT_DG" | grep -qiE "ORA-|Error" && fail "Target DG broker has errors"
 echo "$TGT_DG" | grep -qi "SUCCESS" || log_warn "Target DG status not SUCCESS"
 
 # Apply lag must be 0 on both standbys (we'll show, then check transport/apply)

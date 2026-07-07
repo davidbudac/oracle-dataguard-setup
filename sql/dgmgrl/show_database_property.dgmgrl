@@ -1,0 +1,4 @@
+-- Show one broker database property
+-- Usage: dgmgrl @show_database_property.dgmgrl db_unique_name property_name
+SHOW DATABASE '&1' '&2';
+EXIT;

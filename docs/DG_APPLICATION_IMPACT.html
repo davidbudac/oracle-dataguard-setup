@@ -1,0 +1,167 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>What Data Guard Changes for Your Application</title>
+  <style>
+    :root {
+      color: #17202a;
+      background: #ffffff;
+      font-family: Arial, Helvetica, sans-serif;
+      line-height: 1.45;
+    }
+    body {
+      margin: 0;
+      padding: 32px;
+    }
+    main {
+      max-width: 920px;
+      margin: 0 auto;
+    }
+    h1 {
+      font-size: 30px;
+      margin: 0 0 8px;
+      color: #10233f;
+    }
+    h2 {
+      font-size: 20px;
+      margin: 28px 0 8px;
+      color: #10233f;
+      border-bottom: 1px solid #d8dee8;
+      padding-bottom: 4px;
+    }
+    p {
+      margin: 8px 0 12px;
+    }
+    ul {
+      margin: 8px 0 14px 22px;
+      padding: 0;
+    }
+    li {
+      margin: 6px 0;
+    }
+    code {
+      font-family: Consolas, "Courier New", monospace;
+      font-size: 0.95em;
+      background: #f3f6fa;
+      padding: 1px 4px;
+      border-radius: 3px;
+    }
+    .lead {
+      font-size: 16px;
+      color: #334155;
+      margin-bottom: 22px;
+    }
+    .callout {
+      border-left: 4px solid #2f6fed;
+      background: #f5f8ff;
+      padding: 10px 14px;
+      margin: 16px 0;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 12px 0 18px;
+    }
+    th, td {
+      border: 1px solid #d8dee8;
+      padding: 8px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    th {
+      background: #eef3f8;
+      color: #10233f;
+    }
+    @media print {
+      body {
+        padding: 18mm;
+      }
+      a {
+        color: inherit;
+        text-decoration: none;
+      }
+      h2 {
+        break-after: avoid;
+      }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>What Data Guard Changes for Your Application</h1>
+  <p class="lead">Oracle Data Guard protects the database by maintaining a physical standby. Application teams need to plan for the behavioral changes below before go-live.</p>
+
+  <h2>Commit Latency Under SYNC</h2>
+  <p>When transport is <code>SYNC</code> or <code>FASTSYNC</code> in Maximum Availability, commits wait for standby acknowledgement according to the configured mode. This improves data-loss protection, but chatty transaction patterns can see higher commit latency than a single-instance primary.</p>
+  <ul>
+    <li>Batch small commits where the application can do so safely.</li>
+    <li>Watch transaction latency during network maintenance windows.</li>
+    <li>Keep idempotent retry logic for recoverable connection failures.</li>
+  </ul>
+
+  <h2>FORCE LOGGING and NOLOGGING Jobs</h2>
+  <p>Data Guard relies on redo. <code>NOLOGGING</code> operations can create unrecoverable gaps on the standby unless FORCE LOGGING is in effect for the database or the relevant object scope.</p>
+  <ul>
+    <li>Review direct-path loads, index rebuilds, and ETL jobs that request <code>NOLOGGING</code>.</li>
+    <li>Coordinate any temporary FORCE LOGGING changes with the DBA team.</li>
+    <li>Validate standby recovery after large maintenance loads.</li>
+  </ul>
+
+  <h2>Sequence Gaps After Role Change</h2>
+  <p>Sequence values are not a gap-free business counter. Cached sequence values on the old primary can be discarded during switchover or failover, so applications must tolerate gaps.</p>
+  <div class="callout">Use sequences for surrogate keys. Use a separate controlled process for legally gap-free document numbers.</div>
+
+  <h2>Cold-Cache Brownout</h2>
+  <p>After switchover or failover, the new primary may have a colder buffer cache and different session state. The database can be open, while application latency remains elevated until hot blocks and execution paths warm up.</p>
+  <ul>
+    <li>Expect a short brownout after the role change.</li>
+    <li>Use pool ramp-up instead of reconnecting every application worker at once.</li>
+    <li>Keep synthetic checks focused on application transactions, not just listener reachability.</li>
+  </ul>
+
+  <h2>Read-Only Standby Semantics</h2>
+  <p>A mounted standby cannot serve application sessions. A standby opened <code>READ ONLY WITH APPLY</code> can serve reporting reads with Active Data Guard, but it remains read-only.</p>
+  <table>
+    <thead>
+      <tr>
+        <th>Behavior</th>
+        <th>Application impact</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td>DML on standby</td>
+        <td>Fails with <code>ORA-16000</code>; send writes to the primary service.</td>
+      </tr>
+      <tr>
+        <td>Apply lag</td>
+        <td>Recent primary commits may not be visible immediately on standby.</td>
+      </tr>
+      <tr>
+        <td>Read-your-writes</td>
+        <td>Not guaranteed when a request writes to primary and then reads from standby.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <h2>Connection Strings and Retry Guidance</h2>
+  <p>Use the role-aware descriptor from the handoff report for application write traffic. It lists both hosts and relies on the Data Guard service trigger to run the service only on the current primary.</p>
+  <ul>
+    <li>Use short connect and transport timeouts so down hosts do not stall request threads.</li>
+    <li>Enable pool validation on borrow or an equivalent lightweight connection check.</li>
+    <li>Enable TCP keepalive on client hosts and review server-side <code>SQLNET.EXPIRE_TIME</code>.</li>
+    <li>Treat TAF as SELECT-only replay; in-flight DML still needs application retry and reconciliation.</li>
+  </ul>
+
+  <h2>Reach Both Hosts Before Go-Live</h2>
+  <p>The application tier must be able to reach both database hosts on the listener port before a planned or unplanned role change. Firewalls, routing, DNS, and security groups must all allow both paths.</p>
+  <ul>
+    <li>Run <code>tnsping</code> or equivalent connection checks to both hosts.</li>
+    <li>Run <code>nc -z &lt;host&gt; &lt;port&gt;</code> or the platform equivalent from every app network zone.</li>
+    <li>Include both hosts in monitoring and operational runbooks.</li>
+  </ul>
+</main>
+</body>
+</html>

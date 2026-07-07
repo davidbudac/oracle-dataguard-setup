@@ -21,8 +21,9 @@ This document describes what each automation script does and shows the equivalen
 14. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
 15. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
 16. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
-17. [Summary](#summary-what-would-be-done-manually-without-scripts)
-18. [Common Monitoring Commands](#common-monitoring-commands)
+17. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
+18. [Summary](#summary-what-would-be-done-manually-without-scripts)
+19. [Common Monitoring Commands](#common-monitoring-commands)
 
 ---
 
@@ -52,13 +53,14 @@ Run this on the server that will host the NFS share (can be primary, standby, or
 
 1. Validates root/sudo privileges
 2. Prompts for primary and standby server hostnames/IPs
-3. Installs NFS server packages (auto-detects yum, dnf, or apt-get)
-4. Creates NFS share directory: `/OINSTALL/_dataguard_setup` (with `logs/` subdirectory)
-5. Backs up `/etc/exports` and adds export entries for both servers
-6. Enables and starts NFS services (`nfs-server`, `rpcbind`)
-7. Exports the filesystem (`exportfs -ra`)
-8. Configures firewall (firewalld or ufw) for NFS ports 111 and 2049
-9. Verifies setup
+3. Prompts for the OS user:group that should own the share (default `oracle:oinstall`) - its UID/GID must match on both DB hosts, since NFS maps ownership by number, not by name
+4. Installs NFS server packages (auto-detects yum, dnf, or apt-get)
+5. Creates NFS share directory: `/OINSTALL/_dataguard_setup` (with `logs/` subdirectory), `chown`s it to the specified owner, and `chmod`s it `750`
+6. Backs up `/etc/exports` and adds export entries for both servers (`rw,sync,no_subtree_check` - no `no_root_squash`, since everything in this workflow runs as the oracle OS user)
+7. Enables and starts NFS services (`nfs-server`, `rpcbind`)
+8. Exports the filesystem (`exportfs -ra`)
+9. Configures firewall (firewalld or ufw) for NFS ports 111 and 2049
+10. Verifies setup
 
 #### Manual Equivalent
 
@@ -68,12 +70,14 @@ sudo yum install -y nfs-utils
 
 # Create directories
 sudo mkdir -p /OINSTALL/_dataguard_setup/logs
-sudo chmod 775 /OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup/logs
+sudo chown oracle:oinstall /OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup/logs
+sudo chmod 750 /OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup/logs
 
-# Add exports (replace hostnames)
+# Add exports (replace hostnames). no_root_squash is intentionally omitted:
+# everything in this workflow runs as the oracle OS user, never root.
 cat >> /etc/exports << 'EOF'
-/OINSTALL/_dataguard_setup primary_host(rw,sync,no_subtree_check,no_root_squash)
-/OINSTALL/_dataguard_setup standby_host(rw,sync,no_subtree_check,no_root_squash)
+/OINSTALL/_dataguard_setup primary_host(rw,sync,no_subtree_check)
+/OINSTALL/_dataguard_setup standby_host(rw,sync,no_subtree_check)
 EOF
 
 # Export and start services
@@ -105,7 +109,7 @@ Run this on **both** primary and standby servers.
 8. Mounts the NFS share (NFSv4 with options: `rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576`)
 9. Tests write access
 10. Adds persistent mount entry to `/etc/fstab` (with backup)
-11. Sets ownership to `oracle:oinstall` (or `oracle:dba`)
+11. Sets ownership to `oracle:oinstall` (or `oracle:dba`) and `chmod`s the mount point `750`
 
 #### Manual Equivalent
 
@@ -130,9 +134,11 @@ touch /OINSTALL/_dataguard_setup/.test && rm /OINSTALL/_dataguard_setup/.test
 # Persist in fstab
 echo "nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup nfs4 rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576 0 0" >> /etc/fstab
 
-# Set permissions
+# Set permissions (750, not 775 - the mount point IS the exported share
+# directory, so a wider mode here would undo the 750 set by
+# nfs/01_setup_nfs_server.sh for every client that mounts it)
 sudo chown oracle:oinstall /OINSTALL/_dataguard_setup
-sudo chmod 775 /OINSTALL/_dataguard_setup
+sudo chmod 750 /OINSTALL/_dataguard_setup
 ```
 
 ---
@@ -153,6 +159,8 @@ sudo chmod 775 /OINSTALL/_dataguard_setup
 2. Remove standby data files: `rm -rf /path/to/standby/oradata/*`
 3. Remove standby control files and redo logs
 4. Re-run step 5
+
+**Re-cloning after Step 8 hardening:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this during its password check (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run Step 8 afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
 
 **To restart from Step 6 after a failure:**
 1. Connect to DGMGRL: `dgmgrl /`
@@ -822,6 +830,10 @@ EXIT;
   ALTER USER SYSTEM ACCOUNT LOCK;
   ```
 
+- **Standby impact:** the SYS password change regenerates the primary's local password file. The script stages a refreshed copy (`orapw<STANDBY_SID>_hardened`) on the NFS share and prints the exact `cp`/`chmod` commands to install it on the standby; until that copy is installed, Data Guard redo transport fails with `ORA-16191`.
+
+- **Re-cloning after hardening:** if you later need to re-run `standby/05_clone_standby.sh` (see [Restartability](#restartability)), SYS on the primary is now locked. The clone script detects this (`ORA-28000`) and prints the temporary unlock/reset procedure, ending with re-running this step to re-harden SYS and re-propagate the password file.
+
 ---
 
 ## Step 9: Configure Fast-Start Failover (Optional)
@@ -1122,6 +1134,39 @@ To change which services are managed, re-run the script:
 ```
 
 The script will discover current services and let you edit the list interactively. Re-running replaces the existing PL/SQL objects.
+
+---
+
+## Step 12: NFS Artifact Cleanup (Optional)
+
+**Script:** `common/cleanup_nfs_artifacts.sh`
+
+Run this once Data Guard has been verified (Step 7), and ideally after the handoff report (Step 15 / `primary/10_generate_handoff_report.sh`) has been reviewed, to scrub sensitive/transient artifacts for a build off the group-readable NFS share.
+
+### What the Script Does
+
+1. Selects (or accepts via `-c`/`--config`) the `standby_config_*.env` file for the build and derives its primary/standby `DB_UNIQUE_NAME`s
+2. Scans the NFS share for that build's password file copies (`orapw*`, including the `_hardened` variant staged by Step 8), the generated standby pfile, and RMAN duplicate cmdfiles/logs
+3. Prints the exact list of files that will be removed, and the files that will be left in place
+4. Prompts for confirmation (unless `-y`/`--yes` is given) before deleting anything
+5. By default, keeps the config `.env` files, the handoff report, and the application-impact briefing; `--all` removes those too (with a stronger, typed confirmation)
+
+### Manual Equivalent
+
+```bash
+# As oracle user, on any host with the NFS share mounted
+rm -f /OINSTALL/_dataguard_setup/orapw<PRIMARY_SID>
+rm -f /OINSTALL/_dataguard_setup/orapw<PRIMARY_DB_NAME>
+rm -f /OINSTALL/_dataguard_setup/orapw<STANDBY_SID>_hardened
+rm -f /OINSTALL/_dataguard_setup/init<STANDBY_SID>_<STANDBY_DB_UNIQUE_NAME>.ora
+rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.rcv
+rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
+```
+
+### Important Notes
+
+- RMAN duplicate cmdfiles/logs are not tagged with `DB_UNIQUE_NAME` in their filename, so if multiple builds have shared the same NFS share, review the printed list carefully before confirming.
+- Use `--all` for a full teardown of a build's NFS footprint once the handoff report and any application-impact briefing have been distributed and are no longer needed from the share.
 
 ---
 

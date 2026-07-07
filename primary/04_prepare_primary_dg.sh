@@ -128,9 +128,14 @@ fi
 progress_step "Configuring Listener on Primary"
 
 LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
-LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${PRIMARY_DB_UNIQUE_NAME}.ora"
 
-TEMP_SID_DESC="/tmp/dg_sid_desc_primary_$$.tmp"
+# Private temp dir + EXIT-trap cleanup: create_temp_dir prefers `mktemp -d`,
+# falling back to a mode-700 directory on AIX images without mktemp - safer
+# than a predictable /tmp/..._$$ filename. No pre-existing EXIT trap in this
+# script, so it is safe to install one here.
+TEMP_SID_DESC_DIR=$(create_temp_dir) || { log_error "Could not create temp directory"; exit 1; }
+trap 'rm -rf "$TEMP_SID_DESC_DIR"' EXIT
+TEMP_SID_DESC="${TEMP_SID_DESC_DIR}/dg_sid_desc_primary.$$"
 PRIMARY_STATIC_GLOBAL_NAME="${PRIMARY_DB_UNIQUE_NAME}${DB_DOMAIN:+.${DB_DOMAIN}}"
 PRIMARY_DGMGRL_GLOBAL_NAME="${PRIMARY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
 MISSING_GLOBAL_NAMES=()
@@ -201,7 +206,7 @@ EOF
     log_info "listener.ora created successfully"
 fi
 
-rm -f "$TEMP_SID_DESC"
+rm -rf "$TEMP_SID_DESC_DIR"
 record_artifact "listener:${LISTENER_ORA}"
 
 log_info "Listener configuration updated (changes will take effect on next listener reload)"

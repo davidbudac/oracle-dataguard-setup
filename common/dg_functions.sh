@@ -1,15 +1,21 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Shared Utility Functions
 # ============================================================
 
-# Color codes for output
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-BLUE='\033[0;34m'
-CYAN='\033[0;36m'
-NC='\033[0m' # No Color
+# Get the directory where this script is located
+DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Color codes for output. TTY/NO_COLOR-aware color init (dg_render_init_colors)
+# lives in dg_render_common.sh, shared with dg_status.sh and
+# dg_local_status_common.sh (WS4.2). Sourcing it here means every script
+# under primary/, standby/, trigger/, fsfo/, nfs/ that sources dg_functions.sh
+# picks up TTY-aware colors and --no-color (via enable_verbose_mode below)
+# automatically - no per-script changes needed. dg_render_common.sh already
+# calls dg_render_init_colors once, unconditionally, as soon as it is
+# sourced, so color vars are sane immediately - before enable_verbose_mode
+# (or any --no-color flag) is ever parsed.
+source "${DG_FUNCTIONS_DIR}/dg_render_common.sh"
 
 # NFS share path for file exchange (default, can be overridden by confirm_nfs_share)
 NFS_SHARE="${NFS_SHARE:-/OINSTALL/_dataguard_setup}"
@@ -21,9 +27,6 @@ ERROR_TRAP_ACTIVE=0
 CURRENT_PROGRESS_TITLE=""
 STEP_STATE_FILE=""
 
-# Get the directory where this script is located
-DG_FUNCTIONS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-
 # SQL scripts directory (relative to project root)
 SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 
@@ -34,6 +37,7 @@ SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 enable_verbose_mode() {
     local args=("$@")
     local i=0
+    local no_color_flag=false
 
     while [[ $i -lt ${#args[@]} ]]; do
         case "${args[$i]}" in
@@ -55,9 +59,17 @@ enable_verbose_mode() {
             --execute)
                 CHECK_ONLY=0
                 ;;
+            --no-color)
+                no_color_flag=true
+                ;;
         esac
         i=$((i + 1))
     done
+
+    # Re-initialize colors now that --no-color has been parsed (WS4.2). Any
+    # script that calls enable_verbose_mode "$@" near its own top gets this
+    # for free without adding its own flag handling.
+    $no_color_flag && dg_render_init_colors 1
 
     export VERBOSE
     export APPROVAL_MODE
@@ -206,7 +218,7 @@ confirm_approval_action() {
     printf "  %s\n" "$action_cmd"
     echo ""
     printf "${YELLOW}Approve this action? [y/N]: ${NC}"
-    read response
+    read -r response
 
     case "$response" in
         [yY][eE][sS]|[yY])
@@ -339,6 +351,31 @@ strip_whitespace() {
 }
 
 # ============================================================
+# Temp File Helpers
+# ============================================================
+
+# Create a private temp directory for scratch files, preferring `mktemp -d`
+# (unpredictable name, created atomically, mode 700). Falls back to a
+# manually created mode-700 directory named with $$ when `mktemp` is not on
+# PATH (e.g. a minimal AIX image) - a fixed `/tmp/foo_$$` filename is
+# predictable and can be pre-created/symlinked by another user, so any
+# fallback still needs its own private, non-world-writable directory rather
+# than a bare file directly under /tmp.
+# Prints the directory path to stdout. Callers should immediately register
+# `trap 'rm -rf "$dir"' EXIT` (merging with any existing EXIT trap) so the
+# directory and everything placed inside it are cleaned up on every exit
+# path, not just the happy path.
+# Usage: MY_TMP_DIR=$(create_temp_dir) && trap 'rm -rf "$MY_TMP_DIR"' EXIT
+#        MY_TMP_FILE="${MY_TMP_DIR}/dg_sid_desc_primary.$$"
+create_temp_dir() {
+    if command -v mktemp >/dev/null 2>&1; then
+        mktemp -d 2>/dev/null && return
+    fi
+    local dir="${TMPDIR:-/tmp}/dg_tmp_$$"
+    mkdir -m 700 -p "$dir" 2>/dev/null && printf '%s\n' "$dir"
+}
+
+# ============================================================
 # Validation Functions
 # ============================================================
 
@@ -415,6 +452,24 @@ check_nfs_mount() {
     return 0
 }
 
+# Parse the available-KB column from POSIX `df -Pk` output, reading the
+# report from stdin. Kept as a separate pure function (no `df` call of its
+# own) so a unit test can pipe captured df output through it directly.
+# Usage: df -Pk "$path" | parse_df_available_kb
+parse_df_available_kb() {
+    tail -1 | awk '{print $4}'
+}
+
+# Get available space in KB for the filesystem containing $path.
+# Uses `df -Pk` (POSIX output format) so the column layout is identical on
+# Linux and AIX. Plain `df -k` on AIX places %Used in field 4 (not free KB
+# as on Linux), which silently breaks downstream arithmetic.
+# Usage: AVAILABLE_KB=$(get_available_space_kb "$path")
+get_available_space_kb() {
+    local path="$1"
+    df -Pk "$path" 2>/dev/null | parse_df_available_kb
+}
+
 # Prompt user to confirm or provide NFS share location
 # Usage: confirm_nfs_share
 # Sets: NFS_SHARE global variable
@@ -432,7 +487,7 @@ confirm_nfs_share() {
     printf "Current NFS share path: ${GREEN}%s${NC}\n" "$default_path"
     echo ""
     printf "Press Enter to use this path, or type a different path: "
-    read user_input
+    read -r user_input
 
     if [[ -n "$user_input" ]]; then
         # User provided a different path - strip trailing slash
@@ -614,7 +669,11 @@ run_dgmgrl_with_password() {
     content=$(cat "$script_path")
     content=$(substitute_dgmgrl_args "$content" "$@")
     pause_verbose_trace
-    printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent "sys/${password}@${tns_alias}"
+    # CONNECT is fed as the first line of stdin (dgmgrl -silent /nolog)
+    # instead of on the command line, so the SYS password never appears in
+    # `ps -ef` output for the life of the call.
+    { printf 'CONNECT sys/"%s"@%s\n' "${password}" "${tns_alias}"; printf '%s\n' "$content"; } \
+        | "$ORACLE_HOME/bin/dgmgrl" -silent /nolog
     local rc=$?
     resume_verbose_trace
     return $rc
@@ -633,7 +692,7 @@ prompt_password() {
     # AIX compatible: use stty instead of read -s
     pause_verbose_trace
     stty -echo 2>/dev/null || true
-    read password
+    read -r password
     stty echo 2>/dev/null || true
     resume_verbose_trace
     echo "" >&2
@@ -654,7 +713,7 @@ prompt_with_default() {
         printf "%s: " "$prompt_text"
     fi
 
-    read user_input
+    read -r user_input
 
     if [[ -z "$user_input" ]]; then
         user_input="$default_value"
@@ -669,10 +728,21 @@ verify_sys_password() {
 
     local result
     pause_verbose_trace
-    # </dev/null so a bad password makes sqlplus exit on EOF rather than
-    # re-prompting for credentials and hanging on the terminal. 2>&1 is kept
-    # deliberately: the connection test inspects the error text in $result.
-    result=$(sqlplus -s "sys/${password}@${tns_alias} as sysdba" @"${SQL_DIR}/queries/check_connection.sql" 2>&1 </dev/null)
+    # CONNECT is fed on stdin (sqlplus -s /nolog) instead of on the sqlplus
+    # command line, so the SYS password never appears in `ps -ef` output.
+    # WHENEVER SQLERROR EXIT SQL.SQLCODE makes a failed CONNECT itself end
+    # the session with a non-zero exit code before check_connection.sql ever
+    # runs - this replaces the old "</dev/null so a bad password hits EOF at
+    # the re-prompt" trick, which only applied to a bad *command-line* logon
+    # and is unreachable now that the logon happens as an in-script CONNECT.
+    # 2>&1 is kept deliberately: the connection test inspects the error text
+    # in $result.
+    result=$(sqlplus -s /nolog <<SQL 2>&1
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CONNECT sys/"${password}"@${tns_alias} AS SYSDBA
+@${SQL_DIR}/queries/check_connection.sql
+SQL
+)
     local rc=$?
     resume_verbose_trace
 
@@ -921,18 +991,28 @@ add_sid_to_listener() {
         return 1
     fi
 
-    # Create the new file by inserting sid_desc before the insert_line
-    # AIX compatible: use $$ (PID) instead of mktemp
-    local temp_file
-    temp_file="/tmp/dg_listener_edit_$$.tmp"
+    # Create the new file by inserting sid_desc before the insert_line.
+    # Use a private temp directory (create_temp_dir: mktemp -d, or a mode-700
+    # fallback dir on AIX images without mktemp) instead of a predictable
+    # /tmp/..._$$ filename, and clean it up explicitly on every path out of
+    # this function - including a declined approval - rather than a
+    # script-wide EXIT trap, since this function is sourced into several
+    # top-level scripts that may install their own traps.
+    local temp_dir temp_file
+    temp_dir=$(create_temp_dir) || { echo "ERROR: Could not create temp directory" >&2; return 1; }
+    temp_file="${temp_dir}/dg_listener_edit.$$"
 
     head -n $((insert_line - 1)) "$listener_file" > "$temp_file"
     cat "$sid_desc_file" >> "$temp_file"
     tail -n "+${insert_line}" "$listener_file" >> "$temp_file"
 
     # Replace original
-    confirm_approval_action "Update listener file" "mv $temp_file $listener_file" || return 1
+    if ! confirm_approval_action "Update listener file" "mv $temp_file $listener_file"; then
+        rm -rf "$temp_dir"
+        return 1
+    fi
     mv "$temp_file" "$listener_file"
+    rm -rf "$temp_dir"
 
     return 0
 }
@@ -976,7 +1056,7 @@ select_config_file() {
     local file_count=${#files_array[@]}
 
     if [[ $file_count -eq 1 ]]; then
-        eval "$result_var=\"${files_array[0]}\""
+        printf -v "$result_var" '%s' "${files_array[0]}"
         log_info "Found ${file_type} file: ${files_array[0]}"
         return 0
     fi
@@ -1000,7 +1080,7 @@ select_config_file() {
 
     echo ""
     printf "Select ${file_type} [1-%d, default=%d]: " "$file_count" "$file_count"
-    read selection
+    read -r selection
 
     # Default to newest (last in list) if empty
     if [[ -z "$selection" ]]; then
@@ -1014,7 +1094,7 @@ select_config_file() {
     fi
 
     local selected_file="${files_array[$((selection - 1))]}"
-    eval "$result_var=\"$selected_file\""
+    printf -v "$result_var" '%s' "$selected_file"
     log_info "Selected: $selected_file"
     return 0
 }
@@ -1031,7 +1111,7 @@ confirm_proceed() {
     echo ""
     printf "${YELLOW}%s${NC}\n" "$message"
     printf "Do you want to proceed? [y/N]: "
-    read response
+    read -r response
 
     case "$response" in
         [yY][eE][sS]|[yY])
@@ -1051,7 +1131,7 @@ confirm_typed_value() {
     echo ""
     printf "${YELLOW}%s${NC}\n" "$message"
     printf "Type '%s' to continue: " "$expected_value"
-    read response
+    read -r response
 
     if [[ "$response" == "$expected_value" ]]; then
         return 0
@@ -1151,9 +1231,20 @@ display_config() {
 
 print_banner() {
     local title="$1"
+    local approval_line
+    # WS4.6: reflect the actual approval-mode state (set via -a/--approval-mode,
+    # or the legacy -s/--suspicious/$SUSPICIOUS) on every banner, so an
+    # operator can tell at a glance whether mutating actions will prompt for
+    # approval without having to check invocation flags.
+    if [[ "${APPROVAL_MODE:-0}" == "1" ]]; then
+        approval_line="Approval prompts: ON"
+    else
+        approval_line="Approval prompts: OFF (use -a to enable)"
+    fi
     echo ""
     printf "${BLUE}============================================================${NC}\n"
     printf "${BLUE}     Oracle Data Guard Setup - %s${NC}\n" "$title"
+    printf "${BLUE}     %s${NC}\n" "$approval_line"
     printf "${BLUE}============================================================${NC}\n"
     echo ""
 }

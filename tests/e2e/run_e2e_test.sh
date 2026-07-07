@@ -296,7 +296,7 @@ assert_dgmgrl() {
     local result
     result=$(ssh_cmd "$host" "dgmgrl -silent / '${dgmgrl_cmd}'" 2>&1)
 
-    if echo "$result" | grep -qi "${expected}"; then
+    if echo "$result" | grep -qiE "${expected}"; then
         log_pass "${label}"
     else
         log_fail "${label}: expected '${expected}' in output"
@@ -418,8 +418,9 @@ cleanup_standby() {
         if grep -q 'NAMES.DEFAULT_DOMAIN' '${ORACLE_HOME}/network/admin/sqlnet.ora' 2>/dev/null; then
             sed -i 's/^NAMES.DEFAULT_DOMAIN/#NAMES.DEFAULT_DOMAIN/' '${ORACLE_HOME}/network/admin/sqlnet.ora'
         fi
-        # Stop observer if running
-        pkill -f 'dgmgrl.*observer' 2>/dev/null || true
+        # Stop observer if running (process cmdline is 'START OBSERVER', uppercase;
+        # match case-insensitively without relying on pkill -i support)
+        pkill -f 'dgmgrl.*[Oo][Bb][Ss][Ee][Rr][Vv][Ee][Rr]' 2>/dev/null || true
 
         # Shutdown standby database
         sqlplus -s / as sysdba << 'SQLEOF' 2>/dev/null || true
@@ -652,13 +653,13 @@ SQLEOF
         return 1
     fi
 
-    if echo "$result" | grep -q 'OMF=$\|OMF=UNSET'; then
+    if echo "$result" | grep -qE 'OMF=$|OMF=UNSET'; then
         log_pass "OMF disabled (db_create_file_dest unset)"
     else
         log_info "OMF parameter may still have a value (DBCA residual) - continuing"
     fi
 
-    if echo "$result" | grep -q 'FRA=$\|FRA=UNSET'; then
+    if echo "$result" | grep -qE 'FRA=$|FRA=UNSET'; then
         log_pass "FRA disabled (db_recovery_file_dest unset)"
     else
         log_info "FRA parameter may still have a value - continuing"
@@ -845,7 +846,7 @@ phase_step3() {
         "Standby TNS entry on standby" || return 1
 
     # Validate: listener is running
-    if ssh_standby "lsnrctl status 2>&1 | grep -qi 'ready\\|running\\|LSNRCTL'" 2>/dev/null; then
+    if ssh_standby "lsnrctl status 2>&1 | grep -qiE 'ready|running|LSNRCTL'" 2>/dev/null; then
         log_pass "Standby listener is running"
     else
         log_fail "Standby listener not running"
@@ -927,7 +928,7 @@ SQLEOF
         "Primary SID in listener.ora" || return 1
 
     # Validate: tnsping to standby
-    if ssh_primary "tnsping '${TEST_STANDBY_DB_UNIQUE_NAME}' 2>&1 | grep -qi 'OK\\|ok'" 2>/dev/null; then
+    if ssh_primary "tnsping '${TEST_STANDBY_DB_UNIQUE_NAME}' 2>&1 | grep -qiE 'OK|ok'" 2>/dev/null; then
         log_pass "tnsping to standby succeeded"
     else
         log_info "tnsping to standby may fail if standby listener not yet configured - continuing"
@@ -1065,9 +1066,9 @@ phase_step7() {
     fi
 
     # Check for HEALTHY status in output
-    if echo "$result" | grep -qi "HEALTHY\|healthy\|All checks passed"; then
+    if echo "$result" | grep -qiE "HEALTHY|healthy|All checks passed"; then
         log_pass "Verification reports HEALTHY"
-    elif echo "$result" | grep -qi "WARNING\|warning"; then
+    elif echo "$result" | grep -qiE "WARNING|warning"; then
         log_info "Verification reports WARNINGs (non-fatal)"
         log_pass "Verification completed with warnings"
     else
@@ -1252,7 +1253,7 @@ phase_step10() {
 
     # Validate: observer process running
     sleep 10
-    if ssh_standby "ps -ef | grep -v grep | grep -q 'dgmgrl.*observer'" 2>/dev/null; then
+    if ssh_standby "ps -ef | grep -v grep | grep -qi 'dgmgrl.*observer'" 2>/dev/null; then
         log_pass "Observer process is running"
     else
         log_fail "Observer process not found"
@@ -1299,7 +1300,7 @@ phase_step11() {
 
     if [[ $exit_code -ne 0 ]]; then
         # Service trigger may fail if no user services are discovered (test DB is empty)
-        if echo "$result" | grep -qi "no.*services\|no.*service.*found\|empty"; then
+        if echo "$result" | grep -qiE "no.*services|no.*service.*found|empty"; then
             log_info "No user services found in test database (expected for empty DB)"
             log_skip "Step 11: No services to manage"
             return 0

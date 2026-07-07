@@ -53,7 +53,7 @@ fi
 log_info "DGMGRL SHOW CONFIGURATION VERBOSE:"
 DG_CFG="$(run_dgmgrl "$TARGET_CDB_ORACLE_SID" "SHOW CONFIGURATION VERBOSE;")"
 echo "$DG_CFG" | tee_into_log
-echo "$DG_CFG" | grep -qi "ORA-\|Error" && fail "DGMGRL reports broker errors"
+echo "$DG_CFG" | grep -qiE "ORA-|Error" && fail "DGMGRL reports broker errors"
 echo "$DG_CFG" | grep -qi "SUCCESS" || fail "DGMGRL Configuration Status not SUCCESS"
 
 # ---- 3. New PDB is present in dictionary on the standby --------------------

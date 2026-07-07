@@ -961,41 +961,12 @@ EOF
 log_info "Listener entries written to: $LISTENER_FILE"
 log_success "Standby listener snippet written to: $LISTENER_FILE"
 
-# ============================================================
-# Generate Listener Entry for Primary
-# ============================================================
-
-log_section "Generating Listener Configuration for Primary"
-
-# Include primary DB_UNIQUE_NAME in filename
-LISTENER_PRIMARY_FILE="${NFS_SHARE}/listener_primary_${DB_UNIQUE_NAME}.ora"
-
-cat > "$LISTENER_PRIMARY_FILE" <<EOF
-# ============================================================
-# Oracle Data Guard Listener Entry for Primary
-# Generated: $(date)
-# Add this SID_LIST entry to listener.ora on PRIMARY server
-# Static registration ensures connectivity during switchover
-# ============================================================
-
-# Add this to your existing SID_LIST_LISTENER or create new:
-SID_LIST_LISTENER =
-  (SID_LIST =
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${PRIMARY_SERVICE_NAME})
-      (ORACLE_HOME = ${PRIMARY_ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-    (SID_DESC =
-      (GLOBAL_DBNAME = ${DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}})
-      (ORACLE_HOME = ${PRIMARY_ORACLE_HOME})
-      (SID_NAME = ${PRIMARY_ORACLE_SID})
-    )
-  )
-EOF
-
-log_info "Primary listener entries written to: $LISTENER_PRIMARY_FILE"
-log_success "Primary listener snippet written to: $LISTENER_PRIMARY_FILE"
+# Note: no separate "listener entry for primary" snippet is generated here.
+# primary/04_prepare_primary_dg.sh builds the primary's actual listener.ora
+# SID_DESC entries itself (via TEMP_SID_DESC/add_sid_to_listener), so a
+# standalone listener_primary_*.ora reference file would go unused - unlike
+# the standby snippet above, which standby/03_setup_standby_env.sh checks
+# for as a precondition gate.
 
 # ============================================================
 # Generate Data Guard Broker Configuration Script
@@ -1084,7 +1055,6 @@ if [[ "$REGENERATE" == "1" ]]; then
         "Standby pfile: $STANDBY_PFILE" \
         "TNS entries: $TNSNAMES_FILE" \
         "Standby listener: $LISTENER_FILE" \
-        "Primary listener: $LISTENER_PRIMARY_FILE" \
         "DGMGRL script: $DGMGRL_SCRIPT"
 
     print_summary "SUCCESS" "Files regenerated from $STANDBY_CONFIG_FILE"
@@ -1094,7 +1064,6 @@ else
         "Standby pfile: $STANDBY_PFILE" \
         "TNS entries: $TNSNAMES_FILE" \
         "Standby listener: $LISTENER_FILE" \
-        "Primary listener: $LISTENER_PRIMARY_FILE" \
         "DGMGRL script: $DGMGRL_SCRIPT"
 
     # ============================================================

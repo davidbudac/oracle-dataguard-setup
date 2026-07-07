@@ -15,7 +15,7 @@ primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10)
 standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
 fsfo/            - Observer scripts (run on observer server - standby or 3rd server)
 trigger/         - Role-aware service trigger (run on PRIMARY); two variants: SYS-owned and dedicated-user
-common/          - Shared scripts and functions, including setup_dg_wallet.sh
+common/          - Shared scripts and functions, including setup_dg_wallet.sh, cleanup_nfs_artifacts.sh, and dg_render_common.sh (shared render/threshold library for dg_status.sh and the local triage/diag tools)
 templates/       - Reference templates (init.ora, listener, tnsnames)
 sql/             - SQL/RMAN/DGMGRL command snippets used by the workflow scripts
 docs/            - Detailed walkthrough and tool references (DG_STATUS, DG_CHECK, WALLET_SETUP)
@@ -39,6 +39,7 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 13. `fsfo/observer.sh start` - Start observer (on observer server)
 14. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
 15. `primary/10_generate_handoff_report.sh` - Generate end-user handoff report with status snapshot and TNS/JDBC connection strings (on PRIMARY)
+16. `common/cleanup_nfs_artifacts.sh` - Remove sensitive/transient setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share once the build is verified (optional, run from any host with the share mounted)
 
 ## Restartability
 
@@ -48,6 +49,8 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 1. Shut down the standby instance
 2. Remove all standby data files, control files, and redo logs
 3. Re-run step 5
+
+**Post-hardening re-clone limitation:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this at the password-verification step (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run `primary/08_security_hardening.sh` afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
 
 **Steps 6-7 are restartable** - the broker configuration can be removed with `REMOVE CONFIGURATION` in DGMGRL and recreated. Step 7 is read-only verification.
 
@@ -84,6 +87,8 @@ bash common/setup_dg_wallet.sh -w /path     # Custom wallet directory
 
 The script auto-detects the local role, discovers the peer TNS alias from the broker, creates an auto-login wallet with SYS credentials, configures `sqlnet.ora`, and tests the connection. It is idempotent — re-running adds/updates credentials in an existing wallet.
 
+`-A`/`--auto-password` generates the wallet password automatically instead of prompting. Re-running with `-A` against a wallet that already holds credentials (or whose auto-generated password can no longer be supplied) lists the existing credentials and requires typing `RECREATE WALLET` to confirm before rebuilding it - the rebuild happens in a staging directory and is swapped in only after every step succeeds, with the old wallet kept as a timestamped `.bak` copy.
+
 ## Validation Checks
 
 Built-in validations:
@@ -105,6 +110,12 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 **What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, currently running services, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, broker configuration including FSFO and per-member ORA errors, and recent Data Guard-related alert log entries.
 
 **SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
+
+**Exit codes:** `0` healthy, `1` warnings only, `2` errors present - suitable for cron/monitoring wrappers instead of scraping the colored text output. An unreachable host is reported explicitly (`UNREACHABLE`) rather than rendered as blank fields with a healthy status.
+
+**Output control:** `--no-color` (or the `NO_COLOR` env var) disables ANSI color codes.
+
+**Configurable thresholds** (env vars, override by exporting before running): `DG_FRA_WARN_PCT` (default 80), `DG_FRA_CRIT_PCT` (default 90), `DG_SEQ_GAP_WARN` (default 1), `DG_SEQ_GAP_CRIT` (default 5), `DG_LAG_WARN_SECONDS` (default 60).
 
 See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
 
@@ -179,6 +190,8 @@ This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mo
 
 The observer must be running for automatic failover to occur.
 
+`observer.sh` validates a pidfile's PID against the process's actual command line (must be a `dgmgrl` process) before trusting it as the running observer; stale or mismatched pidfiles are automatically cleaned up.
+
 ## Role-Aware Service Trigger (Optional)
 
 After Data Guard setup is complete, you can deploy triggers that automatically start/stop services based on database role:
@@ -188,6 +201,8 @@ After Data Guard setup is complete, you can deploy triggers that automatically s
 ./trigger/create_role_trigger.sh
 ```
 This discovers running user services, creates PL/SQL package `SYS.DG_SERVICE_MGR` and two database triggers. Services are started on PRIMARY and stopped on STANDBY, triggered on both role change (switchover/failover) and database startup.
+
+Standalone: both `create_role_trigger.sh` and `create_role_trigger_dedicated_user.sh` self-discover the primary/standby topology from `V$DATABASE` / `V$DATAGUARD_CONFIG` and do not require `standby_config_*.env`. The NFS share is optional - the generated SQL is written there when available, otherwise falls back to `$PWD`.
 
 **Objects created:**
 - `SYS.DG_SERVICE_MGR` - PL/SQL package with `MANAGE_SERVICES` procedure
@@ -200,7 +215,7 @@ Objects replicate to standby automatically via redo apply. The script is restart
 ```bash
 ./trigger/create_role_trigger_dedicated_user.sh
 ```
-Same behavior, but creates a dedicated database user (`DG_ADMIN`, or `C##DG_ADMIN` for CDB) with only the privileges required, and places the package and triggers under that user instead of `SYS`. Use this variant when policy disallows adding objects to `SYS`.
+Same behavior, but creates a dedicated database user (`DG_ADMIN`, or `C##DG_ADMIN` for CDB) with only the privileges required, and places the package and triggers under that user instead of `SYS`. Use this variant when policy disallows adding objects to `SYS`. Since the dedicated user cannot call SYS-only `DBMS_SYSTEM.KSDWRT` for alert-log writes, the script creates a narrow SYS-owned wrapper procedure (`SYS.DG_ALERT_LOG_MSG`) and grants `EXECUTE` on that wrapper only - not on `DBMS_SYSTEM` - to the dedicated user.
 
 **Alternative variant: CDB / PDB-aware**
 ```bash
@@ -213,6 +228,7 @@ Key differences from the base script:
 - Discovers services as `(container, service)` pairs via `sql/queries/get_user_services_cdb.sql` (`V$ACTIVE_SERVICES` joined to `V$CONTAINERS`), excluding `PDB$SEED`, system services, and each container's default service.
 - The `SYS.DG_SERVICE_MGR` package stores the pairs as records; `MANAGE_SERVICES` switches into the owning PDB (`ALTER SESSION SET CONTAINER`) before calling `DBMS_SERVICE`, then returns to `CDB$ROOT`. Per-service failures (e.g. a PDB only MOUNTED on the standby) are written to the alert log and never abort the others.
 - Triggers (`AFTER DB_ROLE_CHANGE` / `AFTER STARTUP ON DATABASE`) still fire in `CDB$ROOT`; the role transition is CDB-wide. A PDB service only starts if the PDB is OPEN, so ensure PDBs auto-open (`SAVE STATE` or an open trigger). Generated SQL: `${NFS_SHARE}/dg_service_mgr_cdb_<PRIMARY_DB_UNIQUE_NAME>.sql`.
+- **Active Data Guard (ADG) caveat:** a system trigger cannot switch containers (ORA-65123), so `MANAGE_SERVICES` defers the actual start/stop work to a one-time `DBMS_SCHEDULER.CREATE_JOB`. If the standby is opened read-only (Active Data Guard / real-time query), `CREATE_JOB` cannot write to the data dictionary and fails with `ORA-16000`; this is caught and only logged to the alert log (`DBMS_SYSTEM.KSDWRT`) - services are silently **not** stopped by this trigger on an ADG-opened standby. Watch for `DG_SERVICE_MGR SCHEDULE failed` entries in the alert log and stop such services manually if they must not run against a read-only standby.
 
 **Create a role-aware PDB service**
 ```bash
@@ -230,11 +246,15 @@ After Data Guard is verified (and ideally after FSFO and the role-aware service 
 ./primary/10_generate_handoff_report.sh
 ```
 
-The script collects a short status snapshot (roles, modes, MRP, apply lag, archive gaps, FSFO state, broker config) and emits per-service connection info in three flavors:
+The script collects a status snapshot for both DBAs and application teams: roles, open modes, protection mode, standby `LogXptMode`, MRP/apply lag, archive gaps, FSFO state and threshold, broker config, role-trigger deployment status, and server-side `SQLNET.EXPIRE_TIME`. It emits per-service connection info in three flavors:
 
 - **Primary-only** TNS + JDBC — writes / admin
-- **Standby-only** TNS + JDBC — read-only reporting against an open standby
-- **Role-aware failover** TNS + JDBC — single descriptor with both hosts in `ADDRESS_LIST`. Recommended for the application tier when the step-14 service trigger is deployed: the service is only running on whichever side is primary, so clients automatically follow the active database after a switchover or failover
+- **Standby-only** TNS + JDBC — read-only reporting against an open standby. If the standby is `MOUNTED`, the report marks these strings as not currently usable; if it is `READ ONLY WITH APPLY`, it includes the Active Data Guard licensing note, apply-lag/read-your-writes caveat, and ORA-16000 no-DML warning
+- **Role-aware failover** TNS + JDBC + Easy Connect Plus — single descriptor with both hosts in `ADDRESS_LIST`. Recommended for the application tier when `trigger/create_role_trigger.sh` is deployed and enabled: the service is only running on whichever side is primary, so clients automatically follow the active database after a switchover or failover
+
+The report now includes application-facing sections for RPO/data-loss expectations, expected outage behavior with or without FSFO, role-trigger readiness warnings, Easy Connect Plus and driver mapping examples for ODP.NET / python-oracledb / SQLAlchemy, a concrete client/pool settings checklist, and quick verification commands that test both database hosts with `tnsping` and `nc -z`.
+
+It also copies `docs/DG_APPLICATION_IMPACT.html` to `${NFS_SHARE}/dg_application_impact.html` when available and links it from "Notes for Client Teams". The Markdown remains self-contained with a 5-bullet "What changes for your application" summary covering commit latency, NOLOGGING jobs, sequence gaps, cold-cache brownout, and the reach-both-hosts firewall prerequisite.
 
 User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the role trigger), with the default `<DB_UNIQUE_NAME>` service always included. Output: `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` plus stdout. Re-run after listener changes, new services, or topology changes to refresh the report.
 
@@ -242,6 +262,20 @@ User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the
 ```bash
 ./dg_handoff.sh
 ./dg_handoff.sh -o /tmp/handoff.md
-./dg_handoff.sh --primary-host pri --standby-host stb --port 1521 --domain example.com
+./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
 ```
-Produces the same Markdown report against any existing Data Guard configuration without depending on `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`. Use the `--*-host` / `--port` / `--domain` flags when broker is down or discovery returns the wrong value. Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`.
+Produces the same Markdown report against any existing Data Guard configuration without depending on `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`. Use the `--*-host` / `--port` flags when broker is down or discovery returns the wrong value. Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`. The standalone report references `DG_APPLICATION_IMPACT.html` only when the file is present next to the script or under `docs/`.
+
+## NFS Artifact Cleanup
+
+`primary/01_gather_primary_info.sh` and `primary/09_configure_fsfo.sh` stage `orapw*` password file copies (SYS password hash) on the group-readable NFS share, and `primary/08_security_hardening.sh` stages a refreshed `orapw*_hardened` copy; `primary/02_generate_standby_config.sh` and `standby/05_clone_standby.sh` leave a generated pfile and RMAN duplicate cmdfiles/logs behind. None of this is ever cleaned up automatically.
+
+**Step 16: Clean Up NFS Artifacts (on any host with the share mounted, optional)**
+```bash
+./common/cleanup_nfs_artifacts.sh                 # default: password files, pfile, RMAN cmdfiles/logs
+./common/cleanup_nfs_artifacts.sh -c /path/to/standby_config_<NAME>.env
+./common/cleanup_nfs_artifacts.sh --all           # also remove config .env, handoff report, app-impact HTML
+./common/cleanup_nfs_artifacts.sh -y              # skip the confirmation prompt
+```
+
+Run this once Data Guard has been verified (Step 7) and the handoff report (Step 15) has been reviewed. It selects (or accepts via `-c`/`--config`) the build's `standby_config_*.env`, prints exactly what will be removed and what will be kept, and requires confirmation before deleting anything.

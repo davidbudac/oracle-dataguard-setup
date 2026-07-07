@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Data Guard Handoff Report - Standalone
 # ============================================================
@@ -95,6 +95,24 @@ EOF
 clean() { tr -d ' \r' | sed '/^$/d'; }
 field()  { awk -F'|' -v i="$2" '{print $i}' <<< "$1"; }
 
+# ============================================================
+# Discovery failure tracking
+# ============================================================
+# The initial connectivity check (below) is the only thing that should
+# kill this script. Every discovery query after that point is
+# best-effort: a single transient ORA- error must not abort the whole
+# report. Each discovery site wraps its `run_sql` call as
+# `VAR=$(run_sql ...) || VAR=""` (required because of `set -e` -
+# an unwrapped failing command substitution assignment aborts the
+# script), renders the missing field as "n/a", and records a note here
+# so the report tells the reader what could not be discovered.
+DISCOVERY_WARNINGS=()
+note_discovery_failure() {
+    local label="$1"
+    warn "Discovery failed: ${label} (showing n/a in report)"
+    DISCOVERY_WARNINGS+=("$label")
+}
+
 run_dgmgrl_cmd() {
     # Pipe a single command to dgmgrl /
     local cmd="$1"
@@ -102,6 +120,82 @@ run_dgmgrl_cmd() {
 ${cmd}
 EXIT;
 EOF
+}
+
+parse_broker_property() {
+    awk -F= '
+        /[A-Za-z0-9_]+[[:space:]]*=/ {
+            value=$2
+            gsub(/^[[:space:]]*'\''?/, "", value)
+            gsub(/'\''?[[:space:]]*$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }
+    '
+}
+
+extract_open_mode_from_broker() {
+    awk -F: '
+        {
+            line=tolower($0)
+        }
+        line ~ /open[[:space:]]+mode/ {
+            value=$2
+            gsub(/^[[:space:]]*/, "", value)
+            gsub(/[[:space:]]*$/, "", value)
+            if (value != "") {
+                print value
+                exit
+            }
+        }
+    '
+}
+
+extract_fsfo_threshold() {
+    awk '
+        {
+            line=tolower($0)
+        }
+        line ~ /faststartfailoverthreshold/ || line ~ /fast-start failover threshold/ || line ~ /threshold/ {
+            for (i = 1; i <= NF; i++) {
+                if ($i ~ /^[0-9][0-9]*$/) {
+                    print $i
+                    exit
+                }
+            }
+        }
+    '
+}
+
+get_sqlnet_expire_time() {
+    local sqlnet="${ORACLE_HOME}/network/admin/sqlnet.ora"
+    if [[ ! -f "$sqlnet" ]]; then
+        printf 'not set (sqlnet.ora not found)'
+        return
+    fi
+    awk -F= '
+        {
+            line=tolower($1)
+        }
+        line ~ /^[[:space:]]*sqlnet[.]expire_time[[:space:]]*$/ {
+            value=$2
+            sub(/[[:space:]]*#.*/, "", value)
+            gsub(/^[[:space:]]*/, "", value)
+            gsub(/[[:space:]]*$/, "", value)
+            if (value != "") {
+                print value " minutes"
+                found=1
+                exit
+            }
+        }
+        END {
+            if (!found) {
+                print "not set"
+            }
+        }
+    ' "$sqlnet"
 }
 
 # ============================================================
@@ -118,20 +212,41 @@ fi
 
 info "Discovering Data Guard topology from ${ORACLE_SID}..."
 
-LOCAL_DB_UNIQUE_NAME=$(run_sql "SELECT DB_UNIQUE_NAME FROM V\$DATABASE;" | clean | head -1)
-[[ -n "$LOCAL_DB_UNIQUE_NAME" ]] || die "Could not read local DB_UNIQUE_NAME."
+if ! LOCAL_DB_UNIQUE_NAME=$(run_sql "SELECT DB_UNIQUE_NAME FROM V\$DATABASE;" | clean | head -1); then
+    LOCAL_DB_UNIQUE_NAME=""
+    note_discovery_failure "local DB_UNIQUE_NAME"
+fi
+if [[ -z "$LOCAL_DB_UNIQUE_NAME" ]]; then
+    LOCAL_DB_UNIQUE_NAME="$ORACLE_SID"
+fi
 
-DB_STATUS=$(run_sql "SELECT DATABASE_ROLE||'|'||OPEN_MODE||'|'||PROTECTION_MODE||'|'||SWITCHOVER_STATUS FROM V\$DATABASE;" | clean | head -1)
+if ! DB_STATUS=$(run_sql "SELECT DATABASE_ROLE||'|'||OPEN_MODE||'|'||PROTECTION_MODE||'|'||SWITCHOVER_STATUS FROM V\$DATABASE;" | clean | head -1); then
+    DB_STATUS=""
+    note_discovery_failure "database role/open-mode/protection-mode/switchover-status"
+fi
 DB_ROLE=$(field          "$DB_STATUS" 1)
 OPEN_MODE=$(field        "$DB_STATUS" 2)
 PROTECTION_MODE=$(field  "$DB_STATUS" 3)
 SWITCHOVER_STATUS=$(field "$DB_STATUS" 4)
 
-FORCE_LOGGING=$(run_sql "SELECT FORCE_LOGGING FROM V\$DATABASE;" | clean | head -1)
-DG_BROKER_START=$(run_sql "SELECT VALUE FROM V\$PARAMETER WHERE NAME='dg_broker_start';" | clean | head -1)
+if ! FORCE_LOGGING=$(run_sql "SELECT FORCE_LOGGING FROM V\$DATABASE;" | clean | head -1); then
+    FORCE_LOGGING=""
+    note_discovery_failure "force logging status"
+fi
 
-# Peer DB_UNIQUE_NAME from V$DATAGUARD_CONFIG (everything except local)
-PEER_DB_UNIQUE_NAME=$(run_sql "SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG WHERE DB_UNIQUE_NAME <> '${LOCAL_DB_UNIQUE_NAME}' AND ROWNUM=1;" | clean | head -1)
+if ! DG_BROKER_START=$(run_sql "SELECT VALUE FROM V\$PARAMETER WHERE NAME='dg_broker_start';" | clean | head -1); then
+    DG_BROKER_START=""
+    note_discovery_failure "dg_broker_start parameter"
+fi
+
+# Peer DB_UNIQUE_NAME from V$DATAGUARD_CONFIG (everything except local).
+# An empty result here is a legitimate outcome (no peer registered yet), not
+# necessarily a query failure, so it is reported via the existing warn()
+# below rather than added to the discovery-failure list.
+if ! PEER_DB_UNIQUE_NAME=$(run_sql "SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG WHERE DB_UNIQUE_NAME <> '${LOCAL_DB_UNIQUE_NAME}' AND ROWNUM=1;" | clean | head -1); then
+    PEER_DB_UNIQUE_NAME=""
+    note_discovery_failure "peer DB_UNIQUE_NAME (V\$DATAGUARD_CONFIG)"
+fi
 
 if [[ -z "$PEER_DB_UNIQUE_NAME" ]]; then
     warn "No peer found in V\$DATAGUARD_CONFIG. Report will be primary-only."
@@ -142,29 +257,81 @@ if [[ "$DB_ROLE" == "PRIMARY" ]]; then
     PRIMARY_DB_UNIQUE_NAME="$LOCAL_DB_UNIQUE_NAME"
     STANDBY_DB_UNIQUE_NAME="$PEER_DB_UNIQUE_NAME"
 else
-    warn "Local role is ${DB_ROLE} (not PRIMARY). Treating local as standby for the report."
+    warn "Local role is ${DB_ROLE:-unknown} (not PRIMARY). Treating local as standby for the report."
     PRIMARY_DB_UNIQUE_NAME="$PEER_DB_UNIQUE_NAME"
     STANDBY_DB_UNIQUE_NAME="$LOCAL_DB_UNIQUE_NAME"
 fi
 
 # Apply/gap info (only meaningful on primary or standby with archive history)
-APPLY_INFO=$(run_sql "SELECT NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0)||'|'||NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;" | clean | head -1)
+if ! APPLY_INFO=$(run_sql "SELECT NVL(MAX(CASE WHEN APPLIED='YES' THEN SEQUENCE# END),0)||'|'||NVL(MAX(SEQUENCE#),0) FROM V\$ARCHIVED_LOG WHERE THREAD#=1;" | clean | head -1); then
+    APPLY_INFO=""
+    note_discovery_failure "archived log apply/receive sequence#"
+fi
 LAST_APPLIED=$(field  "$APPLY_INFO" 1)
 LAST_RECEIVED=$(field "$APPLY_INFO" 2)
 APPLY_LAG_SEQ=$(( ${LAST_RECEIVED:-0} - ${LAST_APPLIED:-0} ))
 
-GAP_COUNT=$(run_sql "SELECT COUNT(*) FROM V\$ARCHIVE_GAP;" | clean | head -1)
+if ! GAP_COUNT=$(run_sql "SELECT COUNT(*) FROM V\$ARCHIVE_GAP;" | clean | head -1); then
+    GAP_COUNT=""
+    note_discovery_failure "archive gap count"
+fi
 GAP_COUNT="${GAP_COUNT:-0}"
 
 # FSFO
-FSFO_RAW=$(run_sql "SELECT FS_FAILOVER_STATUS||'|'||FS_FAILOVER_OBSERVER_PRESENT||'|'||FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;" | clean | head -1)
+if ! FSFO_RAW=$(run_sql "SELECT FS_FAILOVER_STATUS||'|'||FS_FAILOVER_OBSERVER_PRESENT||'|'||FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;" | clean | head -1); then
+    FSFO_RAW=""
+    note_discovery_failure "fast-start failover status"
+fi
 FSFO_STATUS=$(field        "$FSFO_RAW" 1)
 FSFO_OBSERVER=$(field      "$FSFO_RAW" 2)
 FSFO_OBSERVER_HOST=$(field "$FSFO_RAW" 3)
 
-# Listener port from V$LISTENER_NETWORK / local_listener
+if ! TRIGGER_STATUS=$(run_sql "
+WITH pkg AS (
+    SELECT owner
+    FROM DBA_OBJECTS
+    WHERE OBJECT_NAME = 'DG_SERVICE_MGR'
+      AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
+      AND STATUS = 'VALID'
+),
+trg AS (
+    SELECT owner, trigger_name, status
+    FROM DBA_TRIGGERS
+    WHERE trigger_name IN ('TRG_MANAGE_SERVICES_ROLE_CHG', 'TRG_MANAGE_SERVICES_STARTUP')
+)
+SELECT
+    (SELECT COUNT(DISTINCT owner) FROM pkg) || '|' ||
+    (SELECT COUNT(*) FROM trg WHERE status = 'ENABLED') || '|' ||
+    (SELECT COUNT(*) FROM trg) || '|' ||
+    NVL((SELECT LISTAGG(owner, ',') WITHIN GROUP (ORDER BY owner)
+         FROM (SELECT DISTINCT owner FROM pkg
+               UNION
+               SELECT DISTINCT owner FROM trg)), 'NONE')
+FROM DUAL;
+" | clean | head -1); then
+    TRIGGER_STATUS=""
+    note_discovery_failure "role-aware service trigger status"
+fi
+TRIGGER_PACKAGE_COUNT=$(field "$TRIGGER_STATUS" 1)
+TRIGGER_ENABLED_COUNT=$(field "$TRIGGER_STATUS" 2)
+TRIGGER_TOTAL_COUNT=$(field "$TRIGGER_STATUS" 3)
+TRIGGER_OWNERS=$(field "$TRIGGER_STATUS" 4)
+ROLE_TRIGGER_READY="NO"
+case "$TRIGGER_PACKAGE_COUNT" in ''|*[!0-9]*) TRIGGER_PACKAGE_COUNT=0 ;; esac
+case "$TRIGGER_ENABLED_COUNT" in ''|*[!0-9]*) TRIGGER_ENABLED_COUNT=0 ;; esac
+case "$TRIGGER_TOTAL_COUNT" in ''|*[!0-9]*) TRIGGER_TOTAL_COUNT=0 ;; esac
+if [[ "$TRIGGER_PACKAGE_COUNT" -gt 0 && "$TRIGGER_ENABLED_COUNT" -ge 2 ]]; then
+    ROLE_TRIGGER_READY="YES"
+fi
+
+# Listener port from V$LISTENER_NETWORK / local_listener. An empty result can
+# be legitimate (no network registration recorded yet), so it falls back to
+# the default port below without being counted as a discovery failure.
 # AIX-portable: avoid GNU `grep -o`; use POSIX BRE sed to extract the port digits.
-LOCAL_LISTENER_RAW=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;" | clean | head -1)
+if ! LOCAL_LISTENER_RAW=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='LOCAL LISTENER' AND ROWNUM=1;" | clean | head -1); then
+    LOCAL_LISTENER_RAW=""
+    note_discovery_failure "local listener port (V\$LISTENER_NETWORK)"
+fi
 DISCOVERED_PORT=$(echo "$LOCAL_LISTENER_RAW" | sed -n 's/.*PORT *= *\([0-9][0-9]*\).*/\1/p' | head -1)
 PORT="${PORT_OVERRIDE:-${DISCOVERED_PORT:-1521}}"
 
@@ -175,6 +342,9 @@ PORT="${PORT_OVERRIDE:-${DISCOVERED_PORT:-1521}}"
 PRIMARY_HOSTNAME=""
 STANDBY_HOSTNAME=""
 BROKER_OUTPUT=""
+STANDBY_LOGXPTMODE="unknown"
+STANDBY_OPEN_MODE="unknown"
+FSFO_THRESHOLD="unknown"
 
 if [[ "$DG_BROKER_START" == "TRUE" ]]; then
     BROKER_OUTPUT=$(run_dgmgrl_cmd "SHOW CONFIGURATION;" || true)
@@ -183,7 +353,7 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
         # SHOW DATABASE VERBOSE prints a "DGConnectIdentifier = '...'" line.
         # That value is either an easy-connect string (host:port/service) or
         # a TNS alias. Extract the first hostname-looking token.
-        # AIX-portable: avoid `sed -E` and `\s` (GNU extensions); use POSIX BRE
+        # AIX-portable: avoid GNU regex extensions; use POSIX BRE
         # with [[:space:]] character classes and `\(...\)` capture groups.
         local db="$1" out
         out=$(run_dgmgrl_cmd "SHOW DATABASE VERBOSE '${db}';" 2>/dev/null || true)
@@ -207,6 +377,29 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
 
     [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]] && PRIMARY_HOSTNAME=$(extract_host_from_show_db "$PRIMARY_DB_UNIQUE_NAME")
     [[ -n "$STANDBY_DB_UNIQUE_NAME" ]] && STANDBY_HOSTNAME=$(extract_host_from_show_db "$STANDBY_DB_UNIQUE_NAME")
+    if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
+        STANDBY_LOGXPTMODE=$(run_dgmgrl_cmd "SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}' 'LogXptMode';" | parse_broker_property || true)
+        if [[ -z "$STANDBY_LOGXPTMODE" ]]; then
+            STANDBY_LOGXPTMODE="unknown"
+            note_discovery_failure "standby LogXptMode (broker)"
+        fi
+        STANDBY_SHOW_OUTPUT=$(run_dgmgrl_cmd "SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';" || true)
+        STANDBY_OPEN_MODE=$(printf '%s\n' "$STANDBY_SHOW_OUTPUT" | extract_open_mode_from_broker)
+        if [[ -z "$STANDBY_OPEN_MODE" ]]; then
+            STANDBY_OPEN_MODE="unknown"
+            note_discovery_failure "standby open mode (broker)"
+        fi
+    fi
+    if [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]]; then
+        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}' 'FastStartFailoverThreshold';" | parse_broker_property || true)
+    fi
+    if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
+        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
+    fi
+    if [[ -z "$FSFO_THRESHOLD" ]]; then
+        FSFO_THRESHOLD="unknown"
+        note_discovery_failure "fast-start failover threshold (broker)"
+    fi
 else
     warn "DG broker is not started (dg_broker_start=${DG_BROKER_START:-FALSE}); cannot auto-discover peer hostname."
 fi
@@ -234,7 +427,11 @@ fi
 # Discover services
 # ============================================================
 
-SERVICE_OUTPUT=$(run_sql "
+# An empty result here is a legitimate outcome (no user-facing services
+# active yet), not necessarily a query failure - only a real run_sql failure
+# (non-zero exit, e.g. an ORA- error under WHENEVER SQLERROR EXIT 1) is
+# counted as a discovery failure below.
+if ! SERVICE_OUTPUT=$(run_sql "
 SELECT NAME FROM V\$ACTIVE_SERVICES
 WHERE UPPER(NAME) NOT IN (
     SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE
@@ -246,7 +443,10 @@ AND UPPER(NAME) NOT LIKE '%XDB%'
 AND UPPER(NAME) NOT LIKE '%\_CFG' ESCAPE '\'
 AND UPPER(NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
 ORDER BY NAME;
-" | clean)
+" | clean); then
+    SERVICE_OUTPUT=""
+    note_discovery_failure "active services list (report will show no per-service connection strings)"
+fi
 
 SERVICE_LIST=()
 while IFS= read -r line; do
@@ -255,30 +455,44 @@ done <<< "$SERVICE_OUTPUT"
 
 info "Services in report: ${SERVICE_LIST[*]}"
 
+SQLNET_EXPIRE_TIME=$(get_sqlnet_expire_time)
+
+RPO_STATEMENT="Data-loss exposure is unknown because protection mode or standby transport mode could not be discovered."
+case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%s' "$STANDBY_LOGXPTMODE" | tr '[:lower:]' '[:upper:]')" in
+    *MAXIMUM*AVAILABILITY*'|'SYNC|*MAXIMUM*AVAILABILITY*'|'FASTSYNC)
+        RPO_STATEMENT="Protection is ${PROTECTION_MODE} with standby transport ${STANDBY_LOGXPTMODE}: a failover loses no committed transactions. SYNC/FASTSYNC can add commit latency, which is most visible for chatty transaction patterns."
+        ;;
+    *MAXIMUM*PERFORMANCE*'|'ASYNC)
+        RPO_STATEMENT="Protection is ${PROTECTION_MODE} with standby transport ${STANDBY_LOGXPTMODE}: a failover may lose the last few seconds of committed transactions - design idempotency and reconciliation accordingly."
+        ;;
+    *)
+        if [[ "$STANDBY_LOGXPTMODE" != "unknown" ]]; then
+            RPO_STATEMENT="Protection is ${PROTECTION_MODE:-unknown} with standby transport ${STANDBY_LOGXPTMODE}; confirm exact RPO with the DBA team. SYNC/FASTSYNC can add commit latency for chatty transaction patterns."
+        fi
+        ;;
+esac
+
+FSFO_STATUS_UPPER=$(printf '%s' "$FSFO_STATUS" | tr '[:lower:]' '[:upper:]')
+if [[ -n "$FSFO_STATUS_UPPER" && "$FSFO_STATUS_UPPER" != "DISABLED" && "$FSFO_STATUS_UPPER" != "N/A" ]]; then
+    if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
+        OUTAGE_STATEMENT="FSFO is enabled: automatic failover begins after approximately ${FSFO_THRESHOLD}s of primary unreachability. Expect connection errors for roughly that window plus driver reconnect time, followed by a cold-cache brownout after the role change."
+    else
+        OUTAGE_STATEMENT="FSFO is enabled, but the failover threshold could not be discovered. Expect connection errors for the configured threshold plus driver reconnect time, followed by a cold-cache brownout after the role change."
+    fi
+else
+    OUTAGE_STATEMENT="FSFO is not enabled or could not be confirmed: failover is a manual DBA action, so outage lasts until it is performed. Expect a cold-cache brownout after the role change."
+fi
+
 # ============================================================
 # Renderers (same shape as the setup-time script)
 # ============================================================
-
-render_tns_single() {
-    local alias="$1" host="$2" port="$3" service="$4"
-    cat <<EOF
-${alias} =
-  (DESCRIPTION =
-    (ADDRESS = (PROTOCOL = TCP)(HOST = ${host})(PORT = ${port}))
-    (CONNECT_DATA =
-      (SERVER = DEDICATED)
-      (SERVICE_NAME = ${service})
-    )
-  )
-EOF
-}
 
 render_tns_ha() {
     local alias="$1" phost="$2" shost="$3" port="$4" service="$5"
     cat <<EOF
 ${alias} =
   (DESCRIPTION =
-    (CONNECT_TIMEOUT = 3)(RETRY_COUNT = 10)
+    (CONNECT_TIMEOUT = 10)(TRANSPORT_CONNECT_TIMEOUT = 3)(RETRY_COUNT = 3)(RETRY_DELAY = 3)
     (ADDRESS_LIST =
       (LOAD_BALANCE = OFF)
       (ADDRESS = (PROTOCOL = TCP)(HOST = ${phost})(PORT = ${port}))
@@ -292,14 +506,27 @@ ${alias} =
 EOF
 }
 
-render_jdbc_single() {
-    echo "jdbc:oracle:thin:@//$1:$2/$3"
-}
-
 render_jdbc_ha() {
     local phost="$1" shost="$2" port="$3" service="$4"
-    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=3)(RETRY_COUNT=10)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)))\n' \
+    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=10)(TRANSPORT_CONNECT_TIMEOUT=3)(RETRY_COUNT=3)(RETRY_DELAY=3)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)))\n' \
         "$phost" "$port" "$shost" "$port" "$service"
+}
+
+render_easy_connect_ha() {
+    local phost="$1" shost="$2" port="$3" service="$4"
+    printf '%s:%s,%s:%s/%s?connect_timeout=5&transport_connect_timeout=3&retry_count=2\n' \
+        "$phost" "$port" "$shost" "$port" "$service"
+}
+
+render_driver_table() {
+    local ez="$1"
+    printf '| Client | Form |\n'
+    printf '|--------|------|\n'
+    printf '| ODP.NET | `User Id=app_user;Password=<pwd>;Data Source=%s` |\n' "$ez"
+    printf '| python-oracledb | `oracledb.connect(user="app_user", password="<pwd>", dsn="%s")` |\n' "$ez"
+    printf '| SQLAlchemy | `oracle+oracledb://app_user:<pwd>@%s` |\n' "$ez"
+    printf '| SQL*Plus | `sqlplus app_user/<pwd>@%s` |\n' "$ez"
+    printf '\n'
 }
 
 # ============================================================
@@ -331,6 +558,15 @@ fi
 
 GEN_DATE=$(date)
 GEN_HOST=$(hostname 2>/dev/null)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+IMPACT_LOCAL="${SCRIPT_DIR}/DG_APPLICATION_IMPACT.html"
+IMPACT_DOCS="${SCRIPT_DIR}/docs/DG_APPLICATION_IMPACT.html"
+IMPACT_REFERENCE=""
+if [[ -f "$IMPACT_LOCAL" ]]; then
+    IMPACT_REFERENCE="$IMPACT_LOCAL"
+elif [[ -f "$IMPACT_DOCS" ]]; then
+    IMPACT_REFERENCE="$IMPACT_DOCS"
+fi
 
 {
     echo "# Data Guard Handoff Report"
@@ -356,12 +592,14 @@ GEN_HOST=$(hostname 2>/dev/null)
     echo ""
     echo "| Item                  | Value |"
     echo "|-----------------------|-------|"
-    echo "| Local role            | ${DB_ROLE} |"
-    echo "| Open mode             | ${OPEN_MODE} |"
-    echo "| Protection mode       | ${PROTECTION_MODE} |"
-    echo "| Switchover status     | ${SWITCHOVER_STATUS} |"
-    echo "| Force logging         | ${FORCE_LOGGING} |"
-    echo "| Broker started        | ${DG_BROKER_START} |"
+    echo "| Local role            | ${DB_ROLE:-N/A} |"
+    echo "| Open mode             | ${OPEN_MODE:-N/A} |"
+    echo "| Protection mode       | ${PROTECTION_MODE:-N/A} |"
+    echo "| Standby LogXptMode    | ${STANDBY_LOGXPTMODE:-unknown} |"
+    echo "| Standby open mode     | ${STANDBY_OPEN_MODE:-unknown} |"
+    echo "| Switchover status     | ${SWITCHOVER_STATUS:-N/A} |"
+    echo "| Force logging         | ${FORCE_LOGGING:-N/A} |"
+    echo "| Broker started        | ${DG_BROKER_START:-N/A} |"
     echo "| Last received seq#    | ${LAST_RECEIVED:-N/A} |"
     echo "| Last applied seq#     | ${LAST_APPLIED:-N/A} |"
     echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
@@ -371,11 +609,24 @@ GEN_HOST=$(hostname 2>/dev/null)
     if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
         echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
     fi
+    echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
+    echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
     echo ""
     echo "**Verdict:** ${VERDICT}"
     if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
         for n in "${VERDICT_NOTES[@]}"; do echo "- ${n}"; done
     fi
+
+    echo ""
+    echo "### Application Impact Summary"
+    echo ""
+    echo "- ${RPO_STATEMENT}"
+    echo "- ${OUTAGE_STATEMENT}"
+    echo "- FORCE LOGGING is ${FORCE_LOGGING:-unknown}; NOLOGGING batch jobs can still create unrecoverable standby gaps if force logging is disabled for maintenance."
+    echo "- Sequence values can have gaps after switchover/failover because cached values on the old primary are discarded."
+    echo "- Application firewalls must allow the app tier to reach both database hosts on listener port ${PORT} before go-live."
+    echo ""
 
     if [[ -n "$BROKER_OUTPUT" ]]; then
         echo ""
@@ -388,6 +639,18 @@ GEN_HOST=$(hostname 2>/dev/null)
 
     echo ""
     echo "## 3. Connection Strings"
+    echo ""
+    echo "- **Role-aware (failover)** — single descriptor with both hosts. Best"
+    echo "  for the application tier when the role-aware service trigger"
+    echo "  (\`trigger/create_role_trigger.sh\`) is deployed and enabled: the"
+    echo "  service is only up on whichever side is primary, so clients"
+    echo "  automatically follow the active database after a switchover or failover."
+    echo ""
+    if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
+        echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
+    else
+        echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
+    fi
     echo ""
 
     for svc in "${SERVICE_LIST[@]}"; do
@@ -406,8 +669,71 @@ GEN_HOST=$(hostname 2>/dev/null)
             echo "JDBC: $(render_jdbc_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")"
             echo '```'
             echo ""
+            EASY_HA=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")
+            echo "Easy Connect Plus (19c+ clients):"
+            echo ""
+            echo '```'
+            echo "$EASY_HA"
+            echo '```'
+            echo ""
+            render_driver_table "$EASY_HA"
+            STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
+            if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
+                echo "Standby-only note: standby is MOUNTED - direct standby connections will fail until it is opened READ ONLY."
+                echo ""
+            elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
+                echo "Standby-only note: READ ONLY WITH APPLY requires the appropriate Active Data Guard license. Reads can lag primary commits, read-your-writes is not guaranteed, and DML fails with ORA-16000."
+                echo ""
+            elif [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
+                echo "Standby-only note: standby readability could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
+                echo ""
+            fi
         fi
     done
+
+    echo "## 4. Notes for Client Teams"
+    echo ""
+    if [[ -n "$IMPACT_REFERENCE" ]]; then
+        echo "- Full application behavior briefing: \`${IMPACT_REFERENCE}\`."
+    fi
+    echo "- What changes for your application: SYNC/FASTSYNC can add commit latency; NOLOGGING batch jobs need DBA review; sequence caches can create gaps after role change; expect a cold-cache brownout; firewalls must reach both hosts."
+    echo "- The role-aware descriptor relies on the service being **stopped on"
+    echo "  the standby** by \`trigger/create_role_trigger.sh\`. Without it,"
+    echo "  clients may attach to a read-only standby and receive ORA-16000 on writes."
+    echo "- TAF settings reconnect SELECT cursors only when configured by the service or descriptor; active DML transactions still need application-level retry."
+    echo ""
+    echo "## 5. Recommended Client and Pool Settings"
+    echo ""
+    echo "- [ ] Use the provided descriptor timeouts: \`CONNECT_TIMEOUT=10\`, \`TRANSPORT_CONNECT_TIMEOUT=3\`, and retry counts to bound connect hangs."
+    echo "- [ ] Set driver connection timeout to 5-10 seconds and read/call timeout to the smallest value your request SLO allows."
+    echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}; also enable TCP keepalive on client hosts."
+    echo "- [ ] Enable pool validation on borrow or an equivalent lightweight connection check before handing out idle connections."
+    echo "- [ ] TAF is SELECT-only replay; in-flight DML, commits, and non-idempotent calls require application retry/reconciliation."
+    echo ""
+    echo "## 6. Quick Verification"
+    echo ""
+    echo '```bash'
+    echo "tnsping ${PRIMARY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+    if [[ -n "$STANDBY_HOSTNAME" ]]; then
+        echo "tnsping ${STANDBY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+    fi
+    echo "nc -z ${PRIMARY_HOSTNAME} ${PORT}"
+    if [[ -n "$STANDBY_HOSTNAME" ]]; then
+        echo "nc -z ${STANDBY_HOSTNAME} ${PORT}"
+    fi
+    echo '```'
+
+    if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
+        echo ""
+        echo "## Discovery Warnings"
+        echo ""
+        echo "The following items could not be discovered (shown as N/A above) - this is"
+        echo "usually a transient ORA- error; re-run the report if the field is needed:"
+        echo ""
+        for w in "${DISCOVERY_WARNINGS[@]}"; do
+            echo "- ${w}"
+        done
+    fi
 
 } > "$OUTPUT_FILE"
 
@@ -415,6 +741,12 @@ info "Report written: $OUTPUT_FILE"
 echo ""
 cat "$OUTPUT_FILE"
 echo ""
+if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
+    warn "${#DISCOVERY_WARNINGS[@]} discovery item(s) failed and were rendered as N/A (see 'Discovery Warnings' in the report):"
+    for w in "${DISCOVERY_WARNINGS[@]}"; do
+        warn "  - ${w}"
+    done
+fi
 info "Verdict: ${VERDICT}  |  Apply lag: ${APPLY_LAG_SEQ}  |  Gaps: ${GAP_COUNT}  |  Services: ${#SERVICE_LIST[@]}"
 
 case "$VERDICT" in

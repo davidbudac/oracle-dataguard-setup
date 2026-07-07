@@ -199,9 +199,7 @@ log_info "Standby database: $STANDBY_DB_UNIQUE_NAME"
 # Create configuration
 log_info "Creating broker configuration..."
 log_cmd "dgmgrl /:" "CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}'"
-run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"
-
-if [[ $? -ne 0 ]]; then
+if ! run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"; then
     log_error "Failed to create broker configuration"
     exit 1
 fi
@@ -210,9 +208,7 @@ log_info "Configuration created successfully"
 # Add standby database
 log_info "Adding standby database to configuration..."
 log_cmd "dgmgrl /:" "ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL"
-run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"
-
-if [[ $? -ne 0 ]]; then
+if ! run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"; then
     log_error "Failed to add standby database"
     exit 1
 fi
@@ -312,7 +308,13 @@ log_section "Testing Log Shipping"
 
 log_info "Forcing log switch to test redo transport..."
 log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SWITCH LOGFILE"
-run_sql_command "switch_logfile.sql"
+# Non-fatal: this is a post-configuration transport test, not a core broker
+# action. A failure here is real and downgrades the reported status, but
+# must not (via set -e) abort the script before the final summary is shown.
+if ! run_sql_command "switch_logfile.sql"; then
+    log_error "Failed to switch log file - redo transport test could not be run"
+    BROKER_STATUS="ERROR"
+fi
 
 sleep 5
 

@@ -35,6 +35,21 @@
 # the alert log and never abort the others.
 #
 # Objects are created on PRIMARY and replicate to standby via redo.
+#
+# ACTIVE DATA GUARD (ADG) CAVEAT:
+# MANAGE_SERVICES cannot switch containers directly (ORA-65123 in a
+# system trigger), so it defers the real work to a one-time
+# DBMS_SCHEDULER.CREATE_JOB running APPLY_SERVICES. If the standby is
+# opened read-only (Active Data Guard / real-time query), CREATE_JOB
+# cannot write to the data dictionary and fails with ORA-16000
+# ("database open for read-only access"). That failure is caught by
+# MANAGE_SERVICES' WHEN OTHERS handler and only logged to the alert
+# log (DBMS_SYSTEM.KSDWRT via log_service_issue) - it is never raised,
+# retried, or surfaced directly to an operator. Practical effect:
+# services are NOT automatically stopped by this trigger on an
+# ADG-opened standby. Watch the alert log for "DG_SERVICE_MGR SCHEDULE
+# failed" entries, and stop such services manually (or via separate
+# tooling) if they must not run against a read-only standby.
 # ============================================================
 
 set -e
@@ -183,6 +198,55 @@ fi
 init_log "create_role_trigger_cdb_${PRIMARY_DB_UNIQUE_NAME}"
 
 # ============================================================
+# Discover Containers
+# ============================================================
+# Used below to resolve any hand-entered container name against the actual
+# set of containers in this CDB, case-insensitively, before it is ever
+# quoted into `ALTER SESSION SET CONTAINER = "..."` (which is case-sensitive
+# for double-quoted identifiers).
+
+log_section "Discovering Containers"
+
+CONTAINER_OUTPUT=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT NAME FROM V$CONTAINERS WHERE NAME <> 'PDB$SEED' ORDER BY NAME;
+EXIT;
+EOSQL
+)
+
+CONTAINER_NAMES=()
+while IFS= read -r line; do
+    line=$(echo "$line" | tr -d ' \n\r')
+    if [[ -n "$line" ]]; then
+        CONTAINER_NAMES+=("$line")
+    fi
+done <<< "$CONTAINER_OUTPUT"
+
+if [[ ${#CONTAINER_NAMES[@]} -eq 0 ]]; then
+    log_error "Could not discover any containers from V\$CONTAINERS"
+    exit 1
+fi
+
+log_info "Discovered ${#CONTAINER_NAMES[@]} container(s): ${CONTAINER_NAMES[*]}"
+
+# Resolve a hand-entered container name against CONTAINER_NAMES,
+# case-insensitively, and print the exact discovered spelling on stdout.
+# Returns 1 (and prints nothing) if there is no match.
+resolve_container_name() {
+    local input="$1"
+    local input_upper
+    local c
+    input_upper=$(echo "$input" | tr '[:lower:]' '[:upper:]')
+    for c in "${CONTAINER_NAMES[@]}"; do
+        if [[ "$(echo "$c" | tr '[:lower:]' '[:upper:]')" == "$input_upper" ]]; then
+            printf '%s\n' "$c"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ============================================================
 # Discover User-Defined Services (per container)
 # ============================================================
 
@@ -226,25 +290,36 @@ print_service_list() {
 add_service_pair() {
     local pdb="$1"
     local svc="$2"
+    local resolved_pdb
     pdb=$(echo "$pdb" | tr -d ' \n\r')
     svc=$(echo "$svc" | tr -d ' \n\r')
     if [[ -z "$pdb" ]]; then
         pdb="CDB\$ROOT"
     fi
-    if ! echo "$svc" | grep -q '^[A-Za-z0-9_.$]*$' || [[ -z "$svc" ]]; then
+    if ! echo "$svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
         log_error "Invalid service name: $svc"
-        log_error "Service names may only contain letters, numbers, underscore, dot, and dollar sign"
-        return 1
-    fi
-    # Container names: letters, numbers, underscore, dollar, hash (plus the literal CDB$ROOT)
-    if ! echo "$pdb" | grep -q '^[A-Za-z0-9_$#]*$'; then
-        log_error "Invalid container name: $pdb"
+        log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
         return 1
     fi
     if [[ ${#svc} -gt 64 ]]; then
         log_error "Service name too long (max 64 chars): $svc"
         return 1
     fi
+    if ! echo "$pdb" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
+        log_error "Invalid container name: $pdb"
+        return 1
+    fi
+    # Resolve the entered container name case-insensitively against the
+    # containers actually discovered from V$CONTAINERS, and use the exact
+    # discovered spelling. This prevents an arbitrarily-cased, hand-typed
+    # name from being quoted as-is into `ALTER SESSION SET CONTAINER = "..."`
+    # (double-quoted Oracle identifiers are case-sensitive).
+    if ! resolved_pdb=$(resolve_container_name "$pdb"); then
+        log_error "Unknown container: $pdb"
+        log_error "Available containers: ${CONTAINER_NAMES[*]}"
+        return 1
+    fi
+    pdb="$resolved_pdb"
     PDB_LIST+=("$pdb")
     SVC_LIST+=("$svc")
     log_info "Added service: ${svc} [${pdb}]"
@@ -379,12 +454,15 @@ if [[ ${#SVC_LIST[@]} -eq 0 ]]; then
     exit 1
 fi
 
-# Final validation of all (container, service) pairs
+# Final validation of all (container, service) pairs. Container names are
+# re-checked against the discovered CONTAINER_NAMES list (not just a format
+# regex) so nothing reaches the PL/SQL's ALTER SESSION SET CONTAINER with an
+# unresolved or mismatched-case name.
 i=0
 while [[ $i -lt ${#SVC_LIST[@]} ]]; do
     svc="${SVC_LIST[$i]}"
     pdb="${PDB_LIST[$i]}"
-    if ! echo "$svc" | grep -q '^[A-Za-z0-9_.$]*$'; then
+    if ! echo "$svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
         log_error "Invalid service name: $svc"
         exit 1
     fi
@@ -392,8 +470,9 @@ while [[ $i -lt ${#SVC_LIST[@]} ]]; do
         log_error "Service name too long (max 64 chars): $svc"
         exit 1
     fi
-    if ! echo "$pdb" | grep -q '^[A-Za-z0-9_$#]*$'; then
-        log_error "Invalid container name: $pdb"
+    if ! resolve_container_name "$pdb" >/dev/null; then
+        log_error "Unknown container: $pdb"
+        log_error "Available containers: ${CONTAINER_NAMES[*]}"
         exit 1
     fi
     i=$((i + 1))

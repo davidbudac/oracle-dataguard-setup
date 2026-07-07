@@ -24,7 +24,16 @@ bash dg_diag_sid.sh -L
 # Force password prompt for remote runtime checks
 bash dg_triage_sid.sh -P
 bash dg_diag_sid.sh -P
+
+# Disable colored output (for logs/pipes; NO_COLOR is also honored,
+# and color is off automatically when stdout is not a terminal)
+bash dg_triage_sid.sh --no-color
 ```
+
+Warning/critical thresholds (FRA %, sequence gaps, lag seconds) are
+env-overridable via `DG_FRA_WARN_PCT`, `DG_FRA_CRIT_PCT`, `DG_SEQ_GAP_WARN`,
+`DG_SEQ_GAP_CRIT`, `DG_LAG_WARN_SECONDS` -- see
+[DG_STATUS.md](DG_STATUS.md#thresholds) for defaults and meaning.
 
 ## Command Roles
 

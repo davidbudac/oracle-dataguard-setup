@@ -16,6 +16,14 @@
 #   - Oracle environment variables must be set
 #   - For 3rd server: Oracle client installed, TNS entries configured
 #   - Wallet must be set up before starting (run setup first)
+#
+# Note on mkstore and `ps -ef`: mkstore has no stdin-based way to pass the
+# observer credential password to -createCredential (only the wallet
+# password itself can be fed via stdin/heredoc). The observer password
+# therefore appears briefly on the mkstore process argv at the
+# -createCredential call sites in the `setup` command below. This is a
+# short, one-time exposure at setup time (not a long-lived service argv);
+# see the comments at each call site.
 # ============================================================
 
 set -e
@@ -71,13 +79,35 @@ check_wallet_exists() {
 }
 
 is_observer_running() {
-    if [[ -f "$PID_FILE" ]]; then
-        local pid=$(cat "$PID_FILE")
-        if kill -0 "$pid" 2>/dev/null; then
-            return 0
-        fi
+    if [[ ! -f "$PID_FILE" ]]; then
+        return 1
     fi
-    return 1
+
+    local pid
+    pid=$(cat "$PID_FILE")
+
+    if [[ -z "$pid" ]]; then
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    if ! kill -0 "$pid" 2>/dev/null; then
+        # Process is gone - stale pidfile left over from a prior run.
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    # kill -0 only proves *some* process owns this PID. After a reboot the
+    # PID may have been recycled by an unrelated process, which would make
+    # status/start/stop all trust the wrong process. Verify the command
+    # line actually looks like our dgmgrl observer before trusting it.
+    if ! ps -p "$pid" -o args= 2>/dev/null | grep -qi 'dgmgrl'; then
+        log_warn "PID $pid from $PID_FILE is not a dgmgrl process - treating pidfile as stale"
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    return 0
 }
 
 require_observer_tools() {
@@ -108,6 +138,12 @@ do_setup() {
 
     log_section "Checking for Existing Wallet"
 
+    # NEW_WALLET_STAGED=true means the wallet is being (re)built from
+    # scratch in a temporary staging directory and only swapped into
+    # $WALLET_DIR after every step below succeeds - so a failure never
+    # leaves the live wallet missing or half-written.
+    NEW_WALLET_STAGED=false
+
     if check_wallet_exists; then
         log_warn "Wallet already exists at: $WALLET_DIR"
 
@@ -136,10 +172,11 @@ do_setup() {
                 log_info "Wallet recreation cancelled by user"
                 exit 0
             fi
-            log_info "Backing up existing wallet before recreation..."
-            WALLET_BACKUP=$(backup_directory "$WALLET_DIR") || exit 1
-            log_info "Wallet backup created at: $WALLET_BACKUP"
+            log_info "Wallet will be rebuilt in a staging directory and swapped in only on success"
+            NEW_WALLET_STAGED=true
         fi
+    else
+        NEW_WALLET_STAGED=true
     fi
 
     # ============================================================
@@ -148,22 +185,34 @@ do_setup() {
 
     log_section "Creating Wallet"
 
-    mkdir -p "$WALLET_DIR"
-    chmod 700 "$WALLET_DIR"
-
-    log_info "Created wallet directory: $WALLET_DIR"
+    if $NEW_WALLET_STAGED; then
+        if command -v mktemp >/dev/null 2>&1; then
+            WORK_WALLET_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_observer_wallet.XXXXXX")
+        else
+            WORK_WALLET_DIR="${TMPDIR:-/tmp}/dg_observer_wallet.$$"
+            mkdir -p "$WORK_WALLET_DIR"
+        fi
+        chmod 700 "$WORK_WALLET_DIR"
+        log_info "Staging new wallet in: $WORK_WALLET_DIR"
+    else
+        WORK_WALLET_DIR="$WALLET_DIR"
+        mkdir -p "$WORK_WALLET_DIR"
+        chmod 700 "$WORK_WALLET_DIR"
+        log_info "Using existing wallet directory: $WORK_WALLET_DIR"
+    fi
 
     # ============================================================
     # Create Wallet
     # ============================================================
 
-    if [[ ! -f "${WALLET_DIR}/ewallet.p12" ]]; then
+    if [[ ! -f "${WORK_WALLET_DIR}/ewallet.p12" ]]; then
         log_info "Creating new Oracle Wallet..."
 
         WALLET_PASSWORD=$(prompt_password "Enter wallet password (used to protect the wallet)")
 
         if [[ -z "$WALLET_PASSWORD" ]]; then
             log_error "Wallet password cannot be empty"
+            $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
             exit 1
         fi
 
@@ -171,24 +220,30 @@ do_setup() {
 
         if [[ "$WALLET_PASSWORD" != "$WALLET_PASSWORD_CONFIRM" ]]; then
             log_error "Passwords do not match"
+            $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
             exit 1
         fi
 
         # Create auto-login wallet
-        "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -create << EOF
+        if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -create << EOF
 ${WALLET_PASSWORD}
 ${WALLET_PASSWORD}
 EOF
-
-        if [[ $? -ne 0 ]]; then
+        then
             log_error "Failed to create wallet"
+            $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
             exit 1
         fi
 
         # Enable auto-login (creates cwallet.sso)
-        "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createSSO << EOF
+        if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createSSO << EOF
 ${WALLET_PASSWORD}
 EOF
+        then
+            log_error "Failed to enable auto-login (createSSO) for wallet"
+            $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
+            exit 1
+        fi
 
         log_info "Wallet created with auto-login enabled"
     else
@@ -225,29 +280,70 @@ EOF
 
     if [[ -z "$OBSERVER_PASSWORD" ]]; then
         log_error "Password cannot be empty"
+        $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
         exit 1
     fi
 
     # Add credential for primary
+    # NOTE: mkstore has no stdin-based way to supply the credential password
+    # to -createCredential (only the wallet password above can be piped in),
+    # so $OBSERVER_PASSWORD is briefly visible on this process's argv
+    # (`ps -ef`) for the short lifetime of this one mkstore invocation. This
+    # is a known limitation of the mkstore CLI, not something this script
+    # can route around; the exposure is a one-time setup event, not a
+    # persistent service argv.
     log_info "Adding credential for $PRIMARY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         log_error "Failed to add credential for $PRIMARY_TNS_ALIAS"
+        $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
         exit 1
     fi
 
-    # Add credential for standby
+    # Add credential for standby (same mkstore argv caveat as above)
     log_info "Adding credential for $STANDBY_TNS_ALIAS..."
-    "$ORACLE_HOME/bin/mkstore" -wrl "$WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
+    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
-
-    if [[ $? -ne 0 ]]; then
+    then
         log_error "Failed to add credential for $STANDBY_TNS_ALIAS"
+        $NEW_WALLET_STAGED && rm -rf "$WORK_WALLET_DIR"
         exit 1
+    fi
+
+    # ============================================================
+    # Activate Staged Wallet
+    # ============================================================
+    # Everything above succeeded, so it is now safe to swap the fully
+    # built wallet into place. The original wallet (if any) is moved
+    # aside as a timestamped backup rather than deleted.
+
+    if $NEW_WALLET_STAGED; then
+        log_section "Activating New Wallet"
+
+        if [[ -d "$WALLET_DIR" ]]; then
+            WALLET_SWAP_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
+            if ! mv "$WALLET_DIR" "$WALLET_SWAP_BACKUP"; then
+                log_error "Failed to move existing wallet out of the way: $WALLET_DIR"
+                log_error "New wallet remains staged (not activated) at: $WORK_WALLET_DIR"
+                exit 1
+            fi
+            log_info "Previous wallet backed up to: $WALLET_SWAP_BACKUP"
+        fi
+
+        if ! mv "$WORK_WALLET_DIR" "$WALLET_DIR"; then
+            log_error "Failed to move staged wallet into place: $WALLET_DIR"
+            if [[ -n "${WALLET_SWAP_BACKUP:-}" ]]; then
+                log_error "Restoring previous wallet from backup: $WALLET_SWAP_BACKUP"
+                mv "$WALLET_SWAP_BACKUP" "$WALLET_DIR" 2>/dev/null || log_error "Restore failed - previous wallet backup left at: $WALLET_SWAP_BACKUP"
+            fi
+            log_error "Staged wallet left at: $WORK_WALLET_DIR for manual recovery"
+            exit 1
+        fi
+
+        log_info "New wallet activated at: $WALLET_DIR"
     fi
 
     # Clear passwords from memory
@@ -334,7 +430,7 @@ test_wallet_connection() {
     local result
     result=$("$ORACLE_HOME/bin/dgmgrl" -silent "/@${PRIMARY_TNS_ALIAS}" "show configuration" 2>&1 || true)
 
-    if echo "$result" | grep -q "Configuration -\|SUCCESS\|WARNING"; then
+    if echo "$result" | grep -qE "Configuration -|SUCCESS|WARNING"; then
         return 0
     else
         log_warn "Connection test output:"
@@ -372,7 +468,7 @@ do_start() {
         exit 1
     fi
 
-    if echo "$FSFO_STATUS" | grep -qi "ORA-\|error"; then
+    if echo "$FSFO_STATUS" | grep -qiE "ORA-|error"; then
         log_error "Cannot connect to Data Guard configuration"
         log_error "Check wallet credentials and TNS configuration"
         echo ""
