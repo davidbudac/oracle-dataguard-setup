@@ -241,6 +241,26 @@ Hardcoded: FRA 80/90% (`dg_status.sh:614-618`, `dg_local_status_common.sh:837-84
 
 `--json` flag for `dg_triage_sid.sh` / `dg_status.sh` emitting a flat JSON object (role, modes, lag seconds, gaps, fra_pct, errors[], warnings[], exit_code) for monitoring ingestion. Pure printf-generated JSON (no jq dependency). Defer until 4.3/4.4 land.
 
+### 4.8 Application-facing handoff report enhancements
+
+**Problem:** The handoff report (`primary/10_generate_handoff_report.sh`, `dg_handoff.sh`) gives application teams connection strings but little of the information that actually determines how their application behaves against a Data Guard pair. It states facts a DBA cares about (apply lag, gaps) but not their application consequences (RPO, brownout duration, standby readability). The companion briefing `docs/DG_APPLICATION_IMPACT.html` covers the behavioral side but is generic and not linked from the generated report.
+
+**Change — derive app-relevant facts from the live config and state them in application terms:**
+
+- **Data-loss / RPO statement.** Read protection mode + per-member `LogXptMode` (broker `SHOW DATABASE`) and emit a plain-language line: SYNC/FASTSYNC + MaxAvailability → "a failover loses no committed transactions"; ASYNC/MaxPerformance → "a failover may lose the last few seconds of committed transactions — design idempotency/reconciliation accordingly." Also note the commit-latency implication of SYNC for chatty transaction patterns.
+- **Expected outage behavior.** If FSFO is enabled, read `FastStartFailoverThreshold` and state: "automatic failover after ~Ns of primary unreachability; expect connection errors for roughly that window plus reconnect time." If FSFO is off: "failover is a manual DBA action; outage lasts until it is performed." Mention the post-role-change cold-cache brownout.
+- **Standby readability.** Read the standby's `OPEN_MODE`. If `MOUNTED`, suppress (or clearly mark as unavailable) the standby-only connection strings — today they're emitted unconditionally and connecting to a mounted standby fails confusingly for an app user. If `READ ONLY WITH APPLY`, keep them but add the Active Data Guard licensing note, the apply-lag/read-your-writes caveat, and no-DML warning (ORA-16000).
+- **Role-trigger detection instead of assumption.** Check whether `DG_SERVICE_MGR` (SYS or dedicated-user variant) actually exists and its triggers are ENABLED. If yes: state the role-aware descriptor is safe. If no: print a prominent warning that role-aware descriptors may connect apps to a read-only standby until the trigger (`trigger/create_role_trigger.sh`) is deployed. Replaces the current unconditional "when the step-14 trigger is deployed" wording (ties into 4.6's step-14 cleanup).
+- **More connection formats per service** (apps aren't all JDBC): Easy Connect Plus with failover/timeout parameters (single line, no tnsnames needed, 19c+ clients), plus a short table mapping the same descriptor into ODP.NET / python-oracledb / SQLAlchemy DSN forms. Keep the existing TNS + JDBC blocks as-is.
+- **Recommended client/pool settings section** (concrete values, not prose): `CONNECT_TIMEOUT`/`TRANSPORT_CONNECT_TIMEOUT`/`RETRY_COUNT` (already in the descriptor — explain them), driver-level connection/read timeouts, dead-connection detection (`SQLNET.EXPIRE_TIME` server-side is already set or not — report it; TCP keepalive client-side), pool validation-on-borrow, and a note on TAF scope (SELECT-only replay; in-flight DML still needs app retry — the report already hints at this, make it a checklist).
+- **Firewall prerequisite check.** The report should state explicitly, as a checklist item, that the app tier must reach *both* hosts on the listener port before go-live, and include the two `tnsping`/`nc` commands to prove it (extend the existing "Quick Verification" section to test both hosts, not just the two aliases).
+- **Link the behavioral briefing.** Commit `docs/DG_APPLICATION_IMPACT.html` to the repo (currently untracked), and have step 10 copy it next to the report on the NFS share (`dg_application_impact.html`) and reference it from the report's "Notes for Client Teams" section. Optionally add a condensed "What changes for your application" summary (5 bullets: commit latency, FORCE LOGGING vs NOLOGGING batch jobs, sequence gaps after role change, cold cache brownout, reach-both-hosts) directly in the Markdown so the report is self-contained even if the HTML isn't distributed.
+- **Apply the same changes to `dg_handoff.sh`** (standalone variant) — it discovers topology live, so it can derive everything above from `V$DATABASE`, `V$DATAGUARD_CONFIG`, and `DGMGRL SHOW DATABASE VERBOSE`; where broker is down, degrade to "unknown" with a note (consistent with 2.4).
+
+**Files:** `primary/10_generate_handoff_report.sh`, `dg_handoff.sh`, new `sql/queries/` snippets (standby open mode via broker/remote query, trigger-presence check, FSFO threshold), `docs/DG_APPLICATION_IMPACT.html` (commit), `CLAUDE.md` handoff section.
+
+**Verify:** generate the report on the E2E pair in three states — (a) trigger deployed + FSFO on, (b) no trigger, (c) standby mounted — and assert the conditional sections render correctly in each; check the Easy Connect string actually connects from a client.
+
 ---
 
 ## Workstream 5 — Documentation
