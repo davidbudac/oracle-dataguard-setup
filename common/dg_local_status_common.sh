@@ -435,6 +435,7 @@ ${DG_SQL_SELECT_DBSTATUS_FULL}
 ${DG_SQL_SELECT_REDOLOG}
 ${DG_SQL_SELECT_SRLCOUNT}
 ${DG_SQL_SELECT_ARCHGAP}
+SELECT 'UNNAMEDDF|' || COUNT(*) FROM V\$DATAFILE WHERE NAME LIKE '%UNNAMED%';
 ${DG_SQL_SELECT_FRA}
 ${DG_SQL_SELECT_SERVICE}
 ${DG_SQL_SELECT_MRP}
@@ -451,6 +452,7 @@ ${DG_SQL_SELECT_DGPARAMS}
 ${DG_SQL_SELECT_REDOLOG}
 ${DG_SQL_SELECT_SRLCOUNT}
 ${DG_SQL_SELECT_ARCHGAP}
+SELECT 'UNNAMEDDF|' || COUNT(*) FROM V\$DATAFILE WHERE NAME LIKE '%UNNAMED%';
 SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || DB_UNIQUE_NAME || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
 ${DG_SQL_SELECT_FSFODB}
 ${DG_SQL_SELECT_FRA}
@@ -474,6 +476,8 @@ parse_local_sql() {
 
     LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
     LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+    LOC_UNNAMED=$(printf '%s\n' "$LOCAL_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+    case "$LOC_UNNAMED" in ''|*[!0-9]*) LOC_UNNAMED="" ;; esac
     LOC_REDO=$(printf '%s\n' "$LOCAL_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
     LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | xargs)
     LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | xargs)
@@ -523,6 +527,7 @@ parse_remote_sql() {
     REM_REDO_MB=""
     REM_SRL=""
     REM_ARCHGAP=""
+    REM_UNNAMED=""
     REM_FRA_PATH=""
     REM_FRA_SIZE=""
     REM_FRA_USED=""
@@ -556,6 +561,8 @@ parse_remote_sql() {
     REM_REDO_MB=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $2}' | xargs)
     REM_SRL=$(printf '%s\n' "$REMOTE_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
     REM_ARCHGAP=$(printf '%s\n' "$REMOTE_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+    REM_UNNAMED=$(printf '%s\n' "$REMOTE_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+    case "$REM_UNNAMED" in ''|*[!0-9]*) REM_UNNAMED="" ;; esac
 
     REM_FRA=$(printf '%s\n' "$REMOTE_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
     REM_FRA_PATH=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $1}' | xargs)
@@ -618,6 +625,7 @@ assign_role_views() {
         PRI_DEST2_DBUNIQ="$LOC_DEST2_DBUNIQ"
         PRI_DEST2_ERROR="${LOC_DEST2_ERROR:-}"
         PRI_ARCHGAP="$LOC_ARCHGAP"
+        PRI_UNNAMED="$LOC_UNNAMED"
         PRI_FRA_PATH="$LOC_FRA_PATH"
         PRI_FRA_SIZE="$LOC_FRA_SIZE"
         PRI_FRA_USED="$LOC_FRA_USED"
@@ -637,6 +645,7 @@ assign_role_views() {
         STB_REDO_MB="$REM_REDO_MB"
         STB_SRL="$REM_SRL"
         STB_ARCHGAP="$REM_ARCHGAP"
+        STB_UNNAMED="$REM_UNNAMED"
         STB_MRP_STATUS="$REM_MRP_STATUS"
         STB_MRP_SEQ="$REM_MRP_SEQ"
         STB_TRANSPORT_LAG="$REM_TRANSPORT_LAG"
@@ -664,6 +673,7 @@ assign_role_views() {
         STB_REDO_MB="$LOC_REDO_MB"
         STB_SRL="$LOC_SRL"
         STB_ARCHGAP="$LOC_ARCHGAP"
+        STB_UNNAMED="$LOC_UNNAMED"
         STB_MRP_STATUS="$LOC_MRP_STATUS"
         STB_MRP_SEQ="$LOC_MRP_SEQ"
         STB_TRANSPORT_LAG="$LOC_TRANSPORT_LAG"
@@ -695,6 +705,7 @@ assign_role_views() {
         PRI_DEST2_DBUNIQ=""
         PRI_DEST2_ERROR=""
         PRI_ARCHGAP="$REM_ARCHGAP"
+        PRI_UNNAMED="$REM_UNNAMED"
         PRI_FRA_PATH="$REM_FRA_PATH"
         PRI_FRA_SIZE="$REM_FRA_SIZE"
         PRI_FRA_USED="$REM_FRA_USED"
@@ -755,6 +766,11 @@ assess_primary() {
     if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
         PRI_OK=false
         add_summary_error "Primary reports ${PRI_ARCHGAP} archive gap(s)"
+    fi
+
+    if [[ -n "${PRI_UNNAMED:-}" ]] && [[ "${PRI_UNNAMED:-0}" -gt 0 ]]; then
+        PRI_OK=false
+        add_summary_error "Primary has ${PRI_UNNAMED} UNNAMED datafile(s) (ORA-01274: datafile path not covered by DB_FILE_NAME_CONVERT pairs; repair with ALTER DATABASE CREATE DATAFILE)"
     fi
 
     if [[ -n "${PRI_SRL:-}" ]] && [[ "${PRI_SRL:-0}" -le 0 ]]; then
@@ -835,6 +851,11 @@ assess_standby() {
     if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
         STB_OK=false
         add_summary_error "Standby reports ${STB_ARCHGAP} archive gap(s)"
+    fi
+
+    if [[ -n "${STB_UNNAMED:-}" ]] && [[ "${STB_UNNAMED:-0}" -gt 0 ]]; then
+        STB_OK=false
+        add_summary_error "Standby has ${STB_UNNAMED} UNNAMED datafile(s) (ORA-01274: datafile path not covered by DB_FILE_NAME_CONVERT pairs; repair with ALTER DATABASE CREATE DATAFILE)"
     fi
 
     if [[ -n "${STB_FLASH:-}" ]] && ! printf '%s' "$STB_FLASH" | grep -qi "YES"; then
@@ -1089,6 +1110,9 @@ render_standby_triage() {
         if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
             row "Archive Gaps" "${STB_ARCHGAP} gap(s)" "$FAIL"
         fi
+        if [[ -n "${STB_UNNAMED:-}" ]] && [[ "${STB_UNNAMED:-0}" -gt 0 ]]; then
+            row "UNNAMED Datafiles" "${STB_UNNAMED} UNNAMED datafile(s)" "$FAIL"
+        fi
         if [[ -n "${STB_FRA_PATH:-}" ]]; then
             row "FRA Usage" "${STB_FRA_EFFECTIVE_USED}/${STB_FRA_SIZE} GB effective (${STB_FRA_PCT}%)" "$(dg_fra_icon "${STB_FRA_PCT:-0}")"
         fi
@@ -1229,6 +1253,9 @@ render_primary_diag() {
         if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
             row "Archive Gaps" "${PRI_ARCHGAP} gap(s)" "$FAIL"
         fi
+        if [[ -n "${PRI_UNNAMED:-}" ]] && [[ "${PRI_UNNAMED:-0}" -gt 0 ]]; then
+            row "UNNAMED Datafiles" "${PRI_UNNAMED} UNNAMED datafile(s)" "$FAIL"
+        fi
 
         subheader "Recovery Area"
         if [[ -n "${PRI_FRA_PATH:-}" ]]; then
@@ -1291,6 +1318,9 @@ render_standby_diag() {
         fi
         if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
             row "Archive Gaps" "${STB_ARCHGAP} gap(s)" "$FAIL"
+        fi
+        if [[ -n "${STB_UNNAMED:-}" ]] && [[ "${STB_UNNAMED:-0}" -gt 0 ]]; then
+            row "UNNAMED Datafiles" "${STB_UNNAMED} UNNAMED datafile(s)" "$FAIL"
         fi
 
         subheader "Recovery Area"

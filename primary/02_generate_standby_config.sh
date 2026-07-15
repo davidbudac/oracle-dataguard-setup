@@ -28,6 +28,140 @@ for _arg in "$@"; do
 done
 
 # ============================================================
+# Convert-pair builder (shared by NORMAL and REGENERATE modes)
+# ============================================================
+# Builds DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT from the four
+# path arrays whose NAMES are passed as arguments:
+#   $1 = primary data array name    $2 = standby data array name
+#   $3 = primary redo array name    $4 = standby redo array name
+# Also reads the PRIMARY_SRL_PATH / STANDBY_SRL_PATH /
+# PRIMARY_REDO_PATH / STANDBY_REDO_PATH globals for the optional
+# separate-SRL pair.
+#
+# Convention: pairs are 'primary','standby' repeated. ORDER MATTERS:
+# Oracle applies the FIRST pair whose primary string prefix-matches a
+# filename, so a short path like /u01/oradata listed before
+# /u01/oradata2 would shadow it (every /u01/oradata2 file would be
+# mis-remapped through the /u01/oradata pair). Pairs are therefore
+# sorted by primary-path length DESCENDING (longest, most specific
+# first). Each side is also emitted with a single trailing slash
+# ('/u01/oradata2/','/stby/data2/') so the prefix match is bounded at
+# a path-component boundary and a parent dir can never swallow a
+# sibling whose name merely starts with the same characters.
+# (standby/03_setup_standby_env.sh's add_convert_standby_dirs strips
+# the quotes and mkdir -p's each standby side - trailing slashes are
+# harmless there, and Oracle/RMAN accept them in the convert string.)
+build_convert_pairs() {
+    local _pd_arr="$1"
+    local _sd_arr="$2"
+    local _pr_arr="$3"
+    local _sr_arr="$4"
+    local _seen_pairs=" "  # space-bounded list so we can test membership
+    _cp_pri=()
+    _cp_stby=()
+
+    # Normalize both sides to exactly one trailing slash, dedup, and
+    # collect into the parallel _cp_pri/_cp_stby arrays.
+    # NOTE: separate `local` statements - declaring on one line as
+    # `local a="$1" b="$2" key="...${a}...${b}..."` evaluates ${a}
+    # and ${b} BEFORE local assigns them, so key would be empty and
+    # the dedup membership check would collapse every pair into one.
+    _collect_pair() {
+        local primary="$1"
+        local standby="$2"
+        [[ -z "$primary" || -z "$standby" ]] && return 0
+        # "${p%/}/" maps /a -> /a/, /a/ -> /a/, and / -> / unchanged.
+        primary="${primary%/}/"
+        standby="${standby%/}/"
+        local key=" ${primary}=>${standby} "
+        case "$_seen_pairs" in
+            *"$key"*) return 0 ;;
+        esac
+        _seen_pairs="${_seen_pairs}${primary}=>${standby} "
+        _cp_pri+=("$primary")
+        _cp_stby+=("$standby")
+    }
+
+    # Walk two index-parallel arrays by NAME (eval indirection keeps
+    # this bash 3.2 / AIX compatible - no namerefs).
+    _collect_from_arrays() {
+        local _pa="$1"
+        local _sa="$2"
+        local _k=0 _cnt _p _s
+        eval "_cnt=\${#${_pa}[@]}"
+        while [[ $_k -lt $_cnt ]]; do
+            eval "_p=\${${_pa}[$_k]}"
+            eval "_s=\${${_sa}[$_k]}"
+            _collect_pair "$_p" "$_s"
+            _k=$(( _k + 1 ))
+        done
+    }
+
+    # Datafile pairs, then redo log pairs - one per distinct directory
+    _collect_from_arrays "$_pd_arr" "$_sd_arr"
+    _collect_from_arrays "$_pr_arr" "$_sr_arr"
+
+    # Separate SRL pair when configured. When the PRIMARY side is NOT
+    # separated (PRIMARY_SRL_PATH == PRIMARY_REDO_PATH) no SRL pair is
+    # emitted - so a standby-only separation is unreachable: no pair
+    # maps anything INTO that standby SRL directory, and SRLs will be
+    # created under STANDBY_REDO_PATH via the ordinary redo pair.
+    # Detect and warn about that contradiction instead of silently
+    # shipping a directory that never gets used.
+    if [[ -n "${PRIMARY_SRL_PATH:-}" && "${PRIMARY_SRL_PATH}" != "${PRIMARY_REDO_PATH:-}" ]]; then
+        _collect_pair "$PRIMARY_SRL_PATH" "${STANDBY_SRL_PATH:-}"
+    elif [[ -n "${STANDBY_SRL_PATH:-}" && "${STANDBY_SRL_PATH}" != "${STANDBY_REDO_PATH:-}" ]]; then
+        log_warn "SRL path contradiction: PRIMARY_SRL_PATH equals PRIMARY_REDO_PATH, but"
+        log_warn "  STANDBY_SRL_PATH (${STANDBY_SRL_PATH}) differs from STANDBY_REDO_PATH (${STANDBY_REDO_PATH:-})."
+        log_warn "  Convert pairs remap primary filenames, and no primary SRL filename is"
+        log_warn "  distinguishable from an ORL filename when both share one directory - so"
+        log_warn "  no pair can target the standby SRL directory. SRLs will be created under"
+        log_warn "  ${STANDBY_REDO_PATH:-} on the standby. To separate SRLs on the standby,"
+        log_warn "  set PRIMARY_SRL_PATH to a distinct primary directory as well."
+    fi
+
+    # Stable insertion sort by primary-path length DESCENDING (see the
+    # ordering rationale in the function header). Pair counts are tiny
+    # (a handful of directories), so O(n^2) in pure bash is fine.
+    local _n=${#_cp_pri[@]}
+    local _i=1 _j _kp _ks
+    while [[ $_i -lt $_n ]]; do
+        _kp="${_cp_pri[$_i]}"
+        _ks="${_cp_stby[$_i]}"
+        _j=$(( _i - 1 ))
+        while [[ $_j -ge 0 && ${#_cp_pri[$_j]} -lt ${#_kp} ]]; do
+            _cp_pri[$(( _j + 1 ))]="${_cp_pri[$_j]}"
+            _cp_stby[$(( _j + 1 ))]="${_cp_stby[$_j]}"
+            _j=$(( _j - 1 ))
+        done
+        _cp_pri[$(( _j + 1 ))]="$_kp"
+        _cp_stby[$(( _j + 1 ))]="$_ks"
+        _i=$(( _i + 1 ))
+    done
+
+    # Assemble the quoted, comma-separated convert string
+    local _pairs=""
+    _i=0
+    while [[ $_i -lt $_n ]]; do
+        if [[ -z "$_pairs" ]]; then
+            _pairs="'${_cp_pri[$_i]}','${_cp_stby[$_i]}'"
+        else
+            _pairs="${_pairs},'${_cp_pri[$_i]}','${_cp_stby[$_i]}'"
+        fi
+        _i=$(( _i + 1 ))
+    done
+    DB_FILE_NAME_CONVERT="$_pairs"
+    LOG_FILE_NAME_CONVERT="$_pairs"
+
+    if [[ $_n -gt 20 || ${#_pairs} -gt 2000 ]]; then
+        log_warn "DB_FILE_NAME_CONVERT holds ${_n} pairs (${#_pairs} chars). Very long"
+        log_warn "  convert strings are fragile (parameter length limits, easy to miss a"
+        log_warn "  directory). For many-PDB CDBs consider OMF mode instead (storage mode"
+        log_warn "  2 at step 2: db_create_file_dest, no convert strings needed)."
+    fi
+}
+
+# ============================================================
 # Main Script
 # ============================================================
 
@@ -73,6 +207,41 @@ fi
 
 init_log "02_regenerate_config_${STANDBY_DB_UNIQUE_NAME}"
 log_info "Config: ${PRIMARY_DB_UNIQUE_NAME} -> ${STANDBY_DB_UNIQUE_NAME}"
+
+# ------------------------------------------------------------
+# Re-derive the convert pairs from the (possibly user-edited)
+# path arrays. Without this, editing STANDBY_DATA_PATHS in the
+# .env and regenerating would silently ship the STALE
+# DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT strings stored at
+# generation time into the pfile and RMAN cmdfile.
+# ------------------------------------------------------------
+_can_rebuild_pairs=0
+if [[ -n "${PRIMARY_DATA_PATHS+x}" && -n "${STANDBY_DATA_PATHS+x}" \
+   && -n "${PRIMARY_REDO_PATHS+x}" && -n "${STANDBY_REDO_PATHS+x}" ]]; then
+    if [[ ${#PRIMARY_DATA_PATHS[@]} -gt 0 \
+       && ${#PRIMARY_DATA_PATHS[@]} -eq ${#STANDBY_DATA_PATHS[@]} \
+       && ${#PRIMARY_REDO_PATHS[@]} -eq ${#STANDBY_REDO_PATHS[@]} ]]; then
+        _can_rebuild_pairs=1
+    fi
+fi
+
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    # OMF mode never uses convert pairs - keep them empty as stored.
+    :
+elif [[ "$_can_rebuild_pairs" == "1" ]]; then
+    # Backward compat for pre-SRL configs (same defaulting as below)
+    PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH:-$PRIMARY_REDO_PATH}"
+    STANDBY_SRL_PATH="${STANDBY_SRL_PATH:-$STANDBY_REDO_PATH}"
+    build_convert_pairs PRIMARY_DATA_PATHS STANDBY_DATA_PATHS PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
+    log_info "Rebuilt convert pairs from the path arrays in the config:"
+    log_info "  DB_FILE_NAME_CONVERT:  $DB_FILE_NAME_CONVERT"
+    log_info "  LOG_FILE_NAME_CONVERT: $LOG_FILE_NAME_CONVERT"
+else
+    log_warn "PRIMARY_*/STANDBY_* path arrays are missing or length-mismatched in"
+    log_warn "  $STANDBY_CONFIG_FILE"
+    log_warn "  Convert pairs were NOT re-derived - using the stored"
+    log_warn "  DB_FILE_NAME_CONVERT / LOG_FILE_NAME_CONVERT strings verbatim."
+fi
 
 else
 
@@ -145,6 +314,71 @@ fi
 # Standby Oracle SID
 echo ""
 prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
+
+# ============================================================
+# Token remapping helpers (case-aware, substring-safe)
+# ============================================================
+# Primary file directories normally embed the DB-name as a path
+# COMPONENT (e.g. /u01/oradata/DGNONC). The standby equivalent is the
+# same path with that component swapped to the standby DB name.
+#
+# Each path is remapped INDEPENDENTLY: a datafile mount using one case
+# (.../DGNONC) and a redo mount using another (.../dgnonc) both remap
+# correctly. The previous logic detected a single token from the
+# datafile path only and applied it to every path, so a case-mismatched
+# redo path came back unchanged and fell to the operator-confirm step.
+#
+# Replacement is bounded to whole, slash-delimited path components, so a
+# token that also appears as a SUBSTRING of a mount name (e.g. token
+# PROD inside /prod_archive/) is never corrupted - the old unbounded
+# `sed s/tok/rep/g` would have rewritten it.
+#
+# Defined here (before the storage/archive prompts) because the
+# archive-destination default below also uses remap_path_token.
+DB_UNIQUE_NAME_UPPER=$(echo "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+DB_UNIQUE_NAME_LOWER=$(echo "$DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+STANDBY_DIR_NAME_UPPER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+STANDBY_DIR_NAME_LOWER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+
+# True when $2 occurs as a whole, slash-delimited component of path $1.
+# Wrapping in slashes makes the first/last components match the same
+# `/token/` pattern as interior ones.
+_path_has_component() {
+    case "/$1/" in
+        *"/$2/"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Echo path $1 with every whole-component occurrence of token $2 swapped
+# to $3. Components are slash-delimited, so a token embedded inside a
+# larger directory name is left untouched. Two sed passes (interior
+# `/tok/`, then a trailing `/tok` at end of string) keep this portable
+# to AIX / bash 3.2 - no GNU regex alternation.
+_replace_path_component() {
+    local _p="$1" _tok="$2" _rep="$3"
+    _p=$(printf '%s' "$_p" | sed "s|/${_tok}/|/${_rep}/|g")
+    _p=$(printf '%s' "$_p" | sed "s|/${_tok}\$|/${_rep}|")
+    printf '%s' "$_p"
+}
+
+# Echo the standby path for a primary path by swapping whichever case
+# variant of DB_UNIQUE_NAME appears as a path component (upper, then
+# lower, then the literal mixed case). A path containing no token
+# variant is echoed unchanged so the operator-confirm step below can
+# surface it instead of silently mis-mapping it.
+remap_path_token() {
+    local _p="$1"
+    if   _path_has_component "$_p" "$DB_UNIQUE_NAME_UPPER"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME_UPPER" "$STANDBY_DIR_NAME_UPPER"
+    elif _path_has_component "$_p" "$DB_UNIQUE_NAME_LOWER"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME_LOWER" "$STANDBY_DIR_NAME_LOWER"
+    elif _path_has_component "$_p" "$DB_UNIQUE_NAME"; then
+        _replace_path_component "$_p" "$DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"
+    else
+        printf '%s' "$_p"
+    fi
+}
 
 # ============================================================
 # Select Standby Storage Mode
@@ -275,8 +509,11 @@ case "$_archive_choice" in
 
         _arch_default=""
         if [[ -n "$PRIMARY_ARCHIVE_DEST" ]]; then
-            _arch_default=$(echo "$PRIMARY_ARCHIVE_DEST" \
-                | sed "s|/${DB_UNIQUE_NAME}|/${STANDBY_DB_UNIQUE_NAME}|g")
+            # Component-bounded remap: only a whole /<DB_UNIQUE_NAME>/
+            # path component is swapped, so a directory that merely
+            # CONTAINS the name (e.g. /arch/PROD_ARCH with DB name PROD)
+            # is left intact - the old unbounded sed corrupted it.
+            _arch_default=$(remap_path_token "$PRIMARY_ARCHIVE_DEST")
         fi
         prompt_with_default "Standby archive log directory" "$_arch_default" STANDBY_ARCHIVE_DEST
         if [[ -z "$STANDBY_ARCHIVE_DEST" ]]; then
@@ -329,64 +566,9 @@ else
 # ============================================================
 # Per-path token remapping (case-aware, substring-safe)
 # ============================================================
-# Primary file directories normally embed the DB-name as a path
-# COMPONENT (e.g. /u01/oradata/DGNONC). The standby equivalent is the
-# same path with that component swapped to the standby DB name.
-#
-# Each path is remapped INDEPENDENTLY: a datafile mount using one case
-# (.../DGNONC) and a redo mount using another (.../dgnonc) both remap
-# correctly. The previous logic detected a single token from the
-# datafile path only and applied it to every path, so a case-mismatched
-# redo path came back unchanged and fell to the operator-confirm step.
-#
-# Replacement is bounded to whole, slash-delimited path components, so a
-# token that also appears as a SUBSTRING of a mount name (e.g. token
-# PROD inside /prod_archive/) is never corrupted - the old unbounded
-# `sed s/tok/rep/g` would have rewritten it.
-DB_UNIQUE_NAME_UPPER=$(echo "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
-DB_UNIQUE_NAME_LOWER=$(echo "$DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
-STANDBY_DIR_NAME_UPPER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
-STANDBY_DIR_NAME_LOWER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
-
-# True when $2 occurs as a whole, slash-delimited component of path $1.
-# Wrapping in slashes makes the first/last components match the same
-# `/token/` pattern as interior ones.
-_path_has_component() {
-    case "/$1/" in
-        *"/$2/"*) return 0 ;;
-        *) return 1 ;;
-    esac
-}
-
-# Echo path $1 with every whole-component occurrence of token $2 swapped
-# to $3. Components are slash-delimited, so a token embedded inside a
-# larger directory name is left untouched. Two sed passes (interior
-# `/tok/`, then a trailing `/tok` at end of string) keep this portable
-# to AIX / bash 3.2 - no GNU regex alternation.
-_replace_path_component() {
-    local _p="$1" _tok="$2" _rep="$3"
-    _p=$(printf '%s' "$_p" | sed "s|/${_tok}/|/${_rep}/|g")
-    _p=$(printf '%s' "$_p" | sed "s|/${_tok}\$|/${_rep}|")
-    printf '%s' "$_p"
-}
-
-# Echo the standby path for a primary path by swapping whichever case
-# variant of DB_UNIQUE_NAME appears as a path component (upper, then
-# lower, then the literal mixed case). A path containing no token
-# variant is echoed unchanged so the operator-confirm step below can
-# surface it instead of silently mis-mapping it.
-remap_path_token() {
-    local _p="$1"
-    if   _path_has_component "$_p" "$DB_UNIQUE_NAME_UPPER"; then
-        _replace_path_component "$_p" "$DB_UNIQUE_NAME_UPPER" "$STANDBY_DIR_NAME_UPPER"
-    elif _path_has_component "$_p" "$DB_UNIQUE_NAME_LOWER"; then
-        _replace_path_component "$_p" "$DB_UNIQUE_NAME_LOWER" "$STANDBY_DIR_NAME_LOWER"
-    elif _path_has_component "$_p" "$DB_UNIQUE_NAME"; then
-        _replace_path_component "$_p" "$DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"
-    else
-        printf '%s' "$_p"
-    fi
-}
+# remap_path_token and its helpers are defined above (right after the
+# STANDBY_DB_UNIQUE_NAME prompt) because the archive-destination
+# default also uses them. Each path below is remapped INDEPENDENTLY.
 
 # Derive matching standby paths for each primary directory.
 STANDBY_DATA_PATHS=()
@@ -439,6 +621,80 @@ _confirm_unmapped_paths() {
 }
 _confirm_unmapped_paths "datafile" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS
 _confirm_unmapped_paths "redo log" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
+
+# ============================================================
+# Interactive mapping review (interactive terminals only)
+# ============================================================
+# Token remapping handles the symmetric case (same base mount, DB-name
+# component swapped). The asymmetric case - the token IS present but
+# the standby uses a different base mount entirely, e.g.
+# /u01/oradata/PROD -> /oracle/data/STBY - auto-remaps to
+# /u01/oradata/STBY without ever surfacing, and previously required
+# hand-editing the .env afterwards. Show the operator the full derived
+# mapping table and let them correct any entry BEFORE the convert
+# pairs and the .env are built, so corrections flow everywhere.
+#
+# The edit prompt fires ONLY on a real terminal ([[ -t 0 ]]). With
+# piped stdin (the E2E suite drives this script with a fixed input
+# line sequence) the table is printed for the log and the derived
+# defaults are accepted silently - no input is consumed.
+_review_path_mappings() {
+    local _n_data _n_redo _total _i _idx _pri _stby _num _ans _label
+    local _pri_arr _stby_arr
+    _n_data=${#PRIMARY_DATA_PATHS[@]}
+    _n_redo=${#PRIMARY_REDO_PATHS[@]}
+    _total=$(( _n_data + _n_redo ))
+    while :; do
+        echo ""
+        echo "Derived primary -> standby directory mappings:"
+        _i=0
+        while [[ $_i -lt $_n_data ]]; do
+            printf "  %2d) [data] %s -> %s\n" $(( _i + 1 )) \
+                "${PRIMARY_DATA_PATHS[$_i]}" "${STANDBY_DATA_PATHS[$_i]}"
+            _i=$(( _i + 1 ))
+        done
+        _i=0
+        while [[ $_i -lt $_n_redo ]]; do
+            printf "  %2d) [redo] %s -> %s\n" $(( _n_data + _i + 1 )) \
+                "${PRIMARY_REDO_PATHS[$_i]}" "${STANDBY_REDO_PATHS[$_i]}"
+            _i=$(( _i + 1 ))
+        done
+        # Non-interactive (piped stdin): table is informational only.
+        if [[ ! -t 0 ]]; then
+            return 0
+        fi
+        printf "Accept all mappings [Enter], or enter a number to edit: "
+        read _num || _num=""
+        _num=$(echo "$_num" | tr -d ' \n\r')
+        [[ -z "$_num" ]] && return 0
+        case "$_num" in
+            *[!0-9]*) echo "Invalid selection: $_num"; continue ;;
+        esac
+        if [[ "$_num" -lt 1 || "$_num" -gt $_total ]]; then
+            echo "Selection out of range (1-${_total})"
+            continue
+        fi
+        if [[ "$_num" -le $_n_data ]]; then
+            _label="data"
+            _pri_arr=PRIMARY_DATA_PATHS
+            _stby_arr=STANDBY_DATA_PATHS
+            _idx=$(( _num - 1 ))
+        else
+            _label="redo"
+            _pri_arr=PRIMARY_REDO_PATHS
+            _stby_arr=STANDBY_REDO_PATHS
+            _idx=$(( _num - _n_data - 1 ))
+        fi
+        eval "_pri=\${${_pri_arr}[$_idx]}"
+        eval "_stby=\${${_stby_arr}[$_idx]}"
+        prompt_with_default "New standby ${_label} directory for '$_pri'" "$_stby" _ans
+        # Keep the no-trailing-slash convention used by every other path
+        [[ "$_ans" != "/" ]] && _ans="${_ans%/}"
+        eval "${_stby_arr}[$_idx]=\"\$_ans\""
+    done
+}
+_review_path_mappings
+
 STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
 STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
 
@@ -478,53 +734,13 @@ else
     log_info "SRLs will share the ORL directory on both databases"
 fi
 
-# Build FILE_NAME_CONVERT covering EVERY primary directory.
-# Convention: pairs are 'primary','standby' repeated. Order doesn't
-# matter to Oracle as long as the pair counts are even.
-_convert_pairs=""
-_seen_pairs=" "  # space-bounded list so we can grep for membership
-
-_emit_pair() {
-    # NOTE: separate `local` statements - declaring on one line as
-    # `local a="$1" b="$2" key="...${a}...${b}..."` evaluates ${a}
-    # and ${b} BEFORE local assigns them, so key would be empty and
-    # the dedup membership check would collapse every pair into one.
-    local primary="$1"
-    local standby="$2"
-    local key=" ${primary}=>${standby} "
-    [[ -z "$primary" || -z "$standby" ]] && return 0
-    case "$_seen_pairs" in
-        *"$key"*) return 0 ;;
-    esac
-    _seen_pairs="${_seen_pairs}${primary}=>${standby} "
-    if [[ -z "$_convert_pairs" ]]; then
-        _convert_pairs="'${primary}','${standby}'"
-    else
-        _convert_pairs="${_convert_pairs},'${primary}','${standby}'"
-    fi
-}
-
-# Datafile pairs - one per distinct primary datafile directory
-_idx=0
-for _p in "${PRIMARY_DATA_PATHS[@]}"; do
-    _emit_pair "$_p" "${STANDBY_DATA_PATHS[$_idx]}"
-    _idx=$((_idx + 1))
-done
-
-# Redo log pairs - one per distinct primary redo directory
-_idx=0
-for _p in "${PRIMARY_REDO_PATHS[@]}"; do
-    _emit_pair "$_p" "${STANDBY_REDO_PATHS[$_idx]}"
-    _idx=$((_idx + 1))
-done
-
-# Separate SRL pair when configured
-if [[ "$PRIMARY_SRL_PATH" != "$PRIMARY_REDO_PATH" ]]; then
-    _emit_pair "$PRIMARY_SRL_PATH" "$STANDBY_SRL_PATH"
-fi
-
-DB_FILE_NAME_CONVERT="$_convert_pairs"
-LOG_FILE_NAME_CONVERT="$_convert_pairs"
+# Build FILE_NAME_CONVERT covering EVERY primary directory (data,
+# redo, and the optional separate SRL directory). Pair ORDER matters -
+# Oracle uses the first prefix match - so build_convert_pairs (defined
+# at the top of this script, shared with --regenerate mode) sorts the
+# pairs longest-primary-first and emits trailing slashes on both sides
+# to keep prefix matches component-safe.
+build_convert_pairs PRIMARY_DATA_PATHS STANDBY_DATA_PATHS PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
 
 log_info "Primary data paths:"
 for _p in "${PRIMARY_DATA_PATHS[@]}"; do log_info "    $_p"; done
@@ -565,9 +781,18 @@ log_info "Standby TNS alias: $STANDBY_TNS_ALIAS"
 
 progress_step "Generating Admin Directories"
 
-# Assume same ORACLE_BASE structure on standby
+# Default: same ORACLE_BASE / ORACLE_HOME structure on the standby.
+# On a real terminal, let the operator override both (the standby's
+# pfile derives audit_file_dest and diagnostic_dest from
+# STANDBY_ORACLE_BASE, and the listener snippet uses
+# STANDBY_ORACLE_HOME). With piped stdin (E2E suite's fixed input
+# sequence) the primary's values are kept silently - no input is read.
 STANDBY_ORACLE_BASE="$PRIMARY_ORACLE_BASE"
 STANDBY_ORACLE_HOME="$PRIMARY_ORACLE_HOME"
+if [[ -t 0 ]]; then
+    prompt_with_default "Standby ORACLE_BASE" "$STANDBY_ORACLE_BASE" STANDBY_ORACLE_BASE
+    prompt_with_default "Standby ORACLE_HOME" "$STANDBY_ORACLE_HOME" STANDBY_ORACLE_HOME
+fi
 
 STANDBY_ADMIN_DIR="${STANDBY_ORACLE_BASE}/admin/${STANDBY_DB_UNIQUE_NAME}"
 
@@ -651,6 +876,17 @@ STANDBY_DATA_PATH="$STANDBY_DATA_PATH"
 STANDBY_DATA_PATHS=(
 $(printf '    "%s"\n' "${STANDBY_DATA_PATHS[@]}")
 )
+$(if [[ -n "${PRIMARY_DATA_PATH_SIZES_MB+x}" ]] \
+   && [[ ${#PRIMARY_DATA_PATH_SIZES_MB[@]} -eq ${#PRIMARY_DATA_PATHS[@]} ]] \
+   && [[ ${#STANDBY_DATA_PATHS[@]} -eq ${#PRIMARY_DATA_PATHS[@]} ]]; then
+printf '# STANDBY_DATA_PATH_SIZES_MB = required size (MB) per directory,\n'
+printf '# index-parallel to STANDBY_DATA_PATHS (values carried over from\n'
+printf '# PRIMARY_DATA_PATH_SIZES_MB gathered at step 1; step 3 uses them\n'
+printf '# for per-filesystem disk space checks on the standby).\n'
+printf 'STANDBY_DATA_PATH_SIZES_MB=(\n'
+printf '    "%s"\n' "${PRIMARY_DATA_PATH_SIZES_MB[@]}"
+printf ')\n'
+fi)
 PRIMARY_REDO_PATH="$PRIMARY_REDO_PATH"
 PRIMARY_REDO_PATHS=(
 $(printf '    "%s"\n' "${PRIMARY_REDO_PATHS[@]}")

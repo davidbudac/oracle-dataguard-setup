@@ -635,6 +635,15 @@ fi
     echo "- Application firewalls must allow the app tier to reach both database hosts on listener port ${PORT} before go-live."
     echo ""
 
+    echo "### Adding Datafiles or PDBs After Setup (DBA Note)"
+    echo ""
+    echo "- New datafiles and PDBs replicate to the standby automatically only when their primary-side paths fall under a directory prefix covered by the standby's \`DB_FILE_NAME_CONVERT\` pairs. OMF-mode standbys (\`db_create_file_dest\` set) are immune."
+    echo "- A file added in an uncovered directory is created as \`UNNAMEDnnnnn\` in \`\$ORACLE_HOME/dbs\` on the standby; MRP stops with ORA-01274 and redo apply halts until manually repaired."
+    echo "- Before creating a PDB or adding a datafile in a new directory, keep paths under a covered prefix, or use \`CREATE PLUGGABLE DATABASE ... FILE_NAME_CONVERT\` / PDB-level OMF."
+    echo "- After any addition, verify the standby: \`dg_status.sh\` flags UNNAMED datafiles; also check \`V\$RECOVER_FILE\` and the standby alert log."
+    echo "- Repair sequence (\`STANDBY_FILE_MANAGEMENT=MANUAL\`, \`ALTER DATABASE CREATE DATAFILE ... AS ...\`, back to \`AUTO\`, restart apply): see \"Life After Setup: Adding Datafiles and PDBs\" in the repository's \`docs/DATA_GUARD_WALKTHROUGH.md\`."
+    echo ""
+
     if [[ -n "$BROKER_OUTPUT" ]]; then
         echo ""
         echo "### Broker Configuration"

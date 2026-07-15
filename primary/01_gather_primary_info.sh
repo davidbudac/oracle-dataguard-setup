@@ -199,7 +199,34 @@ while IFS= read -r _line; do
     PRIMARY_DATA_PATHS+=("$_line")
 done <<< "$DATAFILE_DIRS"
 
-PRIMARY_DATA_PATH="${PRIMARY_DATA_PATHS[0]:-}"
+# Merge in tempfile directories - tempfiles on a mount with no
+# datafiles would otherwise get no convert pair and no standby
+# directory, and the RMAN duplicate would fail.
+TEMPFILE_DIRS=$(run_sql_query "get_tempfile_dirs.sql")
+while IFS= read -r _line; do
+    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    [[ -z "$_line" ]] && continue
+    _found="NO"
+    for _p in "${PRIMARY_DATA_PATHS[@]}"; do
+        if [[ "$_p" == "$_line" ]]; then
+            _found="YES"
+            break
+        fi
+    done
+    if [[ "$_found" == "NO" ]]; then
+        PRIMARY_DATA_PATHS+=("$_line")
+        log_info "  Tempfile-only directory detected: $_line"
+    fi
+done <<< "$TEMPFILE_DIRS"
+
+# Deterministic primary data path: use the SYSTEM datafile's directory
+# (FILE#=1) - on a CDB, the first directory in sorted order can be a
+# GUID/seed directory. Fall back to the first gathered directory.
+PRIMARY_DATA_PATH=$(run_sql_query "get_system_datafile_dir.sql")
+PRIMARY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | tr -d ' \n\r')
+if [[ -z "$PRIMARY_DATA_PATH" ]]; then
+    PRIMARY_DATA_PATH="${PRIMARY_DATA_PATHS[0]:-}"
+fi
 log_info "Primary data path: $PRIMARY_DATA_PATH"
 if [[ ${#PRIMARY_DATA_PATHS[@]} -gt 1 ]]; then
     log_info "  Additional datafile directories detected: ${#PRIMARY_DATA_PATHS[@]} total"
@@ -207,6 +234,25 @@ if [[ ${#PRIMARY_DATA_PATHS[@]} -gt 1 ]]; then
         log_info "    $_p"
     done
 fi
+
+# Per-directory sizes (datafiles + tempfiles) for per-mount disk
+# checks on the standby. PRIMARY_DATA_PATH_SIZES_MB is kept EXACTLY
+# parallel to PRIMARY_DATA_PATHS (same order, same length); a
+# directory with no size reported gets 0.
+DATAFILE_DIR_SIZES_RAW=$(run_sql_query "get_datafile_dir_sizes.sql")
+PRIMARY_DATA_PATH_SIZES_MB=()
+for _p in "${PRIMARY_DATA_PATHS[@]}"; do
+    _size=""
+    while IFS='|' read -r _dir _mb; do
+        _dir=$(printf '%s' "$_dir" | tr -d ' \r')
+        _mb=$(printf '%s' "$_mb" | tr -d ' \r')
+        if [[ -n "$_dir" && "$_dir" == "$_p" ]]; then
+            _size="$_mb"
+        fi
+    done <<< "$DATAFILE_DIR_SIZES_RAW"
+    PRIMARY_DATA_PATH_SIZES_MB+=("${_size:-0}")
+    log_info "  Directory size: $_p = ${_size:-0} MB"
+done
 
 # Show all data files
 echo "Data files:"
@@ -475,7 +521,9 @@ DB_BLOCK_SIZE="$(strip_whitespace "$DB_BLOCK_SIZE")"
 COMPATIBLE="$COMPATIBLE"
 
 # --- Storage Paths ---
-# *_PATH is the FIRST directory and stays for backward compatibility.
+# *_PATH is a single representative directory (SYSTEM datafile's
+# directory for DATA, first directory otherwise) and stays for
+# backward compatibility.
 # *_PATHS is the FULL list of distinct directories (bash array literal)
 # - step 2 uses it to build a full DB_FILE_NAME_CONVERT covering every
 # primary directory, and step 3 uses the standby equivalent to create
@@ -483,6 +531,12 @@ COMPATIBLE="$COMPATIBLE"
 PRIMARY_DATA_PATH="$PRIMARY_DATA_PATH"
 PRIMARY_DATA_PATHS=(
 $(printf '    "%s"\n' "${PRIMARY_DATA_PATHS[@]}")
+)
+# *_SIZES_MB is parallel to PRIMARY_DATA_PATHS (same order/length):
+# size in MB (datafiles + tempfiles) of each directory, for
+# per-mount disk space checks on the standby.
+PRIMARY_DATA_PATH_SIZES_MB=(
+$(printf '    "%s"\n' "${PRIMARY_DATA_PATH_SIZES_MB[@]}")
 )
 PRIMARY_REDO_PATH="$REDO_LOG_PATH"
 PRIMARY_REDO_PATHS=(

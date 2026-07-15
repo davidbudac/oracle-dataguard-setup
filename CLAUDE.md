@@ -65,7 +65,7 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 - **Concurrent builds**: All generated files include DB_UNIQUE_NAME to support multiple DG setups
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)
-- **Storage mode choice**: Step 2 offers Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or OMF mode (`db_create_file_dest` + `db_recovery_file_dest`). OMF mode supports mixed-storage scenarios where primary uses regular file paths and standby uses FRA
+- **Storage mode choice**: Step 2 offers Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or OMF mode (`db_create_file_dest` + `db_recovery_file_dest`). OMF mode supports mixed-storage scenarios where primary uses regular file paths and standby uses FRA. OMF mode also protects against the post-setup new-PDB/new-datafile convert-pair gap: in Traditional mode a file created in a directory not covered by any `DB_FILE_NAME_CONVERT` pair becomes an `UNNAMED` placeholder on the standby and halts apply with ORA-01274 (see "Life After Setup" in docs/DATA_GUARD_WALKTHROUGH.md)
 - **AIX 7.2 compatible**: Uses printf instead of echo -e, sed instead of grep -P
 
 ## Common Functions
@@ -109,7 +109,7 @@ bash dg_status.sh -s cdb1            # Explicit SID
 bash dg_status.sh -c myconfig.env    # Custom SSH config
 ```
 
-**What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, currently running services, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, broker configuration including FSFO and per-member ORA errors, and recent Data Guard-related alert log entries.
+**What it checks (both databases):** database role, open mode, protection mode, switchover status, force logging, flashback, DG broker status, currently running services, redo/standby redo log counts, archive destination errors, archive gaps, FRA usage (with 80%/90% thresholds), MRP apply status, transport/apply lag, archived log sequence gaps, UNNAMED datafile detection (ORA-01274: a datafile added outside convert-pair coverage halts redo apply), broker configuration including FSFO and per-member ORA errors, and recent Data Guard-related alert log entries.
 
 **SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
 

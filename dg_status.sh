@@ -259,6 +259,7 @@ ${DG_SQL_SELECT_DGPARAMS}
 ${DG_SQL_SELECT_REDOLOG}
 ${DG_SQL_SELECT_SRLCOUNT}
 ${DG_SQL_SELECT_ARCHGAP}
+SELECT 'UNNAMEDDF|' || COUNT(*) FROM V\$DATAFILE WHERE NAME LIKE '%UNNAMED%';
 SELECT 'ARCHDEST|' || DEST_ID || '|' || STATUS || '|' || ERROR FROM V\$ARCHIVE_DEST WHERE DEST_ID IN (1,2);
 ${DG_SQL_SELECT_FSFODB}
 ${DG_SQL_SELECT_FRA}
@@ -281,6 +282,7 @@ SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MOD
 ${DG_SQL_SELECT_MRP}
 ${DG_SQL_SELECT_DGSTATS}
 ${DG_SQL_SELECT_ARCHGAP}
+SELECT 'UNNAMEDDF|' || COUNT(*) FROM V\$DATAFILE WHERE NAME LIKE '%UNNAMED%';
 ${DG_SQL_SELECT_APPLYINFO}
 ${DG_SQL_SELECT_SRLCOUNT}
 ${DG_SQL_SELECT_RECMODE}
@@ -380,6 +382,8 @@ PRI_DBUNIQ=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
 
 PRI_BROKER=$(printf '%s\n' "$PRI_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
 PRI_ARCHGAP=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+PRI_UNNAMED=$(printf '%s\n' "$PRI_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+case "$PRI_UNNAMED" in ''|*[!0-9]*) PRI_UNNAMED="" ;; esac
 PRI_REDO=$(printf '%s\n' "$PRI_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
 PRI_REDO_CNT=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $1}' | xargs)
 PRI_REDO_MB=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $2}' | xargs)
@@ -415,6 +419,8 @@ STB_TRANSPORT_LAG=$(printf '%s\n' "$STB_SQL" | grep 'transport lag' | awk -F'|' 
 STB_APPLY_LAG=$(printf '%s\n' "$STB_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
 
 STB_ARCHGAP=$(printf '%s\n' "$STB_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
+STB_UNNAMED=$(printf '%s\n' "$STB_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+case "$STB_UNNAMED" in ''|*[!0-9]*) STB_UNNAMED="" ;; esac
 STB_APPLYINFO=$(printf '%s\n' "$STB_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
 STB_LAST_APPLIED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
 STB_LAST_RECEIVED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
@@ -586,6 +592,10 @@ if [[ -n "${PRI_ARCHGAP:-}" ]] && [[ "${PRI_ARCHGAP:-0}" -gt 0 ]]; then
     row "Archive Gaps" "${PRI_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Primary reports ${PRI_ARCHGAP} archive gap(s)"
 fi
 
+if [[ -n "${PRI_UNNAMED:-}" ]] && [[ "${PRI_UNNAMED:-0}" -gt 0 ]]; then
+    row "UNNAMED Datafiles" "${PRI_UNNAMED} UNNAMED datafile(s)!" "$FAIL"; add_summary_error "Primary has ${PRI_UNNAMED} UNNAMED datafile(s) (ORA-01274: datafile path not covered by DB_FILE_NAME_CONVERT pairs; repair with ALTER DATABASE CREATE DATAFILE)"
+fi
+
 subheader "Recovery Area"
 
 if [[ -n "${PRI_FRA_PATH:-}" ]]; then
@@ -685,6 +695,10 @@ fi
 
 if [[ -n "${STB_ARCHGAP:-}" ]] && [[ "${STB_ARCHGAP:-0}" -gt 0 ]]; then
     row "Archive Gaps" "${STB_ARCHGAP} gap(s)!" "$FAIL"; add_summary_error "Standby reports ${STB_ARCHGAP} archive gap(s)"
+fi
+
+if [[ -n "${STB_UNNAMED:-}" ]] && [[ "${STB_UNNAMED:-0}" -gt 0 ]]; then
+    row "UNNAMED Datafiles" "${STB_UNNAMED} UNNAMED datafile(s)!" "$FAIL"; add_summary_error "Standby has ${STB_UNNAMED} UNNAMED datafile(s) (ORA-01274: datafile path not covered by DB_FILE_NAME_CONVERT pairs; repair with ALTER DATABASE CREATE DATAFILE)"
 fi
 
 subheader "Recovery Area"

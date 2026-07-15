@@ -23,7 +23,8 @@ This document describes what each automation script does and shows the equivalen
 16. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
 17. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
 18. [Summary](#summary-what-would-be-done-manually-without-scripts)
-19. [Common Monitoring Commands](#common-monitoring-commands)
+19. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
+20. [Common Monitoring Commands](#common-monitoring-commands)
 
 ---
 
@@ -1201,6 +1202,99 @@ rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 - Password security (prompted at runtime, never stored)
 - Dry-run mode (review changes before applying)
 - Approval mode (gate every mutating action for high-security environments)
+
+---
+
+## Life After Setup: Adding Datafiles and PDBs
+
+Step 2 captures `DB_FILE_NAME_CONVERT` / `LOG_FILE_NAME_CONVERT` pairs for the datafile directories that exist **at build time**. In Traditional (path-substitution) mode those pairs are the standby's only way to translate a primary-side file path into a local one - and `standby_file_management=AUTO` does not help for paths the pairs don't cover: `AUTO` creates files in *derivable* locations, it never invents a new directory mapping.
+
+**OMF-mode standbys are immune to this entire section.** If the standby was built in OMF mode (`db_create_file_dest` set - the Step 2 storage-mode choice), every new file lands under the OMF destination regardless of its primary-side path, and the failure below cannot occur.
+
+### Which Directories Are Safe
+
+Any new datafile (or PDB) whose primary-side path starts with a prefix already covered by the standby's convert pairs replicates without intervention. Check the current pairs before adding files in a new location:
+
+```sql
+-- On the STANDBY
+SELECT value FROM v$parameter WHERE name = 'db_file_name_convert';
+```
+
+```
+-- Or via the broker
+dgmgrl / "SHOW DATABASE '<standby_db_unique_name>' DbFileNameConvert;"
+```
+
+If the target directory is not under a covered prefix, either place the files under one that is, or extend the convert pairs first. Note that `DB_FILE_NAME_CONVERT` is not dynamic: changing it requires `SCOPE=SPFILE` and a standby restart (use the broker property `DbFileNameConvert`, then restart the standby instance), so plan this ahead of the datafile addition, not after apply has already broken.
+
+### Creating a PDB Safely (CDB Builds)
+
+`CREATE PLUGGABLE DATABASE` copies the seed (or clone source) files to a new directory on the primary - which is exactly the "new directory not covered at build time" case. Two safe options:
+
+```sql
+-- Option 1: per-statement FILE_NAME_CONVERT, keeping the target under a
+-- directory prefix that the standby's convert pairs already cover
+CREATE PLUGGABLE DATABASE newpdb ADMIN USER pdbadmin IDENTIFIED BY "..."
+  FILE_NAME_CONVERT = ('/u02/oradata/PRIM/pdbseed/', '/u02/oradata/PRIM/newpdb/');
+
+-- Option 2: PDB-level OMF - files are created under an OMF destination,
+-- which the standby handles without any convert pair
+CREATE PLUGGABLE DATABASE newpdb ADMIN USER pdbadmin IDENTIFIED BY "..."
+  CREATE_FILE_DEST = '/u02/oradata';
+```
+
+(If `db_create_file_dest` is already set at the CDB level on both sides, plain `CREATE PLUGGABLE DATABASE` is safe too.)
+
+### How the Failure Manifests
+
+If a datafile is added on the primary in a directory no convert pair covers, redo apply on the standby cannot create it (often surfacing `ORA-01119: error in creating database file` for the missing directory). Instead, the standby registers a placeholder file named `UNNAMEDnnnnn` in `$ORACLE_HOME/dbs`, MRP stops with `ORA-01274: cannot add data file that was created as ...`, and **redo apply halts** - the standby silently falls behind until someone notices. To check:
+
+```sql
+-- On the STANDBY: placeholder files and files needing recovery
+SELECT file#, name FROM v$datafile WHERE name LIKE '%UNNAMED%';
+SELECT * FROM v$recover_file;
+```
+
+Also check the standby alert log for `ORA-01274` / `ORA-01119`. `dg_status.sh`, `dg_triage_sid.sh`, and `dg_diag_sid.sh` all flag UNNAMED datafiles as an error.
+
+### The Repair
+
+Standard 19c procedure, on the **standby**:
+
+```
+-- 1. Ensure redo apply is stopped (MRP has usually already died with
+--    ORA-01274; make the state explicit via the broker)
+dgmgrl / "EDIT DATABASE '<standby_db_unique_name>' SET STATE='APPLY-OFF';"
+```
+
+```sql
+-- 2. Switch to manual file management (the CREATE DATAFILE below fails
+--    with ORA-01275 while standby_file_management is AUTO)
+ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=MANUAL;
+
+-- 3. Re-create each placeholder at its correct local path
+--    (use the exact UNNAMED name from v$datafile)
+ALTER DATABASE CREATE DATAFILE
+  '/u01/app/oracle/product/19.0.0/dbhome_1/dbs/UNNAMED00012'
+  AS '/u02/oradata/STBY/newpdb/users01.dbf';
+--   On an OMF standby, use "AS NEW" instead of an explicit path.
+
+-- 4. Back to automatic file management
+ALTER SYSTEM SET STANDBY_FILE_MANAGEMENT=AUTO;
+```
+
+```
+-- 5. Restart redo apply
+dgmgrl / "EDIT DATABASE '<standby_db_unique_name>' SET STATE='APPLY-ON';"
+```
+
+Then confirm apply catches up (`v$dataguard_stats`, `v$recover_file` now empty, `dg_status.sh` clean). If more than one file was added, repeat step 3 for every `UNNAMED` entry before restarting apply.
+
+### Preventing It
+
+- Prefer OMF mode for new standby builds when there is any chance of future PDBs or new datafile directories.
+- On Traditional-mode builds, treat "new datafile directory on the primary" as a change that **first** requires extending the standby's `DbFileNameConvert` (broker property, `SCOPE=SPFILE`, standby restart).
+- Run `dg_status.sh` (or the local triage tools) after any tablespace/PDB addition - they detect UNNAMED datafiles before the apply lag becomes an incident.
 
 ---
 

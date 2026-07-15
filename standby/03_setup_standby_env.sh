@@ -71,44 +71,150 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
     log_info "  Tempfiles:  ${TEMPFILE_SIZE_MB:-N/A} MB"
     log_info "  Redo logs:  ${REDOLOG_SIZE_MB:-N/A} MB"
 
-    # Get the parent directory of standby data path
-    STANDBY_DATA_PARENT=$(dirname "$STANDBY_DATA_PATH")
-
-    # Ensure the parent directory exists for df check
-    if [[ -d "$STANDBY_DATA_PARENT" ]]; then
-        CHECK_PATH="$STANDBY_DATA_PARENT"
-    elif [[ -d "$STANDBY_DATA_PATH" ]]; then
-        CHECK_PATH="$STANDBY_DATA_PATH"
-    else
-        # Find the closest existing parent
-        CHECK_PATH="$STANDBY_DATA_PARENT"
-        while [[ ! -d "$CHECK_PATH" && "$CHECK_PATH" != "/" ]]; do
-            CHECK_PATH=$(dirname "$CHECK_PATH")
+    # ------------------------------------------------------------
+    # Per-filesystem data check (preferred)
+    # ------------------------------------------------------------
+    # When step 2 recorded STANDBY_DATA_PATH_SIZES_MB (per-directory
+    # datafile+tempfile MB, parallel to STANDBY_DATA_PATHS), validate
+    # each standby data filesystem individually. The aggregate check
+    # in the else-branch sizes only the mount holding
+    # STANDBY_DATA_PATHS[0]: it falsely fails when the data
+    # intentionally spans several standby mounts, and falsely passes
+    # when a secondary mount is too small. Older config files do not
+    # carry the sizes array - fall back to the aggregate check then.
+    PER_DIR_SIZES_OK=0
+    if [[ -n "${STANDBY_DATA_PATH_SIZES_MB+x}" && -n "${STANDBY_DATA_PATHS+x}" ]] \
+       && [[ ${#STANDBY_DATA_PATH_SIZES_MB[@]} -gt 0 ]] \
+       && [[ ${#STANDBY_DATA_PATH_SIZES_MB[@]} -eq ${#STANDBY_DATA_PATHS[@]} ]]; then
+        PER_DIR_SIZES_OK=1
+        # Every entry must be a plain integer MB value.
+        for _sz in "${STANDBY_DATA_PATH_SIZES_MB[@]}"; do
+            case "$_sz" in
+                ''|*[!0-9]*) PER_DIR_SIZES_OK=0; break ;;
+            esac
         done
     fi
 
-    log_info "Checking available space on: $CHECK_PATH"
+    if [[ "$PER_DIR_SIZES_OK" -eq 1 ]]; then
+        log_info "Per-directory sizes available - checking each standby data filesystem individually"
 
-    # Get available space in MB (AIX-compatible: df -Pk normalizes the
-    # column layout so field 4 is always available KB, not %Used)
-    AVAILABLE_SPACE_KB=$(get_available_space_kb "$CHECK_PATH")
-    AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
+        # Group the data directories by filesystem mount point and sum
+        # the required MB per mount. bash 3.2 / AIX safe: parallel
+        # arrays instead of declare -A. Mount point comes from `df -Pk`
+        # (POSIX format) so the column layout is identical on Linux and
+        # AIX - same idiom as the SRL check below and
+        # get_available_space_kb in common/dg_functions.sh.
+        MOUNT_POINTS=()
+        MOUNT_REQUIRED_MB=()
+        MOUNT_CHECK_PATHS=()
+        _idx=0
+        while [[ $_idx -lt ${#STANDBY_DATA_PATHS[@]} ]]; do
+            _dir="${STANDBY_DATA_PATHS[$_idx]}"
+            _dir_mb="${STANDBY_DATA_PATH_SIZES_MB[$_idx]}"
 
-    log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
-    log_info "Required space:  ${REQUIRED_SPACE_MB} MB"
+            # Find the nearest EXISTING parent for df (the standby data
+            # directories themselves are created later in this script).
+            _check_path="$_dir"
+            while [[ ! -d "$_check_path" && "$_check_path" != "/" ]]; do
+                _check_path=$(dirname "$_check_path")
+            done
 
-    if [[ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]]; then
-        log_error "INSUFFICIENT DISK SPACE!"
-        log_error "  Available: ${AVAILABLE_SPACE_MB} MB"
-        log_error "  Required:  ${REQUIRED_SPACE_MB} MB"
-        log_error "  Shortfall: $((REQUIRED_SPACE_MB - AVAILABLE_SPACE_MB)) MB"
-        log_error ""
-        log_error "Please free up space or add storage before proceeding."
-        exit 1
+            _mount=$(df -Pk "$_check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
+            [[ -z "$_mount" ]] && _mount="$_check_path"
+            log_info "  ${_dir}: ${_dir_mb} MB (filesystem: ${_mount})"
+
+            _found=0
+            _m=0
+            while [[ $_m -lt ${#MOUNT_POINTS[@]} ]]; do
+                if [[ "${MOUNT_POINTS[$_m]}" == "$_mount" ]]; then
+                    MOUNT_REQUIRED_MB[$_m]=$(( ${MOUNT_REQUIRED_MB[$_m]} + _dir_mb ))
+                    _found=1
+                    break
+                fi
+                _m=$(( _m + 1 ))
+            done
+            if [[ $_found -eq 0 ]]; then
+                MOUNT_POINTS+=("$_mount")
+                MOUNT_REQUIRED_MB+=("$_dir_mb")
+                MOUNT_CHECK_PATHS+=("$_check_path")
+            fi
+            _idx=$(( _idx + 1 ))
+        done
+
+        # Check every mount with the same +20% headroom factor the
+        # aggregate REQUIRED_SPACE_MB carries, and report ALL
+        # insufficient mounts before failing - not just the first.
+        INSUFFICIENT_MOUNTS=()
+        _m=0
+        while [[ $_m -lt ${#MOUNT_POINTS[@]} ]]; do
+            _mount_required_mb=$(( ${MOUNT_REQUIRED_MB[$_m]} * 12 / 10 ))
+            _mount_available_kb=$(get_available_space_kb "${MOUNT_CHECK_PATHS[$_m]}")
+            _mount_available_mb=$(( ${_mount_available_kb:-0} / 1024 ))
+
+            if [[ "$_mount_available_mb" -lt "$_mount_required_mb" ]]; then
+                log_error "  ${MOUNT_POINTS[$_m]}: required ${_mount_required_mb} MB (incl. 20% buffer), available ${_mount_available_mb} MB - SHORTFALL $(( _mount_required_mb - _mount_available_mb )) MB"
+                INSUFFICIENT_MOUNTS+=("${MOUNT_POINTS[$_m]}")
+            else
+                log_info "  ${MOUNT_POINTS[$_m]}: required ${_mount_required_mb} MB (incl. 20% buffer), available ${_mount_available_mb} MB - OK"
+            fi
+            _m=$(( _m + 1 ))
+        done
+
+        if [[ ${#INSUFFICIENT_MOUNTS[@]} -gt 0 ]]; then
+            log_error "INSUFFICIENT DISK SPACE on ${#INSUFFICIENT_MOUNTS[@]} filesystem(s): ${INSUFFICIENT_MOUNTS[*]}"
+            log_error ""
+            log_error "Please free up space or add storage before proceeding."
+            exit 1
+        fi
+        log_info "PASS: Sufficient disk space available on all data filesystems"
+        log_info "Note: per-directory sizes cover datafiles and tempfiles; redo/SRL space is validated separately below"
     else
-        SPACE_REMAINING=$((AVAILABLE_SPACE_MB - REQUIRED_SPACE_MB))
-        log_info "PASS: Sufficient disk space available"
-        log_info "  Space remaining after clone: ${SPACE_REMAINING} MB"
+        if [[ -n "${STANDBY_DATA_PATH_SIZES_MB+x}" ]]; then
+            log_info "STANDBY_DATA_PATH_SIZES_MB does not match STANDBY_DATA_PATHS - using single-filesystem aggregate check"
+        else
+            log_info "Config predates per-directory sizes (STANDBY_DATA_PATH_SIZES_MB not set) - using single-filesystem aggregate check"
+            log_info "Re-run steps 1 and 2 to enable per-filesystem validation"
+        fi
+
+        # Get the parent directory of standby data path
+        STANDBY_DATA_PARENT=$(dirname "$STANDBY_DATA_PATH")
+
+        # Ensure the parent directory exists for df check
+        if [[ -d "$STANDBY_DATA_PARENT" ]]; then
+            CHECK_PATH="$STANDBY_DATA_PARENT"
+        elif [[ -d "$STANDBY_DATA_PATH" ]]; then
+            CHECK_PATH="$STANDBY_DATA_PATH"
+        else
+            # Find the closest existing parent
+            CHECK_PATH="$STANDBY_DATA_PARENT"
+            while [[ ! -d "$CHECK_PATH" && "$CHECK_PATH" != "/" ]]; do
+                CHECK_PATH=$(dirname "$CHECK_PATH")
+            done
+        fi
+
+        log_info "Checking available space on: $CHECK_PATH"
+
+        # Get available space in MB (AIX-compatible: df -Pk normalizes the
+        # column layout so field 4 is always available KB, not %Used)
+        AVAILABLE_SPACE_KB=$(get_available_space_kb "$CHECK_PATH")
+        AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
+
+        log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
+        log_info "Required space:  ${REQUIRED_SPACE_MB} MB"
+
+        if [[ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]]; then
+            log_error "INSUFFICIENT DISK SPACE!"
+            log_error "  Available: ${AVAILABLE_SPACE_MB} MB"
+            log_error "  Required:  ${REQUIRED_SPACE_MB} MB"
+            log_error "  Shortfall: $((REQUIRED_SPACE_MB - AVAILABLE_SPACE_MB)) MB"
+            log_error ""
+            log_error "Please free up space or add storage before proceeding."
+            exit 1
+        else
+            SPACE_REMAINING=$((AVAILABLE_SPACE_MB - REQUIRED_SPACE_MB))
+            log_info "PASS: Sufficient disk space available"
+            log_info "  Space remaining after clone: ${SPACE_REMAINING} MB"
+        fi
     fi
 else
     log_warn "Database size information not available in config file"
@@ -328,8 +434,55 @@ EOF
         DIRS_TO_CREATE+=("$STANDBY_FRA")
         log_info "Using Fast Recovery Area: $STANDBY_FRA"
     elif [[ -n "$DB_RECOVERY_FILE_DEST" && "$DB_RECOVERY_FILE_DEST" != "USE_DB_RECOVERY_FILE_DEST" ]]; then
-        # Fallback: calculate from DB_RECOVERY_FILE_DEST if STANDBY_FRA not set
-        STANDBY_FRA_CALC=$(echo "$DB_RECOVERY_FILE_DEST" | sed "s/${PRIMARY_DB_UNIQUE_NAME}/${STANDBY_DB_UNIQUE_NAME}/g")
+        # Fallback: calculate from DB_RECOVERY_FILE_DEST if STANDBY_FRA not set.
+        # The DB-name swap is bounded to whole, slash-delimited path
+        # components (mirrors remap_path_token in
+        # primary/02_generate_standby_config.sh), so a token that also
+        # appears as a SUBSTRING of a mount name (e.g. token PROD inside
+        # /prod_archive/) is never corrupted - the old unbounded
+        # `sed s/tok/rep/g` would have rewritten it.
+
+        # True when $2 occurs as a whole, slash-delimited component of path $1.
+        _path_has_component() {
+            case "/$1/" in
+                *"/$2/"*) return 0 ;;
+                *) return 1 ;;
+            esac
+        }
+
+        # Echo path $1 with every whole-component occurrence of token $2
+        # swapped to $3. Two sed passes (interior `/tok/`, then a trailing
+        # `/tok` at end of string) keep this portable to AIX / bash 3.2.
+        _replace_path_component() {
+            local _p="$1" _tok="$2" _rep="$3"
+            _p=$(printf '%s' "$_p" | sed "s|/${_tok}/|/${_rep}/|g")
+            _p=$(printf '%s' "$_p" | sed "s|/${_tok}\$|/${_rep}|")
+            printf '%s' "$_p"
+        }
+
+        # Echo the standby path for a primary path by swapping whichever
+        # case variant of PRIMARY_DB_UNIQUE_NAME appears as a path
+        # component (upper, then lower, then the literal mixed case).
+        # A path containing no variant is echoed unchanged.
+        _remap_dbname_component() {
+            local _p="$1"
+            local _tok_upper _tok_lower _rep_upper _rep_lower
+            _tok_upper=$(printf '%s' "$PRIMARY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+            _tok_lower=$(printf '%s' "$PRIMARY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+            _rep_upper=$(printf '%s' "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')
+            _rep_lower=$(printf '%s' "$STANDBY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
+            if   _path_has_component "$_p" "$_tok_upper"; then
+                _replace_path_component "$_p" "$_tok_upper" "$_rep_upper"
+            elif _path_has_component "$_p" "$_tok_lower"; then
+                _replace_path_component "$_p" "$_tok_lower" "$_rep_lower"
+            elif _path_has_component "$_p" "$PRIMARY_DB_UNIQUE_NAME"; then
+                _replace_path_component "$_p" "$PRIMARY_DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"
+            else
+                printf '%s' "$_p"
+            fi
+        }
+
+        STANDBY_FRA_CALC=$(_remap_dbname_component "$DB_RECOVERY_FILE_DEST")
         DIRS_TO_CREATE+=("$STANDBY_FRA_CALC")
     fi
 fi

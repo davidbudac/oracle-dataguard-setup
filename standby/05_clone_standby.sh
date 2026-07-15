@@ -81,8 +81,21 @@ source "$STANDBY_CONFIG_FILE"
 # Reinitialize log with standby DB name
 init_log "05_clone_standby_${STANDBY_DB_UNIQUE_NAME}"
 
-# Set Oracle environment
-export ORACLE_HOME="$STANDBY_ORACLE_HOME"
+# Set Oracle environment. Prefer a locally-set ORACLE_HOME when it points
+# at a usable installation (bin/sqlplus present) - the standby host's
+# Oracle installation may live somewhere other than the path recorded in
+# the config. Fall back to STANDBY_ORACLE_HOME from the config otherwise
+# (same preference as 03_setup_standby_env.sh; check_oracle_env below
+# still validates the final value).
+if [[ -n "$ORACLE_HOME" && -x "$ORACLE_HOME/bin/sqlplus" ]]; then
+    if [[ -n "$STANDBY_ORACLE_HOME" && "$ORACLE_HOME" != "$STANDBY_ORACLE_HOME" ]]; then
+        log_warn "Locally-set ORACLE_HOME ($ORACLE_HOME) differs from config STANDBY_ORACLE_HOME ($STANDBY_ORACLE_HOME)"
+        log_warn "Using the locally-set ORACLE_HOME"
+    fi
+    export ORACLE_HOME
+else
+    export ORACLE_HOME="$STANDBY_ORACLE_HOME"
+fi
 export ORACLE_SID="$STANDBY_ORACLE_SID"
 export PATH="$ORACLE_HOME/bin:$PATH"
 
