@@ -150,7 +150,8 @@ if [[ -n "$SRC_PLATFORM" && -n "$TGT_PLATFORM" ]]; then
 fi
 
 # Reject if NEW_PDB_NAME already exists
-if [[ ",${TGT_PDBS}," == *",${NEW_PDB_NAME^^},"* || ",${TGT_PDBS}," == *",${NEW_PDB_NAME},"* ]]; then
+NEW_PDB_NAME_UC="$(printf '%s' "$NEW_PDB_NAME" | tr '[:lower:]' '[:upper:]')"
+if [[ ",${TGT_PDBS}," == *",${NEW_PDB_NAME_UC},"* || ",${TGT_PDBS}," == *",${NEW_PDB_NAME},"* ]]; then
     fail "PDB name '${NEW_PDB_NAME}' already exists in target CDB (existing: ${TGT_PDBS})"
 fi
 

@@ -10,12 +10,14 @@ dg_triage_sid.sh - Fast local Data Guard triage (run directly on DB host)
 dg_diag_sid.sh   - Deep local Data Guard diagnostics (run directly on DB host)
 dg_check_sid.sh  - Deprecated wrapper to dg_triage_sid.sh
 dg_handoff.sh    - Standalone handoff report generator (post-setup; no NFS/config dependencies)
+dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 error)
+migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby (has its own README/WALKTHROUGH)
 nfs/             - NFS setup scripts (run before Data Guard setup)
 primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10)
 standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
 fsfo/            - Observer scripts (run on observer server - standby or 3rd server)
 trigger/         - Role-aware service trigger (run on PRIMARY); two variants: SYS-owned and dedicated-user
-common/          - Shared scripts and functions, including setup_dg_wallet.sh, cleanup_nfs_artifacts.sh, and dg_render_common.sh (shared render/threshold library for dg_status.sh and the local triage/diag tools)
+common/          - Shared scripts and functions, including setup_dg_wallet.sh, cleanup_nfs_artifacts.sh, dg_render_common.sh (shared render/threshold library for dg_status.sh and the local triage/diag tools), and dg_local_status_common.sh (the engine behind dg_triage_sid.sh/dg_diag_sid.sh)
 templates/       - Reference templates (init.ora, listener, tnsnames)
 sql/             - SQL/RMAN/DGMGRL command snippets used by the workflow scripts
 docs/            - Detailed walkthrough and tool references (DG_STATUS, DG_CHECK, WALLET_SETUP)
@@ -138,6 +140,10 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 - `tests/test_add_sid_to_listener.sh` - Tests the `add_sid_to_listener()` function
 - `tests/test_file_name_convert.sh` - Tests `DB_FILE_NAME_CONVERT` / `LOG_FILE_NAME_CONVERT` pair generation (multi-directory coverage, dedup)
 - `tests/test_path_token_remap.sh` - Tests step 2's per-path, case-aware, substring-safe DB-name token remapping
+- `tests/test_counter_increment.sh` - Demonstrates why `((VAR++))` is banned under `set -e` and sweeps the repo for the construct (codebase uses `x=$((x+1))`)
+- `tests/test_df_parsing.sh` - Tests `parse_df_available_kb` / `get_available_space_kb`; guards the `df -Pk` (POSIX format) requirement for AIX compatibility
+- `tests/test_grep_portability.sh` - Tests broker-output detection patterns and sweeps the repo for GNU-grep-only usage (`grep -P`, `\s`, BRE `\|` alternation)
+- `tests/test_sid_detection.sh` - Tests the SID-detection/validation pipeline used by `dg_status.sh` (`_detect_pmon_sid` / `_validate_sid`)
 
 ### End-to-End Tests
 - `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator
@@ -236,6 +242,13 @@ Key differences from the base script:
 ./trigger/create_pdb_service.sh <PDB_NAME> <SERVICE_NAME>          # positional form
 ```
 Creates a service *inside* a PDB to be used as a Data Guard switchover/failover service (runs only on the side currently holding the PRIMARY role). Must run on the PRIMARY of a CDB; verifies the target PDB exists and is OPEN READ WRITE, then creates the service via `DBMS_SERVICE.CREATE_SERVICE` (idempotent — skips if it already exists) and starts it. `--taf` adds basic TAF attributes (`FAILOVER_TYPE=SELECT`, `FAILOVER_METHOD=BASIC`); `--no-start` creates without starting. The service definition replicates to the standby via redo. It does **not** save PDB state, so role-awareness comes from the `DG_SERVICE_MGR` trigger — after creating, (re-)run `create_role_trigger_cdb.sh` so the service is started on PRIMARY and stopped on STANDBY automatically. Note: `-s` is reserved (approval mode) by the shared arg parser, so the service flag is the long `--service` only.
+
+**Create a role-aware CDB-level service**
+```bash
+./trigger/create_cdb_service.sh --service <SERVICE_NAME> [--no-start] [--taf]
+./trigger/create_cdb_service.sh <SERVICE_NAME>                     # positional form
+```
+Creates a service in the ROOT container (`CDB$ROOT`) of a multitenant database for use as a Data Guard switchover/failover service. Must run on the PRIMARY of a CDB; creates the service via `DBMS_SERVICE` (idempotent — skips if it already exists) and starts it (`--no-start` to skip; `--taf` for basic TAF attributes). The definition replicates to the standby via redo. Role-awareness comes from the `DG_SERVICE_MGR` trigger — after creating, (re-)run `create_role_trigger_cdb.sh` so the service follows the PRIMARY role. For a service inside a PDB, use `create_pdb_service.sh` instead.
 
 ## Handoff Report (End-User Documentation)
 

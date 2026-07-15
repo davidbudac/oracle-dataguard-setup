@@ -200,6 +200,12 @@ prompt_with_default "Enter username for observer" "$DEFAULT_OBSERVER_USER" OBSER
 # Convert to uppercase for Oracle
 OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
 
+if ! echo "$OBSERVER_USER" | grep -q '^[A-Za-z][A-Za-z0-9_$]*$' || [[ ${#OBSERVER_USER} -gt 30 ]]; then
+    log_error "Invalid observer username: $OBSERVER_USER"
+    log_error "Usernames must start with a letter, contain only letters, numbers, underscore, and dollar sign, and be at most 30 characters"
+    exit 1
+fi
+
 log_info "Observer username: $OBSERVER_USER"
 
 echo ""
@@ -269,6 +275,11 @@ EOF
             exit 1
         fi
 
+        if [[ "$OBSERVER_PASSWORD" == *'"'* ]]; then
+            log_error "Password must not contain a double-quote (\") character"
+            exit 1
+        fi
+
         log_info "Updating password for $OBSERVER_USER..."
         log_cmd "sqlplus / as sysdba:" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***"
         confirm_approval_action "Update observer user password" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***" || exit 1
@@ -282,6 +293,7 @@ EOF
 
         if ! echo "$RESULT" | grep -q "SUCCESS"; then
             log_error "Failed to update password for $OBSERVER_USER"
+            [[ -n "$OBSERVER_PASSWORD" ]] && RESULT=${RESULT//"$OBSERVER_PASSWORD"/********}
             echo "$RESULT"
             exit 1
         fi
@@ -294,6 +306,11 @@ else
 
     if [[ -z "$OBSERVER_PASSWORD" ]]; then
         log_error "Password cannot be empty"
+        exit 1
+    fi
+
+    if [[ "$OBSERVER_PASSWORD" == *'"'* ]]; then
+        log_error "Password must not contain a double-quote (\") character"
         exit 1
     fi
 
@@ -320,6 +337,7 @@ EOF
 
     if ! echo "$RESULT" | grep -q "SUCCESS"; then
         log_error "Failed to create user $OBSERVER_USER"
+        [[ -n "$OBSERVER_PASSWORD" ]] && RESULT=${RESULT//"$OBSERVER_PASSWORD"/********}
         echo "$RESULT"
         exit 1
     fi
@@ -445,7 +463,7 @@ else
         # too. Run common/cleanup_nfs_artifacts.sh once the observer is
         # configured to remove it from the share entirely.
         confirm_approval_action "Copy primary password file for observer" "cp $ORAPW_FILE $NFS_ORAPW_FILE && chmod 600 $NFS_ORAPW_FILE" || exit 1
-        cp "$ORAPW_FILE" "$NFS_ORAPW_FILE"
+        ( umask 077; cp "$ORAPW_FILE" "$NFS_ORAPW_FILE" )
         chmod 600 "$NFS_ORAPW_FILE"
         log_info "Password file copied to: $NFS_ORAPW_FILE"
     else

@@ -52,7 +52,7 @@ Options:
 
 Exit codes:
   0  All checked sides have SRLs at the correct count and size.
-  1  At least one side requires DDL.
+  1  At least one side requires DDL, or a peer exists but was not checked.
   2  Argument or pre-flight error.
 EOF
 }
@@ -174,6 +174,7 @@ emit_side() {
     local du="$1" role="$2" max_orl="$3" threads="$4" max_grp="$5" path="$6" omf="$7"
     local needs_fix="no" any_size_mismatch="no"
     local ddl_lines=""
+    case "$max_grp" in ''|*[!0-9]*) max_grp=0 ;; esac
     local next_grp=$((max_grp + 1))
 
     local target_path="$path"
@@ -195,9 +196,12 @@ emit_side() {
     printf "  %-8s %-12s %-12s %-15s %-12s\n" "------" "----------" "----------" "------------" "----------"
 
     local max_orl_int="${max_orl%.*}"
+    case "$max_orl_int" in ''|*[!0-9]*) max_orl_int=0 ;; esac
 
     while IFS=':' read -r tid orl_cnt srl_cnt min_mb; do
         [[ -z "$tid" ]] && continue
+        case "$orl_cnt" in ''|*[!0-9]*) orl_cnt=0 ;; esac
+        case "$srl_cnt" in ''|*[!0-9]*) srl_cnt=0 ;; esac
         local required=$((orl_cnt + 1))
         local deficit=$((required - srl_cnt))
         printf "  %-8s %-12s %-12s %-15s %-12s\n" \
@@ -205,6 +209,7 @@ emit_side() {
 
         if [[ "$srl_cnt" -gt 0 ]]; then
             local min_mb_int="${min_mb%.*}"
+            case "$min_mb_int" in ''|*[!0-9]*) min_mb_int=0 ;; esac
             if [[ "${min_mb_int:-0}" -ne "${max_orl_int:-0}" ]]; then
                 any_size_mismatch="yes"
                 needs_fix="yes"
@@ -342,14 +347,17 @@ echo "============================================================"
 printf "  %-30s %s\n" "${LOCAL_DU} (${LOCAL_ROLE})" \
     "$([[ $LOCAL_FIX_RC -eq 0 ]] && echo OK || echo 'ACTION REQUIRED')"
 
+PEER_UNCHECKED="no"
 if [[ "$PEER_REACHED" == "yes" ]]; then
     printf "  %-30s %s\n" "${PEER_DU} (${PEER_ROLE})" \
         "$([[ $PEER_FIX_RC -eq 0 ]] && echo OK || echo 'ACTION REQUIRED')"
 elif [[ "$PEER_MODE" != "skip" && -n "$LOCAL_PEER" ]]; then
-    printf "  %-30s %s\n" "${LOCAL_PEER} (peer)" "UNCHECKED"
+    PEER_UNCHECKED="yes"
+    printf "  %-30s %s\n" "${LOCAL_PEER} (peer)" "UNCHECKED - peer exists but was not verified (exit code 1)"
 fi
 
 EXIT_CODE=0
 [[ $LOCAL_FIX_RC -ne 0 ]] && EXIT_CODE=1
 [[ $PEER_FIX_RC  -ne 0 ]] && EXIT_CODE=1
+[[ "$PEER_UNCHECKED" == "yes" && $EXIT_CODE -eq 0 ]] && EXIT_CODE=1
 exit $EXIT_CODE

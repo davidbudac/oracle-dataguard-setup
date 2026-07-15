@@ -368,7 +368,7 @@ else
     # Traditional mode: use FILE_NAME_CONVERT (existing behavior)
     if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
         FRA_SETTINGS="    SET DB_RECOVERY_FILE_DEST='${STANDBY_FRA}'
-    SET DB_RECOVERY_FILE_DEST_SIZE='${DB_RECOVERY_FILE_DEST_SIZE}'"
+    SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE:-${DB_RECOVERY_FILE_DEST_SIZE}}'"
     else
         FRA_SETTINGS=""
     fi
@@ -405,8 +405,8 @@ fi
 # before DUPLICATE can run), then the duplicate statement body. The file
 # was created with chmod 600 above, before either password was written.
 {
-    printf 'CONNECT TARGET SYS/%s@%s;\n' "${SYS_PASSWORD}" "${PRIMARY_TNS_ALIAS}"
-    printf 'CONNECT AUXILIARY SYS/%s@%s;\n' "${SYS_PASSWORD}" "${STANDBY_TNS_ALIAS}"
+    printf 'CONNECT TARGET SYS/"%s"@%s;\n' "${SYS_PASSWORD}" "${PRIMARY_TNS_ALIAS}"
+    printf 'CONNECT AUXILIARY SYS/"%s"@%s;\n' "${SYS_PASSWORD}" "${STANDBY_TNS_ALIAS}"
     printf '%s\n' "$RMAN_BODY"
 } >> "$RMAN_SCRIPT"
 
@@ -437,10 +437,14 @@ confirm_approval_action "Run RMAN duplicate for standby creation" "\"$ORACLE_HOM
 # Reuse RMAN_TMP_DIR (created above, mode 700, already covered by the
 # EXIT-trap installed above) for the exit-code file too.
 RMAN_EXIT_FILE="${RMAN_TMP_DIR}/rman_exit.$$"
+# Disable errexit around the pipeline so an RMAN failure still writes the
+# exit-code file and reaches the failure-handling block below.
+set +e
 (
 "$ORACLE_HOME/bin/rman" cmdfile "${RMAN_SCRIPT}"
 echo $? > "$RMAN_EXIT_FILE"
 ) 2>&1 | tee "$RMAN_LOG"
+set -e
 
 RMAN_EXIT_CODE=$(cat "$RMAN_EXIT_FILE" 2>/dev/null || echo "1")
 

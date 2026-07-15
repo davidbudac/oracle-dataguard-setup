@@ -827,7 +827,7 @@ echo "# --- Archive Log Destination (local only) ---"
 if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
 echo "*.log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
 echo "*.db_recovery_file_dest='${STANDBY_FRA}'"
-echo "*.db_recovery_file_dest_size=${DB_RECOVERY_FILE_DEST_SIZE}"
+echo "*.db_recovery_file_dest_size=${STANDBY_DB_RECOVERY_FILE_DEST_SIZE:-${DB_RECOVERY_FILE_DEST_SIZE}}"
 else
 echo "*.log_archive_dest_1='LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
 fi

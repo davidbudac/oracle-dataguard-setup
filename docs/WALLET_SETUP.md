@@ -40,7 +40,7 @@ After setup, any tool that connects using `/@<tns_alias> as sysdba` will authent
 | Flag | Description |
 |---|---|
 | `-A`, `--auto-password` | Generate wallet password automatically (no prompt) |
-| `-w`, `--wallet-dir DIR` | Custom wallet directory (default: `$ORACLE_HOME/network/admin`) |
+| `-w`, `--wallet-dir DIR` | Custom wallet directory (default: `$ORACLE_HOME/network/admin/dg_wallet`) |
 | `-h`, `--help` | Show usage |
 
 ## Wallet Password Modes
@@ -118,13 +118,13 @@ These can coexist in the same wallet directory -- credentials are keyed by TNS a
 ### Check what's in the wallet
 
 ```bash
-mkstore -wrl $ORACLE_HOME/network/admin -listCredential
+mkstore -wrl $ORACLE_HOME/network/admin/dg_wallet -listCredential
 ```
 
 ### Remove a credential
 
 ```bash
-mkstore -wrl $ORACLE_HOME/network/admin -deleteCredential tns_alias
+mkstore -wrl $ORACLE_HOME/network/admin/dg_wallet -deleteCredential tns_alias
 ```
 
 ### Update SYS password in wallet (after password change)
@@ -145,7 +145,7 @@ sqlplus /@peer_tns_alias as sysdba
 ### Wallet not working?
 
 1. **Check sqlnet.ora** -- verify `WALLET_LOCATION` points to the right directory
-2. **Check files exist** -- `ls -la $ORACLE_HOME/network/admin/ewallet.p12 cwallet.sso`
+2. **Check files exist** -- `ls -la $ORACLE_HOME/network/admin/dg_wallet/ewallet.p12 cwallet.sso`
 3. **Check TNS entry** -- `tnsping peer_tns_alias` should resolve
 4. **Check credentials** -- `mkstore -wrl ... -listCredential` should show the alias
 5. **Check WALLET_OVERRIDE** -- must be `TRUE` for `/@alias as sysdba` to use wallet credentials

@@ -231,9 +231,11 @@ SWITCHOVER_STATUS=$(field_at "$DB_STATUS" 4)
 FORCE_LOGGING=$(clean_field "$(run_sql_query "get_force_logging.sql")")
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
 
-APPLY_INFO=$(clean_field "$(run_sql_query "get_apply_info_pipe.sql")")
+APPLY_INFO=$(clean_field "$(run_sql_query "get_apply_info_pipe.sql" || true)")
 LAST_APPLIED=$(field_at "$APPLY_INFO" 1)
 LAST_RECEIVED=$(field_at "$APPLY_INFO" 2)
+case "$LAST_APPLIED" in ''|*[!0-9]*) LAST_APPLIED="" ;; esac
+case "$LAST_RECEIVED" in ''|*[!0-9]*) LAST_RECEIVED="" ;; esac
 APPLY_LAG_SEQ=$(( ${LAST_RECEIVED:-0} - ${LAST_APPLIED:-0} ))
 
 GAP_COUNT=$(clean_field "$(run_sql_query "get_archive_gap_count.sql")")
@@ -370,19 +372,25 @@ fi
 GEN_DATE=$(date)
 GEN_HOST=$(hostname 2>/dev/null)
 
-# Status verdict
+# Status verdict (escalate-only: HEALTHY -> WARNING -> ERROR, never lowered)
 VERDICT="HEALTHY"
 VERDICT_NOTES=()
+escalate_verdict() {
+    case "$1" in
+        ERROR)   VERDICT="ERROR" ;;
+        WARNING) if [[ "$VERDICT" != "ERROR" ]]; then VERDICT="WARNING"; fi ;;
+    esac
+}
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
-    VERDICT="WARNING"
+    escalate_verdict "WARNING"
     VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY")
 fi
 if [[ "${GAP_COUNT}" -gt 0 ]]; then
-    VERDICT="ERROR"
+    escalate_verdict "ERROR"
     VERDICT_NOTES+=("${GAP_COUNT} archive gap(s) detected")
 fi
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
-    VERDICT="WARNING"
+    escalate_verdict "WARNING"
     VERDICT_NOTES+=("Data Guard Broker is not started")
 fi
 

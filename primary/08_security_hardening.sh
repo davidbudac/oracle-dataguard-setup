@@ -171,11 +171,24 @@ log_info "Changing SYS password and locking account..."
 log_cmd "sqlplus / as sysdba:" "ALTER USER SYS IDENTIFIED BY '********'"
 log_cmd "sqlplus / as sysdba:" "ALTER USER SYS ACCOUNT LOCK"
 
-# Change SYS password and lock the account. secure_sys_account.sql now sets
-# WHENEVER SQLERROR EXIT SQL.SQLCODE, so a failed password change aborts the
-# script BEFORE the ACCOUNT LOCK statement runs, and the exit code (not a
-# 'SUCCESS' marker in captured output) is now the authoritative result.
-if run_sql_command "secure_sys_account.sql" "$RANDOM_PWD"; then
+# Change SYS password and lock the account. WHENEVER SQLERROR EXIT
+# SQL.SQLCODE ensures a failed password change (e.g. rejected by a password
+# verify function) aborts BEFORE the ACCOUNT LOCK statement runs, so we
+# never lock SYS while leaving the old password in place. The exit code
+# (not a 'SUCCESS' marker in captured output) is the authoritative result.
+confirm_approval_action "Run SQL command" "ALTER USER SYS IDENTIFIED BY ******** ; ALTER USER SYS ACCOUNT LOCK" || exit 1
+pause_verbose_trace
+SECURE_SYS_RC=0
+sqlplus -s / as sysdba <<EOF || SECURE_SYS_RC=$?
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+ALTER USER SYS IDENTIFIED BY "${RANDOM_PWD}";
+ALTER USER SYS ACCOUNT LOCK;
+EXIT SUCCESS;
+EOF
+resume_verbose_trace
+if [[ "$SECURE_SYS_RC" -eq 0 ]]; then
     log_success "SYS account secured successfully"
 else
     log_error "Failed to secure SYS account"
@@ -235,7 +248,7 @@ NFS_ORAPW_STAGING="${NFS_SHARE}/orapw${STANDBY_ORACLE_SID}_hardened"
 if [[ -f "$ORAPW_FILE" ]]; then
     log_info "Staging refreshed password file on the NFS share..."
     confirm_approval_action "Copy refreshed primary password file to NFS share" "cp $ORAPW_FILE $NFS_ORAPW_STAGING && chmod 600 $NFS_ORAPW_STAGING" || exit 1
-    cp "$ORAPW_FILE" "$NFS_ORAPW_STAGING"
+    ( umask 077; cp "$ORAPW_FILE" "$NFS_ORAPW_STAGING" )
     chmod 600 "$NFS_ORAPW_STAGING"
     log_success "Password file staged at: $NFS_ORAPW_STAGING"
     record_artifact "password_file_hardened:${NFS_ORAPW_STAGING}"

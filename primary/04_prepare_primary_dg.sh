@@ -100,8 +100,10 @@ fi
 if [[ -f "$TNSNAMES_ORA" ]]; then
     backup_file "$TNSNAMES_ORA"
 
-    # Check if entries already exist
-    if grep -q "$STANDBY_TNS_ALIAS" "$TNSNAMES_ORA"; then
+    # Check if entries already exist (anchor on an alias definition line;
+    # aliases may contain dots, so escape them for the regex)
+    STANDBY_ALIAS_RE=$(printf '%s' "$STANDBY_TNS_ALIAS" | sed 's/[.]/\\./g')
+    if grep -qiE "^[[:space:]]*${STANDBY_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA"; then
         log_info "TNS entry for standby already exists"
     else
         log_info "Adding TNS entries to tnsnames.ora"

@@ -533,18 +533,25 @@ render_driver_table() {
 # Verdict
 # ============================================================
 
+# Escalate-only: HEALTHY -> WARNING -> ERROR, never lowered
 VERDICT="HEALTHY"
 VERDICT_NOTES=()
+escalate_verdict() {
+    case "$1" in
+        ERROR)   VERDICT="ERROR" ;;
+        WARNING) if [[ "$VERDICT" != "ERROR" ]]; then VERDICT="WARNING"; fi ;;
+    esac
+}
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
-    VERDICT="WARNING"
+    escalate_verdict "WARNING"
     VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY")
 fi
 if [[ "${GAP_COUNT}" -gt 0 ]]; then
-    VERDICT="ERROR"
+    escalate_verdict "ERROR"
     VERDICT_NOTES+=("${GAP_COUNT} archive gap(s) detected")
 fi
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
-    VERDICT="WARNING"
+    escalate_verdict "WARNING"
     VERDICT_NOTES+=("Data Guard Broker is not started")
 fi
 

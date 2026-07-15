@@ -79,16 +79,46 @@ check_wallet_exists() {
 }
 
 is_observer_running() {
+    # Sets OBSERVER_PID (local case) or OBSERVER_REMOTE_HOST (pidfile was
+    # written by another host - the NFS-shared pidfile stores host:pid
+    # because PIDs are only meaningful on the host that wrote them).
+    OBSERVER_PID=""
+    OBSERVER_REMOTE_HOST=""
+
     if [[ ! -f "$PID_FILE" ]]; then
         return 1
     fi
 
-    local pid
-    pid=$(cat "$PID_FILE")
+    local entry pid pid_host
+    entry=$(cat "$PID_FILE")
+
+    if [[ -z "$entry" ]]; then
+        rm -f "$PID_FILE"
+        return 1
+    fi
+
+    case "$entry" in
+        *:*)
+            pid_host="${entry%%:*}"
+            pid="${entry#*:}"
+            ;;
+        *)
+            # Legacy pidfile with a bare PID - treat as local host.
+            pid_host="$(hostname)"
+            pid="$entry"
+            ;;
+    esac
 
     if [[ -z "$pid" ]]; then
         rm -f "$PID_FILE"
         return 1
+    fi
+
+    if [[ "$pid_host" != "$(hostname)" ]]; then
+        # The PID belongs to another host and cannot be validated (or
+        # cleaned up) from here - report the observer as running there.
+        OBSERVER_REMOTE_HOST="$pid_host"
+        return 0
     fi
 
     if ! kill -0 "$pid" 2>/dev/null; then
@@ -107,6 +137,7 @@ is_observer_running() {
         return 1
     fi
 
+    OBSERVER_PID="$pid"
     return 0
 }
 
@@ -445,8 +476,12 @@ do_start() {
 
     # Check if already running
     if is_observer_running; then
-        local pid=$(cat "$PID_FILE")
-        log_warn "Observer is already running (PID: $pid)"
+        if [[ -n "$OBSERVER_REMOTE_HOST" ]]; then
+            log_error "Observer is already running on host ${OBSERVER_REMOTE_HOST} (per $PID_FILE)"
+            log_error "Run './observer.sh stop' on that host first if it must move"
+            exit 1
+        fi
+        log_warn "Observer is already running (PID: $OBSERVER_PID)"
         log_info "Use './observer.sh status' to check status"
         exit 0
     fi
@@ -486,8 +521,8 @@ do_start() {
     nohup "$ORACLE_HOME/bin/dgmgrl" "/@${PRIMARY_TNS_ALIAS}" "START OBSERVER" > "$LOG_FILE" 2>&1 &
     OBSERVER_PID=$!
 
-    # Save PID
-    echo "$OBSERVER_PID" > "$PID_FILE"
+    # Save host:PID (pidfile lives on the NFS share, PIDs are host-local)
+    echo "$(hostname):$OBSERVER_PID" > "$PID_FILE"
 
     # Wait a moment and verify it's running
     sleep 3
@@ -525,7 +560,13 @@ do_stop() {
         return 0
     fi
 
-    local pid=$(cat "$PID_FILE")
+    if [[ -n "$OBSERVER_REMOTE_HOST" ]]; then
+        log_error "Observer is running on host ${OBSERVER_REMOTE_HOST} (per $PID_FILE)"
+        log_error "Run './observer.sh stop' on that host - it cannot be stopped from $(hostname)"
+        exit 1
+    fi
+
+    local pid="$OBSERVER_PID"
 
     # Try graceful stop via DGMGRL first
     log_info "Sending stop command via DGMGRL..."
@@ -577,8 +618,11 @@ do_status() {
 
     # Check process status
     if is_observer_running; then
-        local pid=$(cat "$PID_FILE")
-        echo "Process Status : RUNNING (PID: $pid)"
+        if [[ -n "$OBSERVER_REMOTE_HOST" ]]; then
+            echo "Process Status : RUNNING on host ${OBSERVER_REMOTE_HOST} (not verifiable from $(hostname))"
+        else
+            echo "Process Status : RUNNING (PID: $OBSERVER_PID)"
+        fi
         echo "PID File       : $PID_FILE"
         echo "Log File       : $LOG_FILE"
     else

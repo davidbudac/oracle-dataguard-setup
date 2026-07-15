@@ -316,6 +316,7 @@ if [[ "$CREATE_USER" == "true" ]]; then
 
     confirm_approval_action "Create user $USER_SCHEMA and grant privileges" "sqlplus -s / as sysdba <create user and grant privileges>" || exit 1
 
+    CREATE_RC=0
     CREATE_RESULT=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -334,8 +335,8 @@ GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 
 EXIT;
 EOSQL
-    )
-    CREATE_RC=$?
+    ) || CREATE_RC=$?
+    [[ -n "$USER_PASSWORD" ]] && CREATE_RESULT=${CREATE_RESULT//"$USER_PASSWORD"/********}
     echo "$CREATE_RESULT" | while IFS= read -r line; do
         [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
     done
@@ -350,6 +351,7 @@ else
 
     confirm_approval_action "Grant privileges to $USER_SCHEMA" "sqlplus -s / as sysdba <grant privileges>" || exit 1
 
+    GRANT_RC=0
     GRANT_RESULT=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -363,8 +365,7 @@ GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
 
 EXIT;
 EOSQL
-    )
-    GRANT_RC=$?
+    ) || GRANT_RC=$?
     echo "$GRANT_RESULT" | while IFS= read -r line; do
         [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
     done

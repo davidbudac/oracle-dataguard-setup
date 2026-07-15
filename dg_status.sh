@@ -204,8 +204,16 @@ _validate_sid() {
 
 if [[ -n "$ORACLE_SID_OVERRIDE" ]]; then
     DETECTED_SID="$ORACLE_SID_OVERRIDE"
+    if ! _validate_sid "$DETECTED_SID"; then
+        printf "ERROR: SID '%s' from -s/--sid looks invalid\n" "$DETECTED_SID"
+        exit 1
+    fi
 elif [[ -n "${ORACLE_SID:-}" ]]; then
     DETECTED_SID="$ORACLE_SID"
+    if ! _validate_sid "$DETECTED_SID"; then
+        printf "ERROR: SID '%s' from \$ORACLE_SID looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID"
+        exit 1
+    fi
 elif $PRIMARY_REACHABLE; then
     DETECTED_SID=$(_detect_pmon_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}")
     if [[ -z "$DETECTED_SID" ]]; then
@@ -631,8 +639,8 @@ else
 fi
 
 if [[ -n "${STB_RECOVERY_MODE:-}" ]]; then
-    icon=$(status_icon "$STB_RECOVERY_MODE" "REAL TIME")
-    [[ "$icon" == *"XX"* ]] && add_summary_warning "Recovery mode is '${STB_RECOVERY_MODE}' (not real-time apply)"
+    icon=$(warn_icon "$STB_RECOVERY_MODE" "REAL TIME")
+    [[ "$icon" == *"!!"* ]] && add_summary_warning "Recovery mode is '${STB_RECOVERY_MODE}' (not real-time apply)"
     row "Recovery Mode" "$STB_RECOVERY_MODE" "$icon"
 fi
 
@@ -709,6 +717,9 @@ else
         icon=$(status_icon "$BROKER_OVERALL" "SUCCESS")
         [[ "$icon" == *"XX"* ]] && add_summary_error "Broker overall status is '$BROKER_OVERALL'"
         row "Overall Status" "$BROKER_OVERALL" "$icon"
+    else
+        row "Overall Status" "UNKNOWN (DGMGRL output could not be parsed)" "$WARN"
+        add_summary_warning "Broker status could not be determined"
     fi
 
     # Show members and their ORA errors/warnings from SHOW CONFIGURATION

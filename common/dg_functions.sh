@@ -203,21 +203,25 @@ confirm_approval_action() {
             ;;
     esac
 
-    echo ""
-    printf "${BLUE}============================================================${NC}\n"
-    printf "${YELLOW}Approval Mode Check${NC}\n"
-    printf "${BLUE}============================================================${NC}\n"
-    print_status_row "Action" "$action_title"
-    print_status_row "Impact" "$impact_scope"
-    if [[ -n "$LOG_FILE" ]]; then
-        print_status_row "Log File" "$LOG_FILE"
-    fi
-    echo ""
-    printf "${BLUE}Command Preview${NC}\n"
-    printf "${BLUE}%s${NC}\n" "------------------------------------------------------------"
-    printf "  %s\n" "$action_cmd"
-    echo ""
-    printf "${YELLOW}Approve this action? [y/N]: ${NC}"
+    # Send banner and prompt to stderr so they remain visible when a call
+    # site captures stdout via command substitution.
+    {
+        echo ""
+        printf "${BLUE}============================================================${NC}\n"
+        printf "${YELLOW}Approval Mode Check${NC}\n"
+        printf "${BLUE}============================================================${NC}\n"
+        print_status_row "Action" "$action_title"
+        print_status_row "Impact" "$impact_scope"
+        if [[ -n "$LOG_FILE" ]]; then
+            print_status_row "Log File" "$LOG_FILE"
+        fi
+        echo ""
+        printf "${BLUE}Command Preview${NC}\n"
+        printf "${BLUE}%s${NC}\n" "------------------------------------------------------------"
+        printf "  %s\n" "$action_cmd"
+        echo ""
+        printf "${YELLOW}Approve this action? [y/N]: ${NC}"
+    } >&2
     read -r response
 
     case "$response" in
@@ -281,19 +285,32 @@ init_log() {
     LOG_FILE="${log_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').log"
     STEP_STATE_FILE="${state_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').state"
 
-    echo "============================================================" > "$LOG_FILE"
+    # If the log location is not writable (e.g. NFS share not mounted yet),
+    # degrade gracefully: disable file logging so the script can proceed to
+    # the proper check_nfs_mount error instead of dying here under set -e.
+    if ! echo "============================================================" > "$LOG_FILE" 2>/dev/null; then
+        LOG_FILE="/dev/null"
+        STEP_STATE_FILE=""
+        log_warn "Log directory not writable: ${log_dir} - file logging disabled for this run"
+        return 0
+    fi
     echo "Log started: $(date)" >> "$LOG_FILE"
     echo "Script: $script_name" >> "$LOG_FILE"
     echo "Hostname: $(hostname)" >> "$LOG_FILE"
     echo "============================================================" >> "$LOG_FILE"
 
-    cat > "$STEP_STATE_FILE" <<EOF
+    if ! cat > "$STEP_STATE_FILE" 2>/dev/null <<EOF
 script_name=$(printf '%q' "$script_name")
 hostname=$(printf '%q' "$(hostname)")
 status=RUNNING
 log_file=$(printf '%q' "$LOG_FILE")
 check_only=$(printf '%q' "$CHECK_ONLY")
 EOF
+    then
+        log_warn "State directory not writable: ${state_dir} - state tracking disabled for this run"
+        STEP_STATE_FILE=""
+        return 0
+    fi
 
     log_info "Log file initialized: $LOG_FILE"
     log_info "State file initialized: $STEP_STATE_FILE"

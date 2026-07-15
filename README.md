@@ -5,8 +5,8 @@ Automated scripts for building, verifying, and operating an Oracle 19c Physical 
 ## What's Included
 
 - **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
-- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (step 9 + observer setup), role-aware service trigger (step 14).
-- **Handoff report** (step 15) — Markdown doc with topology, status, and per-service TNS/JDBC strings for application teams.
+- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11).
+- **Handoff report** (step 12) — Markdown doc with topology, status, and per-service TNS/JDBC strings for application teams.
 - **Operational tools** — SSH dashboard, local triage/diagnostics, wallet setup for password-free peer access, standalone handoff regenerator.
 
 ## Prerequisites
@@ -37,7 +37,9 @@ dataguard_setup/
 ├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 8, 9, 10)
 ├── standby/                     # STANDBY-side steps (3, 5, 7)
 ├── fsfo/                        # observer.sh - lifecycle for FSFO observer
-├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant)
+├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant) + CDB/PDB service creation
+│
+├── migrate_noncdb_to_pdb/       # Non-CDB → PDB migration subproject (own README/WALKTHROUGH)
 │
 ├── common/                      # Shared functions, wallet setup, status helpers
 ├── templates/                   # Reference templates (init, listener, tnsnames)
@@ -48,6 +50,7 @@ dataguard_setup/
 ├── dg_diag_sid.sh               # Deep local diagnostics (run on DB host)
 ├── dg_check_sid.sh              # Deprecated wrapper - prefer triage/diag
 ├── dg_handoff.sh                # Standalone handoff report (no setup-time deps)
+├── dg_check_srl.sh              # Standby redo log checker - prints fix DDL for missing/undersized SRLs
 │
 ├── docs/
 │   ├── DATA_GUARD_WALKTHROUGH.md   # Detailed walkthrough with manual equivalents
@@ -72,11 +75,11 @@ dataguard_setup/
 | 7  | STANDBY  | `./standby/07_verify_dataguard.sh`       | Health check |
 | 8  | PRIMARY  | `./primary/08_security_hardening.sh`     | Optional: lock SYS |
 | 9  | PRIMARY  | `./primary/09_configure_fsfo.sh`         | Optional: enable FSFO |
-| —  | OBSERVER | `./fsfo/observer.sh setup` then `start`  | Optional: required for FSFO |
-| 14 | PRIMARY  | `./trigger/create_role_trigger.sh`       | Optional: role-aware service start/stop |
-| 15 | PRIMARY  | `./primary/10_generate_handoff_report.sh`| Markdown handoff for app teams |
+| 10 | OBSERVER | `./fsfo/observer.sh setup` then `start`  | Optional: required for FSFO |
+| 11 | PRIMARY  | `./trigger/create_role_trigger.sh`       | Optional: role-aware service start/stop |
+| 12 | PRIMARY  | `./primary/10_generate_handoff_report.sh`| Markdown handoff for app teams |
 
-`./trigger/create_role_trigger_dedicated_user.sh` is an alternative to step 14 that puts trigger objects under a dedicated user instead of `SYS`.
+`./trigger/create_role_trigger_dedicated_user.sh` is an alternative to step 11 that puts trigger objects under a dedicated user instead of `SYS`. For multitenant databases, `./trigger/create_role_trigger_cdb.sh` manages PDB services, and `./trigger/create_cdb_service.sh` / `./trigger/create_pdb_service.sh` create role-aware services at the `CDB$ROOT` or PDB level.
 
 See [`WALKTHROUGH.md`](WALKTHROUGH.md) for prompts, outputs, and verification per step. See [`docs/DATA_GUARD_WALKTHROUGH.md`](docs/DATA_GUARD_WALKTHROUGH.md) for the manual-equivalent commands.
 
@@ -85,7 +88,7 @@ See [`WALKTHROUGH.md`](WALKTHROUGH.md) for prompts, outputs, and verification pe
 - **Steps 1-4** — idempotent, re-runnable.
 - **Step 5** — once RMAN duplicate starts, you must shut down the standby instance and remove its data files / control files / redo logs before re-running. The script requires you to retype the standby `DB_UNIQUE_NAME` before starting, to reduce accidental execution.
 - **Steps 6-7** — re-runnable; remove the broker config with `REMOVE CONFIGURATION` first if needed.
-- **Step 15** — re-run any time; refreshes the handoff doc.
+- **Step 12** — re-run any time; refreshes the handoff doc.
 
 ## Runtime Modes
 

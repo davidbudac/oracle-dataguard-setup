@@ -182,6 +182,13 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
     fi
 
     log_info "Existing configuration removed"
+else
+    log_error "Unexpected output from SHOW CONFIGURATION - cannot determine broker state"
+    echo ""
+    echo "$EXISTING_CONFIG"
+    echo ""
+    log_error "Check that the broker (DMON) is started on the primary and that TNS connectivity works, then re-run this script"
+    exit 1
 fi
 
 # ============================================================

@@ -870,6 +870,8 @@ assess_broker() {
         elif [[ "$BROKER_OVERALL" == "WARNING" ]]; then
             add_summary_warning "Broker overall status is WARNING"
         fi
+    else
+        add_summary_warning "Broker status could not be determined"
     fi
 
     while IFS= read -r line; do

@@ -74,7 +74,7 @@ while [[ $# -gt 0 ]]; do
         -A|--auto-password) AUTO_PASSWORD=true; shift ;;
         -h|--help)
             printf "Usage: bash common/setup_dg_wallet.sh [-w wallet_dir] [-A]\n"
-            printf "  -w, --wallet-dir DIR   Wallet directory (default: \$ORACLE_HOME/network/admin)\n"
+            printf "  -w, --wallet-dir DIR   Wallet directory (default: \$ORACLE_HOME/network/admin/dg_wallet)\n"
             printf "  -A, --auto-password    Generate wallet password automatically (no prompt)\n"
             printf "                         The auto-login wallet handles all connections;\n"
             printf "                         to modify the wallet later, re-run this script\n"
@@ -84,11 +84,15 @@ while [[ $# -gt 0 ]]; do
 done
 
 generate_random_password() {
-    # Generate a random 24-char password (AIX compatible — no /dev/urandom dependency)
+    # Generate a random 24-char password (openssl, with a bounded
+    # od /dev/urandom read as the AIX-safe fallback)
     local pw=""
-    pw=$(printf '%s%s%s' "$(date '+%N%s')" "$$" "${RANDOM:-0}" | cksum | awk '{print $1}')
-    pw="Wlt_${pw}_$(printf '%05d' "$$")Aa1"
-    printf '%s' "$pw"
+    if command -v openssl >/dev/null 2>&1; then
+        pw=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-24)
+    else
+        pw=$(od -An -tx1 -N 16 /dev/urandom | tr -d '[:space:]' | cut -c1-24)
+    fi
+    printf 'Wlt_%sAa1' "$pw"
 }
 
 # -- Verify Oracle environment ------------------------------------------------
@@ -109,7 +113,7 @@ fi
 
 # Default wallet location
 if [[ -z "$WALLET_DIR" ]]; then
-    WALLET_DIR="${ORACLE_HOME}/network/admin"
+    WALLET_DIR="${ORACLE_HOME}/network/admin/dg_wallet"
 fi
 
 printf "\n ${BOLD}${CYAN}Data Guard Wallet Setup${NC}\n"
@@ -438,6 +442,17 @@ if $CREATE_NEW_WALLET; then
     step "Activating new wallet"
 
     if [[ -d "$WALLET_DIR" ]]; then
+        NON_WALLET_ENTRIES=$(ls -A "$WALLET_DIR" 2>/dev/null | grep -v -E '^(ewallet\.p12|ewallet\.p12\.lck|cwallet\.sso|cwallet\.sso\.lck)$' || true)
+        if [[ -n "$NON_WALLET_ENTRIES" ]]; then
+            error "Wallet directory ${WALLET_DIR} contains files that are not wallet artifacts:"
+            printf '%s\n' "$NON_WALLET_ENTRIES" | while IFS= read -r entry; do
+                printf "   ${DIM}%s${NC}\n" "$entry"
+            done
+            error "Refusing to move this directory aside - use -w to point at a dedicated wallet directory"
+            error "New wallet remains staged (not activated) at: ${WORK_WALLET_DIR}"
+            unset SYS_PASSWORD WALLET_PASSWORD
+            exit 1
+        fi
         WALLET_SWAP_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
         if ! mv "$WALLET_DIR" "$WALLET_SWAP_BACKUP"; then
             error "Failed to move existing wallet out of the way: ${WALLET_DIR}"
