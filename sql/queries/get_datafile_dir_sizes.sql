@@ -1,5 +1,7 @@
 -- Get per-directory size in MB (datafiles + tempfiles), one line per
 -- directory as <dir>|<size_mb>, for per-mount disk space checks.
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 400 PAGESIZE 0 TRIMSPOOL ON
 SELECT DIR || '|' || CEIL(SUM(BYTES)/1024/1024)
 FROM (

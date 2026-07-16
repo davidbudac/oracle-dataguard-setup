@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 4: Prepare Primary for DG"
-init_progress 7
+init_progress 8
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "04_prepare_primary_dg"

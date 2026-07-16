@@ -2,6 +2,8 @@
 -- Check Data Guard role-aware service trigger deployment
 -- Returns: package_count|enabled_trigger_count|trigger_count|owners
 -- ============================================================
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 WITH pkg AS (
     SELECT owner

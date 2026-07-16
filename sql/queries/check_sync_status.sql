@@ -3,6 +3,8 @@
 -- Returns transport lag and apply lag from V$DATAGUARD_STATS
 -- Format: NAME|VALUE|UNIT (pipe-delimited)
 -- ============================================================
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF LINESIZE 200
 SELECT NAME || '|' || VALUE || '|' || UNIT
 FROM V$DATAGUARD_STATS

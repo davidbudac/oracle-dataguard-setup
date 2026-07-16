@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
-init_progress 8
+init_progress 9
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -206,7 +206,7 @@ log_info "Standby database: $STANDBY_DB_UNIQUE_NAME"
 # Create configuration
 log_info "Creating broker configuration..."
 log_cmd "dgmgrl /:" "CREATE CONFIGURATION '${DG_BROKER_CONFIG_NAME}' AS PRIMARY DATABASE IS '${PRIMARY_DB_UNIQUE_NAME}' CONNECT IDENTIFIER IS '${PRIMARY_TNS_ALIAS}'"
-if ! run_dgmgrl "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"; then
+if ! run_dgmgrl_checked "create_configuration.dgmgrl" "$DG_BROKER_CONFIG_NAME" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_TNS_ALIAS"; then
     log_error "Failed to create broker configuration"
     exit 1
 fi
@@ -215,7 +215,7 @@ log_info "Configuration created successfully"
 # Add standby database
 log_info "Adding standby database to configuration..."
 log_cmd "dgmgrl /:" "ADD DATABASE '${STANDBY_DB_UNIQUE_NAME}' AS CONNECT IDENTIFIER IS '${STANDBY_TNS_ALIAS}' MAINTAINED AS PHYSICAL"
-if ! run_dgmgrl "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"; then
+if ! run_dgmgrl_checked "add_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_TNS_ALIAS"; then
     log_error "Failed to add standby database"
     exit 1
 fi
@@ -246,10 +246,16 @@ log_info "Standby StaticConnectIdentifier:"
 log_info "  $STANDBY_STATIC_CONNECT"
 
 log_cmd "dgmgrl /:" "EDIT DATABASE '${PRIMARY_DB_UNIQUE_NAME}' SET PROPERTY StaticConnectIdentifier='...'"
-run_dgmgrl "set_static_connect_identifier.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_STATIC_CONNECT"
+if ! run_dgmgrl_checked "set_static_connect_identifier.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_STATIC_CONNECT"; then
+    log_error "Failed to set StaticConnectIdentifier on $PRIMARY_DB_UNIQUE_NAME"
+    exit 1
+fi
 
 log_cmd "dgmgrl /:" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY StaticConnectIdentifier='...'"
-run_dgmgrl "set_static_connect_identifier.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_STATIC_CONNECT"
+if ! run_dgmgrl_checked "set_static_connect_identifier.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_STATIC_CONNECT"; then
+    log_error "Failed to set StaticConnectIdentifier on $STANDBY_DB_UNIQUE_NAME"
+    exit 1
+fi
 
 # ============================================================
 # Enable Configuration
@@ -259,7 +265,10 @@ progress_step "Enabling Data Guard Broker Configuration"
 
 log_info "Enabling configuration..."
 log_cmd "dgmgrl /:" "ENABLE CONFIGURATION"
-run_dgmgrl "enable_configuration.dgmgrl"
+if ! run_dgmgrl_checked "enable_configuration.dgmgrl"; then
+    log_error "Failed to enable broker configuration"
+    exit 1
+fi
 
 # Wait for configuration to stabilize
 log_info "Waiting for configuration to stabilize..."

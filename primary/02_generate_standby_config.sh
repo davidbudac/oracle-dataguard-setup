@@ -250,7 +250,7 @@ else
 # ============================================================
 
 print_banner "Step 2: Generate Standby Config"
-init_progress 7
+init_progress 8
 
 # Initialize logging (will reinitialize with DB names later)
 init_log "02_generate_standby_config"
@@ -802,6 +802,10 @@ log_info "Standby admin directory: $STANDBY_ADMIN_DIR"
 # Calculate Standby Redo Log Groups
 # ============================================================
 
+if ! is_numeric "${ONLINE_REDO_GROUPS:-}"; then
+    log_error "ONLINE_REDO_GROUPS from the primary info file is not numeric: '${ONLINE_REDO_GROUPS:-}' (re-run step 1)"
+    exit 1
+fi
 RECOMMENDED_STBY_GROUPS=$((ONLINE_REDO_GROUPS + 1))
 
 log_info "Online redo groups: $ONLINE_REDO_GROUPS"
@@ -1008,6 +1012,32 @@ fi  # end REGENERATE check
 PRIMARY_SRL_PATH="${PRIMARY_SRL_PATH:-$PRIMARY_REDO_PATH}"
 STANDBY_SRL_PATH="${STANDBY_SRL_PATH:-$STANDBY_REDO_PATH}"
 
+# ============================================================
+# Control File Multiplexing (Traditional mode only)
+# ============================================================
+# By default both standby control file copies land in STANDBY_DATA_PATH,
+# i.e. on a single filesystem - one mount failure destroys every copy.
+# Warn about this, and when running interactively, offer to place the
+# second copy on a separate filesystem. Non-interactive runs and config
+# files that already set STANDBY_CONTROL_FILE_2_DIR are unaffected -
+# default behavior (both copies in STANDBY_DATA_PATH) is unchanged
+# unless the user opts in.
+if [[ "$STANDBY_STORAGE_MODE" != "OMF" && -z "${STANDBY_CONTROL_FILE_2_DIR:-}" ]]; then
+    log_warn "Both standby control file copies will be created in the same directory: $STANDBY_DATA_PATH"
+    log_warn "A single filesystem/mount failure could take out every control file copy."
+    log_warn "Consider multiplexing control files across separate filesystems."
+    if [[ -t 0 ]]; then
+        printf "Enter a SEPARATE directory for the second control file copy (blank to keep both in %s): " "$STANDBY_DATA_PATH"
+        read -r _control_file_2_dir
+        if [[ -n "$_control_file_2_dir" ]]; then
+            [[ "$_control_file_2_dir" != "/" ]] && _control_file_2_dir="${_control_file_2_dir%/}"
+            STANDBY_CONTROL_FILE_2_DIR="$_control_file_2_dir"
+            log_info "Second control file copy will be created in: $STANDBY_CONTROL_FILE_2_DIR"
+            printf 'STANDBY_CONTROL_FILE_2_DIR="%s"\n' "$STANDBY_CONTROL_FILE_2_DIR" >> "$STANDBY_CONFIG_FILE"
+        fi
+    fi
+fi
+
 # ############################################################
 # FILE GENERATION
 # ############################################################
@@ -1057,7 +1087,7 @@ echo "*.db_recovery_file_dest='${STANDBY_DB_RECOVERY_FILE_DEST}'"
 echo "*.db_recovery_file_dest_size=${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}"
 else
 echo "# --- Control Files ---"
-echo "*.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'"
+echo "*.control_files='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_CONTROL_FILE_2_DIR:-$STANDBY_DATA_PATH}/control02.ctl'"
 echo ""
 echo "# --- Archive Log Destination (local only) ---"
 if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then

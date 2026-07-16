@@ -20,7 +20,10 @@ done
 
 # Configuration
 NFS_MOUNT_PATH="/OINSTALL/_dataguard_setup"
-FSTAB_OPTIONS="rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576"
+# nointr is intentionally omitted: it's a no-op on modern Linux kernels
+# and AIX (hard mounts have not been interruptible via this option for
+# years) and is documented obsolete - keeping it would just be cargo cult.
+FSTAB_OPTIONS="rw,bg,hard,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576"
 
 # Colors for output
 RED='\033[0;31m'
@@ -134,26 +137,31 @@ mkdir -p "$NFS_MOUNT_PATH"
 
 log_info "Testing connectivity to NFS server..."
 
+# ICMP is frequently filtered by firewalls/security groups even when the
+# NFS server is perfectly reachable, so a failed ping is not proof of an
+# outage - warn and let the actual mount attempt below be the real test.
 if ! ping -c 1 -W 5 "$NFS_SERVER" &> /dev/null; then
-    log_error "Cannot reach NFS server: $NFS_SERVER"
-    log_error "Please check network connectivity and hostname resolution"
-    exit 1
+    log_warn "Could not ping NFS server: $NFS_SERVER (ICMP may be filtered - continuing)"
+else
+    log_info "NFS server is reachable"
 fi
 
-log_info "NFS server is reachable"
-
-# Check if NFS exports are available
+# Check if NFS exports are available. showmount queries rpc.mountd, which
+# NFSv4-only servers do not run (there's no separate MOUNT protocol in
+# NFSv4 - clients reach exports directly via the pseudo-filesystem), so a
+# failed/empty showmount does not necessarily mean the export is missing.
+# Warn instead of aborting and let the actual mount attempt be the judge.
 log_info "Checking NFS exports from server..."
 if command -v showmount &> /dev/null; then
     if ! showmount -e "$NFS_SERVER" 2>/dev/null | grep -q "$NFS_MOUNT_PATH"; then
-        log_error "NFS export not found on server"
-        log_error "Please verify NFS server setup and that this host is allowed"
+        log_warn "showmount did not list export $NFS_MOUNT_PATH on $NFS_SERVER"
+        log_warn "This is expected on NFSv4-only servers (no rpc.mountd) - continuing to the mount attempt"
         echo ""
-        echo "Available exports from $NFS_SERVER:"
-        showmount -e "$NFS_SERVER" 2>/dev/null || echo "(unable to list exports)"
-        exit 1
+        echo "Available exports from $NFS_SERVER (if any):"
+        showmount -e "$NFS_SERVER" 2>/dev/null || echo "(unable to list exports - showmount/mountd unavailable)"
+    else
+        log_info "NFS export is available"
     fi
-    log_info "NFS export is available"
 fi
 
 # ============================================================

@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 3: Setup Standby Environment"
-init_progress 9
+init_progress 11
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "03_setup_standby_env"
@@ -258,6 +258,9 @@ if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
 
     if [[ -n "$DATA_FS" && "$DATA_FS" == "$SRL_FS" ]]; then
         log_info "SRL path shares the data filesystem ($DATA_FS) - space already covered"
+    elif ! is_numeric "$REDO_LOG_SIZE_MB" || ! is_numeric "$STANDBY_REDO_GROUPS"; then
+        log_error "REDO_LOG_SIZE_MB ('${REDO_LOG_SIZE_MB}') or STANDBY_REDO_GROUPS ('${STANDBY_REDO_GROUPS}') from the config file is not numeric - skipping separate SRL filesystem check"
+        log_error "Please verify SRL filesystem space manually, or re-run steps 1-2 to regenerate the config"
     else
         # SRL storage needed = redo group size x group count x 1.2 (safety margin)
         SRL_REQUIRED_MB=$(( REDO_LOG_SIZE_MB * STANDBY_REDO_GROUPS * 12 / 10 ))
@@ -381,6 +384,14 @@ else
     if [[ -n "${STANDBY_SRL_PATH:-}" ]] && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
         DIRS_TO_CREATE+=("${STANDBY_SRL_PATH}")
         log_info "Separate SRL directory configured: $STANDBY_SRL_PATH"
+    fi
+
+    # Add the multiplexed second control-file directory if configured
+    # (step 2 optional prompt) - the pfile references it, so RMAN
+    # duplicate fails if it does not exist.
+    if [[ -n "${STANDBY_CONTROL_FILE_2_DIR:-}" ]]; then
+        DIRS_TO_CREATE+=("${STANDBY_CONTROL_FILE_2_DIR}")
+        log_info "Separate second control-file directory configured: $STANDBY_CONTROL_FILE_2_DIR"
     fi
 
     # ------------------------------------------------------------

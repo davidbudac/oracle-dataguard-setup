@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 7: Verify Data Guard"
-init_progress 9
+init_progress 10
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "07_verify_dataguard"

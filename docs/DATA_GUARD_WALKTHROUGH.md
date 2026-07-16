@@ -107,7 +107,7 @@ Run this on **both** primary and standby servers.
 5. Creates mount point directory
 6. Tests network connectivity to NFS server (ping)
 7. Verifies NFS export is available (`showmount -e`)
-8. Mounts the NFS share (NFSv4 with options: `rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576`)
+8. Mounts the NFS share (NFSv4 with options: `rw,bg,hard,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576`)
 9. Tests write access
 10. Adds persistent mount entry to `/etc/fstab` (with backup)
 11. Sets ownership to `oracle:oinstall` (or `oracle:dba`) and `chmod`s the mount point `750`
@@ -127,13 +127,13 @@ showmount -e nfs-server
 
 # Mount
 sudo mount -t nfs4 nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup \
-  -o rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576
+  -o rw,bg,hard,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576
 
 # Verify write access
 touch /OINSTALL/_dataguard_setup/.test && rm /OINSTALL/_dataguard_setup/.test
 
 # Persist in fstab
-echo "nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup nfs4 rw,bg,hard,nointr,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576 0 0" >> /etc/fstab
+echo "nfs-server:/OINSTALL/_dataguard_setup /OINSTALL/_dataguard_setup nfs4 rw,bg,hard,tcp,vers=4,timeo=600,rsize=1048576,wsize=1048576 0 0" >> /etc/fstab
 
 # Set permissions (750, not 775 - the mount point IS the exported share
 # directory, so a wider mode here would undo the 750 set by

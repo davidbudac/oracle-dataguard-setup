@@ -36,7 +36,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
-init_progress 14
+init_progress 13
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -359,11 +359,17 @@ progress_step "Setting LogXptMode to FASTSYNC"
 log_info "Setting LogXptMode to FASTSYNC for both databases..."
 
 log_cmd "dgmgrl / :" "EDIT DATABASE '${PRIMARY_DB_UNIQUE_NAME}' SET PROPERTY LogXptMode='FASTSYNC'"
-run_dgmgrl "set_logxptmode_fastsync.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME"
+if ! run_dgmgrl_checked "set_logxptmode_fastsync.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME"; then
+    log_error "Failed to set LogXptMode=FASTSYNC on $PRIMARY_DB_UNIQUE_NAME"
+    exit 1
+fi
 log_info "LogXptMode set to FASTSYNC for ${PRIMARY_DB_UNIQUE_NAME}"
 
 log_cmd "dgmgrl / :" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY LogXptMode='FASTSYNC'"
-run_dgmgrl "set_logxptmode_fastsync.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
+if ! run_dgmgrl_checked "set_logxptmode_fastsync.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"; then
+    log_error "Failed to set LogXptMode=FASTSYNC on $STANDBY_DB_UNIQUE_NAME"
+    exit 1
+fi
 log_info "LogXptMode set to FASTSYNC for ${STANDBY_DB_UNIQUE_NAME}"
 
 # ============================================================
@@ -420,7 +426,10 @@ progress_step "Setting FSFO Properties"
 
 log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=${FSFO_THRESHOLD}"
 log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='${STANDBY_DB_UNIQUE_NAME}'"
-run_dgmgrl "set_fsfo_properties.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$FSFO_THRESHOLD"
+if ! run_dgmgrl_checked "set_fsfo_properties.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$FSFO_THRESHOLD"; then
+    log_error "Failed to set FSFO properties (threshold/target)"
+    exit 1
+fi
 
 log_info "FSFO threshold set to ${FSFO_THRESHOLD} seconds"
 log_info "FSFO target set to ${STANDBY_DB_UNIQUE_NAME}"

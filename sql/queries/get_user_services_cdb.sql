@@ -7,6 +7,8 @@
 --   - PDB$SEED
 --   - The default per-container service (service name = container name)
 --   - The CDB-level DB/DB_UNIQUE_NAME/instance services
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 SELECT c.NAME || '|' || s.NAME
 FROM V$ACTIVE_SERVICES s

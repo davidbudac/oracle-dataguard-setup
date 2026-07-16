@@ -26,22 +26,24 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 
 ## Execution Order
 
-1. `nfs/01_setup_nfs_server.sh` - Setup NFS (on NFS server, requires sudo)
-2. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo)
-3. `primary/01_gather_primary_info.sh` - Collect primary DB info
-4. `primary/02_generate_standby_config.sh` - Generate standby config (user reviews)
-5. `standby/03_setup_standby_env.sh` - Prepare standby environment
-6. `primary/04_prepare_primary_dg.sh` - Configure primary for DG
-7. `standby/05_clone_standby.sh` - RMAN duplicate (prompts for SYS password)
-8. `primary/06_configure_broker.sh` - Configure DGMGRL
-9. `standby/07_verify_dataguard.sh` - Verify setup
-10. `primary/08_security_hardening.sh` - Lock SYS account (optional)
-11. `primary/09_configure_fsfo.sh` - Configure Fast-Start Failover (optional)
-12. `fsfo/observer.sh setup` - Set up observer wallet (on observer server)
-13. `fsfo/observer.sh start` - Start observer (on observer server)
-14. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
-15. `primary/10_generate_handoff_report.sh` - Generate end-user handoff report with status snapshot and TNS/JDBC connection strings (on PRIMARY)
-16. `common/cleanup_nfs_artifacts.sh` - Remove sensitive/transient setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share once the build is verified (optional, run from any host with the share mounted)
+Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step reference): NFS setup is Step 0a/0b (prerequisite, not counted in the main 1-12 sequence), and observer wallet setup + start are both part of Step 10.
+
+0a. `nfs/01_setup_nfs_server.sh` - Setup NFS (on NFS server, requires sudo)
+0b. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo)
+1. `primary/01_gather_primary_info.sh` - Collect primary DB info
+2. `primary/02_generate_standby_config.sh` - Generate standby config (user reviews)
+3. `standby/03_setup_standby_env.sh` - Prepare standby environment
+4. `primary/04_prepare_primary_dg.sh` - Configure primary for DG
+5. `standby/05_clone_standby.sh` - RMAN duplicate (prompts for SYS password)
+6. `primary/06_configure_broker.sh` - Configure DGMGRL
+7. `standby/07_verify_dataguard.sh` - Verify setup
+8. `primary/08_security_hardening.sh` - Lock SYS account (optional)
+9. `primary/09_configure_fsfo.sh` - Configure Fast-Start Failover (optional)
+10. `fsfo/observer.sh setup` then `fsfo/observer.sh start` - Set up and start the observer (on observer server, optional)
+11. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
+12. `common/cleanup_nfs_artifacts.sh` - Remove sensitive/transient setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share once the build is verified (optional, run from any host with the share mounted)
+
+Recommended, run any time after Step 7 (not part of the walkthrough's numbered sequence, but worth doing before Step 12 cleanup since cleanup can remove it): `primary/10_generate_handoff_report.sh` - Generate end-user handoff report with status snapshot and TNS/JDBC connection strings (on PRIMARY).
 
 ## Restartability
 
@@ -202,7 +204,7 @@ The observer must be running for automatic failover to occur.
 
 After Data Guard setup is complete, you can deploy triggers that automatically start/stop services based on database role:
 
-**Step 14: Deploy Service Trigger (on PRIMARY)**
+**Step 11: Deploy Service Trigger (on PRIMARY)**
 ```bash
 ./trigger/create_role_trigger.sh
 ```
@@ -254,7 +256,7 @@ Creates a service in the ROOT container (`CDB$ROOT`) of a multitenant database f
 
 After Data Guard is verified (and ideally after FSFO and the role-aware service trigger are in place), generate a Markdown handoff document for application teams that consume the database:
 
-**Step 15: Generate Handoff Report (on PRIMARY)**
+**Generate Handoff Report (on PRIMARY, recommended - see note in Execution Order above)**
 ```bash
 ./primary/10_generate_handoff_report.sh
 ```
@@ -283,7 +285,7 @@ Produces the same Markdown report against any existing Data Guard configuration 
 
 `primary/01_gather_primary_info.sh` and `primary/09_configure_fsfo.sh` stage `orapw*` password file copies (SYS password hash) on the group-readable NFS share, and `primary/08_security_hardening.sh` stages a refreshed `orapw*_hardened` copy; `primary/02_generate_standby_config.sh` and `standby/05_clone_standby.sh` leave a generated pfile and RMAN duplicate cmdfiles/logs behind. None of this is ever cleaned up automatically.
 
-**Step 16: Clean Up NFS Artifacts (on any host with the share mounted, optional)**
+**Step 12: Clean Up NFS Artifacts (on any host with the share mounted, optional)**
 ```bash
 ./common/cleanup_nfs_artifacts.sh                 # default: password files, pfile, RMAN cmdfiles/logs
 ./common/cleanup_nfs_artifacts.sh -c /path/to/standby_config_<NAME>.env
@@ -291,4 +293,4 @@ Produces the same Markdown report against any existing Data Guard configuration 
 ./common/cleanup_nfs_artifacts.sh -y              # skip the confirmation prompt
 ```
 
-Run this once Data Guard has been verified (Step 7) and the handoff report (Step 15) has been reviewed. It selects (or accepts via `-c`/`--config`) the build's `standby_config_*.env`, prints exactly what will be removed and what will be kept, and requires confirmation before deleting anything.
+Run this once Data Guard has been verified (Step 7) and the handoff report has been reviewed. It selects (or accepts via `-c`/`--config`) the build's `standby_config_*.env`, prints exactly what will be removed and what will be kept, and requires confirmation before deleting anything.

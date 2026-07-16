@@ -280,6 +280,19 @@ init_log() {
     local log_dir="${NFS_SHARE}/logs"
     local state_dir="${NFS_SHARE}/state"
 
+    # Idempotent: several scripts call init_log twice in one run (a
+    # generic name at startup, then a DB_UNIQUE_NAME-qualified name once
+    # config is loaded). Without this guard, the second call created a
+    # brand-new state file and left the first one behind forever marked
+    # status=RUNNING - print_summary only ever updates the *current*
+    # STEP_STATE_FILE, so the earlier one never gets finalized. Reuse the
+    # existing log/state files and just relabel the run instead.
+    if [[ -n "${STEP_STATE_FILE:-}" && -f "$STEP_STATE_FILE" ]]; then
+        record_state_value "script_name" "$script_name"
+        log_info "Log re-initialized for: $script_name (reusing existing log/state files)"
+        return 0
+    fi
+
     mkdir -p "$log_dir" 2>/dev/null
     mkdir -p "$state_dir" 2>/dev/null
     LOG_FILE="${log_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').log"
@@ -557,7 +570,21 @@ run_sql_query() {
     # so if sqlplus ever falls through to its SQL> prompt (e.g. SP2-0310 when
     # the script file is missing, or a statement that errors before EXIT) it
     # gets EOF and exits instead of blocking forever reading the terminal.
-    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
+    #
+    # The query scripts carry WHENEVER SQLERROR EXIT SQL.SQLCODE, so a
+    # failed query returns nonzero. Callers almost always capture stdout
+    # via $(...) - under set -e that would abort the script with the ORA-
+    # text trapped inside the never-used substitution. Surface the failure
+    # on stderr before propagating the exit code.
+    # The && rc=0 || rc=$? form keeps set -e from exiting on the failing
+    # assignment before we get a chance to print the error to stderr.
+    local output rc
+    output=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null) && rc=0 || rc=$?
+    printf '%s\n' "$output"
+    if [[ $rc -ne 0 ]]; then
+        printf 'ERROR: SQL query %s failed (exit %s). Output:\n%s\n' "$script_name" "$rc" "$output" >&2
+    fi
+    return $rc
 }
 
 # Run a SQL command script
@@ -576,6 +603,19 @@ run_sql_display() {
     local script_name="$1"
     shift
     sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
+}
+
+# Check whether a value is a plain non-negative integer (no sign, no
+# decimal point, no thousands separators). Use this to guard SQL*Plus
+# query output before it flows into shell arithmetic ($(( )) ) or gets
+# written into a generated env file - a query that errors out (or
+# returns NULL/empty because of an unexpected server state) must not
+# silently poison a downstream calculation.
+# bash 3.2 / AIX safe: plain ERE via [[ =~ ]], no grep -P, no \s.
+# Usage: is_numeric <value>
+is_numeric() {
+    local value="$1"
+    [[ "$value" =~ ^[0-9]+$ ]]
 }
 
 # Get a database parameter value
@@ -638,8 +678,20 @@ substitute_dgmgrl_args() {
     local content="$1"
     shift
     local i=1
+    local arg esc_arg
     for arg in "$@"; do
-        content=$(printf '%s' "$content" | sed "s|&${i}|${arg}|g")
+        # Escape the replacement side for sed: backslash first (so we
+        # don't double-escape the backslashes just inserted), then the
+        # '|' delimiter, then '&' (sed's "whole match" backreference).
+        # Without this, an arg containing any of those characters (e.g.
+        # a password or path with '&') could corrupt the substitution
+        # or inject a bogus backreference into the generated DGMGRL
+        # script. (Bash's own ${content//pat/repl} was tried instead of
+        # sed here, but bash 5.2+ gives '&' in the replacement the same
+        # "whole match" meaning sed does, so it needs identical escaping
+        # - sed is kept since callers already expect sed semantics.)
+        esc_arg=$(printf '%s' "$arg" | sed 's/\\/\\\\/g; s/|/\\|/g; s/&/\\\&/g')
+        content=$(printf '%s' "$content" | sed "s|&${i}|${esc_arg}|g")
         i=$((i + 1))
     done
     printf '%s' "$content"
@@ -672,6 +724,65 @@ run_dgmgrl() {
         confirm_approval_action "Run DGMGRL script" "printf '<script>' | \"$ORACLE_HOME/bin/dgmgrl\" -silent /  # ${script_name} $(shell_join "$@")" || return 1
     fi
     printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /
+}
+
+# Inspect captured DGMGRL output for failure patterns.
+# dgmgrl scripts always end in EXIT; so the process exit code is 0 even
+# when a command inside the script failed - the only reliable signal is
+# the text DGMGRL printed. Matches real ORA-/DGM- error codes and
+# "Error:"/"Failed." lines, while deliberately NOT matching benign broker
+# report lines such as "Error: 0" (no error) that appear in SHOW
+# CONFIGURATION / SHOW DATABASE output, or property names/values that
+# merely contain the word "error".
+# Usage: dgmgrl_output_has_error <output>
+dgmgrl_output_has_error() {
+    local output="$1"
+    # Real Oracle/broker error codes anywhere in the output.
+    if printf '%s\n' "$output" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+        return 0
+    fi
+    # A standalone "Error:" line with a nonzero code. "Error: 0" is the
+    # benign per-member status line in SHOW CONFIGURATION/SHOW DATABASE.
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Error:[[:space:]]*[1-9]'; then
+        return 0
+    fi
+    # DGMGRL prints a standalone "Failed." line for some failed operations.
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Failed\.[[:space:]]*$'; then
+        return 0
+    fi
+    return 1
+}
+
+# Run a DGMGRL script from the sql/dgmgrl directory and check its output
+# for failure patterns, since the script's own exit code is always 0
+# (every sql/dgmgrl/*.dgmgrl script ends in EXIT;). Use this instead of
+# run_dgmgrl for MUTATING broker commands (CREATE/ADD/EDIT/ENABLE/REMOVE,
+# protection mode changes, FSFO enable) where the caller relies on the
+# return code to detect failure. Prints the output exactly like
+# run_dgmgrl so existing `echo "$output"` / log capture patterns keep
+# working; only the return code differs.
+# Usage: run_dgmgrl_checked <script_name> [arg1] [arg2] ...
+run_dgmgrl_checked() {
+    local script_name="$1"
+    shift
+    local script_path="${SQL_DIR}/dgmgrl/${script_name}"
+    local content
+    content=$(cat "$script_path")
+    content=$(substitute_dgmgrl_args "$content" "$@")
+    if is_mutating_dgmgrl_script "$script_name"; then
+        confirm_approval_action "Run DGMGRL script" "printf '<script>' | \"$ORACLE_HOME/bin/dgmgrl\" -silent /  # ${script_name} $(shell_join "$@")" || return 1
+    fi
+    local output
+    output=$(printf '%s\n' "$content" | "$ORACLE_HOME/bin/dgmgrl" -silent /)
+    local rc=$?
+    printf '%s\n' "$output"
+    if [[ $rc -ne 0 ]]; then
+        return $rc
+    fi
+    if dgmgrl_output_has_error "$output"; then
+        return 1
+    fi
+    return 0
 }
 
 # Run a DGMGRL script with password authentication
@@ -1048,27 +1159,44 @@ select_config_file() {
     local file_type="$2"
     local glob_pattern="$3"
 
-    # Get files sorted by modification time (oldest first, newest last)
-    # AIX compatible: use ls -t (newest first) then reverse with tail -r or tac
+    # Build the candidate list via a glob loop rather than parsing `ls`
+    # output (the old approach broke on filenames containing spaces).
+    # The pattern is intentionally left unquoted so the shell performs
+    # pathname expansion; each match becomes exactly one array element
+    # here regardless of embedded spaces. Bash 3.2/AIX safe: no mapfile.
     local files_array=()
     local file
+    for file in $glob_pattern; do
+        [[ -e "$file" ]] || continue
+        files_array+=("$file")
+    done
 
-    # First check if any files match the pattern
-    local matching_files
-    matching_files=$(ls -1t $glob_pattern 2>/dev/null) || true
-
-    if [[ -z "$matching_files" ]]; then
+    if [[ ${#files_array[@]} -eq 0 ]]; then
         log_error "No ${file_type} files found matching: $glob_pattern"
         return 1
     fi
 
-    # Reverse the order (oldest first, newest last) - AIX compatible
-    # Using a while loop to reverse since tac may not exist on AIX
-    local reversed_files=()
-    while IFS= read -r file; do
-        reversed_files=("$file" "${reversed_files[@]}")
-    done <<< "$matching_files"
-    files_array=("${reversed_files[@]}")
+    # Sort oldest-first using bash's built-in -ot ("older than") file
+    # test instead of parsing `ls -t` output. Simple insertion sort -
+    # fine for the small number of candidate files expected here.
+    local sorted_files=()
+    for file in "${files_array[@]}"; do
+        local inserted=0
+        local new_sorted=()
+        local existing
+        for existing in "${sorted_files[@]}"; do
+            if [[ $inserted -eq 0 && "$file" -ot "$existing" ]]; then
+                new_sorted+=("$file")
+                inserted=1
+            fi
+            new_sorted+=("$existing")
+        done
+        if [[ $inserted -eq 0 ]]; then
+            new_sorted+=("$file")
+        fi
+        sorted_files=("${new_sorted[@]}")
+    done
+    files_array=("${sorted_files[@]}")
 
     local file_count=${#files_array[@]}
 

@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 1: Gather Primary Info"
-init_progress 11
+init_progress 12
 
 # ============================================================
 # NFS Share Configuration
@@ -140,9 +140,17 @@ echo "$ONLINE_REDO_INFO"
 # Get redo log size (in MB) and count
 REDO_LOG_SIZE_MB=$(run_sql_query "get_redo_log_size.sql")
 REDO_LOG_SIZE_MB=$(echo "$REDO_LOG_SIZE_MB" | tr -d ' \n\r')
+if ! is_numeric "$REDO_LOG_SIZE_MB"; then
+    log_error "get_redo_log_size.sql returned a non-numeric result: '${REDO_LOG_SIZE_MB}'"
+    exit 1
+fi
 
 ONLINE_REDO_GROUPS=$(run_sql_query "get_online_redo_count.sql")
 ONLINE_REDO_GROUPS=$(echo "$ONLINE_REDO_GROUPS" | tr -d ' \n\r')
+if ! is_numeric "$ONLINE_REDO_GROUPS"; then
+    log_error "get_online_redo_count.sql returned a non-numeric result: '${ONLINE_REDO_GROUPS}'"
+    exit 1
+fi
 
 log_info "Redo log size: ${REDO_LOG_SIZE_MB}MB"
 log_info "Online redo groups: $ONLINE_REDO_GROUPS"
@@ -151,7 +159,7 @@ log_info "Online redo groups: $ONLINE_REDO_GROUPS"
 REDO_LOG_PATHS_RAW=$(run_sql_query "get_redo_log_paths.sql")
 PRIMARY_REDO_PATHS=()
 while IFS= read -r _line; do
-    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    _line=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$_line" ]] && continue
     PRIMARY_REDO_PATHS+=("$_line")
 done <<< "$REDO_LOG_PATHS_RAW"
@@ -172,6 +180,10 @@ progress_step "Checking Standby Redo Logs"
 
 STANDBY_REDO_COUNT=$(run_sql_query "get_standby_redo_count.sql")
 STANDBY_REDO_COUNT=$(echo "$STANDBY_REDO_COUNT" | tr -d ' \n\r')
+if ! is_numeric "$STANDBY_REDO_COUNT"; then
+    log_error "get_standby_redo_count.sql returned a non-numeric result: '${STANDBY_REDO_COUNT}'"
+    exit 1
+fi
 
 if [[ "$STANDBY_REDO_COUNT" -gt 0 ]]; then
     log_info "Standby redo logs exist: $STANDBY_REDO_COUNT groups"
@@ -194,7 +206,7 @@ DATAFILE_DIRS=$(run_sql_query "get_datafile_dirs.sql")
 
 PRIMARY_DATA_PATHS=()
 while IFS= read -r _line; do
-    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    _line=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$_line" ]] && continue
     PRIMARY_DATA_PATHS+=("$_line")
 done <<< "$DATAFILE_DIRS"
@@ -204,7 +216,7 @@ done <<< "$DATAFILE_DIRS"
 # directory, and the RMAN duplicate would fail.
 TEMPFILE_DIRS=$(run_sql_query "get_tempfile_dirs.sql")
 while IFS= read -r _line; do
-    _line=$(printf '%s' "$_line" | tr -d ' \r')
+    _line=$(printf '%s' "$_line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
     [[ -z "$_line" ]] && continue
     _found="NO"
     for _p in "${PRIMARY_DATA_PATHS[@]}"; do
@@ -223,7 +235,7 @@ done <<< "$TEMPFILE_DIRS"
 # (FILE#=1) - on a CDB, the first directory in sorted order can be a
 # GUID/seed directory. Fall back to the first gathered directory.
 PRIMARY_DATA_PATH=$(run_sql_query "get_system_datafile_dir.sql")
-PRIMARY_DATA_PATH=$(echo "$PRIMARY_DATA_PATH" | tr -d ' \n\r')
+PRIMARY_DATA_PATH=$(printf '%s' "$PRIMARY_DATA_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 if [[ -z "$PRIMARY_DATA_PATH" ]]; then
     PRIMARY_DATA_PATH="${PRIMARY_DATA_PATHS[0]:-}"
 fi
@@ -270,6 +282,22 @@ TEMPFILE_SIZE_MB=$(echo "$TEMPFILE_SIZE_MB" | tr -d ' \n\r')
 REDOLOG_SIZE_MB=$(run_sql_query "get_redolog_total_size.sql")
 REDOLOG_SIZE_MB=$(echo "$REDOLOG_SIZE_MB" | tr -d ' \n\r')
 
+# Guard the three sizes before they feed shell arithmetic - a failed
+# query (or unexpected NULL) must not silently poison the required-space
+# calculation with a garbage value.
+if ! is_numeric "$DATAFILE_SIZE_MB"; then
+    log_error "get_datafile_size.sql returned a non-numeric result: '${DATAFILE_SIZE_MB}'"
+    exit 1
+fi
+if ! is_numeric "$TEMPFILE_SIZE_MB"; then
+    log_error "get_tempfile_size.sql returned a non-numeric result: '${TEMPFILE_SIZE_MB}'"
+    exit 1
+fi
+if ! is_numeric "$REDOLOG_SIZE_MB"; then
+    log_error "get_redolog_total_size.sql returned a non-numeric result: '${REDOLOG_SIZE_MB}'"
+    exit 1
+fi
+
 # Total size with 20% buffer for growth and standby redo logs
 TOTAL_DB_SIZE_MB=$((DATAFILE_SIZE_MB + TEMPFILE_SIZE_MB + REDOLOG_SIZE_MB))
 REQUIRED_SPACE_MB=$((TOTAL_DB_SIZE_MB * 120 / 100))
@@ -307,7 +335,7 @@ USE_FRA_FOR_ARCHIVE="NO"
 
 # First try V$ARCHIVE_DEST which shows the actual resolved destination
 ARCHIVE_DEST_PATH=$(run_sql_query "get_archive_dest.sql")
-ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
+ARCHIVE_DEST_PATH=$(printf '%s' "$ARCHIVE_DEST_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
 # If V$ARCHIVE_DEST didn't return a path, try the parameter
 if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
@@ -334,7 +362,7 @@ if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
     else
         # Last resort: query V$ARCHIVED_LOG for an existing archive location
         ARCHIVE_DEST_PATH=$(run_sql_query "get_archive_dest_from_logs.sql")
-        ARCHIVE_DEST_PATH=$(echo "$ARCHIVE_DEST_PATH" | tr -d ' \n\r')
+        ARCHIVE_DEST_PATH=$(printf '%s' "$ARCHIVE_DEST_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         if [[ -n "$ARCHIVE_DEST_PATH" ]]; then
             log_info "Archive destination (from archived logs): $ARCHIVE_DEST_PATH"
         else

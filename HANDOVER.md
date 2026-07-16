@@ -42,6 +42,12 @@ The user asked to verify usability when primary and standby have **different fil
 
 ## Known remaining issues (found, deliberately NOT fixed — good next tasks)
 
+> **Update 2026-07-17:** items 1, 2, and 4 below are FIXED on branch `handover-followups`.
+> Item 1 → new `run_dgmgrl_checked` (output-grepping, `Error: 0` benign line excluded) used by all mutating broker calls in steps 6/9; read-only and custom-grepping call sites left on `run_dgmgrl`.
+> Item 2 → `WHENEVER SQLERROR EXIT SQL.SQLCODE` added to all 54 `sql/queries/*.sql`; `run_sql_query` now surfaces failures on stderr (set -e safe); `is_numeric()` guards added at arithmetic/env consumption sites in steps 1/2/3.
+> Item 4 → all eight sub-items fixed (glob-based `select_config_file`, escaped `substitute_dgmgrl_args`, progress totals, idempotent `init_log`, NFS ping/showmount downgraded to warnings + `nointr` dropped, CLAUDE.md renumbered to walkthrough steps, optional TTY-gated control-file-2 dir prompt in step 2 + dir creation in step 3, `tr -d ' '` replaced with edge-trimming sed on paths).
+> Item 3 (E2E gaps) remains open — needs the live lab.
+
 1. **DGMGRL exit codes are meaningless** (`common/dg_functions.sh` `run_dgmgrl*`): scripts end in `EXIT;` so dgmgrl returns 0 even when CREATE CONFIGURATION / `StaticConnectIdentifier` edits failed; every `if ! run_dgmgrl` is a no-op. Fix = output-grepping wrappers (`ORA-|Error|Failed` → nonzero), but that changes behavior for ALL callers (some grep output themselves, e.g. `06:288`) — needs a deliberate pass, possibly a `run_dgmgrl_checked` used only by mutating calls.
 2. **`sql/queries/*.sql` lack `WHENEVER SQLERROR EXIT`** — error text can flow into env files/arithmetic as data. A sweep changes exit-code semantics under `set -e` repo-wide; pair with an `is_numeric` guard helper.
 3. E2E gaps: CDB E2E (`tests/e2e/run_e2e_test_cdb.sh`) builds a **zero-PDB, symmetric, token-in-path** CDB only. Untested: real PDBs/GUID dirs, asymmetric mounts, the new `_review_path_mappings` interactive path, OMF-primary→Traditional-standby, post-setup PDB creation with apply verification. IMPROVEMENT_PLAN.md items 6.2–6.4 (switchover/observer/CDB E2E) also still open.
