@@ -221,7 +221,7 @@ log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl r
 progress_step "Checking Force Logging"
 
 FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
-FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
+FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d '[:space:]')
 
 if [[ "$FORCE_LOGGING" != "YES" ]]; then
     log_info "Enabling FORCE LOGGING..."
@@ -240,7 +240,7 @@ progress_step "Checking Standby Redo Logs"
 
 # Get current standby redo log count
 CURRENT_STBY_GROUPS=$(run_sql_query "get_standby_redo_count.sql")
-CURRENT_STBY_GROUPS=$(echo "$CURRENT_STBY_GROUPS" | tr -d ' \n\r')
+CURRENT_STBY_GROUPS=$(echo "$CURRENT_STBY_GROUPS" | tr -d '[:space:]')
 
 REQUIRED_STBY_GROUPS=$STANDBY_REDO_GROUPS
 
@@ -252,7 +252,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
 
     # Get the max group number
     MAX_GROUP=$(run_sql_query "get_max_redo_group.sql")
-    MAX_GROUP=$(echo "$MAX_GROUP" | tr -d ' \n\r')
+    MAX_GROUP=$(echo "$MAX_GROUP" | tr -d '[:space:]')
 
     # Determine where to place SRLs on the primary.
     # Prefer PRIMARY_SRL_PATH from the config (set at step 2, may differ
@@ -265,7 +265,7 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         log_info "Using PRIMARY_SRL_PATH from config: $REDO_PATH"
     else
         REDO_PATH=$(run_sql_query "get_redo_member_path.sql")
-        REDO_PATH=$(echo "$REDO_PATH" | tr -d ' \n\r')
+        REDO_PATH=$(echo "$REDO_PATH" | tr -d '[:space:]')
         log_info "PRIMARY_SRL_PATH not set in config, using queried ORL path: $REDO_PATH"
     fi
 
@@ -366,7 +366,7 @@ fi
 
 # Verify broker processes are running
 DMON_COUNT=$(run_sql_query "get_dmon_count.sql")
-DMON_COUNT=$(echo "$DMON_COUNT" | tr -d ' \n\r')
+DMON_COUNT=$(echo "$DMON_COUNT" | tr -d '[:space:]')
 
 if [[ "$DMON_COUNT" -gt 0 ]]; then
     log_info "Data Guard Broker process (DMON) is running"

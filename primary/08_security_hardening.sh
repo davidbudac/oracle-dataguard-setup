@@ -39,7 +39,7 @@ check_nfs_mount || exit 1
 
 # Verify this is the primary database
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d '[:space:]')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -212,7 +212,7 @@ progress_step "Verifying Security Changes"
 
 # Check account status
 ACCOUNT_STATUS=$(run_sql_query "get_sys_account_status.sql")
-ACCOUNT_STATUS=$(echo "$ACCOUNT_STATUS" | tr -d ' \n\r')
+ACCOUNT_STATUS=$(echo "$ACCOUNT_STATUS" | tr -d '[:space:]')
 
 if [[ "$ACCOUNT_STATUS" == *"LOCKED"* ]]; then
     log_info "PASS: SYS account is locked (status: $ACCOUNT_STATUS)"

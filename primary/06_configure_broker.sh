@@ -100,7 +100,7 @@ fi
 
 # Check DMON process is running
 DMON_COUNT=$(run_sql_query "get_dmon_count.sql")
-DMON_COUNT=$(echo "$DMON_COUNT" | tr -d ' \n\r')
+DMON_COUNT=$(echo "$DMON_COUNT" | tr -d '[:space:]')
 
 if [[ "$DMON_COUNT" -eq 0 ]]; then
     log_error "Data Guard Broker process (DMON) is not running"

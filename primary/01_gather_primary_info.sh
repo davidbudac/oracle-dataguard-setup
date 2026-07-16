@@ -75,11 +75,11 @@ DB_UNIQUE_NAME=$(get_db_parameter "db_unique_name")
 init_log "01_gather_primary_info_${DB_UNIQUE_NAME}"
 DB_DOMAIN=$(get_db_parameter "db_domain")
 INSTANCE_NAME=$(run_sql_query "get_instance_name.sql")
-INSTANCE_NAME=$(echo "$INSTANCE_NAME" | tr -d ' \n\r')
+INSTANCE_NAME=$(echo "$INSTANCE_NAME" | tr -d '[:space:]')
 
 # Get DBID
 DBID=$(run_sql_query "get_dbid.sql")
-DBID=$(echo "$DBID" | tr -d ' \n\r')
+DBID=$(echo "$DBID" | tr -d '[:space:]')
 
 log_info "DB_NAME: $DB_NAME"
 log_info "DB_UNIQUE_NAME: $DB_UNIQUE_NAME"
@@ -139,14 +139,14 @@ echo "$ONLINE_REDO_INFO"
 
 # Get redo log size (in MB) and count
 REDO_LOG_SIZE_MB=$(run_sql_query "get_redo_log_size.sql")
-REDO_LOG_SIZE_MB=$(echo "$REDO_LOG_SIZE_MB" | tr -d ' \n\r')
+REDO_LOG_SIZE_MB=$(echo "$REDO_LOG_SIZE_MB" | tr -d '[:space:]')
 if ! is_numeric "$REDO_LOG_SIZE_MB"; then
     log_error "get_redo_log_size.sql returned a non-numeric result: '${REDO_LOG_SIZE_MB}'"
     exit 1
 fi
 
 ONLINE_REDO_GROUPS=$(run_sql_query "get_online_redo_count.sql")
-ONLINE_REDO_GROUPS=$(echo "$ONLINE_REDO_GROUPS" | tr -d ' \n\r')
+ONLINE_REDO_GROUPS=$(echo "$ONLINE_REDO_GROUPS" | tr -d '[:space:]')
 if ! is_numeric "$ONLINE_REDO_GROUPS"; then
     log_error "get_online_redo_count.sql returned a non-numeric result: '${ONLINE_REDO_GROUPS}'"
     exit 1
@@ -179,7 +179,7 @@ fi
 progress_step "Checking Standby Redo Logs"
 
 STANDBY_REDO_COUNT=$(run_sql_query "get_standby_redo_count.sql")
-STANDBY_REDO_COUNT=$(echo "$STANDBY_REDO_COUNT" | tr -d ' \n\r')
+STANDBY_REDO_COUNT=$(echo "$STANDBY_REDO_COUNT" | tr -d '[:space:]')
 if ! is_numeric "$STANDBY_REDO_COUNT"; then
     log_error "get_standby_redo_count.sql returned a non-numeric result: '${STANDBY_REDO_COUNT}'"
     exit 1
@@ -256,8 +256,8 @@ PRIMARY_DATA_PATH_SIZES_MB=()
 for _p in "${PRIMARY_DATA_PATHS[@]}"; do
     _size=""
     while IFS='|' read -r _dir _mb; do
-        _dir=$(printf '%s' "$_dir" | tr -d ' \r')
-        _mb=$(printf '%s' "$_mb" | tr -d ' \r')
+        _dir=$(printf '%s' "$_dir" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        _mb=$(printf '%s' "$_mb" | tr -d '[:space:]')
         if [[ -n "$_dir" && "$_dir" == "$_p" ]]; then
             _size="$_mb"
         fi
@@ -274,13 +274,13 @@ run_sql_display "get_datafile_info.sql"
 log_info "Calculating total database size..."
 
 DATAFILE_SIZE_MB=$(run_sql_query "get_datafile_size.sql")
-DATAFILE_SIZE_MB=$(echo "$DATAFILE_SIZE_MB" | tr -d ' \n\r')
+DATAFILE_SIZE_MB=$(echo "$DATAFILE_SIZE_MB" | tr -d '[:space:]')
 
 TEMPFILE_SIZE_MB=$(run_sql_query "get_tempfile_size.sql")
-TEMPFILE_SIZE_MB=$(echo "$TEMPFILE_SIZE_MB" | tr -d ' \n\r')
+TEMPFILE_SIZE_MB=$(echo "$TEMPFILE_SIZE_MB" | tr -d '[:space:]')
 
 REDOLOG_SIZE_MB=$(run_sql_query "get_redolog_total_size.sql")
-REDOLOG_SIZE_MB=$(echo "$REDOLOG_SIZE_MB" | tr -d ' \n\r')
+REDOLOG_SIZE_MB=$(echo "$REDOLOG_SIZE_MB" | tr -d '[:space:]')
 
 # Guard the three sizes before they feed shell arithmetic - a failed
 # query (or unexpected NULL) must not silently poison the required-space
@@ -326,7 +326,7 @@ progress_step "Gathering Archive Log Configuration"
 
 # Check archive log mode
 LOG_MODE=$(run_sql_query "get_log_mode.sql")
-LOG_MODE=$(echo "$LOG_MODE" | tr -d ' \n\r')
+LOG_MODE=$(echo "$LOG_MODE" | tr -d '[:space:]')
 log_info "Log mode: $LOG_MODE"
 
 # Get archive destination - query V$ARCHIVE_DEST for the resolved path
@@ -423,7 +423,7 @@ fi
 # Method 2: Try V$LISTENER_NETWORK view
 if [[ -z "$LISTENER_PORT" ]]; then
     LISTENER_PORT=$(run_sql_query "get_listener_port.sql")
-    LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d ' \n\r')
+    LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d '[:space:]')
     if [[ -n "$LISTENER_PORT" ]]; then
         log_info "Listener port from V\$LISTENER_NETWORK: $LISTENER_PORT"
     fi
@@ -476,7 +476,7 @@ fi
 
 # Check FORCE LOGGING
 FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
-FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d ' \n\r')
+FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d '[:space:]')
 
 if [[ "$FORCE_LOGGING" != "YES" ]]; then
     log_warn "PREREQUISITE WARNING: FORCE_LOGGING is not enabled"

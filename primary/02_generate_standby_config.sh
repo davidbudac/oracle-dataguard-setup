@@ -665,7 +665,7 @@ _review_path_mappings() {
         fi
         printf "Accept all mappings [Enter], or enter a number to edit: "
         read _num || _num=""
-        _num=$(echo "$_num" | tr -d ' \n\r')
+        _num=$(echo "$_num" | tr -d '[:space:]')
         [[ -z "$_num" ]] && return 0
         case "$_num" in
             *[!0-9]*) echo "Invalid selection: $_num"; continue ;;
@@ -712,7 +712,7 @@ echo "  Standby SRLs -> $STANDBY_REDO_PATH"
 echo ""
 printf "Use a SEPARATE directory for standby redo logs? [y/N]: "
 read _separate_srl
-_separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d ' \n\r')
+_separate_srl=$(echo "$_separate_srl" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
 
 if [[ "$_separate_srl" == "y" || "$_separate_srl" == "yes" ]]; then
     prompt_with_default "Primary SRL directory" "$PRIMARY_REDO_PATH" PRIMARY_SRL_PATH
