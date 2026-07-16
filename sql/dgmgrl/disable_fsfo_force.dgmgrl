@@ -1,0 +1,8 @@
+-- ============================================================
+-- Disable Fast-Start Failover (FORCE)
+-- Used when the normal DISABLE fails because the observer or a
+-- member is unreachable - FORCE disables FSFO on the connected
+-- database unconditionally.
+-- ============================================================
+DISABLE FAST_START FAILOVER FORCE;
+EXIT;

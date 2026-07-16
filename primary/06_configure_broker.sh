@@ -152,6 +152,25 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
         exit 0
     fi
 
+    # REMOVE CONFIGURATION fails with ORA-16654 while fast-start
+    # failover is enabled, so disable FSFO first when the existing
+    # config shows it enabled. Fall back to FORCE (works even when
+    # the observer or the standby is unreachable).
+    if echo "$EXISTING_CONFIG" | grep -qi "Fast-Start Failover:[[:space:]]*Enabled"; then
+        log_info "Fast-Start Failover is enabled - disabling it before removal..."
+        log_cmd "dgmgrl /:" "DISABLE FAST_START FAILOVER"
+        DISABLE_OUTPUT=$(run_dgmgrl "disable_fsfo.dgmgrl" 2>&1 || true)
+        if dgmgrl_output_has_error "$DISABLE_OUTPUT"; then
+            log_warn "Normal FSFO disable failed - retrying with FORCE..."
+            log_cmd "dgmgrl /:" "DISABLE FAST_START FAILOVER FORCE"
+            if ! run_dgmgrl_checked "disable_fsfo_force.dgmgrl"; then
+                log_error "Could not disable Fast-Start Failover - cannot remove the configuration"
+                exit 1
+            fi
+        fi
+        log_info "Fast-Start Failover disabled"
+    fi
+
     log_info "Removing existing configuration..."
     log_cmd "dgmgrl /:" "REMOVE CONFIGURATION"
     REMOVE_OUTPUT=$(run_dgmgrl "remove_configuration.dgmgrl" 2>&1)
