@@ -368,19 +368,33 @@ phase_deploy() {
         result=$(ssh_cmd "$label" "
             if [[ -d '${REPO_DIR}/.git' ]]; then
                 cd '${REPO_DIR}'
-                git fetch origin '${REPO_BRANCH}' 2>&1
-                git checkout '${REPO_BRANCH}' 2>&1
-                git reset --hard 'origin/${REPO_BRANCH}' 2>&1
-                echo 'DEPLOY_PULL_OK'
+                if git fetch origin '${REPO_BRANCH}' 2>&1 \
+                    && git checkout '${REPO_BRANCH}' 2>&1 \
+                    && git reset --hard 'origin/${REPO_BRANCH}' 2>&1; then
+                    echo 'DEPLOY_PULL_OK'
+                else
+                    # The host may not be able to reach the git remote
+                    # (e.g. private repo, no credentials). The tree may
+                    # still be current if it was deployed by rsync -
+                    # report that honestly instead of a false PULL_OK.
+                    echo 'DEPLOY_PULL_FAILED'
+                fi
+            elif [[ -d '${REPO_DIR}' ]]; then
+                # Directory exists without .git - rsync-deployed tree.
+                echo 'DEPLOY_RSYNC_TREE'
             else
                 mkdir -p '$(dirname "${REPO_DIR}")'
-                git clone -b '${REPO_BRANCH}' '${REPO_URL}' '${REPO_DIR}' 2>&1
-                echo 'DEPLOY_CLONE_OK'
+                if git clone -b '${REPO_BRANCH}' '${REPO_URL}' '${REPO_DIR}' 2>&1; then
+                    echo 'DEPLOY_CLONE_OK'
+                fi
             fi
         ")
 
-        if echo "$result" | grep -q 'DEPLOY_.*_OK'; then
+        if echo "$result" | grep -q 'DEPLOY_PULL_OK\|DEPLOY_CLONE_OK'; then
             log_pass "${label}: Scripts deployed to ${REPO_DIR}"
+        elif echo "$result" | grep -q 'DEPLOY_PULL_FAILED\|DEPLOY_RSYNC_TREE'; then
+            log_warn "${label}: git deploy unavailable - using the existing tree at ${REPO_DIR} as-is"
+            log_warn "${label}: make sure it is current (e.g. rsync it) before trusting results"
         else
             log_fail "${label}: Failed to deploy scripts"
             log_info "  Output: $(echo "$result" | tail -5)"
@@ -601,7 +615,16 @@ phase_create_db() {
         echo 'DBCA_EXIT_CODE='\$?
     " 1800)
 
-    if ! echo "$result" | grep -q 'DBCA_EXIT_CODE=0'; then
+    # DBCA exits 6 for "completed with warnings" (e.g. a transient
+    # ORA-12721 during character-set setup) even though the database was
+    # fully created. Treat that as success as long as DBCA itself says
+    # creation completed; anything else is a real failure.
+    if echo "$result" | grep -q 'DBCA_EXIT_CODE=0'; then
+        :
+    elif echo "$result" | grep -q 'DBCA_EXIT_CODE=6' \
+        && echo "$result" | grep -qi 'Database creation complete'; then
+        log_info "DBCA exited 6 (completed with warnings) - creation completed, continuing"
+    else
         log_fail "DBCA database creation failed"
         record_issue "create_db" "DBCA failed to create database" "$(echo "$result" | tail -20)"
         return 1
