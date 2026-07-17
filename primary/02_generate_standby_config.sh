@@ -613,8 +613,15 @@ _confirm_unmapped_paths() {
             echo "  case), so it was left unchanged. If the standby host uses the"
             echo "  SAME path, accept the default. If it differs, enter"
             echo "  the correct standby directory now (RMAN will fail later otherwise)."
-            prompt_with_default "Standby ${_label} directory for '$_pri'" "$_pri" _ans
-            eval "${_stby_arr}[$_i]=\"\$_ans\""
+            # TTY-gated: with piped stdin (E2E fixed input sequence) no
+            # input may be consumed - keep the identical default and rely
+            # on the operator editing the .env + --regenerate if needed.
+            if [[ -t 0 ]]; then
+                prompt_with_default "Standby ${_label} directory for '$_pri'" "$_pri" _ans
+                eval "${_stby_arr}[$_i]=\"\$_ans\""
+            else
+                log_warn "Non-interactive run: keeping the identical path on the standby (edit the .env and run --regenerate to change it)"
+            fi
         fi
         _i=$(( _i + 1 ))
     done
