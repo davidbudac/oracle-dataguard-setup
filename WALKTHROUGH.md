@@ -159,8 +159,15 @@ export ORACLE_HOME=/u01/app/oracle/product/19.0.0/dbhome_1
 - Storage mode: `1` Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or `2` OMF (`db_create_file_dest` + `db_recovery_file_dest`)
 - If OMF: `db_create_file_dest`, `db_recovery_file_dest`, `db_recovery_file_dest_size`
 - If Traditional: optionally use a SEPARATE directory for standby redo logs; if yes, the primary and standby SRL paths
+- If Traditional: confirmation for each path that could NOT be auto-derived (no DB-name component — usually redo/temp on its own mount). Accept the identical path, or enter the correct standby directory
+- If Traditional: a numbered `primary -> standby` mapping table — Enter to accept all, or a number to override one entry. Use this when the standby's layout differs from the primary's
+- Standby ORACLE_BASE and ORACLE_HOME (default: the primary's values)
 
 **Review the generated summary and file list before confirming.**
+
+**Different filesystem layout on the standby?** Correct it in the two path prompts above — they run before anything is generated. Afterwards, edit the `PRIMARY_*_PATHS` / `STANDBY_*_PATHS` arrays in the `.env` and re-run `./primary/02_generate_standby_config.sh --regenerate` (edit the arrays, not the convert strings — `--regenerate` rebuilds those from the arrays and writes them back to the `.env`).
+
+> Both path prompts appear on an interactive terminal only. Piped/non-interactive runs accept the derived defaults, so use the edit-env + `--regenerate` route there.
 
 **Output files (on NFS):**
 - `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` - Master configuration (single source of truth)

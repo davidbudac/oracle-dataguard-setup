@@ -304,16 +304,39 @@ cp $ORACLE_HOME/dbs/orapw$ORACLE_SID /OINSTALL/_dataguard_setup/
 ### What the Script Does
 
 1. Loads primary information from NFS share
-2. Prompts for standby hostname and DB_UNIQUE_NAME
+2. Prompts for standby hostname, DB_UNIQUE_NAME, and ORACLE_SID
 3. Prompts for standby storage mode:
    - **Traditional** (default): derives standby paths from primary via path substitution (`DB_FILE_NAME_CONVERT`)
    - **OMF**: prompts for `db_create_file_dest` and `db_recovery_file_dest` — no FILE_NAME_CONVERT needed. Use this when the standby has a different storage layout (e.g., FRA) than the primary.
-4. Generates path conversion parameters (Traditional mode) or OMF configuration
-5. Creates standby parameter file (init.ora)
-5. Creates TNS entries for both databases
-6. Creates listener configuration with static registration (including _DGMGRL services)
-7. Creates DGMGRL script template
-8. Writes master configuration file `standby_config_<STANDBY_DB_UNIQUE_NAME>.env`
+4. Derives each standby directory from its primary counterpart by swapping the DB-name path component, then (Traditional mode) walks you through the result — see [Reviewing the derived path mappings](#reviewing-the-derived-path-mappings) below
+5. Prompts for the standby `ORACLE_BASE` / `ORACLE_HOME` (defaults: the primary's values)
+6. Generates path conversion parameters (Traditional mode) or OMF configuration
+7. Creates standby parameter file (init.ora)
+8. Creates TNS entries for both databases
+9. Creates listener configuration with static registration (including _DGMGRL services)
+10. Creates DGMGRL script template
+11. Writes master configuration file `standby_config_<STANDBY_DB_UNIQUE_NAME>.env`
+
+### Reviewing the Derived Path Mappings
+
+Standby directories are derived by replacing the DB-name component of each primary path (`/u01/oradata/PROD` → `/u01/oradata/PRODSTBY`). That is correct when both hosts share a mount layout, but a standby with a **different layout** needs corrections. Traditional mode surfaces two opportunities to make them:
+
+1. **Unmapped-path confirmation.** A path with no DB-name component in it (in any case) — typically redo or temp on its own mount — cannot be auto-derived and is left pointing at the *primary's* directory. Each one is flagged individually so you can accept the identical path or type the correct standby directory. Leaving a wrong path here makes the Step 5 RMAN duplicate fail with `ORA-17502` / `ORA-19504`, because the directory is never created on the standby.
+2. **Mapping review table.** A numbered table of every derived `primary -> standby` directory mapping. Press Enter to accept all, or enter a number to override that entry. This is where you redirect an *asymmetric* standby — one where the token substitution succeeded but the base mount differs entirely (`/u01/oradata/PROD` → `/oracle/data/PRODSTBY`).
+
+Both run **before** the convert pairs and the `.env` are written, so corrections propagate into every generated file.
+
+> **Non-interactive runs (piped stdin):** both prompts are TTY-gated. The mapping table is still printed for the log, but the derived defaults are accepted silently and unmapped paths keep the identical primary path with a warning. To change a path afterwards, edit `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` and re-run with `--regenerate` (see below).
+
+### Regenerating After Editing the Config
+
+```bash
+./primary/02_generate_standby_config.sh --regenerate
+```
+
+`--regenerate` re-derives the `DB_FILE_NAME_CONVERT` / `LOG_FILE_NAME_CONVERT` pairs from the `PRIMARY_*_PATHS` / `STANDBY_*_PATHS` arrays in the `.env`, rewrites the derived files (pfile, TNS, listener, DGMGRL), **and persists the rebuilt convert strings back into the `.env` itself**. That last part matters: Step 5 feeds RMAN's `SPFILE SET` clause from the `.env`, and the `SPFILE SET` value overrides the regenerated pfile — so a stale string there would silently override your edited layout.
+
+Edit the **path arrays**, not the convert strings — the arrays are the source of truth. If the arrays are missing or their lengths don't match, the pairs are *not* re-derived and the stored convert strings are used verbatim (the script warns when this happens).
 
 ### Manual Equivalent
 

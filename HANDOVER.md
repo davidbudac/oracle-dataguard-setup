@@ -1,8 +1,8 @@
 # Handover: Repo Review & Asymmetric-Layout Hardening
 
-**Branch:** `claude/project-review-plan-l5ihf4` (pushed; branched from `main` @ `04012ad`)
-**Commits:** `ef4190b` (review fixes), `02f85f4` (asymmetric filesystem support)
-**Status:** All work committed and pushed. `bash -n` clean on every touched script; all 7 unit tests pass (`for t in tests/test_*.sh; do bash "$t"; done`). No PR opened (user has not asked for one).
+**Branch:** `claude/project-review-plan-l5ihf4` (branched from `main` @ `04012ad`), then `handover-followups`
+**Commits:** `ef4190b` (review fixes), `02f85f4` (asymmetric filesystem support), plus the `handover-followups` series
+**Status:** **Merged to `main` @ `706c1a5` (2026-07-17)** — this document is now a historical record of the work, not an open handover. `bash -n` clean on every touched script; all 7 unit tests pass (`for t in tests/test_*.sh; do bash "$t"; done`). Known issues 1, 2, and 4 below are fixed; see the update block under "Known remaining issues" for what is still open.
 
 ## What this branch contains
 
@@ -66,4 +66,6 @@ for t in tests/test_*.sh; do bash "$t"; done          # all 7 must pass
 bash ./tests/e2e/run_e2e_test.sh                       # ~20 min, needs the lab env (tests/e2e/config.env)
 ```
 
-The single most valuable validation still outstanding: **one live E2E run with an intentionally asymmetric standby layout** (different base mount, temp on its own mount, ideally a 1-PDB CDB) — the asymmetric fixes are verified by code trace and unit tests, not by a real RMAN duplicate.
+~~The single most valuable validation still outstanding: **one live E2E run with an intentionally asymmetric standby layout**~~ — **done 2026-07-17** against the poug-dg1/poug-dg2 lab (non-CDB); see the update block above for the results and the eight fixes it produced. The asymmetric fixes are now backed by a real RMAN duplicate, not only code trace and unit tests.
+
+The most valuable validation now outstanding: **the same asymmetric run against a CDB with real PDBs** (GUID dirs), plus OMF-primary→Traditional-standby and switchover/observer (IMPROVEMENT_PLAN 6.2–6.4).
