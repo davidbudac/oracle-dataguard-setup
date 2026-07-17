@@ -256,7 +256,7 @@ log_info "Password verified successfully"
 progress_step "Starting Standby Instance"
 
 # Check if instance is already running
-INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>&1)
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>&1 || true)
 
 if echo "$INSTANCE_STATUS" | grep -qE "STARTED|MOUNTED|OPEN"; then
     log_warn "Instance is already running"
@@ -270,7 +270,7 @@ log_cmd "sqlplus / as sysdba:" "STARTUP NOMOUNT PFILE='${PFILE}'"
 run_sql_command "startup_nomount.sql" "$PFILE"
 
 # Verify NOMOUNT state
-INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
 INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
 
 if [[ "$INSTANCE_STATUS" != "STARTED" ]]; then
@@ -485,7 +485,7 @@ record_artifact "rman_log:${RMAN_LOG}"
 progress_step "Finalizing Instance Configuration"
 
 # Check if we're mounted
-INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
 INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
 
 log_info "Current instance status: $INSTANCE_STATUS"
@@ -516,7 +516,7 @@ log_cmd "sqlplus / as sysdba:" "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE 
 # already MOUNTED once the duplicate completes, so re-issuing MOUNT STANDBY
 # DATABASE here would raise ORA-01100 (database already mounted) now that
 # mount_standby.sql aborts on SQL errors. Only mount if it isn't already.
-INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql")
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
 INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
 
 if [[ "$INSTANCE_STATUS" == "MOUNTED" ]]; then
