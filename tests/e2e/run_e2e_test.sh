@@ -390,9 +390,9 @@ phase_deploy() {
             fi
         ")
 
-        if echo "$result" | grep -q 'DEPLOY_PULL_OK\|DEPLOY_CLONE_OK'; then
+        if echo "$result" | grep -Eq 'DEPLOY_PULL_OK|DEPLOY_CLONE_OK'; then
             log_pass "${label}: Scripts deployed to ${REPO_DIR}"
-        elif echo "$result" | grep -q 'DEPLOY_PULL_FAILED\|DEPLOY_RSYNC_TREE'; then
+        elif echo "$result" | grep -Eq 'DEPLOY_PULL_FAILED|DEPLOY_RSYNC_TREE'; then
             log_warn "${label}: git deploy unavailable - using the existing tree at ${REPO_DIR} as-is"
             log_warn "${label}: make sure it is current (e.g. rsync it) before trusting results"
         else
@@ -1040,7 +1040,7 @@ phase_step6() {
     # Validate: broker configuration exists and is enabled
     assert_dgmgrl "PRIMARY" \
         "SHOW CONFIGURATION" \
-        "SUCCESS\|enabled\|Enabled" \
+        "SUCCESS|enabled|Enabled" \
         "Broker configuration enabled" || {
         # The broker health check can take a couple of minutes to report
         # SUCCESS on a fresh configuration - retry up to 4x30s before
@@ -1051,7 +1051,7 @@ phase_step6() {
             sleep 30
             if assert_dgmgrl "PRIMARY" \
                 "SHOW CONFIGURATION" \
-                "SUCCESS\|enabled\|Enabled" \
+                "SUCCESS|enabled|Enabled" \
                 "Broker configuration enabled (retry ${_retry})"; then
                 _broker_ok=1
                 break
@@ -1063,12 +1063,12 @@ phase_step6() {
     # Validate: both databases in configuration
     assert_dgmgrl "PRIMARY" \
         "SHOW DATABASE '${TEST_DB_UNIQUE_NAME}'" \
-        "Primary\|PRIMARY" \
+        "Primary|PRIMARY" \
         "Primary database in broker" || return 1
 
     assert_dgmgrl "PRIMARY" \
         "SHOW DATABASE '${TEST_STANDBY_DB_UNIQUE_NAME}'" \
-        "Standby\|STANDBY\|Physical" \
+        "Standby|STANDBY|Physical" \
         "Standby database in broker" || return 1
 
     log_pass "Step 6 completed and validated"
@@ -1211,7 +1211,7 @@ phase_step9() {
     # Validate: FSFO enabled
     assert_dgmgrl "PRIMARY" \
         "SHOW FAST_START FAILOVER" \
-        "Enabled\|enabled\|ENABLED" \
+        "Enabled|enabled|ENABLED" \
         "FSFO is enabled" || return 1
 
     # Validate: protection mode
@@ -1297,7 +1297,7 @@ phase_step10() {
     sleep 10
     assert_dgmgrl "PRIMARY" \
         "SHOW FAST_START FAILOVER" \
-        "Observer.*:.*\|observer" \
+        "Observer.*:.*|observer" \
         "Observer registered in FSFO" || {
         log_info "Observer may take time to register - continuing"
     }
