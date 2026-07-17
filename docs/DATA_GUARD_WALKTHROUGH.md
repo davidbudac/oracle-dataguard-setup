@@ -326,6 +326,14 @@ Standby directories are derived by replacing the DB-name component of each prima
 
 Both run **before** the convert pairs and the `.env` are written, so corrections propagate into every generated file.
 
+#### One split the standby cannot make on its own
+
+If the **primary** keeps datafiles and redo logs in the *same* directory, the standby cannot split them into two. Step 2 warns when you ask for it (`Data/redo path collision`) and tells you which standby directory will go unused.
+
+The reason is structural: a convert pair remaps a primary *filename*, and when ORLs and datafiles share one primary directory, nothing in the filename distinguishes them. Both pairs end up with an identical primary path, so Oracle's first-prefix match takes the datafile pair and every redo log follows the datafiles to the standby's data directory. The result is functional — the standby is correct and applies redo — but the split you configured silently doesn't happen.
+
+To genuinely split redo on the standby, give the **primary** a distinct redo directory as well, then re-run Step 2. This is the same root cause as the SRL-contradiction warning (`PRIMARY_SRL_PATH` equal to `PRIMARY_REDO_PATH` with a differing standby SRL path).
+
 > **Non-interactive runs (piped stdin):** both prompts are TTY-gated. The mapping table is still printed for the log, but the derived defaults are accepted silently and unmapped paths keep the identical primary path with a warning. To change a path afterwards, edit `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` and re-run with `--regenerate` (see below).
 
 ### Regenerating After Editing the Config

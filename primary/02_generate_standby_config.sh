@@ -101,6 +101,59 @@ build_convert_pairs() {
     _collect_from_arrays "$_pd_arr" "$_sd_arr"
     _collect_from_arrays "$_pr_arr" "$_sr_arr"
 
+    # Detect the data/redo collision: the PRIMARY keeps redo logs in the
+    # SAME directory as datafiles, but the STANDBY splits them into two.
+    # Both pairs are emitted and share an identical primary path, so the
+    # length sort below cannot separate them and Oracle's first-prefix
+    # match always picks the earlier one (datafiles). Redo logs then land
+    # in the standby DATA directory and the split redo directory is never
+    # used - functional, but not what the operator asked for, and silent
+    # until someone looks at V$LOGFILE on the standby post-clone.
+    #
+    # A convert pair remaps a primary FILENAME; when ORLs and datafiles
+    # share one primary directory nothing distinguishes them, so no pair
+    # can send them to different standby directories. Warn rather than
+    # "fix": splitting them requires a distinct PRIMARY redo directory,
+    # which is a primary-side change only the operator can make.
+    _warn_data_redo_collision() {
+        local _pa="$1" _sa="$2" _ra="$3" _rsa="$4"
+        local _ri=0 _rn _di _dn _rp _rs _dp _ds
+        eval "_rn=\${#${_ra}[@]}"
+        eval "_dn=\${#${_pa}[@]}"
+        while [[ $_ri -lt $_rn ]]; do
+            eval "_rp=\${${_ra}[$_ri]}"
+            eval "_rs=\${${_rsa}[$_ri]}"
+            if [[ -n "$_rp" && -n "$_rs" ]]; then
+                _rp="${_rp%/}/"
+                _rs="${_rs%/}/"
+                _di=0
+                while [[ $_di -lt $_dn ]]; do
+                    eval "_dp=\${${_pa}[$_di]}"
+                    eval "_ds=\${${_sa}[$_di]}"
+                    if [[ -n "$_dp" && -n "$_ds" ]]; then
+                        _dp="${_dp%/}/"
+                        _ds="${_ds%/}/"
+                        if [[ "$_rp" == "$_dp" && "$_rs" != "$_ds" ]]; then
+                            log_warn "Data/redo path collision: the primary keeps datafiles AND redo logs in"
+                            log_warn "  ${_rp}"
+                            log_warn "  but the standby splits them (data -> ${_ds}, redo -> ${_rs})."
+                            log_warn "  Convert pairs remap primary filenames, and nothing distinguishes an ORL"
+                            log_warn "  from a datafile when both share one primary directory - so both pairs"
+                            log_warn "  share the primary path '${_rp}' and Oracle's first-prefix match takes the"
+                            log_warn "  datafile pair. Redo logs WILL be created under ${_ds} on the standby;"
+                            log_warn "  ${_rs} will stay unused."
+                            log_warn "  To split redo on the standby, give the PRIMARY a distinct redo directory"
+                            log_warn "  as well, then re-run this script."
+                        fi
+                    fi
+                    _di=$(( _di + 1 ))
+                done
+            fi
+            _ri=$(( _ri + 1 ))
+        done
+    }
+    _warn_data_redo_collision "$_pd_arr" "$_sd_arr" "$_pr_arr" "$_sr_arr"
+
     # Separate SRL pair when configured. When the PRIMARY side is NOT
     # separated (PRIMARY_SRL_PATH == PRIMARY_REDO_PATH) no SRL pair is
     # emitted - so a standby-only separation is unreachable: no pair

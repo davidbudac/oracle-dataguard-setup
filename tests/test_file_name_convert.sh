@@ -58,6 +58,22 @@ assert_contains() {
     esac
 }
 
+assert_not_contains() {
+    local name="$1" needle="$2" haystack="$3"
+    case "$haystack" in
+        *"$needle"*)
+            echo "  FAIL: $name"
+            echo "    expected NOT to contain: $needle"
+            echo "    actual:                  $haystack"
+            FAIL=$((FAIL + 1))
+            ;;
+        *)
+            echo "  PASS: $name"
+            PASS=$((PASS + 1))
+            ;;
+    esac
+}
+
 # The script logs through log_warn (dg_functions.sh); capture the
 # messages here so the SRL-contradiction and length warnings can be
 # asserted on.
@@ -78,7 +94,9 @@ reset_globals() {
 # ------------------------------------------------------------
 # build_convert_pairs lifted VERBATIM from
 # primary/02_generate_standby_config.sh - do not edit here; edit the
-# script and re-copy.
+# script and re-copy. assert_no_drift() below enforces that mechanically
+# (this used to be a comment-only convention, so the copies could rot
+# apart while every test still passed).
 # ------------------------------------------------------------
 build_convert_pairs() {
     local _pd_arr="$1"
@@ -129,6 +147,59 @@ build_convert_pairs() {
     # Datafile pairs, then redo log pairs - one per distinct directory
     _collect_from_arrays "$_pd_arr" "$_sd_arr"
     _collect_from_arrays "$_pr_arr" "$_sr_arr"
+
+    # Detect the data/redo collision: the PRIMARY keeps redo logs in the
+    # SAME directory as datafiles, but the STANDBY splits them into two.
+    # Both pairs are emitted and share an identical primary path, so the
+    # length sort below cannot separate them and Oracle's first-prefix
+    # match always picks the earlier one (datafiles). Redo logs then land
+    # in the standby DATA directory and the split redo directory is never
+    # used - functional, but not what the operator asked for, and silent
+    # until someone looks at V$LOGFILE on the standby post-clone.
+    #
+    # A convert pair remaps a primary FILENAME; when ORLs and datafiles
+    # share one primary directory nothing distinguishes them, so no pair
+    # can send them to different standby directories. Warn rather than
+    # "fix": splitting them requires a distinct PRIMARY redo directory,
+    # which is a primary-side change only the operator can make.
+    _warn_data_redo_collision() {
+        local _pa="$1" _sa="$2" _ra="$3" _rsa="$4"
+        local _ri=0 _rn _di _dn _rp _rs _dp _ds
+        eval "_rn=\${#${_ra}[@]}"
+        eval "_dn=\${#${_pa}[@]}"
+        while [[ $_ri -lt $_rn ]]; do
+            eval "_rp=\${${_ra}[$_ri]}"
+            eval "_rs=\${${_rsa}[$_ri]}"
+            if [[ -n "$_rp" && -n "$_rs" ]]; then
+                _rp="${_rp%/}/"
+                _rs="${_rs%/}/"
+                _di=0
+                while [[ $_di -lt $_dn ]]; do
+                    eval "_dp=\${${_pa}[$_di]}"
+                    eval "_ds=\${${_sa}[$_di]}"
+                    if [[ -n "$_dp" && -n "$_ds" ]]; then
+                        _dp="${_dp%/}/"
+                        _ds="${_ds%/}/"
+                        if [[ "$_rp" == "$_dp" && "$_rs" != "$_ds" ]]; then
+                            log_warn "Data/redo path collision: the primary keeps datafiles AND redo logs in"
+                            log_warn "  ${_rp}"
+                            log_warn "  but the standby splits them (data -> ${_ds}, redo -> ${_rs})."
+                            log_warn "  Convert pairs remap primary filenames, and nothing distinguishes an ORL"
+                            log_warn "  from a datafile when both share one primary directory - so both pairs"
+                            log_warn "  share the primary path '${_rp}' and Oracle's first-prefix match takes the"
+                            log_warn "  datafile pair. Redo logs WILL be created under ${_ds} on the standby;"
+                            log_warn "  ${_rs} will stay unused."
+                            log_warn "  To split redo on the standby, give the PRIMARY a distinct redo directory"
+                            log_warn "  as well, then re-run this script."
+                        fi
+                    fi
+                    _di=$(( _di + 1 ))
+                done
+            fi
+            _ri=$(( _ri + 1 ))
+        done
+    }
+    _warn_data_redo_collision "$_pd_arr" "$_sd_arr" "$_pr_arr" "$_sr_arr"
 
     # Separate SRL pair when configured. When the PRIMARY side is NOT
     # separated (PRIMARY_SRL_PATH == PRIMARY_REDO_PATH) no SRL pair is
@@ -336,6 +407,76 @@ done
 build_convert_pairs PRIMARY_DATA STANDBY_DATA PRIMARY_REDO STANDBY_REDO
 assert_contains "21 pairs warns and points at OMF mode" \
     "consider OMF mode" "$_WARNINGS"
+
+# ------------------------------------------------------------
+# Data/redo collision: primary keeps datafiles AND redo in one
+# directory, standby splits them. No pair can target the standby redo
+# dir (nothing distinguishes an ORL from a datafile on the primary
+# side), so the datafile pair wins first-prefix-match and redo lands in
+# the standby DATA dir. Must warn, not ship the split silently.
+# ------------------------------------------------------------
+echo "Test 9: data/redo collision (primary shares a dir, standby splits)"
+# The primary keeps datafiles AND redo in one directory while the standby
+# splits them. Both pairs share the primary path, so the length sort
+# cannot separate them and Oracle takes the datafile pair - redo lands in
+# the standby DATA dir and the split redo dir is never used. Must warn.
+reset_globals
+PRIMARY_DATA=("/u01/oradata/DGNONC")
+STANDBY_DATA=("/u01/stby/data/DGNONC_S")
+PRIMARY_REDO=("/u01/oradata/DGNONC")        # same dir as datafiles
+STANDBY_REDO=("/u01/stby/redo/DGNONC_S")    # standby splits them out
+build_convert_pairs PRIMARY_DATA STANDBY_DATA PRIMARY_REDO STANDBY_REDO
+assert_contains "collision warns" \
+    "Data/redo path collision" "$_WARNINGS"
+assert_contains "collision warning names the standby redo dir that stays unused" \
+    "/u01/stby/redo/DGNONC_S/ will stay unused" "$_WARNINGS"
+assert_eq "datafile pair is emitted first (Oracle takes the first prefix match)" \
+    "'/u01/oradata/DGNONC/','/u01/stby/data/DGNONC_S/','/u01/oradata/DGNONC/','/u01/stby/redo/DGNONC_S/'" \
+    "$DB_FILE_NAME_CONVERT"
+
+echo "Test 10: no collision warning when the standby also shares the dir"
+# Same shared primary dir, but the standby keeps them together too - the
+# dedup collapses the pairs and there is nothing to warn about.
+reset_globals
+PRIMARY_DATA=("/u01/oradata/DGNONC")
+STANDBY_DATA=("/u01/stby/data/DGNONC_S")
+PRIMARY_REDO=("/u01/oradata/DGNONC")
+STANDBY_REDO=("/u01/stby/data/DGNONC_S")    # same target - consistent
+build_convert_pairs PRIMARY_DATA STANDBY_DATA PRIMARY_REDO STANDBY_REDO
+assert_not_contains "identical standby dirs stay quiet" \
+    "Data/redo path collision" "$_WARNINGS"
+
+# ------------------------------------------------------------
+# Drift guard: the build_convert_pairs copy above must stay
+# byte-identical to the one in primary/02_generate_standby_config.sh,
+# or these tests validate code that no longer ships.
+# ------------------------------------------------------------
+echo "Test 11: build_convert_pairs copy has not drifted from the script"
+_SCRIPT="$(dirname "$0")/../primary/02_generate_standby_config.sh"
+if [[ ! -f "$_SCRIPT" ]]; then
+    echo "  FAIL: cannot find $_SCRIPT"
+    FAIL=$((FAIL + 1))
+else
+    # Range: the function header through its first column-0 '}'. Nested
+    # helpers are indented, so they cannot terminate the range early.
+    _TMP_A="${TMPDIR:-/tmp}/bcp_script.$$"
+    _TMP_B="${TMPDIR:-/tmp}/bcp_test.$$"
+    awk '/^build_convert_pairs\(\) \{/,/^\}$/' "$_SCRIPT" > "$_TMP_A"
+    awk '/^build_convert_pairs\(\) \{/,/^\}$/' "$0"       > "$_TMP_B"
+    if [[ ! -s "$_TMP_A" ]]; then
+        echo "  FAIL: could not extract build_convert_pairs from the script"
+        FAIL=$((FAIL + 1))
+    elif diff -u "$_TMP_A" "$_TMP_B" > /dev/null 2>&1; then
+        echo "  PASS: copies are byte-identical"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: build_convert_pairs has drifted from $_SCRIPT"
+        echo "        re-copy the function into this test (script is the source of truth):"
+        diff -u "$_TMP_A" "$_TMP_B" | sed 's/^/        /'
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$_TMP_A" "$_TMP_B"
+fi
 
 echo ""
 echo "============================================================"
