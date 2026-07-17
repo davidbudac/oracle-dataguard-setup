@@ -140,8 +140,13 @@ progress_step "Checking for Existing Broker Configuration"
 # Try to connect and check for existing config
 EXISTING_CONFIG=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
-if echo "$EXISTING_CONFIG" | grep -q "ORA-16532"; then
-    log_info "No existing broker configuration found - proceeding with creation"
+# ORA-16532: configuration does not exist.
+# ORA-16596: this database is not part of the broker configuration - seen
+#            when stale dr1/dr2 broker config files (e.g. from a dropped
+#            and recreated database of the same name) name a different
+#            member. CREATE CONFIGURATION overwrites them.
+if echo "$EXISTING_CONFIG" | grep -Eq "ORA-16532|ORA-16596"; then
+    log_info "No usable broker configuration found - proceeding with creation"
 elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
     log_warn "Existing broker configuration detected!"
     echo ""
