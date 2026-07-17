@@ -236,6 +236,21 @@ elif [[ "$_can_rebuild_pairs" == "1" ]]; then
     log_info "Rebuilt convert pairs from the path arrays in the config:"
     log_info "  DB_FILE_NAME_CONVERT:  $DB_FILE_NAME_CONVERT"
     log_info "  LOG_FILE_NAME_CONVERT: $LOG_FILE_NAME_CONVERT"
+
+    # Persist the rebuilt strings back into the .env. This is NOT
+    # cosmetic: standby/05_clone_standby.sh takes DB_FILE_NAME_CONVERT
+    # from the .env for RMAN's SPFILE SET clause, which overrides the
+    # regenerated pfile - stale strings here mean the clone silently
+    # ignores edited path arrays (found by live asymmetric-layout E2E).
+    # AIX-safe: no sed -i; write to a temp file and move into place.
+    _env_tmp="${STANDBY_CONFIG_FILE}.tmp.$$"
+    awk -v db="DB_FILE_NAME_CONVERT=\"${DB_FILE_NAME_CONVERT}\"" \
+        -v lg="LOG_FILE_NAME_CONVERT=\"${LOG_FILE_NAME_CONVERT}\"" '
+        /^DB_FILE_NAME_CONVERT=/  { print db; next }
+        /^LOG_FILE_NAME_CONVERT=/ { print lg; next }
+        { print }
+    ' "$STANDBY_CONFIG_FILE" > "$_env_tmp" && mv "$_env_tmp" "$STANDBY_CONFIG_FILE"
+    log_info "Updated convert strings persisted to $STANDBY_CONFIG_FILE"
 else
     log_warn "PRIMARY_*/STANDBY_* path arrays are missing or length-mismatched in"
     log_warn "  $STANDBY_CONFIG_FILE"
