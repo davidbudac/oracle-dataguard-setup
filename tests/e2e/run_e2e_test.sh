@@ -1042,13 +1042,22 @@ phase_step6() {
         "SHOW CONFIGURATION" \
         "SUCCESS\|enabled\|Enabled" \
         "Broker configuration enabled" || {
-        # Might still be starting - wait and retry
-        log_info "Retrying after 30 seconds..."
-        sleep 30
-        assert_dgmgrl "PRIMARY" \
-            "SHOW CONFIGURATION" \
-            "SUCCESS\|enabled\|Enabled" \
-            "Broker configuration enabled (retry)" || return 1
+        # The broker health check can take a couple of minutes to report
+        # SUCCESS on a fresh configuration - retry up to 4x30s before
+        # declaring failure.
+        _broker_ok=0
+        for _retry in 1 2 3 4; do
+            log_info "Broker not ready yet - retrying in 30 seconds (attempt ${_retry}/4)..."
+            sleep 30
+            if assert_dgmgrl "PRIMARY" \
+                "SHOW CONFIGURATION" \
+                "SUCCESS\|enabled\|Enabled" \
+                "Broker configuration enabled (retry ${_retry})"; then
+                _broker_ok=1
+                break
+            fi
+        done
+        [[ $_broker_ok -eq 1 ]] || return 1
     }
 
     # Validate: both databases in configuration
