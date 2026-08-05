@@ -21,7 +21,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 1: Gather Primary Info"
-init_progress 12
+init_progress 13
 
 # ============================================================
 # NFS Share Configuration
@@ -400,6 +400,205 @@ log_info "DB_RECOVERY_FILE_DEST: $DB_RECOVERY_FILE_DEST"
 log_info "DB_RECOVERY_FILE_DEST_SIZE: $DB_RECOVERY_FILE_DEST_SIZE"
 
 # ============================================================
+# Archive Log and Redo Generation Statistics
+# ============================================================
+# Sizing input for the standby build: the redo generation rate
+# drives the bandwidth redo transport needs, how much archive space
+# the standby has to hold, and whether the online redo logs (and
+# therefore the standby redo logs sized from them) are big enough.
+# V$ARCHIVED_LOG only retains as much history as
+# CONTROL_FILE_RECORD_KEEP_TIME allows (7 days by default), so the
+# window actually observed is reported next to the numbers.
+#
+# Everything here is informational: a query that fails or returns
+# nothing degrades to zeros and a warning, and never fails the step.
+# ============================================================
+
+progress_step "Analyzing Archive Log and Redo Generation"
+
+# AIX-compatible field extraction (no here-strings, no GNU-only tools)
+pipe_field() {
+    echo "$1" | awk -F'|' -v i="$2" '{print $i}'
+}
+
+# Assign a pipe field to a variable only when it is a plain integer -
+# a failed query must not poison the arithmetic below or the .env.
+# bash 3.2 has no namerefs, hence eval on an is_numeric-validated value.
+assign_numeric_field() {
+    local _val
+    _val=$(pipe_field "$2" "$3")
+    if is_numeric "$_val"; then
+        eval "$1=\$_val"
+    fi
+}
+
+# Labels (timestamps, "n/a") go into the .env, so keep them to
+# characters that need no quoting and cannot expand when it is sourced.
+sanitize_label() {
+    echo "$1" | sed 's/[^A-Za-z0-9:_./-]//g'
+}
+
+# Defaults: the .env is always written with well-formed values.
+REDO_STATS_SOURCE="ARCHIVED_LOG_HISTORY"
+REDO_HISTORY_DAYS="0"
+REDO_ARCHIVED_LOG_COUNT="0"
+REDO_TOTAL_MB="0"
+REDO_AVG_MB_PER_DAY="0"
+REDO_PEAK_MB_PER_DAY="0"
+REDO_PEAK_DAY="n/a"
+REDO_AVG_MB_PER_HOUR="0"
+REDO_PEAK_MB_PER_HOUR="0"
+REDO_PEAK_HOUR="n/a"
+REDO_AVG_SWITCHES_PER_DAY="0"
+REDO_PEAK_SWITCHES_PER_HOUR="0"
+
+ARCHIVE_LOGS_ON_DISK="0"
+ARCHIVE_SIZE_ON_DISK_MB="0"
+ARCHIVE_FRA_MB="0"
+ARCHIVE_OLDEST_SEQ="0"
+ARCHIVE_NEWEST_SEQ="0"
+ARCHIVE_OLDEST_TIME="n/a"
+ARCHIVE_NEWEST_TIME="n/a"
+
+# --- Archived logs currently on disk ---
+ARCHIVE_DISK_RAW=$(run_sql_query "get_archive_disk_usage_pipe.sql" | tr -d ' \t\n\r')
+if [[ "$ARCHIVE_DISK_RAW" == *"|"* ]]; then
+    assign_numeric_field ARCHIVE_LOGS_ON_DISK "$ARCHIVE_DISK_RAW" 1
+    assign_numeric_field ARCHIVE_SIZE_ON_DISK_MB "$ARCHIVE_DISK_RAW" 2
+    assign_numeric_field ARCHIVE_FRA_MB "$ARCHIVE_DISK_RAW" 3
+    assign_numeric_field ARCHIVE_OLDEST_SEQ "$ARCHIVE_DISK_RAW" 4
+    assign_numeric_field ARCHIVE_NEWEST_SEQ "$ARCHIVE_DISK_RAW" 5
+    ARCHIVE_OLDEST_TIME=$(sanitize_label "$(pipe_field "$ARCHIVE_DISK_RAW" 6)")
+    ARCHIVE_NEWEST_TIME=$(sanitize_label "$(pipe_field "$ARCHIVE_DISK_RAW" 7)")
+else
+    log_warn "Could not read archived log inventory from V\$ARCHIVED_LOG"
+fi
+
+# --- Redo generation rate over the retained history ---
+REDO_STATS_RAW=$(run_sql_query "get_redo_stats_pipe.sql" | tr -d ' \t\n\r')
+if [[ "$REDO_STATS_RAW" == *"|"* ]]; then
+    REDO_HISTORY_DAYS=$(sanitize_label "$(pipe_field "$REDO_STATS_RAW" 1)")
+    assign_numeric_field REDO_ARCHIVED_LOG_COUNT "$REDO_STATS_RAW" 2
+    assign_numeric_field REDO_TOTAL_MB "$REDO_STATS_RAW" 3
+    assign_numeric_field REDO_AVG_MB_PER_DAY "$REDO_STATS_RAW" 4
+    assign_numeric_field REDO_PEAK_MB_PER_DAY "$REDO_STATS_RAW" 5
+    REDO_PEAK_DAY=$(sanitize_label "$(pipe_field "$REDO_STATS_RAW" 6)")
+    assign_numeric_field REDO_AVG_MB_PER_HOUR "$REDO_STATS_RAW" 7
+    assign_numeric_field REDO_PEAK_MB_PER_HOUR "$REDO_STATS_RAW" 8
+    REDO_PEAK_HOUR=$(sanitize_label "$(pipe_field "$REDO_STATS_RAW" 9)")
+    assign_numeric_field REDO_AVG_SWITCHES_PER_DAY "$REDO_STATS_RAW" 10
+    assign_numeric_field REDO_PEAK_SWITCHES_PER_HOUR "$REDO_STATS_RAW" 11
+else
+    log_warn "Could not read redo generation statistics from V\$ARCHIVED_LOG"
+fi
+
+# Fresh (or freshly restarted) database: no useful archive history.
+# Fall back to redo generated since instance startup so the sizing
+# numbers below are based on something rather than on zeros.
+if [[ "$REDO_ARCHIVED_LOG_COUNT" -eq 0 ]]; then
+    log_warn "No archived logs in the last 30 days - redo rate cannot be derived from archive history"
+    log_warn "  Falling back to redo generated since instance startup (V\$SYSSTAT)"
+    log_warn "  Re-run this step after a representative workload period for meaningful sizing"
+
+    STARTUP_STATS_RAW=$(run_sql_query "get_redo_since_startup_pipe.sql" | tr -d ' \t\n\r')
+    if [[ "$STARTUP_STATS_RAW" == *"|"* ]]; then
+        REDO_STATS_SOURCE="INSTANCE_STARTUP"
+        assign_numeric_field REDO_TOTAL_MB "$STARTUP_STATS_RAW" 1
+        REDO_HISTORY_DAYS=$(sanitize_label "$(pipe_field "$STARTUP_STATS_RAW" 2)")
+        assign_numeric_field REDO_AVG_MB_PER_HOUR "$STARTUP_STATS_RAW" 3
+        # Uptime is reported in hours by the query; the .env stays in days.
+        REDO_HISTORY_DAYS=$(awk -v h="$REDO_HISTORY_DAYS" 'BEGIN{printf "%.2f", h/24}')
+        REDO_AVG_MB_PER_DAY=$((REDO_AVG_MB_PER_HOUR * 24))
+        # Without per-hour history there is no observed peak; the average
+        # is the only honest estimate, and it is labelled as such below.
+        REDO_PEAK_MB_PER_HOUR="$REDO_AVG_MB_PER_HOUR"
+        REDO_PEAK_MB_PER_DAY="$REDO_AVG_MB_PER_DAY"
+    else
+        log_warn "Could not read redo generated since instance startup either - rates reported as 0"
+    fi
+fi
+
+# --- Derived transport sizing ---
+# Peak hour drives the link: a day of average traffic still falls behind
+# during the busiest hour if the link is sized on the daily average.
+# 30% headroom covers protocol overhead plus catch-up after a gap.
+REDO_AVG_MB_PER_SEC=$(awk -v m="$REDO_AVG_MB_PER_HOUR" 'BEGIN{printf "%.2f", m/3600}')
+REDO_PEAK_MB_PER_SEC=$(awk -v m="$REDO_PEAK_MB_PER_HOUR" 'BEGIN{printf "%.2f", m/3600}')
+REDO_REQUIRED_BANDWIDTH_MBPS=$(awk -v m="$REDO_PEAK_MB_PER_HOUR" 'BEGIN{printf "%.1f", m*8*1.3/3600}')
+REDO_AVG_GB_PER_DAY=$(awk -v m="$REDO_AVG_MB_PER_DAY" 'BEGIN{printf "%.2f", m/1024}')
+REDO_PEAK_GB_PER_DAY=$(awk -v m="$REDO_PEAK_MB_PER_DAY" 'BEGIN{printf "%.2f", m/1024}')
+
+# --- Detail tables (only meaningful with archive history) ---
+if [[ "$REDO_ARCHIVED_LOG_COUNT" -gt 0 ]]; then
+    echo ""
+    echo "Daily redo generation (last 14 days, PEAK_HR_* = busiest hour of that day):"
+    run_sql_display "get_redo_daily_stats.sql"
+
+    echo ""
+    echo "Redo generation by hour of day (last 7 days, AVG_MB = per day of window):"
+    run_sql_display "get_redo_hourly_profile.sql"
+fi
+
+print_status_block "Archive Log Overview" \
+    "Log Mode" "$LOG_MODE" \
+    "Archive Destination" "${ARCHIVE_DEST_PATH:-<not detected>}" \
+    "Archives to FRA" "$USE_FRA_FOR_ARCHIVE" \
+    "Logs on Disk" "${ARCHIVE_LOGS_ON_DISK} (${ARCHIVE_SIZE_ON_DISK_MB} MB, ${ARCHIVE_FRA_MB} MB in FRA)" \
+    "Sequence Range" "${ARCHIVE_OLDEST_SEQ} - ${ARCHIVE_NEWEST_SEQ}" \
+    "Oldest Archive" "$ARCHIVE_OLDEST_TIME" \
+    "Newest Archive" "$ARCHIVE_NEWEST_TIME"
+
+if [[ "$REDO_STATS_SOURCE" == "INSTANCE_STARTUP" ]]; then
+    _redo_window_label="${REDO_HISTORY_DAYS} days since instance startup (no archive history)"
+    _redo_peak_suffix=" (estimated - no per-hour history)"
+else
+    _redo_window_label="${REDO_HISTORY_DAYS} days of archive history, ${REDO_ARCHIVED_LOG_COUNT} logs"
+    _redo_peak_suffix=""
+fi
+
+print_status_block "Redo Generation Statistics" \
+    "Observed Window" "$_redo_window_label" \
+    "Total Redo" "${REDO_TOTAL_MB} MB" \
+    "Average per Day" "${REDO_AVG_MB_PER_DAY} MB (${REDO_AVG_GB_PER_DAY} GB)" \
+    "Peak Day" "${REDO_PEAK_MB_PER_DAY} MB (${REDO_PEAK_GB_PER_DAY} GB) on ${REDO_PEAK_DAY}" \
+    "Average per Hour" "${REDO_AVG_MB_PER_HOUR} MB (${REDO_AVG_MB_PER_SEC} MB/s)" \
+    "Peak Hour" "${REDO_PEAK_MB_PER_HOUR} MB (${REDO_PEAK_MB_PER_SEC} MB/s) at ${REDO_PEAK_HOUR}${_redo_peak_suffix}" \
+    "Log Switches per Day" "${REDO_AVG_SWITCHES_PER_DAY} avg" \
+    "Peak Switches per Hour" "${REDO_PEAK_SWITCHES_PER_HOUR}" \
+    "Redo Transport Link" "${REDO_REQUIRED_BANDWIDTH_MBPS} Mbps minimum (peak hour + 30% headroom)" \
+    "Standby Archive Space" "${REDO_AVG_GB_PER_DAY} GB per day of retention"
+
+# --- Sizing sanity checks ---
+
+# Frequent log switches mean undersized online redo logs. Oracle's
+# guidance is a switch every 15-20 minutes (3-4 per hour); the standby
+# redo logs created later must match the online log size, so fixing this
+# is much cheaper before the standby exists than after.
+if [[ "$REDO_ARCHIVED_LOG_COUNT" -eq 0 ]]; then
+    log_info "Log switch rate: not assessed (no archive history to measure)"
+elif [[ "$REDO_PEAK_SWITCHES_PER_HOUR" -gt 12 ]]; then
+    log_warn "Peak log switch rate is ${REDO_PEAK_SWITCHES_PER_HOUR}/hour (redo logs are ${REDO_LOG_SIZE_MB}MB)"
+    log_warn "  Recommended: one switch every 15-20 minutes (3-4 per hour)"
+    log_warn "  Consider larger online redo logs BEFORE the standby is built -"
+    log_warn "  standby redo logs must match the online log size."
+elif [[ "$REDO_PEAK_SWITCHES_PER_HOUR" -gt 6 ]]; then
+    log_info "Peak log switch rate: ${REDO_PEAK_SWITCHES_PER_HOUR}/hour (redo logs are ${REDO_LOG_SIZE_MB}MB) - acceptable but on the high side"
+else
+    log_info "Peak log switch rate: ${REDO_PEAK_SWITCHES_PER_HOUR}/hour - within the recommended range"
+fi
+
+# FRA that cannot hold a day of redo will start deleting (or stalling)
+# quickly once the standby build adds its own traffic.
+if [[ -n "$DB_RECOVERY_FILE_DEST" ]] && is_numeric "$DB_RECOVERY_FILE_DEST_SIZE"; then
+    FRA_SIZE_MB=$((DB_RECOVERY_FILE_DEST_SIZE / 1024 / 1024))
+    log_info "FRA size: ${FRA_SIZE_MB} MB"
+    if [[ "$REDO_AVG_MB_PER_DAY" -gt 0 && "$FRA_SIZE_MB" -lt "$REDO_AVG_MB_PER_DAY" ]]; then
+        log_warn "FRA (${FRA_SIZE_MB} MB) is smaller than one day of redo (${REDO_AVG_MB_PER_DAY} MB)"
+        log_warn "  Size the FRA - on BOTH sides - for the archive retention you need."
+    fi
+fi
+
+# ============================================================
 # Gather Network Configuration
 # ============================================================
 
@@ -584,6 +783,34 @@ ONLINE_REDO_GROUPS="$(strip_whitespace "$ONLINE_REDO_GROUPS")"
 STANDBY_REDO_EXISTS="$STANDBY_REDO_EXISTS"
 STANDBY_REDO_COUNT="$(strip_whitespace "$STANDBY_REDO_COUNT")"
 
+# --- Archive Log Inventory (snapshot at gather time) ---
+ARCHIVE_LOGS_ON_DISK="$(strip_whitespace "$ARCHIVE_LOGS_ON_DISK")"
+ARCHIVE_SIZE_ON_DISK_MB="$(strip_whitespace "$ARCHIVE_SIZE_ON_DISK_MB")"
+ARCHIVE_FRA_MB="$(strip_whitespace "$ARCHIVE_FRA_MB")"
+ARCHIVE_OLDEST_SEQ="$(strip_whitespace "$ARCHIVE_OLDEST_SEQ")"
+ARCHIVE_NEWEST_SEQ="$(strip_whitespace "$ARCHIVE_NEWEST_SEQ")"
+ARCHIVE_OLDEST_TIME="$ARCHIVE_OLDEST_TIME"
+ARCHIVE_NEWEST_TIME="$ARCHIVE_NEWEST_TIME"
+
+# --- Redo Generation Statistics ---
+# REDO_STATS_SOURCE is ARCHIVED_LOG_HISTORY (derived from V\$ARCHIVED_LOG,
+# limited to CONTROL_FILE_RECORD_KEEP_TIME) or INSTANCE_STARTUP (fallback
+# from V\$SYSSTAT when no archive history exists - peak == average there).
+# Rates drive redo transport bandwidth and standby archive space sizing.
+REDO_STATS_SOURCE="$REDO_STATS_SOURCE"
+REDO_HISTORY_DAYS="$REDO_HISTORY_DAYS"
+REDO_ARCHIVED_LOG_COUNT="$(strip_whitespace "$REDO_ARCHIVED_LOG_COUNT")"
+REDO_TOTAL_MB="$(strip_whitespace "$REDO_TOTAL_MB")"
+REDO_AVG_MB_PER_DAY="$(strip_whitespace "$REDO_AVG_MB_PER_DAY")"
+REDO_PEAK_MB_PER_DAY="$(strip_whitespace "$REDO_PEAK_MB_PER_DAY")"
+REDO_PEAK_DAY="$REDO_PEAK_DAY"
+REDO_AVG_MB_PER_HOUR="$(strip_whitespace "$REDO_AVG_MB_PER_HOUR")"
+REDO_PEAK_MB_PER_HOUR="$(strip_whitespace "$REDO_PEAK_MB_PER_HOUR")"
+REDO_PEAK_HOUR="$REDO_PEAK_HOUR"
+REDO_AVG_SWITCHES_PER_DAY="$(strip_whitespace "$REDO_AVG_SWITCHES_PER_DAY")"
+REDO_PEAK_SWITCHES_PER_HOUR="$(strip_whitespace "$REDO_PEAK_SWITCHES_PER_HOUR")"
+REDO_REQUIRED_BANDWIDTH_MBPS="$REDO_REQUIRED_BANDWIDTH_MBPS"
+
 # --- Database Size ---
 DATAFILE_SIZE_MB="$(strip_whitespace "$DATAFILE_SIZE_MB")"
 TEMPFILE_SIZE_MB="$(strip_whitespace "$TEMPFILE_SIZE_MB")"
@@ -629,7 +856,9 @@ if [[ "$PREREQ_PASS" == "true" ]]; then
         "DB_UNIQUE_NAME" "$DB_UNIQUE_NAME" \
         "Instance" "$INSTANCE_NAME" \
         "Redo Size" "${REDO_LOG_SIZE_MB} MB" \
-        "Required Space" "${REQUIRED_SPACE_MB} MB"
+        "Required Space" "${REQUIRED_SPACE_MB} MB" \
+        "Redo Generated" "${REDO_AVG_GB_PER_DAY} GB/day (peak ${REDO_PEAK_MB_PER_HOUR} MB/h)" \
+        "Redo Transport Link" "${REDO_REQUIRED_BANDWIDTH_MBPS} Mbps minimum"
     print_list_block "Generated Files" \
         "Primary info: $OUTPUT_FILE" \
         "Password file: $PWD_DEST"

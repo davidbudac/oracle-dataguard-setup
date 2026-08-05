@@ -222,10 +222,32 @@ You must type `y` or `yes` to approve each action. Declining skips that action w
 4. Documents redo log configuration (size, groups, paths)
 5. Lists data file locations and calculates total database size
 6. Checks archive log configuration
-7. Validates prerequisites (ARCHIVELOG, FORCE_LOGGING, password file)
-8. Detects listener port
-9. Copies password file to NFS share
-10. Writes all collected info to `primary_info_<DB_UNIQUE_NAME>.env`
+7. Reports archive log inventory and redo generation statistics (see [Redo Generation Statistics](#redo-generation-statistics) below)
+8. Validates prerequisites (ARCHIVELOG, FORCE_LOGGING, password file)
+9. Detects listener port
+10. Copies password file to NFS share
+11. Writes all collected info to `primary_info_<DB_UNIQUE_NAME>.env`
+
+### Redo Generation Statistics
+
+Redo volume is the number the rest of the build depends on: it sets the bandwidth the redo transport needs between the two hosts, how much archive space the standby has to hold, and whether the online redo logs — which the standby redo logs are sized from — are big enough. The step reports:
+
+- **Archive Log Overview** — log mode, resolved archive destination, whether archives go to the FRA, how many archived logs are on disk right now and how much space they take, the sequence range, and the oldest/newest archive timestamps.
+- **Daily redo generation** (last 14 days) — logs, MB/GB, average size per log, plus the busiest single hour within each day. The daily average hides bursts; the peak hour is what the link actually has to survive.
+- **Redo by hour of day** (last 7 days) — average and peak MB per clock hour, so batch windows are visible.
+- **Redo Generation Statistics** — observed window, total redo, average and peak per day and per hour, log switch rates, the **minimum redo transport bandwidth** (peak hour + 30% headroom), and archive space needed per day of retention.
+
+Two sanity checks run off these numbers:
+
+- **Log switch rate.** More than 12 switches in the peak hour is warned about (Oracle's guidance is a switch every 15–20 minutes). Fix this *before* the standby is built — standby redo logs must match the online log size, so resizing afterwards means recreating them on both sides.
+- **FRA size.** If `db_recovery_file_dest_size` is smaller than one day of redo, the step warns; the standby needs the same headroom.
+
+All of this is informational and never fails the step. Two caveats worth knowing:
+
+- The history comes from `V$ARCHIVED_LOG`, which only retains what `CONTROL_FILE_RECORD_KEEP_TIME` allows (7 days by default) — the actual observed window is printed next to the numbers rather than assumed.
+- On a database with no archive history at all (freshly created or freshly restarted), the step falls back to redo generated since instance startup (`V$SYSSTAT`), marks the values `INSTANCE_STARTUP`, and reports the peak as an estimate equal to the average. Re-run the step after a representative workload period if you want the numbers to mean anything for sizing.
+
+The values are persisted into `primary_info_<DB_UNIQUE_NAME>.env` under `# --- Archive Log Inventory ---` and `# --- Redo Generation Statistics ---`.
 
 ### Manual Equivalent
 
@@ -270,6 +292,41 @@ FROM dual;
 SELECT log_mode FROM v$database;
 SELECT value FROM v$parameter WHERE name = 'log_archive_dest_1';
 SELECT value FROM v$parameter WHERE name = 'db_recovery_file_dest';
+
+-- Archived logs currently on disk
+SELECT COUNT(*)                                AS logs_on_disk,
+       ROUND(SUM(blocks*block_size)/1024/1024) AS mb_on_disk,
+       MIN(sequence#)                          AS oldest_seq,
+       MAX(sequence#)                          AS newest_seq
+FROM   v$archived_log
+WHERE  standby_dest = 'NO' AND deleted = 'NO' AND status = 'A';
+
+-- Daily redo generation, with the busiest hour of each day.
+-- The inner GROUP BY de-duplicates: one archived log has one row per
+-- destination, so a plain SUM() multiplies the volume by the number of
+-- local destinations.
+WITH logs AS (
+    SELECT thread#, sequence#, resetlogs_id,
+           MIN(first_time) AS first_time, MAX(blocks*block_size) AS bytes
+    FROM   v$archived_log
+    WHERE  standby_dest = 'NO' AND first_time >= TRUNC(SYSDATE) - 13
+    GROUP  BY thread#, sequence#, resetlogs_id
+), hourly AS (
+    SELECT TRUNC(first_time,'HH24') AS hr, SUM(bytes) AS bytes, COUNT(*) AS switches
+    FROM   logs GROUP BY TRUNC(first_time,'HH24')
+)
+SELECT TO_CHAR(TRUNC(hr),'YYYY-MM-DD')  AS day,
+       SUM(switches)                    AS logs,
+       ROUND(SUM(bytes)/1024/1024)      AS redo_mb,
+       ROUND(MAX(bytes)/1024/1024)      AS peak_hr_mb,
+       MAX(switches)                    AS peak_hr_logs
+FROM   hourly GROUP BY TRUNC(hr) ORDER BY 1;
+
+-- Fallback when there is no archive history: redo since instance startup
+SELECT ROUND(s.value/1024/1024)                AS redo_mb,
+       ROUND((SYSDATE - i.startup_time)*24, 2) AS uptime_hours
+FROM   v$sysstat s, v$instance i
+WHERE  s.name = 'redo size';
 
 -- Check prerequisites
 SELECT force_logging FROM v$database;

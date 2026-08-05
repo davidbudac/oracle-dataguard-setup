@@ -104,6 +104,17 @@ Built-in validations:
 - Port connectivity primary → standby (step 4)
 - Listener port detection from `lsnrctl status` (step 1)
 
+## Redo Generation Statistics (Step 1)
+
+Step 1 reports an archive log overview (mode, destination, logs on disk, sequence range) plus redo generation statistics derived from `V$ARCHIVED_LOG`: daily volume for the last 14 days with each day's busiest hour, an hour-of-day profile for the last 7 days, and averages/peaks per day and per hour. From the peak hour it derives the **minimum redo transport bandwidth** (peak hour + 30% headroom) and the archive space needed per day of retention. It warns when the peak log switch rate exceeds 12/hour (fix online redo log size *before* the standby exists — standby redo logs must match it) and when the FRA is smaller than one day of redo.
+
+Design notes:
+- `V$ARCHIVED_LOG` rows are de-duplicated by `(THREAD#, SEQUENCE#, RESETLOGS_ID)` — one archived log has a row per destination, so a plain `SUM()` multiplies the volume by the number of local destinations. `STANDBY_DEST='NO'` excludes shipped logs on re-runs.
+- History is bounded by `CONTROL_FILE_RECORD_KEEP_TIME` (7 days by default); the observed window is reported rather than assumed.
+- With no archive history (fresh or freshly restarted DB — including the E2E test), it falls back to `V$SYSSTAT` "redo size" since startup, sets `REDO_STATS_SOURCE=INSTANCE_STARTUP`, and reports peak == average.
+- The whole section is informational: a failed or empty query degrades to zeros plus a warning, never a failed step.
+- Values are persisted to `primary_info_<DB_UNIQUE_NAME>.env` (`ARCHIVE_*`, `REDO_*`). Since that file is sourced by later steps, label fields are sanitized to shell-safe characters and no value contains a `$`.
+
 ## Status Dashboard
 
 `dg_status.sh` provides a quick health overview of a running Data Guard configuration. Run it from the jump host (or any machine with SSH access to both DB hosts).
