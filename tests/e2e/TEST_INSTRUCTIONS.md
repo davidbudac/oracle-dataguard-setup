@@ -111,6 +111,7 @@ bash ./tests/e2e/run_e2e_test.sh --only cleanup
 | step5 | standby | Runs 05_clone_standby.sh (RMAN duplicate), validates MRP |
 | step6 | primary | Runs 06_configure_broker.sh, validates DGMGRL config |
 | step7 | standby | Runs 07_verify_dataguard.sh, checks health report |
+| step13 | primary | Runs 13_set_max_availability.sh, validates MAXAVAILABILITY + FASTSYNC + idempotent re-run (optional; runs here, not in walkthrough order, so the mutation path is exercised before step 9 would make it a no-op) |
 | step8 | primary | Runs 08_security_hardening.sh, validates SYS locked (optional) |
 | step9 | primary | Runs 09_configure_fsfo.sh, validates FSFO enabled (optional) |
 | step10 | standby | Runs observer.sh setup+start, validates observer running (optional) |

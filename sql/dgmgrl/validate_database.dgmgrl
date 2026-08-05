@@ -1,0 +1,8 @@
+-- ============================================================
+-- Validate a database's readiness in the broker configuration
+-- Reports switchover/failover readiness, SRL sufficiency, and
+-- transport/apply health for the named database
+-- Usage: dgmgrl @validate_database.dgmgrl db_unique_name
+-- ============================================================
+VALIDATE DATABASE '&1';
+EXIT;

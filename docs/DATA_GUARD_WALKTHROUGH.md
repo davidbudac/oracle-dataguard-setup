@@ -22,9 +22,10 @@ This document describes what each automation script does and shows the equivalen
 15. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
 16. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
 17. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
-18. [Summary](#summary-what-would-be-done-manually-without-scripts)
-19. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
-20. [Common Monitoring Commands](#common-monitoring-commands)
+18. [Step 13: Set Maximum Availability Protection (Optional)](#step-13-set-maximum-availability-protection-optional)
+19. [Summary](#summary-what-would-be-done-manually-without-scripts)
+20. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
+21. [Common Monitoring Commands](#common-monitoring-commands)
 
 ---
 
@@ -1259,6 +1260,62 @@ rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 
 ---
 
+## Step 13: Set Maximum Availability Protection (Optional)
+
+**Script:** `primary/13_set_max_availability.sh`
+
+Raises the configuration to zero-data-loss protection — protection mode `MAXIMUM AVAILABILITY` with `LogXptMode=FASTSYNC` — **without** enabling Fast-Start Failover. Step 9 (FSFO) already applies these same two settings as part of enabling FSFO, so this step is for setups that want synchronous, zero-data-loss redo transport but no automatic failover.
+
+Run it on the **PRIMARY** any time after Step 7 verification passes. It needs the build's `standby_config_*.env` on the NFS share, so run it before a `cleanup_nfs_artifacts.sh --all` teardown (the default Step 12 cleanup keeps the `.env`).
+
+### What the Script Does
+
+Everything is validated **before** any change is made:
+
+1. Verifies the local database role is PRIMARY
+2. Verifies the broker configuration exists and reports SUCCESS (warnings require explicit confirmation)
+3. Checks the current protection mode and both databases' `LogXptMode` — if everything already matches the target, exits successfully without prompting (idempotent)
+4. Checks Fast-Start Failover state: if FSFO is enabled but the settings don't match (a mixed state), it refuses — the broker rejects `LogXptMode` edits on FSFO members. Disable FSFO first, or re-run Step 9
+5. Runs `VALIDATE DATABASE` for both databases and checks for `Ready for Switchover: Yes` (this also surfaces missing/insufficient standby redo logs, which FASTSYNC requires)
+6. Reports transport/apply lag from `V$DATAGUARD_STATS` and checks `V$ARCHIVE_DEST` for destination errors
+7. Prints a change summary; `-n`/`--check` mode stops here
+
+Then, after confirmation:
+
+8. Sets `LogXptMode=FASTSYNC` on both databases (skipped if already set)
+9. Sets protection mode to `MAXIMUM AVAILABILITY` and verifies it took effect in `V$DATABASE`
+10. Polls `SHOW CONFIGURATION` (up to ~30 s) until the broker returns SUCCESS
+
+### Manual Equivalent
+
+```
+dgmgrl /
+
+-- Validate first
+SHOW CONFIGURATION;
+VALIDATE DATABASE 'PRIMARY_DB';
+VALIDATE DATABASE 'STANDBY_DB';
+
+-- LogXptMode must be synchronous before raising the protection mode
+EDIT DATABASE 'PRIMARY_DB' SET PROPERTY LogXptMode='FASTSYNC';
+EDIT DATABASE 'STANDBY_DB' SET PROPERTY LogXptMode='FASTSYNC';
+
+EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY;
+
+SHOW CONFIGURATION;
+EXIT;
+```
+
+### Important Notes
+
+- **Commit latency increases**: with FASTSYNC the primary waits for the standby to acknowledge redo *receipt* (not disk write) on every commit — expect roughly one network round-trip added per commit. The Step 1 redo statistics report the minimum transport bandwidth the link needs.
+- **`ORA-16627` on the mode change** means the standby is not synchronized — the broker itself is the final validator; fix transport and re-run.
+- **Availability is preserved**: in MAXIMUM AVAILABILITY the primary keeps running if the standby becomes unreachable, and resynchronizes automatically when it returns.
+- **Rollback**: `EDIT CONFIGURATION SET PROTECTION MODE AS MAXPERFORMANCE;` then set `LogXptMode='ASYNC'` on both databases.
+- To add automatic failover later, run Step 9 — an FSFO-enabled configuration already satisfies this step, and re-running it then is a no-op.
+
+---
+
 ## Summary: What Would Be Done Manually Without Scripts
 
 | Step | Script | Manual Effort |
@@ -1276,6 +1333,8 @@ rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 | 9 | Configure FSFO | Create observer user, set FASTSYNC, enable FSFO (optional) |
 | 10 | Observer Setup | Create wallet, add credentials, start observer process (optional) |
 | 11 | Service Trigger | Write PL/SQL package and triggers, deploy to database (optional) |
+| 12 | NFS Cleanup | Track down and remove password file copies, pfiles, RMAN artifacts (optional) |
+| 13 | Max Availability | Validate readiness, set FASTSYNC + MAXAVAILABILITY, verify (optional) |
 
 **Total Manual Steps:** ~100+ individual commands, queries, and file edits
 

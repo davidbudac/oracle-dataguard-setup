@@ -13,7 +13,7 @@ dg_handoff.sh    - Standalone handoff report generator (post-setup; no NFS/confi
 dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 error)
 migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby (has its own README/WALKTHROUGH)
 nfs/             - NFS setup scripts (run before Data Guard setup)
-primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10)
+primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10, 13)
 standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
 fsfo/            - Observer scripts (run on observer server - standby or 3rd server)
 trigger/         - Role-aware service trigger (run on PRIMARY); two variants: SYS-owned and dedicated-user
@@ -26,7 +26,7 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 
 ## Execution Order
 
-Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step reference): NFS setup is Step 0a/0b (prerequisite, not counted in the main 1-12 sequence), and observer wallet setup + start are both part of Step 10.
+Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step reference): NFS setup is Step 0a/0b (prerequisite, not counted in the main 1-13 sequence), and observer wallet setup + start are both part of Step 10.
 
 0a. `nfs/01_setup_nfs_server.sh` - Setup NFS (on NFS server, requires sudo)
 0b. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo)
@@ -42,6 +42,7 @@ Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step refer
 10. `fsfo/observer.sh setup` then `fsfo/observer.sh start` - Set up and start the observer (on observer server, optional)
 11. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
 12. `common/cleanup_nfs_artifacts.sh` - Remove sensitive/transient setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share once the build is verified (optional, run from any host with the share mounted)
+13. `primary/13_set_max_availability.sh` - Validate the configuration is healthy, then set protection mode MAXIMUM AVAILABILITY + LogXptMode=FASTSYNC (on PRIMARY, optional). For zero-data-loss protection *without* FSFO — Step 9 already applies both settings when enabling FSFO, so skip this if Step 9 was run. Needs the `standby_config_*.env` from the NFS share, so run it before Step 12's `--all` cleanup (the default cleanup keeps the .env)
 
 Recommended, run any time after Step 7 (not part of the walkthrough's numbered sequence, but worth doing before Step 12 cleanup since cleanup can remove it): `primary/10_generate_handoff_report.sh` - Generate end-user handoff report with status snapshot and TNS/JDBC connection strings (on PRIMARY).
 
@@ -57,6 +58,8 @@ Recommended, run any time after Step 7 (not part of the walkthrough's numbered s
 **Post-hardening re-clone limitation:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this at the password-verification step (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run `primary/08_security_hardening.sh` afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
 
 **Steps 6-7 are restartable** - the broker configuration can be removed with `REMOVE CONFIGURATION` in DGMGRL and recreated. Step 7 is read-only verification.
+
+**Step 13 is idempotent** - if the configuration is already MAXIMUM AVAILABILITY with LogXptMode=FASTSYNC on both databases, it reports that and exits successfully without prompting.
 
 ## Key Design Decisions
 
@@ -214,6 +217,19 @@ This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mo
 The observer must be running for automatic failover to occur.
 
 `observer.sh` validates a pidfile's PID against the process's actual command line (must be a `dgmgrl` process) before trusting it as the running observer; stale or mismatched pidfiles are automatically cleaned up.
+
+## Maximum Availability Without FSFO (Optional)
+
+**Step 13: Set Maximum Availability Protection (on PRIMARY)**
+```bash
+./primary/13_set_max_availability.sh
+```
+Raises the configuration to zero-data-loss protection without enabling Fast-Start Failover: validates first (broker `SHOW CONFIGURATION` health, `VALIDATE DATABASE` readiness on both members via `sql/dgmgrl/validate_database.dgmgrl`, transport/apply lag, archive destination errors), then sets `LogXptMode=FASTSYNC` on both databases and `EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY`, and finally polls `SHOW CONFIGURATION` until it returns SUCCESS.
+
+- Skip this step if Step 9 (FSFO) was run — FSFO setup already applies both settings; the script detects that and exits as a no-op.
+- If FSFO is enabled but the settings don't match (mixed state), the script refuses and points to `DISABLE FAST_START FAILOVER` / re-running Step 9, since the broker rejects `LogXptMode` edits on FSFO members.
+- Validation findings (not "Ready for Switchover: Yes", archive dest errors, broker warnings) require explicit confirmation to proceed; `-n`/`--check` runs stop at the preflight summary without changing anything.
+- The broker itself is the last validator: `ORA-16627` on the mode change means the standby is not synchronized.
 
 ## Role-Aware Service Trigger (Optional)
 

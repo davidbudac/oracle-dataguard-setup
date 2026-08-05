@@ -1138,6 +1138,96 @@ SQLEOF
 }
 
 # =============================================================================
+# Phase: Step 13 - Set Maximum Availability Protection (Optional)
+# =============================================================================
+# Runs right after step 7 (not in walkthrough order) so it exercises the real
+# MAXPERFORMANCE/ASYNC -> MAXAVAILABILITY/FASTSYNC mutation path: after step 9
+# (FSFO) the settings are already in place and the script would just no-op.
+# Step 9 tolerates the pre-raised mode (it skips an already-set protection
+# mode, and re-applying FASTSYNC is idempotent).
+
+phase_step13() {
+    if [[ "${SKIP_MAXAVAIL:-false}" == "true" ]]; then
+        log_skip "Step 13: Set Maximum Availability (SKIP_MAXAVAIL=true)"
+        return 0
+    fi
+
+    log_phase "STEP 13: Set Maximum Availability Protection"
+
+    local result
+    # Prompts: final proceed confirmation only (config auto-selected).
+    # The validation prompts (broker warnings, VALIDATE not ready, archive
+    # dest errors) only fire on an unhealthy config - on this freshly
+    # verified build any of them firing is itself a failure, and it would
+    # consume the piped "y" so the final confirm gets EOF -> "cancelled".
+    result=$(ssh_piped "PRIMARY" \
+        "./primary/13_set_max_availability.sh" \
+        "y")
+
+    local exit_code=$?
+    log_info "Step 13 output (last 15 lines):"
+    echo "$result" | tail -15 | while read -r line; do log_info "  $line"; done
+
+    if [[ $exit_code -ne 0 ]]; then
+        log_fail "Step 13 script exited with code ${exit_code}"
+        record_issue "step13" "13_set_max_availability.sh failed" "$(echo "$result" | tail -30)"
+        return 1
+    fi
+
+    if echo "$result" | grep -q "cancelled by user"; then
+        log_fail "Step 13 was cancelled - a validation prompt fired and desynchronized the piped input"
+        record_issue "step13" "Unexpected validation prompt (unhealthy config?)" "$(echo "$result" | tail -30)"
+        return 1
+    fi
+
+    # Validate: protection mode raised (assert_sql strips whitespace)
+    assert_sql "PRIMARY" \
+        "SELECT protection_mode FROM v\$database;" \
+        "MAXIMUMAVAILABILITY" \
+        "Protection mode = MAXIMUM AVAILABILITY" || return 1
+
+    # Validate: LogXptMode=FASTSYNC on both members
+    assert_dgmgrl "PRIMARY" \
+        "SHOW DATABASE '${TEST_DB_NAME}' 'LogXptMode'" \
+        "FASTSYNC" \
+        "LogXptMode=FASTSYNC on primary" || return 1
+    assert_dgmgrl "PRIMARY" \
+        "SHOW DATABASE '${TEST_STANDBY_DB_UNIQUE_NAME}' 'LogXptMode'" \
+        "FASTSYNC" \
+        "LogXptMode=FASTSYNC on standby" || return 1
+
+    # Validate: broker configuration healthy after the change
+    assert_dgmgrl "PRIMARY" \
+        "SHOW CONFIGURATION" \
+        "SUCCESS" \
+        "Broker configuration SUCCESS after protection mode change" || return 1
+
+    # Re-run: the script must detect the already-compliant config and exit 0
+    # without prompting (no piped input at all proves no prompt is read)
+    log_info "Re-running step 13 to validate idempotent early exit..."
+    result=$(ssh_piped "PRIMARY" \
+        "./primary/13_set_max_availability.sh" \
+        "")
+
+    exit_code=$?
+    if [[ $exit_code -ne 0 ]]; then
+        log_fail "Step 13 re-run exited with code ${exit_code} (expected idempotent success)"
+        record_issue "step13" "Idempotent re-run failed" "$(echo "$result" | tail -20)"
+        return 1
+    fi
+
+    if echo "$result" | grep -q "already MAXIMUM AVAILABILITY"; then
+        log_pass "Re-run detected already-compliant configuration"
+    else
+        log_fail "Re-run did not report the already-compliant early exit"
+        record_issue "step13" "Idempotent early exit not detected" "$(echo "$result" | tail -20)"
+        return 1
+    fi
+
+    log_pass "Step 13 completed and validated"
+}
+
+# =============================================================================
 # Phase: Step 8 - Security Hardening (Optional)
 # =============================================================================
 
@@ -1214,10 +1304,10 @@ phase_step9() {
         "Enabled|enabled|ENABLED" \
         "FSFO is enabled" || return 1
 
-    # Validate: protection mode
+    # Validate: protection mode (assert_sql strips whitespace from the result)
     assert_sql "PRIMARY" \
         "SELECT protection_mode FROM v\$database;" \
-        "MAXIMUM AVAILABILITY" \
+        "MAXIMUMAVAILABILITY" \
         "Protection mode = MAXIMUM AVAILABILITY" || return 1
 
     # Validate: observer user exists
@@ -1407,6 +1497,7 @@ ALL_PHASES=(
     step5
     step6
     step7
+    step13
     step8
     step9
     step10
@@ -1431,6 +1522,7 @@ run_phase() {
         step5)           phase_step5 ;;
         step6)           phase_step6 ;;
         step7)           phase_step7 ;;
+        step13)          phase_step13 ;;
         step8)           phase_step8 ;;
         step9)           phase_step9 ;;
         step10)          phase_step10 ;;
