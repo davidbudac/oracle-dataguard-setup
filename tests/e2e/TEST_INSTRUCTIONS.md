@@ -208,10 +208,44 @@ updated. To debug: SSH to the host and run the script manually to see actual pro
 
 ## Last successful full run
 
-**Date:** 2026-03-29, **Duration:** ~20 minutes, **Result:** 62 PASS, 0 FAIL, 3 SKIP
+**Date:** 2026-07-07, **Result:** core pipeline GREEN (create_db + steps 1-7 + 11,
+0 FAIL); optional steps 8, 9, 10 also validated (with the fixes below).
 
-Phases tested: preflight, deploy, cleanup, create_db, steps 1-7, step 11
-Phases skipped: step 8 (security), step 9 (FSFO), step 10 (observer)
+Run directly from the hypervisor `dbmint` (no jump host — `JUMP_HOST=""`, DB hosts
+reached as `oracle@dbmint:2201` / `:2202`), using `LOCAL_DEPLOY=true` to deploy the
+working tree. Final Data Guard state: FSFO enabled (Zero Data Loss), observer running,
+transport lag 0, config SUCCESS. See `docs/IMPROVEMENT_PLAN.md` → "E2E run 2026-07-07"
+for the five bugs this run surfaced and fixed.
+
+### Issue: runner host `grep` is ugrep — `\|` in `grep -E` is literal
+- `dbmint`'s `grep` is `ugrep 7.5.0`. In ERE, ugrep treats `\|` as a *literal* pipe
+  (POSIX-correct), so `assert_dgmgrl` patterns like `SUCCESS\|enabled\|Enabled` never
+  matched and step 6 failed against a healthy `SUCCESS` broker.
+- **Fix:** all harness assert patterns now use real ERE alternation (`a|b|c`).
+
+### Issue: step 9 piped-input order
+- `09_configure_fsfo.sh` prompts in the order: username → proceed(y) → password →
+  confirm password. The harness previously sent `username, password, y`, feeding the
+  password to the proceed prompt (FSFO cancelled).
+- **Fix:** input is now `${OBSERVER_USER}\ny\n${PW}\n${PW}`. Also, `assert_sql` strips
+  whitespace, so the protection-mode expected value is `MAXIMUMAVAILABILITY` (joined).
+
+### Issue: step 8 needs a format-12.2 password file
+- DBCA creates a legacy (format 12) password file; locking SYS needs format 12.2
+  (else `ORA-40365`). `create_db` now migrates the password file to 12.2 after DBCA.
+
+### Issue: refreshing the standby password file needs a standby restart
+- After step 8 (SYS pw change) and step 9 (adds observer SYSDG user), redo transport
+  fails with `ORA-16191` on reconnect until the **standby instance is restarted** to
+  re-read its (replaced) password file — a plain `cp` while it runs is not enough.
+
+### Issue: no jump host from the hypervisor
+- When running from `dbmint` itself, set `JUMP_HOST=""` (the harness then skips
+  ProxyJump) and point `PRIMARY_HOST`/`STANDBY_HOST` at `dbmint` with ports 2201/2202.
+  The committed `config.env` keeps the jump-host form for running from the Mac.
+
+### Previous successful run
+**Date:** 2026-03-29, **Result:** 62 PASS, 0 FAIL, 3 SKIP (steps 8/9/10 skipped).
 
 ## Key files
 

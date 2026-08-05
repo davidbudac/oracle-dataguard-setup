@@ -46,7 +46,9 @@ fi
 source "${SCRIPT_DIR}/config.env"
 
 # Validate required config
-for var in JUMP_HOST JUMP_USER PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME ORACLE_BASE \
+# JUMP_HOST/JUMP_USER are optional: leave JUMP_HOST empty when the machine
+# running this test can reach the DB hosts directly (no bastion hop).
+for var in PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME ORACLE_BASE \
            TEST_DB_NAME TEST_DB_UNIQUE_NAME TEST_STANDBY_DB_UNIQUE_NAME \
            TEST_SYS_PASSWORD NFS_SHARE REPO_URL REPO_DIR; do
     if [[ -z "${!var:-}" ]]; then
@@ -54,11 +56,19 @@ for var in JUMP_HOST JUMP_USER PRIMARY_HOST STANDBY_HOST SSH_USER ORACLE_HOME OR
         exit 1
     fi
 done
+if [[ -n "${JUMP_HOST:-}" && -z "${JUMP_USER:-}" ]]; then
+    echo "ERROR: JUMP_USER must be set when JUMP_HOST is set"
+    exit 1
+fi
 
 # Derived values
 JUMP_KEY_OPT=""
 [[ -n "${JUMP_KEY:-}" ]] && JUMP_KEY_OPT="-i ${JUMP_KEY}"
 JUMP_SSH_PORT="${JUMP_SSH_PORT:-22}"
+# ProxyJump option: only hop through a bastion when JUMP_HOST is configured.
+# When empty, the DB hosts are reached directly from this machine.
+JUMP_OPT=""
+[[ -n "${JUMP_HOST:-}" ]] && JUMP_OPT="-J ${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}"
 PRIMARY_SSH_PORT="${PRIMARY_SSH_PORT:-22}"
 STANDBY_SSH_PORT="${STANDBY_SSH_PORT:-22}"
 DB_SSH_KEY_OPT=""
@@ -157,7 +167,7 @@ _ssh_hop() {
     local cmd="$3"
 
     ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
-        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        ${JUMP_OPT} \
         -p "${port}" "${SSH_USER}@${host}" \
         "export ORACLE_HOME='${ORACLE_HOME}'; \
          export ORACLE_BASE='${ORACLE_BASE}'; \
@@ -198,7 +208,7 @@ ssh_piped() {
 
     printf '%b\n' "${input}" | \
     ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
-        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        ${JUMP_OPT} \
         -p "${port}" "${SSH_USER}@${host}" \
         "export ORACLE_HOME='${ORACLE_HOME}'; \
          export ORACLE_BASE='${ORACLE_BASE}'; \
@@ -213,6 +223,10 @@ ssh_piped() {
 # =============================================================================
 
 assert_ssh_jump_ok() {
+    if [[ -z "${JUMP_HOST:-}" ]]; then
+        log_info "No jump host configured - DB hosts reached directly"
+        return 0
+    fi
     if ssh ${SSH_OPTS} ${JUMP_KEY_OPT} -p "${JUMP_SSH_PORT}" \
         "${JUMP_USER}@${JUMP_HOST}" "echo ok" 2>/dev/null | grep -q ok; then
         log_pass "SSH to jump host (${JUMP_HOST})"
@@ -232,11 +246,11 @@ assert_ssh_ok() {
         host="${PRIMARY_HOST}"; port="${PRIMARY_SSH_PORT}"
     fi
     if ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} \
-        -J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}" \
+        ${JUMP_OPT} \
         -p "${port}" "${SSH_USER}@${host}" "echo ok" 2>/dev/null | grep -q ok; then
-        log_pass "SSH to ${label} (${host}:${port}) via jump"
+        log_pass "SSH to ${label} (${host}:${port})${JUMP_HOST:+ via jump}"
     else
-        log_fail "SSH to ${label} (${host}:${port}) via jump"
+        log_fail "SSH to ${label} (${host}:${port})${JUMP_HOST:+ via jump}"
         return 1
     fi
 }
@@ -362,35 +376,57 @@ phase_preflight() {
 phase_deploy() {
     log_phase "DEPLOY: Deploying scripts to both hosts"
 
+    # LOCAL_DEPLOY=true rsyncs the working tree instead of pulling from git.
+    # Use this to test uncommitted fixes without pushing to origin/main.
+    local local_deploy="${LOCAL_DEPLOY:-false}"
+    local repo_root
+    repo_root="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+
     for label in PRIMARY STANDBY; do
 
         local result
-        result=$(ssh_cmd "$label" "
-            if [[ -d '${REPO_DIR}/.git' ]]; then
-                cd '${REPO_DIR}'
-                if git fetch origin '${REPO_BRANCH}' 2>&1 \
-                    && git checkout '${REPO_BRANCH}' 2>&1 \
-                    && git reset --hard 'origin/${REPO_BRANCH}' 2>&1; then
-                    echo 'DEPLOY_PULL_OK'
-                else
-                    # The host may not be able to reach the git remote
-                    # (e.g. private repo, no credentials). The tree may
-                    # still be current if it was deployed by rsync -
-                    # report that honestly instead of a false PULL_OK.
-                    echo 'DEPLOY_PULL_FAILED'
-                fi
-            elif [[ -d '${REPO_DIR}' ]]; then
-                # Directory exists without .git - rsync-deployed tree.
-                echo 'DEPLOY_RSYNC_TREE'
+        if [[ "$local_deploy" == "true" ]]; then
+            local host port
+            if [[ "$label" == "STANDBY" ]]; then
+                host="${STANDBY_HOST}"; port="${STANDBY_SSH_PORT}"
             else
-                mkdir -p '$(dirname "${REPO_DIR}")'
-                if git clone -b '${REPO_BRANCH}' '${REPO_URL}' '${REPO_DIR}' 2>&1; then
-                    echo 'DEPLOY_CLONE_OK'
-                fi
+                host="${PRIMARY_HOST}"; port="${PRIMARY_SSH_PORT}"
             fi
-        ")
+            ssh_cmd "$label" "mkdir -p '${REPO_DIR}'" >/dev/null 2>&1 || true
+            if result=$(rsync -az --delete \
+                    --exclude='.git/' --exclude='tests/e2e/logs/' \
+                    -e "ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${JUMP_OPT} -p ${port}" \
+                    "${repo_root}/" "${SSH_USER}@${host}:${REPO_DIR}/" 2>&1); then
+                result="DEPLOY_RSYNC_OK"
+            fi
+        else
+            result=$(ssh_cmd "$label" "
+                if [[ -d '${REPO_DIR}/.git' ]]; then
+                    cd '${REPO_DIR}'
+                    if git fetch origin '${REPO_BRANCH}' 2>&1 \
+                        && git checkout '${REPO_BRANCH}' 2>&1 \
+                        && git reset --hard 'origin/${REPO_BRANCH}' 2>&1; then
+                        echo 'DEPLOY_PULL_OK'
+                    else
+                        # The host may not be able to reach the git remote
+                        # (e.g. private repo, no credentials). The tree may
+                        # still be current if it was deployed by rsync -
+                        # report that honestly instead of a false PULL_OK.
+                        echo 'DEPLOY_PULL_FAILED'
+                    fi
+                elif [[ -d '${REPO_DIR}' ]]; then
+                    # Directory exists without .git - rsync-deployed tree.
+                    echo 'DEPLOY_RSYNC_TREE'
+                else
+                    mkdir -p '$(dirname "${REPO_DIR}")'
+                    if git clone -b '${REPO_BRANCH}' '${REPO_URL}' '${REPO_DIR}' 2>&1; then
+                        echo 'DEPLOY_CLONE_OK'
+                    fi
+                fi
+            ")
+        fi
 
-        if echo "$result" | grep -Eq 'DEPLOY_PULL_OK|DEPLOY_CLONE_OK'; then
+        if echo "$result" | grep -Eq 'DEPLOY_PULL_OK|DEPLOY_CLONE_OK|DEPLOY_RSYNC_OK'; then
             log_pass "${label}: Scripts deployed to ${REPO_DIR}"
         elif echo "$result" | grep -Eq 'DEPLOY_PULL_FAILED|DEPLOY_RSYNC_TREE'; then
             log_warn "${label}: git deploy unavailable - using the existing tree at ${REPO_DIR} as-is"
@@ -631,6 +667,23 @@ phase_create_db() {
     fi
 
     log_pass "DBCA database created"
+
+    # DBCA creates a legacy (format=12) password file; step 8 (security
+    # hardening) needs format=12.2 to lock SYS (else ORA-40365). Migrate it
+    # now so the optional step-8 phase can run against a fresh test DB.
+    ssh_cmd "PRIMARY" "
+        cd '${ORACLE_HOME}/dbs' 2>/dev/null || exit 0
+        [[ -f orapw${TEST_DB_NAME} ]] || exit 0
+        fmt=\$(orapwd describe file=orapw${TEST_DB_NAME} 2>/dev/null | sed -n 's/.*format=\([0-9.]*\).*/\1/p')
+        if [[ -n \"\$fmt\" && \"\$fmt\" != '12.2' ]]; then
+            orapwd file=orapw${TEST_DB_NAME}.new input_file=orapw${TEST_DB_NAME} format=12.2 >/dev/null 2>&1 \
+              && mv orapw${TEST_DB_NAME} orapw${TEST_DB_NAME}.fmt12.bak \
+              && mv orapw${TEST_DB_NAME}.new orapw${TEST_DB_NAME} \
+              && echo 'PWFILE_MIGRATED_12_2'
+        else
+            echo 'PWFILE_ALREADY_12_2'
+        fi
+    " | grep -qE 'PWFILE_(MIGRATED|ALREADY)_12_2' && log_pass "Password file is format 12.2 (SYS-lockable)" || log_info "Password file format migration skipped"
 
     # Post-creation: disable OMF and FRA, enable archivelog with explicit dest
     result=$(ssh_cmd "PRIMARY" "
@@ -1283,10 +1336,10 @@ phase_step9() {
     log_phase "STEP 9: Configure Fast-Start Failover"
 
     local result
-    # Prompts: observer user, password, confirm (config auto-selected)
+    # Prompts (new observer user): username, proceed(y), password, confirm password
     result=$(ssh_piped "PRIMARY" \
         "FSFO_THRESHOLD=${FSFO_THRESHOLD} ./primary/09_configure_fsfo.sh" \
-        "${TEST_OBSERVER_USER}\n${TEST_OBSERVER_PASSWORD}\ny")
+        "${TEST_OBSERVER_USER}\ny\n${TEST_OBSERVER_PASSWORD}\n${TEST_OBSERVER_PASSWORD}")
 
     local exit_code=$?
     log_info "Step 9 output (last 10 lines):"
@@ -1612,7 +1665,7 @@ EOF
 
     log "Oracle Data Guard E2E Test"
     log "Started: $(date)"
-    log "Jump:    ${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}"
+    log "Jump:    ${JUMP_HOST:+${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}}${JUMP_HOST:-(none - direct)}"
     log "Primary: ${SSH_USER}@${PRIMARY_HOST}:${PRIMARY_SSH_PORT}"
     log "Standby: ${SSH_USER}@${STANDBY_HOST}:${STANDBY_SSH_PORT}"
     log "Test DB: ${TEST_DB_NAME} / ${TEST_STANDBY_DB_UNIQUE_NAME}"

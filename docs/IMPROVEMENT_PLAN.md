@@ -297,9 +297,11 @@ New tests alongside the existing ones in `tests/`:
 
 Extend `tests/e2e/run_e2e_test.sh` step 11: after deploying the trigger, perform `SWITCHOVER` via DGMGRL, assert via `V$ACTIVE_SERVICES` on both sides that the managed service moved (running on new primary, stopped on new standby), then switch back. Gate behind a flag (`SKIP_SWITCHOVER_TEST:-false`) since it doubles runtime.
 
-### ⏭️ 6.3 E2E: observer lifecycle
+### ✅ 6.3 E2E: observer lifecycle
 
 Flip `SKIP_OBSERVER` default to `false` (after WS1.8 fixes the greps). Add assertions for `observer.sh start` → `status` (running) → `stop` (stopped, pidfile removed) → stale-pidfile handling (write bogus pidfile, expect `start` to succeed).
+
+**Done 2026-07-07** — the full lifecycle (`setup` → `start` → `status` running → `stop` → stale-pidfile cleanup) ran live against the lab pair. It immediately surfaced the `fsfo/observer.sh` false-"Cannot connect" bug, which had gone unnoticed precisely because this phase was always skipped. See "E2E run 2026-07-07" below.
 
 ### ⏭️ 6.4 E2E: CDB variant trigger coverage
 
@@ -316,7 +318,99 @@ The CDB E2E config exists (`tests/e2e/` CDB variant). Add a phase that deploys `
 
 ## Verification (overall)
 
-1. ✅ The unit tests pass: `for t in tests/test_*.sh; do bash "$t"; done` (7 suites, all green). `shellcheck` was not available in the implementation environment — worth a one-off informational run where it is installed. `bash -n` passes on every `*.sh`.
-2. ⬜ Full E2E on the Linux test pair: `bash tests/e2e/run_e2e_test.sh` (non-CDB) and the CDB variant — **not run yet** (skipped with WS6.2–6.4). Strongly recommended before production use; the step 5 RMAN cmdfile flow and the step 8 password-file propagation especially want a live pass.
+1. ✅ The unit tests pass: `for t in tests/test_*.sh; do bash "$t"; done` (8 suites, all green). `shellcheck` was not available in the implementation environment — worth a one-off informational run where it is installed. `bash -n` passes on every `*.sh`.
+2. ◐ Full E2E on the Linux test pair (non-CDB) — validated across **two independent lab runs** on the poug-dg1/poug-dg2 VirtualBox pair (both driven from the `dbmint` hypervisor):
+   - **2026-07-07** — core pipeline (create_db + steps 1–7 + role trigger) GREEN, plus the **optional steps 8, 9, 10** (security hardening, FSFO, observer lifecycle) which had never been exercised before. See "E2E run 2026-07-07" below for the five product/harness bugs it surfaced.
+   - **2026-07-17** — the asymmetric-layout run recorded in [`HANDOVER.md`](../HANDOVER.md); steps 1–7 + role trigger + cleanup against a standby remapped to a completely different base, producing the broker/SQL-error-handling fixes. It did **not** re-run steps 8–10, so the 2026-07-07 findings above remain the only live coverage of those.
+   - Still not run: the **CDB variant** on either date.
 3. ⬜ AIX spot checks (manual, on the real box): `df -Pk` columns, `command -v base64 timeout openssl`, the grep patterns against captured broker output, `ps -p PID -o args=` — **not run** (no AIX box in the implementation environment).
 4. ◐ Security checks: static scan confirms no `sys/<password>` ever reaches a process argv (live `ps -ef` check during clone/diag still worth doing); NFS share perms 750/oracle:oinstall and the cleanup script's `orapw*` removal are implemented but **not yet verified against a live share**.
+
+---
+
+## E2E run 2026-07-07 (non-CDB, poug-dg1 / poug-dg2)
+
+Ran the full non-CDB E2E against the live VirtualBox pair (run directly from the
+hypervisor `dbmint`; DB hosts reachable as `oracle@dbmint:2201` / `:2202`).
+
+**Result:** create_db + steps 1–7 + 11 **all green**; optional steps 8, 9, 10
+validated after fixes. Five bugs surfaced and were fixed (3 product, 2 harness);
+two environment prerequisites were discovered.
+
+> **Relationship to the 2026-07-17 run.** This session ran on a symmetric layout and
+> focused on the *optional* steps 8–10. The later run recorded in
+> [`HANDOVER.md`](../HANDOVER.md) (merged to `main` @ `706c1a5`) covered the
+> *asymmetric* layout for steps 1–7 and never re-ran 8–10. The two are
+> complementary, not competing: only the harness's `\|`-under-ugrep fix was found
+> by both, and that one landed upstream first. Everything else below — the two
+> `08_security_hardening.sh` bugs, the `observer.sh` false-"Cannot connect", the
+> jump-optional/`LOCAL_DEPLOY`/password-file-migration harness work, and the step-9
+> input order — is unique to this run and was merged **after** the 2026-07-17 work.
+
+### Product bugs found & fixed
+
+- **`primary/08_security_hardening.sh` — SYS password 32 chars > Oracle's 30-char
+  limit (`ORA-00972: identifier is too long`).** The WS1.5 generator used
+  `cut -c1-32`; Oracle rejects passwords longer than 30. Changed both the openssl
+  and `/dev/urandom` fallback paths to `cut -c1-30`. Without this, step 8 aborts on
+  the very first `ALTER USER SYS IDENTIFIED BY`.
+- **`primary/08_security_hardening.sh` — no password-file-format pre-check; SYS left
+  changed-but-unlocked on `ORA-40365`.** Locking SYS needs a **format 12.2** password
+  file; DBCA creates format 12. On a legacy file the script changed the SYS password
+  first, then failed the lock — leaving SYS with an *unknown random password* and
+  unlocked (dangerous if OS auth were unavailable). Added a pre-flight `orapwd
+  describe` format check that stops **before** touching SYS, with the exact migration
+  commands.
+- **`fsfo/observer.sh` — `observer.sh start` always failed when FSFO is enabled
+  (false "Cannot connect").** The connection check `grep -qiE "ORA-|error"` matched
+  the literal word "Error" in the normal `show fast_start failover` output ("Oracle
+  **Error** Conditions:", "Datafile Write **Error**s"). Narrowed to
+  `grep -qE "ORA-[0-9]|TNS-[0-9]"`. This was never caught because the observer E2E
+  (WS6.3) was always skipped.
+
+### Harness bugs found & fixed (`tests/e2e/run_e2e_test.sh`)
+
+- **`\|` alternation in `grep -E` never matched under `ugrep`.** The runner host's
+  `grep` is `ugrep 7.5.0`, which (correctly) treats `\|` in ERE as a *literal* pipe,
+  so `assert_dgmgrl` patterns like `SUCCESS\|enabled\|Enabled` never matched — step 6
+  failed even though the broker was `SUCCESS`. Same class as WS1.6, but in the
+  harness. Converted all six patterns to real ERE (`SUCCESS|enabled|Enabled`, …).
+- **Step 9 piped-input order wrong** (`username, password, y`) vs the script's actual
+  prompts (`username → proceed(y) → password → confirm`); the password was fed to the
+  proceed prompt and FSFO was cancelled. Fixed the order. Also fixed the protection-mode
+  assertion (`assert_sql` strips whitespace, so the expected must be `MAXIMUMAVAILABILITY`,
+  not `MAXIMUM AVAILABILITY`).
+- Added: optional ProxyJump (`JUMP_HOST=""` → connect DB hosts directly), a
+  `LOCAL_DEPLOY=true` rsync deploy (test uncommitted fixes without pushing to origin),
+  and a post-DBCA password-file migration to **format 12.2** in `create_db` so the
+  optional step-8 phase works on a fresh DB.
+
+### Environment prerequisites / notes (not code bugs)
+
+- **Password-file format 12.2 is a hard prerequisite for step 8** (SYS lock). See the
+  new pre-check + the create_db migration.
+- **Refreshing the standby's password file requires the standby instance to re-read
+  it.** After step 8 (SYS pw change) *and* step 9 (adds the observer SYSDG user to the
+  primary's password file), redo transport failed with **ORA-16191** on reconnect even
+  with byte-identical password files on both sides — until the standby instance was
+  **restarted** to re-read the file. WS1.4's "stage to NFS + `cp` to standby" step
+  should note that a running standby caches its password file; a copy alone is not
+  enough. Final state after the restart: transport lag 0, config **SUCCESS**.
+- Steps 9/10 lifecycle fully exercised: FSFO enabled (Zero Data Loss / FASTSYNC),
+  observer setup → start → status(running) → stop → **stale-pidfile handling** (WS2.2:
+  a live non-dgmgrl PID in the pidfile is detected as stale and cleaned).
+
+### Still outstanding
+
+*(As of the 2026-07-17 merge — the asymmetric-layout gap listed here originally has
+since been closed by that run; see [`HANDOVER.md`](../HANDOVER.md).)*
+
+- CDB-variant E2E (`run_e2e_test_cdb.sh`) + the CDB trigger coverage (WS6.4), including
+  the asymmetric layout against real PDBs / GUID dirs.
+- Switchover assertion for the role trigger (WS6.2).
+- OMF-primary → Traditional-standby.
+- AIX spot checks (no AIX box).
+- **Pre-existing, unrelated:** the host's own `cdb1 → cdb1_stby` Data Guard config
+  (`my_dg_config`) has **Redo Apply stopped on `cdb1_stby`** (`ORA-16766`, ~4.5h apply
+  lag) — present before this session and not touched. Restart MRP on `cdb1_stby` to
+  clear it.

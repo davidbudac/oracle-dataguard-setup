@@ -140,6 +140,25 @@ else
     exit 1
 fi
 
+# Locking SYS requires a format 12.2 password file. On a legacy (format 12)
+# file, "ALTER USER SYS ACCOUNT LOCK" raises ORA-40365 - but the password
+# change would already have run, leaving SYS with an unknown random password
+# and unlocked. Check the format up front and stop BEFORE touching SYS.
+HARDEN_ORAPW_FILE="${ORACLE_HOME}/dbs/orapw${ORACLE_SID}"
+if command -v orapwd >/dev/null 2>&1 && [[ -f "$HARDEN_ORAPW_FILE" ]]; then
+    PWFILE_FORMAT=$(orapwd describe file="$HARDEN_ORAPW_FILE" 2>/dev/null | sed -n 's/.*format=\([0-9.]*\).*/\1/p')
+    if [[ -n "$PWFILE_FORMAT" && "$PWFILE_FORMAT" != "12.2" ]]; then
+        log_error "Password file ${HARDEN_ORAPW_FILE} is format=${PWFILE_FORMAT}, not 12.2."
+        log_error "Locking SYS requires a format 12.2 password file (otherwise ORA-40365)."
+        log_error "Migrate it first (this preserves existing entries), then re-run this step:"
+        log_error "  cd ${ORACLE_HOME}/dbs"
+        log_error "  orapwd file=orapw${ORACLE_SID}.new input_file=orapw${ORACLE_SID} format=12.2"
+        log_error "  mv orapw${ORACLE_SID} orapw${ORACLE_SID}.fmt12.bak && mv orapw${ORACLE_SID}.new orapw${ORACLE_SID}"
+        log_error "Then propagate the migrated file to the standby before re-running."
+        exit 1
+    fi
+fi
+
 if ! confirm_typed_value "This will change and lock SYS on ${DB_UNIQUE_NAME}." "SECURE ${DB_UNIQUE_NAME}"; then
     log_info "Security hardening cancelled by user"
     exit 0
@@ -161,10 +180,13 @@ log_info "Generating random password..."
 # EOF, so the byte count is bounded with `-N 16` (16 bytes = 32 hex chars)
 # rather than an unbounded `od ... /dev/urandom`, which would hang forever
 # reading from an infinite device.
+# Oracle caps a password (quoted identifier) at 30 bytes; 32 chars raises
+# ORA-00972: identifier is too long. Keep it at 30 - still ~178 bits of
+# entropy from the A-Za-z0-9 alphabet.
 if command -v openssl >/dev/null 2>&1; then
-    RANDOM_PWD=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-32)
+    RANDOM_PWD=$(openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | cut -c1-30)
 else
-    RANDOM_PWD=$(od -An -tx1 -N 16 /dev/urandom | tr -d '[:space:]' | cut -c1-32)
+    RANDOM_PWD=$(od -An -tx1 -N 16 /dev/urandom | tr -d '[:space:]' | cut -c1-30)
 fi
 
 log_info "Changing SYS password and locking account..."

@@ -2,7 +2,7 @@
 
 **Branch:** `claude/project-review-plan-l5ihf4` (branched from `main` @ `04012ad`), then `handover-followups`
 **Commits:** `ef4190b` (review fixes), `02f85f4` (asymmetric filesystem support), plus the `handover-followups` series
-**Status:** **Merged to `main` @ `706c1a5` (2026-07-17)** — this document is now a historical record of the work, not an open handover. `bash -n` clean on every touched script; all 7 unit tests pass (`for t in tests/test_*.sh; do bash "$t"; done`). Known issues 1, 2, and 4 below are fixed; see the update block under "Known remaining issues" for what is still open.
+**Status:** **Merged to `main` @ `706c1a5` (2026-07-17)** — this document is now a historical record of the work, not an open handover. `bash -n` clean on every touched script; all unit tests pass (`for t in tests/test_*.sh; do bash "$t"; done` — 8 suites as of 2026-08-05). Known issues 1, 2, and 4 below are fixed; see the update block under "Known remaining issues" for what is still open.
 
 ## What this branch contains
 
@@ -51,7 +51,9 @@ The user asked to verify usability when primary and standby have **different fil
 > - **Live asymmetric-layout validation done**: primary with 3 datafile dirs (incl. mixed-case DB-name tokens and a temp-only dir), standby remapped to a completely different base (`/u01/stby/{data,data2,temp,redo,arch}`) via edit-env + `--regenerate`; RMAN duplicate placed every file correctly, broker SUCCESS, MRP healthy, and a post-setup `CREATE TABLESPACE` on the primary auto-replicated into the remapped standby dir.
 > - Live-run fixes made along the way: FSFO disable before REMOVE CONFIGURATION (ORA-16654); ORA-16596 treated as no-usable-config; tab-stripping before is_numeric (sqlplus pads scalars with tabs); TTY-gate on the unmapped-path prompt; **`--regenerate` now persists rebuilt convert strings into the .env** (step 5 feeds RMAN from the .env — stale strings silently overrode the regenerated pfile); step 5 instance-status probes tolerate WHENEVER SQLERROR; E2E harness fixes (DBCA exit 6, honest deploy reporting, ERE `|` in asserts, broker-SUCCESS retry loop).
 > - Known limitation found: when the primary keeps data+redo in ONE directory but the standby splits them, first-prefix-match means ORLs/SRLs land in the standby DATA dir, not the split redo dir (both convert strings share one pair list). Functional, but a split needs a distinct primary redo dir too. **Addressed 2026-07-17:** not fixable by ordering (a pair remaps a primary filename; nothing tells an ORL from a datafile in a shared dir), so `build_convert_pairs()` now detects and warns instead of shipping the split silently — tests 9/10 in `tests/test_file_name_convert.sh`.
-> - Still untested live: CDB E2E with real PDBs/GUID dirs, OMF-primary→Traditional-standby, switchover/observer (IMPROVEMENT_PLAN 6.2–6.4).
+> - Still untested live: CDB E2E with real PDBs/GUID dirs, OMF-primary→Traditional-standby, switchover (IMPROVEMENT_PLAN 6.2, 6.4).
+>
+> **Correction 2026-08-05:** the line above originally also listed **observer** as untested. That was true of *this* branch's runs, but a separate lab session on **2026-07-07** (merged after this document, see `docs/IMPROVEMENT_PLAN.md` → "E2E run 2026-07-07") had already exercised the full observer lifecycle plus optional steps 8 and 9 — and found three product bugs there: the 32-char SYS password (`ORA-00972`), the missing password-file format-12.2 pre-check (`ORA-40365` leaving SYS changed-but-unlocked), and `observer.sh start` misreading healthy FSFO output as a connection failure. IMPROVEMENT_PLAN 6.3 is therefore ✅, not ⏭️. Steps 8–10 were *not* re-run on 2026-07-17, so that session remains their only live coverage.
 
 1. **DGMGRL exit codes are meaningless** (`common/dg_functions.sh` `run_dgmgrl*`): scripts end in `EXIT;` so dgmgrl returns 0 even when CREATE CONFIGURATION / `StaticConnectIdentifier` edits failed; every `if ! run_dgmgrl` is a no-op. Fix = output-grepping wrappers (`ORA-|Error|Failed` → nonzero), but that changes behavior for ALL callers (some grep output themselves, e.g. `06:288`) — needs a deliberate pass, possibly a `run_dgmgrl_checked` used only by mutating calls.
 2. **`sql/queries/*.sql` lack `WHENEVER SQLERROR EXIT`** — error text can flow into env files/arithmetic as data. A sweep changes exit-code semantics under `set -e` repo-wide; pair with an `is_numeric` guard helper.
@@ -62,10 +64,10 @@ The user asked to verify usability when primary and standby have **different fil
 
 ```bash
 for f in $(git diff main --name-only | grep '\.sh$'); do bash -n "$f"; done
-for t in tests/test_*.sh; do bash "$t"; done          # all 7 must pass
+for t in tests/test_*.sh; do bash "$t"; done          # all must pass (8 suites as of 2026-08-05)
 bash ./tests/e2e/run_e2e_test.sh                       # ~20 min, needs the lab env (tests/e2e/config.env)
 ```
 
 ~~The single most valuable validation still outstanding: **one live E2E run with an intentionally asymmetric standby layout**~~ — **done 2026-07-17** against the poug-dg1/poug-dg2 lab (non-CDB); see the update block above for the results and the eight fixes it produced. The asymmetric fixes are now backed by a real RMAN duplicate, not only code trace and unit tests.
 
-The most valuable validation now outstanding: **the same asymmetric run against a CDB with real PDBs** (GUID dirs), plus OMF-primary→Traditional-standby and switchover/observer (IMPROVEMENT_PLAN 6.2–6.4).
+The most valuable validation now outstanding: **the same asymmetric run against a CDB with real PDBs** (GUID dirs), plus OMF-primary→Traditional-standby and the switchover assertion (IMPROVEMENT_PLAN 6.2, 6.4). Observer lifecycle is covered — see the 2026-08-05 correction above.

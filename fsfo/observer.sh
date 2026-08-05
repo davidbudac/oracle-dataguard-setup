@@ -503,7 +503,11 @@ do_start() {
         exit 1
     fi
 
-    if echo "$FSFO_STATUS" | grep -qiE "ORA-|error"; then
+    # Match only genuine Oracle/TNS error codes here. A bare "error" match
+    # is a false positive: the normal "show fast_start failover" output
+    # contains the labels "Oracle Error Conditions:" and "Datafile Write
+    # Errors", which would otherwise abort a perfectly healthy start.
+    if echo "$FSFO_STATUS" | grep -qE "ORA-[0-9]|TNS-[0-9]"; then
         log_error "Cannot connect to Data Guard configuration"
         log_error "Check wallet credentials and TNS configuration"
         echo ""
