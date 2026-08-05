@@ -149,6 +149,7 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 - `tests/test_df_parsing.sh` - Tests `parse_df_available_kb` / `get_available_space_kb`; guards the `df -Pk` (POSIX format) requirement for AIX compatibility
 - `tests/test_grep_portability.sh` - Tests broker-output detection patterns and sweeps the repo for GNU-grep-only usage (`grep -P`, `\s`, BRE `\|` alternation)
 - `tests/test_sid_detection.sh` - Tests the SID-detection/validation pipeline used by `dg_status.sh` (`_detect_pmon_sid` / `_validate_sid`)
+- `tests/test_visualizer_url.sh` - Tests the dataguard-doc visualizer link helpers embedded in both handoff scripts (block-drift diff, base64url payload, field mapping/omission, JSON escaping)
 
 ### End-to-End Tests
 - `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator
@@ -275,6 +276,8 @@ The report now includes application-facing sections for RPO/data-loss expectatio
 It also copies `docs/DG_APPLICATION_IMPACT.html` to `${NFS_SHARE}/dg_application_impact.html` when available and links it from "Notes for Client Teams". The Markdown remains self-contained with a 5-bullet "What changes for your application" summary covering commit latency, NOLOGGING jobs, sequence gaps, cold-cache brownout, and the reach-both-hosts firewall prerequisite.
 
 User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the role trigger), with the default `<DB_UNIQUE_NAME>` service always included. Output: `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` plus stdout. Re-run after listener changes, new services, or topology changes to refresh the report.
+
+Both handoff scripts also emit an **"Interactive diagram"** link in the report header: the discovered topology (DB unique names, hosts, observer host/placement, first service, port, protection mode, LogXptMode, FSFO threshold — never credentials) is encoded as `#cfg=<base64url(JSON)>` for the interactive Data Guard configuration explorer (source repo `davidbudac/dataguard-doc`, published at `https://davidbudac.cz/dataguard/`; base overridable via `DG_DOC_BASE_URL`). Unknown/undiscovered fields are omitted so the page falls back to its defaults; the link is skipped entirely if neither `base64` nor `openssl` exists on the host. The helper block is duplicated **byte-identically** in `dg_handoff.sh` and `primary/10_generate_handoff_report.sh` between `# ---- begin/end dataguard-doc visualizer helpers ----` markers — `tests/test_visualizer_url.sh` diffs the two copies and fails on drift, so edit one and re-copy into the other.
 
 **Standalone variant: `dg_handoff.sh`** (root of repo)
 ```bash

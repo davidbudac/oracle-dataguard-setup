@@ -181,6 +181,113 @@ get_sqlnet_expire_time() {
     ' "$sqlnet"
 }
 
+# ---- begin dataguard-doc visualizer helpers ----
+# Kept byte-identical in dg_handoff.sh and
+# primary/10_generate_handoff_report.sh (tests/test_visualizer_url.sh
+# diffs the two copies). The handoff report links the discovered
+# topology into the interactive Data Guard configuration explorer
+# (source: https://github.com/davidbudac/dataguard-doc, published at
+# https://davidbudac.cz/dataguard/). The page restores its state from
+# "#cfg=<base64url(JSON)>"; a partial config is valid - keys we omit
+# fall back to the page defaults and unknown keys are ignored. Only
+# topology already printed in this report is encoded (names, hosts,
+# port, service) - never credentials.
+
+DG_DOC_BASE_URL="${DG_DOC_BASE_URL:-https://davidbudac.cz/dataguard/}"
+
+# stdin -> base64url (URL-safe alphabet, no padding, no newlines).
+# Returns 1 when no encoder exists; the caller then omits the link.
+b64url_encode() {
+    if command -v base64 >/dev/null 2>&1; then
+        base64 | tr -d '\n=' | tr '+/' '-_'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl enc -base64 -A | tr -d '\n=' | tr '+/' '-_'
+    else
+        return 1
+    fi
+}
+
+# Append one JSON member to the object fragment named by $1, skipping
+# empty/unknown values so omitted keys keep the page defaults.
+# viz_add <fragment-var> <key> <value> [num]
+viz_add() {
+    local _var="$1" _key="$2" _val="$3" _kind="${4:-str}" _frag
+    case "$_val" in
+        ''|unknown|UNKNOWN|N/A|n/a) return 0 ;;
+    esac
+    if [[ "$_kind" == "num" ]]; then
+        case "$_val" in *[!0-9]*) return 0 ;; esac
+        _frag="\"${_key}\":${_val}"
+    else
+        _val=$(printf '%s' "$_val" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+        _frag="\"${_key}\":\"${_val}\""
+    fi
+    eval "${_var}=\"\${${_var}:+\${${_var}},}\${_frag}\""
+}
+
+# Case-insensitive short-hostname comparison (FQDN vs short name safe)
+viz_same_host() {
+    local a b
+    a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]'); a="${a%%.*}"
+    b=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]'); b="${b%%.*}"
+    [[ -n "$a" && "$a" == "$b" ]]
+}
+
+build_visualizer_url() {
+    local dep="" par="" sim="" json enc mode_tok="" xpt_tok="" obs_tok=""
+
+    viz_add dep name         "$PRIMARY_DB_UNIQUE_NAME"
+    viz_add dep dbPrimary    "$PRIMARY_DB_UNIQUE_NAME"
+    viz_add dep dbStandby    "$STANDBY_DB_UNIQUE_NAME"
+    viz_add dep hostPrimary  "$PRIMARY_HOSTNAME"
+    viz_add dep hostStandby  "$STANDBY_HOSTNAME"
+    viz_add dep hostObserver "$FSFO_OBSERVER_HOST"
+    viz_add dep service      "${SERVICE_LIST[0]:-}"
+    viz_add dep port         "$PORT" num
+
+    # The page models MaxAvailability and MaxPerformance only;
+    # anything else (e.g. MaxProtection) is omitted -> page default.
+    case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')" in
+        *AVAILABILITY*) mode_tok="maxavail" ;;
+        *PERFORMANCE*)  mode_tok="maxperf" ;;
+    esac
+    viz_add par mode "$mode_tok"
+    case "$(printf '%s' "$STANDBY_LOGXPTMODE" | tr '[:upper:]' '[:lower:]')" in
+        sync)     xpt_tok="sync" ;;
+        fastsync) xpt_tok="fastsync" ;;
+        async)    xpt_tok="async" ;;
+    esac
+    viz_add par logXptMode "$xpt_tok"
+    viz_add par threshold "$FSFO_THRESHOLD" num
+
+    # Observer placement: the page models the primary site as dc1, the
+    # standby site as dc2, a third site as dc3; 'none' = no observer.
+    case "$(printf '%s' "${FSFO_STATUS:-}" | tr '[:lower:]' '[:upper:]')" in
+        ''|DISABLED|N/A) obs_tok="none" ;;
+        *)
+            if viz_same_host "$FSFO_OBSERVER_HOST" "$PRIMARY_HOSTNAME"; then
+                obs_tok="dc1"
+            elif viz_same_host "$FSFO_OBSERVER_HOST" "$STANDBY_HOSTNAME"; then
+                obs_tok="dc2"
+            elif [[ -n "$FSFO_OBSERVER_HOST" ]]; then
+                obs_tok="dc3"
+            fi
+            ;;
+    esac
+    viz_add sim observerLoc "$obs_tok"
+
+    json="{\"v\":1"
+    [[ -n "$dep" ]] && json="${json},\"deployment\":{${dep}}"
+    [[ -n "$par" ]] && json="${json},\"params\":{${par}}"
+    [[ -n "$sim" ]] && json="${json},\"sim\":{${sim}}"
+    json="${json}}"
+
+    enc=$(printf '%s' "$json" | b64url_encode) || return 1
+    [[ -n "$enc" ]] || return 1
+    printf '%s#cfg=%s' "$DG_DOC_BASE_URL" "$enc"
+}
+# ---- end dataguard-doc visualizer helpers ----
+
 # ============================================================
 # Main
 # ============================================================
@@ -372,6 +479,9 @@ fi
 GEN_DATE=$(date)
 GEN_HOST=$(hostname 2>/dev/null)
 
+# Best-effort: no base64/openssl on the host just drops the link
+VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
+
 # Status verdict (escalate-only: HEALTHY -> WARNING -> ERROR, never lowered)
 VERDICT="HEALTHY"
 VERDICT_NOTES=()
@@ -400,6 +510,10 @@ fi
     echo "- **Generated:** ${GEN_DATE}"
     echo "- **Generated on:** ${GEN_HOST}"
     echo "- **Configuration:** ${PRIMARY_DB_UNIQUE_NAME} → ${STANDBY_DB_UNIQUE_NAME}"
+    if [[ -n "$VIZ_URL" ]]; then
+        echo "- **Interactive diagram:** [open this configuration in the Data Guard visualizer](${VIZ_URL})"
+        echo "  (the link encodes only the topology shown in this report - no credentials)"
+    fi
     echo ""
     echo "## 1. Topology"
     echo ""
