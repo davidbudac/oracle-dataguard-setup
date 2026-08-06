@@ -40,7 +40,11 @@ ALTER SYSTEM ARCHIVE LOG CURRENT;
 log_info "Waiting for non-CDB standby (${SOURCE_STANDBY_UNIQUE_NAME}) to drain ..."
 ATTEMPTS=0
 while (( ATTEMPTS < 30 )); do
-    DG_STATE="$(run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW DATABASE VERBOSE '${SOURCE_STANDBY_UNIQUE_NAME}';")"
+    # || true: this is a polling loop watching lag drain to zero, not a
+    # mutation - a transient broker hiccup should be retried, not abort
+    # the whole quiesce (an unresolved real error still shows up in the
+    # printed output above/below for the operator to see).
+    DG_STATE="$(run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW DATABASE VERBOSE '${SOURCE_STANDBY_UNIQUE_NAME}';")" || true
     APPLY_LAG=$(echo "$DG_STATE" | awk -F: '/Apply Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
     TPT_LAG=$(  echo "$DG_STATE" | awk -F: '/Transport Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
     log_info "  apply='${APPLY_LAG}' transport='${TPT_LAG}'"
@@ -55,6 +59,8 @@ if (( ATTEMPTS >= 30 )); then
 fi
 
 # ---- 2. Bounce the non-CDB primary to READ ONLY ----------------------------
+confirm_or_abort "This will SHUTDOWN IMMEDIATE the source non-CDB ${SOURCE_DB_UNIQUE_NAME} (takes it offline) and restart it READ ONLY. Continue?"
+
 log_info "Restarting non-CDB primary into READ ONLY ..."
 run_sql "$SOURCE_ORACLE_SID" "
 SHUTDOWN IMMEDIATE;

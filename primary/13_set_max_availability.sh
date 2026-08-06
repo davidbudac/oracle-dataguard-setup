@@ -92,7 +92,7 @@ init_log "13_set_max_availability_${STANDBY_DB_UNIQUE_NAME}"
 progress_step "Verifying Database Role"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \t\n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -123,7 +123,10 @@ elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
     echo ""
     echo "$CONFIG_STATUS"
     echo ""
-    if ! confirm_proceed "Continue despite broker warnings?"; then
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # prompting, and a non-interactive real run aborts explicitly instead
+    # of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue despite broker warnings?"; then
         log_info "Protection mode change cancelled by user"
         exit 0
     fi
@@ -203,7 +206,20 @@ for DB in "$PRIMARY_DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"; do
     echo "$VALIDATE_OUTPUT"
     echo ""
 
-    if printf '%s\n' "$VALIDATE_OUTPUT" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+    # ORA-01017 from the "Validating static connect identifier" probe is
+    # EXPECTED when this script runs via OS authentication (dgmgrl /):
+    # VALIDATE re-connects over TNS through the static service and has no
+    # password to present. Reaching ORA-01017 actually PROVES the static
+    # registration works (the listener resolved the service and the
+    # database answered) - the genuine static-registration failure is
+    # ORA-12514/ORA-12154, which stays fatal below. Strip only the benign
+    # pattern before scanning for real errors.
+    VALIDATE_SCAN=$(printf '%s\n' "$VALIDATE_OUTPUT" | grep -v 'ORA-01017')
+    if printf '%s\n' "$VALIDATE_OUTPUT" | grep -q 'ORA-01017'; then
+        log_info "${DB}: static connect identifier probe returned ORA-01017 - expected under OS authentication (the static service itself resolved and responded)"
+    fi
+
+    if printf '%s\n' "$VALIDATE_SCAN" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
         log_error "VALIDATE DATABASE '${DB}' reported errors"
         VALIDATION_OK=0
         continue
@@ -220,7 +236,10 @@ done
 if [[ "$VALIDATION_OK" != "1" ]]; then
     log_error "Database validation did not pass cleanly"
     log_error "MAXIMUM AVAILABILITY requires healthy synchronous transport; fix the issues above first"
-    if ! confirm_proceed "Continue anyway despite validation warnings?"; then
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # prompting, and a non-interactive real run aborts explicitly instead
+    # of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue anyway despite validation warnings?"; then
         log_info "Protection mode change cancelled by user"
         exit 1
     fi
@@ -258,14 +277,17 @@ log_info "Note: The broker refuses MAXIMUM AVAILABILITY (ORA-16627) if the stand
 
 progress_step "Checking Archive Destinations"
 
-DEST_ERROR_COUNT=$(run_sql_query "get_archive_dest_error_count.sql" 2>/dev/null | tr -d ' \n\r' || true)
+DEST_ERROR_COUNT=$(run_sql_query "get_archive_dest_error_count.sql" 2>/dev/null | tr -d ' \t\n\r' || true)
 
 if [[ -n "$DEST_ERROR_COUNT" && "$DEST_ERROR_COUNT" != "0" ]]; then
     log_warn "Archive destinations reporting errors: $DEST_ERROR_COUNT"
     echo ""
     run_sql_query "get_archive_dest_errors.sql" || true
     echo ""
-    if ! confirm_proceed "Continue despite archive destination errors?"; then
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # prompting, and a non-interactive real run aborts explicitly instead
+    # of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue despite archive destination errors?"; then
         log_info "Protection mode change cancelled by user"
         exit 1
     fi
@@ -349,7 +371,14 @@ if [[ "$MODE_CHANGE_NEEDED" == "0" ]]; then
     log_info "Protection mode is already MAXIMUM AVAILABILITY"
 else
     log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY"
-    if ! DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl" 2>&1); then
+    # M7: no 2>&1 here - this is a mutating dgmgrl script, so run_dgmgrl's
+    # own confirm_approval_action prompt goes to stderr; merging it into
+    # this capture would swallow the prompt into $DGMGRL_OUTPUT invisibly
+    # while still blocking on `read`, which looks like a silent hang in
+    # approval mode. dgmgrl itself writes its output to stdout (same
+    # assumption run_dgmgrl_checked already relies on), so dropping the
+    # merge does not lose any diagnostic text.
+    if ! DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl"); then
         log_error "DGMGRL command failed:"
         echo ""
         echo "$DGMGRL_OUTPUT"
@@ -367,7 +396,7 @@ else
 
     # Verify change
     sleep 3
-    NEW_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \n\r')
+    NEW_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \t\n\r')
     NEW_MODE_NORMALIZED=$(echo "$NEW_MODE" | tr -d ' ')
 
     if [[ "$NEW_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then

@@ -443,8 +443,13 @@ SQLEOF
 
         # Remove DG broker files
         rm -f '${ORACLE_BASE}/oradata/dg_broker_config_*.dat' 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr1*.dat' 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr2*.dat' 2>/dev/null || true
+        # Only THIS test DB's broker files: a dr1*.dat glob (or the previous
+        # quoted-literal form, which matched nothing) must not touch other
+        # databases sharing this ORACLE_HOME (e.g. the persistent cdb1 pair).
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
 
         # Remove wallet (observer)
         rm -rf '${ORACLE_HOME}/network/admin/wallet' 2>/dev/null || true
@@ -460,7 +465,24 @@ SQLEOF
 
         # Remove SID entries added by DG scripts from listener.ora
         # (remove any SID_DESC blocks for our test SID)
-        sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
+        # Remove whole SID_DESC blocks for the test SID (a line-delete leaves
+        # invalid husks that break the next lsnrctl reload with TNS-01155);
+        # also drop nameless husk blocks left by older cleanups.
+        _lsnr='${ORACLE_HOME}/network/admin/listener.ora'
+        if [[ -f \"\${_lsnr}\" ]]; then
+            awk -v sid='${TEST_ORACLE_SID}' '
+                /^[[:space:]]*\\(SID_DESC/ && blk==0 { blk=1; depth=0; drop=0; hasname=0; n=0 }
+                blk==1 {
+                    buf[++n]=\$0
+                    for (i=1;i<=length(\$0);i++) { c=substr(\$0,i,1); if (c==\"(\") depth++; else if (c==\")\") depth-- }
+                    if (index(tolower(\$0), tolower(sid)) > 0) drop=1
+                    if (tolower(\$0) ~ /sid_name/) hasname=1
+                    if (depth<=0) { blk=0; if (!drop && hasname) for (i=1;i<=n;i++) print buf[i] }
+                    next
+                }
+                { print }
+            ' \"\${_lsnr}\" > \"\${_lsnr}.tmp\" && mv \"\${_lsnr}.tmp\" \"\${_lsnr}\" || rm -f \"\${_lsnr}.tmp\"
+        fi
 
         # Remove oratab entry
         if [[ -f /etc/oratab ]]; then
@@ -519,8 +541,13 @@ SQLEOF
 
         # Remove DG broker files
         rm -f '${ORACLE_BASE}/oradata/dg_broker_config_*.dat' 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr1*.dat' 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr2*.dat' 2>/dev/null || true
+        # Only THIS test DB's broker files: a dr1*.dat glob (or the previous
+        # quoted-literal form, which matched nothing) must not touch other
+        # databases sharing this ORACLE_HOME (e.g. the persistent cdb1 pair).
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
 
         # Remove DG TNS entries from tnsnames.ora and listener.ora
         for f in tnsnames.ora listener.ora; do
@@ -530,7 +557,24 @@ SQLEOF
                 sed -i '/^# DG Listener/,\$d' \"\${local_f}\" 2>/dev/null || true
             fi
         done
-        sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
+        # Remove whole SID_DESC blocks for the test SID (a line-delete leaves
+        # invalid husks that break the next lsnrctl reload with TNS-01155);
+        # also drop nameless husk blocks left by older cleanups.
+        _lsnr='${ORACLE_HOME}/network/admin/listener.ora'
+        if [[ -f \"\${_lsnr}\" ]]; then
+            awk -v sid='${TEST_ORACLE_SID}' '
+                /^[[:space:]]*\\(SID_DESC/ && blk==0 { blk=1; depth=0; drop=0; hasname=0; n=0 }
+                blk==1 {
+                    buf[++n]=\$0
+                    for (i=1;i<=length(\$0);i++) { c=substr(\$0,i,1); if (c==\"(\") depth++; else if (c==\")\") depth-- }
+                    if (index(tolower(\$0), tolower(sid)) > 0) drop=1
+                    if (tolower(\$0) ~ /sid_name/) hasname=1
+                    if (depth<=0) { blk=0; if (!drop && hasname) for (i=1;i<=n;i++) print buf[i] }
+                    next
+                }
+                { print }
+            ' \"\${_lsnr}\" > \"\${_lsnr}.tmp\" && mv \"\${_lsnr}.tmp\" \"\${_lsnr}\" || rm -f \"\${_lsnr}.tmp\"
+        fi
 
         # Remove oratab entry
         if [[ -f /etc/oratab ]]; then
@@ -1005,19 +1049,30 @@ phase_step6() {
     # Wait for broker to stabilize
     sleep 15
 
-    # Validate: broker configuration exists and is enabled
-    assert_dgmgrl "PRIMARY" \
-        "SHOW CONFIGURATION" \
-        "SUCCESS\|enabled\|Enabled" \
-        "Broker configuration enabled" || {
-        # Might still be starting - wait and retry
-        log_info "Retrying after 30 seconds..."
-        sleep 30
-        assert_dgmgrl "PRIMARY" \
-            "SHOW CONFIGURATION" \
-            "SUCCESS\|enabled\|Enabled" \
-            "Broker configuration enabled (retry)" || return 1
-    }
+    # Validate: broker configuration exists and is enabled. Poll QUIETLY
+    # (attempts that will be retried must not log_fail) and assert only
+    # the final outcome. Real ERE alternation, not BRE \| - the runner
+    # host's grep may be ugrep, which treats \| in -E as a literal.
+    _broker_ok=0
+    _broker_out=""
+    for _retry in 0 1 2 3 4; do
+        if [[ $_retry -gt 0 ]]; then
+            log_info "Broker not ready yet - retrying in 30 seconds (attempt ${_retry}/4)..."
+            sleep 30
+        fi
+        _broker_out=$(ssh_cmd "PRIMARY" "dgmgrl -silent / 'SHOW CONFIGURATION'" 2>&1)
+        if echo "$_broker_out" | grep -qiE "SUCCESS|enabled|Enabled"; then
+            _broker_ok=1
+            break
+        fi
+    done
+    if [[ $_broker_ok -eq 1 ]]; then
+        log_pass "Broker configuration enabled"
+    else
+        log_fail "Broker configuration enabled: expected SUCCESS/enabled in output"
+        log_info "  DGMGRL output: $(echo "$_broker_out" | head -5)"
+        return 1
+    fi
 
     # Validate: both databases in configuration
     assert_dgmgrl "PRIMARY" \
@@ -1282,7 +1337,7 @@ phase_step11() {
     #   Re-run:     accept services (Enter), replace existing (y), deploy (y)
     # Extra y's after all prompts are harmless
     result=$(ssh_piped "PRIMARY" \
-        "./trigger/create_role_trigger.sh" \
+        "./trigger/create_role_trigger_cdb.sh" \
         "\ny\ny\ny")
 
     local exit_code=$?
@@ -1297,7 +1352,7 @@ phase_step11() {
             return 0
         fi
         log_fail "Step 11 script exited with code ${exit_code}"
-        record_issue "step11" "create_role_trigger.sh failed" "$(echo "$result" | tail -20)"
+        record_issue "step11" "create_role_trigger_cdb.sh failed" "$(echo "$result" | tail -20)"
         return 1
     fi
 

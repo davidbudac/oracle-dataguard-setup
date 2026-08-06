@@ -137,12 +137,32 @@ progress_step "Gathering Redo Log Configuration"
 ONLINE_REDO_INFO=$(run_sql_display "get_online_redo_info.sql")
 echo "$ONLINE_REDO_INFO"
 
-# Get redo log size (in MB) and count
+# Get redo log size (in MB) and count. REDO_LOG_SIZE_MB is the LARGEST
+# online redo log - standby redo logs are sized from it, and Oracle
+# refuses an SRL smaller than the largest ORL (see H1).
 REDO_LOG_SIZE_MB=$(run_sql_query "get_redo_log_size.sql")
 REDO_LOG_SIZE_MB=$(echo "$REDO_LOG_SIZE_MB" | tr -d '[:space:]')
 if ! is_numeric "$REDO_LOG_SIZE_MB"; then
     log_error "get_redo_log_size.sql returned a non-numeric result: '${REDO_LOG_SIZE_MB}'"
     exit 1
+fi
+
+# Detect mixed-size online redo logs (e.g. grown over time): the standby
+# build below sizes every SRL to REDO_LOG_SIZE_MB (the max), which is
+# correct, but a smaller ORL group left in place will itself reject
+# real-time apply from an SRL that size - flag it now while it's cheap
+# to fix, rather than discovering it as a transport degradation later.
+MIN_REDO_LOG_SIZE_MB=$(run_sql_query "get_min_redo_log_size.sql")
+MIN_REDO_LOG_SIZE_MB=$(echo "$MIN_REDO_LOG_SIZE_MB" | tr -d '[:space:]')
+if ! is_numeric "$MIN_REDO_LOG_SIZE_MB"; then
+    log_error "get_min_redo_log_size.sql returned a non-numeric result: '${MIN_REDO_LOG_SIZE_MB}'"
+    exit 1
+fi
+if [[ "$MIN_REDO_LOG_SIZE_MB" != "$REDO_LOG_SIZE_MB" ]]; then
+    log_warn "Online redo logs have MIXED sizes: smallest ${MIN_REDO_LOG_SIZE_MB}MB, largest ${REDO_LOG_SIZE_MB}MB"
+    log_warn "  Standby redo logs will be sized to the LARGEST online redo log (${REDO_LOG_SIZE_MB}MB) -"
+    log_warn "  Oracle refuses standby redo logs smaller than that, so the undersized ORL group(s)"
+    log_warn "  themselves will not accept real-time apply. Resize them to ${REDO_LOG_SIZE_MB}MB to match."
 fi
 
 ONLINE_REDO_GROUPS=$(run_sql_query "get_online_redo_count.sql")
@@ -337,6 +357,20 @@ USE_FRA_FOR_ARCHIVE="NO"
 ARCHIVE_DEST_PATH=$(run_sql_query "get_archive_dest.sql")
 ARCHIVE_DEST_PATH=$(printf '%s' "$ARCHIVE_DEST_PATH" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 
+# V$ARCHIVE_DEST.DESTINATION can return the literal clause value
+# USE_DB_RECOVERY_FILE_DEST (not a resolved filesystem path) when
+# log_archive_dest_1 points at the FRA. Left alone, this "path" flows
+# straight into step 2 as the default standby archive directory, and
+# step 3 does `mkdir -p USE_DB_RECOVERY_FILE_DEST` (a bogus relative
+# directory) -> ORA-19905/ORA-16032 on the standby (see H2). Treat it
+# the same as an empty result so the FRA-derivation logic below runs,
+# and make sure the literal itself is never persisted as the dest path.
+if [[ "$ARCHIVE_DEST_PATH" == "USE_DB_RECOVERY_FILE_DEST"* ]]; then
+    log_info "Archive destination resolves to the Fast Recovery Area (FRA), not a literal path"
+    USE_FRA_FOR_ARCHIVE="YES"
+    ARCHIVE_DEST_PATH=""
+fi
+
 # If V$ARCHIVE_DEST didn't return a path, try the parameter
 if [[ -z "$ARCHIVE_DEST_PATH" ]]; then
     ARCHIVE_DEST=$(get_db_parameter "log_archive_dest_1")
@@ -461,7 +495,12 @@ ARCHIVE_OLDEST_TIME="n/a"
 ARCHIVE_NEWEST_TIME="n/a"
 
 # --- Archived logs currently on disk ---
-ARCHIVE_DISK_RAW=$(run_sql_query "get_archive_disk_usage_pipe.sql" | tr -d ' \t\n\r')
+# `|| true` on each capture below (M16): this whole section is
+# documented as informational and must never fail the step, but under
+# verbose mode's `set -E -o pipefail`, a query error would otherwise
+# propagate through the pipeline and abort the script - before the .env
+# is even written - despite the "never fails" comment above.
+ARCHIVE_DISK_RAW=$(run_sql_query "get_archive_disk_usage_pipe.sql" | tr -d ' \t\n\r') || true
 if [[ "$ARCHIVE_DISK_RAW" == *"|"* ]]; then
     assign_numeric_field ARCHIVE_LOGS_ON_DISK "$ARCHIVE_DISK_RAW" 1
     assign_numeric_field ARCHIVE_SIZE_ON_DISK_MB "$ARCHIVE_DISK_RAW" 2
@@ -475,7 +514,7 @@ else
 fi
 
 # --- Redo generation rate over the retained history ---
-REDO_STATS_RAW=$(run_sql_query "get_redo_stats_pipe.sql" | tr -d ' \t\n\r')
+REDO_STATS_RAW=$(run_sql_query "get_redo_stats_pipe.sql" | tr -d ' \t\n\r') || true
 if [[ "$REDO_STATS_RAW" == *"|"* ]]; then
     REDO_HISTORY_DAYS=$(sanitize_label "$(pipe_field "$REDO_STATS_RAW" 1)")
     assign_numeric_field REDO_ARCHIVED_LOG_COUNT "$REDO_STATS_RAW" 2
@@ -500,7 +539,7 @@ if [[ "$REDO_ARCHIVED_LOG_COUNT" -eq 0 ]]; then
     log_warn "  Falling back to redo generated since instance startup (V\$SYSSTAT)"
     log_warn "  Re-run this step after a representative workload period for meaningful sizing"
 
-    STARTUP_STATS_RAW=$(run_sql_query "get_redo_since_startup_pipe.sql" | tr -d ' \t\n\r')
+    STARTUP_STATS_RAW=$(run_sql_query "get_redo_since_startup_pipe.sql" | tr -d ' \t\n\r') || true
     if [[ "$STARTUP_STATS_RAW" == *"|"* ]]; then
         REDO_STATS_SOURCE="INSTANCE_STARTUP"
         assign_numeric_field REDO_TOTAL_MB "$STARTUP_STATS_RAW" 1

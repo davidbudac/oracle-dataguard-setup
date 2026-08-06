@@ -70,7 +70,13 @@ WALLET_DIR=""
 AUTO_PASSWORD=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -w|--wallet-dir) WALLET_DIR="$2"; shift 2 ;;
+        -w|--wallet-dir)
+            if [[ $# -lt 2 ]]; then
+                printf "Missing argument for %s\n" "$1" >&2
+                printf "Usage: bash common/setup_dg_wallet.sh [-w wallet_dir] [-A]\n" >&2
+                exit 1
+            fi
+            WALLET_DIR="$2"; shift 2 ;;
         -A|--auto-password) AUTO_PASSWORD=true; shift ;;
         -h|--help)
             printf "Usage: bash common/setup_dg_wallet.sh [-w wallet_dir] [-A]\n"
@@ -298,9 +304,12 @@ EOF
     else
         info "Wallet password verified"
 
-        # Show existing credentials
+        # Show existing credentials. mkstore -listCredential prints numbered
+        # rows like "1: <alias> <username>" - it does NOT print the string
+        # "oracle.security.client.connect_string" (that grep never matched
+        # anything, so this always rendered as an empty list).
         info "Current wallet entries:"
-        printf '%s\n' "$VERIFY_OUT" | grep -i 'oracle.security.client.connect_string' | while IFS= read -r line; do
+        printf '%s\n' "$VERIFY_OUT" | grep -E '^[[:space:]]*[0-9]+:' | while IFS= read -r line; do
             printf "   ${DIM}%s${NC}\n" "$line"
         done
 
@@ -494,9 +503,18 @@ SQLNET.WALLET_OVERRIDE = TRUE
 "
 
 if [[ -f "$SQLNET_FILE" ]]; then
-    if grep -q "WALLET_LOCATION" "$SQLNET_FILE"; then
-        # Check if it points to our wallet directory
-        EXISTING_DIR=$(grep "DIRECTORY" "$SQLNET_FILE" | sed 's/.*DIRECTORY *= *//' | sed 's/[)].*//' | xargs)
+    # Anchored to only match a WALLET_LOCATION entry, not
+    # ENCRYPTION_WALLET_LOCATION (TDE keystore) - a plain substring grep
+    # matches both, so on a TDE host this used to report the TDE keystore
+    # path as the "existing" DG wallet and never wire the real one in.
+    if grep -Eq '^[[:space:]]*WALLET_LOCATION' "$SQLNET_FILE"; then
+        # Scope the DIRECTORY lookup to the WALLET_LOCATION entry itself,
+        # not the first DIRECTORY anywhere in the file (which could belong
+        # to an earlier ENCRYPTION_WALLET_LOCATION block).
+        EXISTING_DIR=$(awk '
+            /^[[:space:]]*WALLET_LOCATION/ { found=1 }
+            found && /DIRECTORY/ { print; exit }
+        ' "$SQLNET_FILE" | sed 's/.*DIRECTORY *= *//' | sed 's/[)].*//' | xargs)
         if [[ "$EXISTING_DIR" == "$WALLET_DIR" ]]; then
             info "sqlnet.ora already configured for: ${WALLET_DIR}"
         else
@@ -563,6 +581,10 @@ info "You can now connect without a password:"
 printf "   ${DIM}sqlplus /@%s as sysdba${NC}\n" "$PEER_TNS"
 [[ -n "${LOC_TNS:-}" ]] && [[ "$LOC_TNS" != "$PEER_TNS" ]] && \
     printf "   ${DIM}sqlplus /@%s as sysdba${NC}\n" "$LOC_TNS"
+printf "\n"
+warn "If SYS is ever rotated (e.g. primary/08_security_hardening.sh), the credential stored"
+warn "in this wallet goes stale - re-run this script afterward. Until then, SQLNET.WALLET_OVERRIDE=TRUE"
+warn "means the stale wallet credential silently wins over a freshly typed password (ORA-01017)."
 printf "\n"
 info "Run this script on the ${PEER_LABEL} host too for bidirectional wallet auth"
 printf "\n"

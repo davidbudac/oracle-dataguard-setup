@@ -1,0 +1,8 @@
+-- Get the SMALLEST online redo log size in MB, used alongside
+-- get_redo_log_size.sql (MAX) to detect mixed-size online redo logs -
+-- see H1 in docs/REVIEW_2026-08-05.md.
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT CEIL(MIN(BYTES)/1024/1024) FROM V$LOG;
+EXIT;

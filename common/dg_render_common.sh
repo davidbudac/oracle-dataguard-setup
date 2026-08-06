@@ -273,6 +273,82 @@ warn_icon() {
     printf '%b' "$WARN"
 }
 
+# -----------------------------------------------------------------------
+# DGMGRL "SHOW CONFIGURATION" line classification (M20)
+# -----------------------------------------------------------------------
+# 19c does NOT put a member's diagnosis on the member line. It prints:
+#
+#     cdb1      - Primary database
+#       Error: ORA-16810: multiple errors or warnings detected for the member
+#
+#       cdb1_stby - Physical standby database
+#         Error: ORA-12154: TNS:could not resolve the connect identifier
+#
+# so a grep for Error/Warning *on the member line* can never fire. Callers
+# iterate the output, remember the last member line seen, and attribute any
+# following Error:/Warning: line to it. These helpers are shared by
+# dg_status.sh and dg_local_status_common.sh so both tools agree on what
+# counts as a member issue.
+dg_is_broker_member_line() {
+    # Takes the RAW (untrimmed) line - the leading indent is part of the
+    # shape that distinguishes a member line from the "Configuration - x"
+    # header.
+    printf '%s' "$1" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'
+}
+
+dg_broker_member_name() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/[[:space:]]*-[[:space:]].*$//'
+}
+
+# Prints "error", "warning", or nothing at all for a diagnosis line.
+# "Error: 0" / ORA-00000 is DGMGRL's *healthy* value and is deliberately
+# not treated as a finding (same exclusion dgmgrl_output_has_error makes).
+dg_broker_diagnosis_severity() {
+    local trimmed
+    trimmed=$(printf '%s' "$1" | sed 's/^[[:space:]]*//')
+    case "$trimmed" in
+        Error:*|error:*|ERROR:*)
+            if printf '%s' "$trimmed" | grep -qiE '^error:[[:space:]]*(0|ORA-00000)[[:space:]]*$'; then
+                return 0
+            fi
+            printf 'error'
+            ;;
+        Warning:*|warning:*|WARNING:*)
+            printf 'warning'
+            ;;
+    esac
+}
+
+# The diagnosis text with the "Error:"/"Warning:" prefix and indent removed.
+dg_broker_diagnosis_text() {
+    printf '%s' "$1" | sed 's/^[[:space:]]*//; s/^[Ee][Rr][Rr][Oo][Rr]:[[:space:]]*//; s/^[Ww][Aa][Rr][Nn][Ii][Nn][Gg]:[[:space:]]*//'
+}
+
+# Worst severity attached to one member across the whole SHOW CONFIGURATION
+# output: "error", "warning", or nothing. Lets a renderer put the right icon
+# on the member line itself, instead of a green OK immediately above the
+# member's own "Error: ORA-16810" line.
+# Usage: dg_broker_member_severity "$DGMGRL_CONFIG" "cdb1"
+dg_broker_member_severity() {
+    local config="$1" member="$2"
+    local line current="" sev result=""
+    while IFS= read -r line; do
+        if dg_is_broker_member_line "$line"; then
+            current=$(dg_broker_member_name "$line")
+            continue
+        fi
+        [[ "$current" != "$member" ]] && continue
+        sev=$(dg_broker_diagnosis_severity "$line")
+        if [[ "$sev" == "error" ]]; then
+            printf 'error'
+            return
+        elif [[ "$sev" == "warning" ]]; then
+            result="warning"
+        fi
+    done <<< "$config"
+    printf '%s' "$result"
+}
+
 format_services() {
     local input="$1" formatted
     formatted=$(printf '%s\n' "$input" | sed '/^$/d' | awk 'BEGIN{ORS=""} {if (NR>1) printf ", "; printf "%s", $0}')

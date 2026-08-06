@@ -209,6 +209,14 @@ progress_step "Authenticating to Primary"
 echo ""
 SYS_PASSWORD=$(prompt_password "Enter SYS password for primary database")
 
+# L16: verify_sys_password() and the RMAN CONNECT lines below both embed
+# this in sys/"<pw>"@... - an embedded double-quote breaks that syntax and
+# would otherwise be misreported as a plain "Invalid SYS password".
+if [[ "$SYS_PASSWORD" == *'"'* ]]; then
+    log_error "SYS password must not contain a double-quote (\") character"
+    exit 1
+fi
+
 # Verify password against primary
 log_info "Verifying SYS password against primary..."
 if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
@@ -271,7 +279,7 @@ run_sql_command "startup_nomount.sql" "$PFILE"
 
 # Verify NOMOUNT state
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
-INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 if [[ "$INSTANCE_STATUS" != "STARTED" ]]; then
     log_error "Failed to start instance in NOMOUNT mode"
@@ -370,7 +378,7 @@ DUPLICATE TARGET DATABASE
     SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}'
     SET LOG_ARCHIVE_DEST_1='${LOG_ARCHIVE_DEST_1_SETTING}'
     SET STANDBY_FILE_MANAGEMENT='AUTO'
-    SET DG_BROKER_START='TRUE'
+    SET DG_BROKER_START='FALSE'
     SET LOCAL_LISTENER='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))'
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
@@ -405,7 +413,7 @@ ${FRA_SETTINGS}
     SET DB_FILE_NAME_CONVERT=${DB_FILE_NAME_CONVERT}
     SET LOG_FILE_NAME_CONVERT=${LOG_FILE_NAME_CONVERT}
     SET STANDBY_FILE_MANAGEMENT='AUTO'
-    SET DG_BROKER_START='TRUE'
+    SET DG_BROKER_START='FALSE'
     SET LOCAL_LISTENER='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))'
     SET AUDIT_FILE_DEST='${STANDBY_ADMIN_DIR}/adump'
   NOFILENAMECHECK;
@@ -472,6 +480,37 @@ SYS_PASSWORD=""
 if [[ $RMAN_EXIT_CODE -ne 0 ]]; then
     log_error "RMAN duplicate failed with exit code: $RMAN_EXIT_CODE"
     log_error "Please check the RMAN log: $RMAN_LOG"
+
+    # M10: this step is not restartable once RMAN duplicate has started -
+    # the reset procedure was only printed once, in "Reviewing Planned
+    # Changes", several minutes/many lines of RMAN output ago. Re-print it
+    # here with the actual concrete paths for this build so it's still on
+    # screen (and in the log) right where the failure just happened.
+    if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+        RESET_DATA_NOTE="Remove standby files under: ${STANDBY_DB_CREATE_FILE_DEST}, ${STANDBY_DB_RECOVERY_FILE_DEST}"
+    else
+        RESET_DATA_PATHS=("$STANDBY_DATA_PATH")
+        if [[ -n "${STANDBY_DATA_PATHS+x}" && ${#STANDBY_DATA_PATHS[@]} -gt 0 ]]; then
+            RESET_DATA_PATHS=("${STANDBY_DATA_PATHS[@]}")
+        fi
+        RESET_REDO_PATHS=("$STANDBY_REDO_PATH")
+        if [[ -n "${STANDBY_REDO_PATHS+x}" && ${#STANDBY_REDO_PATHS[@]} -gt 0 ]]; then
+            RESET_REDO_PATHS=("${STANDBY_REDO_PATHS[@]}")
+        fi
+        RESET_SRL_NOTE=""
+        if [[ -n "${STANDBY_SRL_PATH:-}" && "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
+            RESET_SRL_NOTE=", ${STANDBY_SRL_PATH}"
+        fi
+        RESET_DATA_NOTE="Remove standby datafiles/controlfiles under: $(shell_join "${RESET_DATA_PATHS[@]}"); redo logs under: $(shell_join "${RESET_REDO_PATHS[@]}")${RESET_SRL_NOTE}"
+    fi
+
+    echo ""
+    print_list_block "This Step Is NOT Directly Restartable - Reset Procedure" \
+        "Shut down the standby instance: ORACLE_SID=${STANDBY_ORACLE_SID} sqlplus / as sysdba, then SHUTDOWN ABORT." \
+        "$RESET_DATA_NOTE" \
+        "Review the RMAN log first to confirm which files actually exist before deleting anything: ${RMAN_LOG}" \
+        "Re-run ./standby/05_clone_standby.sh after correcting the failure."
+
     exit 1
 fi
 
@@ -486,7 +525,7 @@ progress_step "Finalizing Instance Configuration"
 
 # Check if we're mounted
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
-INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 log_info "Current instance status: $INSTANCE_STATUS"
 
@@ -517,13 +556,31 @@ log_cmd "sqlplus / as sysdba:" "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE 
 # DATABASE here would raise ORA-01100 (database already mounted) now that
 # mount_standby.sql aborts on SQL errors. Only mount if it isn't already.
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
-INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \n\r')
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 if [[ "$INSTANCE_STATUS" == "MOUNTED" ]]; then
     log_info "Standby instance is already mounted (left MOUNTED by RMAN duplicate) - skipping MOUNT STANDBY DATABASE"
 else
     run_sql_command "mount_standby.sql"
 fi
+
+# The duplicate ran with DG_BROKER_START='FALSE' (deliberately: with the
+# broker up DURING the clone, a leftover broker configuration file from an
+# earlier standby build - which the documented re-clone reset procedure
+# never removes - makes DMON start managed recovery mid-duplicate and the
+# duplicate dies with ORA-01153; found live in the E2E run). Now that the
+# clone is complete: clear any stale broker config files for this standby
+# at their default location while the broker is still down, then enable it.
+for _dr_file in "${ORACLE_HOME}/dbs/dr1${STANDBY_DB_UNIQUE_NAME}.dat" "${ORACLE_HOME}/dbs/dr2${STANDBY_DB_UNIQUE_NAME}.dat"; do
+    if [[ -f "$_dr_file" ]]; then
+        log_warn "Removing stale broker configuration file from a previous build: $_dr_file"
+        rm -f "$_dr_file"
+    fi
+done
+log_info "Enabling Data Guard Broker on the standby (was disabled during the duplicate)..."
+log_cmd "sqlplus / as sysdba:" "ALTER SYSTEM SET DG_BROKER_START=TRUE SCOPE=BOTH"
+run_sql_command "set_dg_broker_start.sql"
+
 run_sql_command "start_mrp.sql"
 
 # Verify MRP is running
@@ -538,6 +595,14 @@ else
     log_warn "MRP status could not be verified"
     log_warn "Please check V\$MANAGED_STANDBY manually"
 fi
+
+# L15: refresh the instance status here. The last assignment above was
+# taken BEFORE the MOUNT STANDBY DATABASE / start_mrp.sql calls just above
+# - the final summary block below used to print that pre-mount value
+# (typically "STARTED") even though the instance is mounted and applying
+# by this point.
+INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>/dev/null || true)
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 # ============================================================
 # Display Status

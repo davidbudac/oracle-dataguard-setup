@@ -55,6 +55,16 @@ IS_PRIMARY=false
 LOC_LABEL=""
 PEER_LABEL=""
 
+# H12: set to false when the local instance cannot be identified at all
+# (ORA-01034 "not available", ORA-12547, idle instance, wrong ORACLE_SID).
+LOCAL_INSTANCE_AVAILABLE=true
+LOCAL_INSTANCE_ERROR=""
+
+# L20: whether the alert/broker log files were actually found, so a missing
+# file is not rendered the same way as a file that simply had no matches.
+LOC_ALERT_FILE_FOUND=false
+LOC_DRC_FILE_FOUND=false
+
 # -- Generic helpers ----------------------------------------------------------
 # repeat_char/strip_ansi/fit_text/wrap_text/row/header/subheader/
 # short_hostname/extract_first_status/status_icon/warn_icon/format_services
@@ -83,19 +93,30 @@ format_event_limit() {
     '
 }
 
+# L20: the file that was actually inspected is ALWAYS printed (it used to be
+# hidden behind DG_DEBUG=1), and "the file isn't there" - the symptom of a
+# non-default diagnostic_dest or a SID mismatch - is rendered differently
+# from "the file was read and nothing matched". Both used to show "(none)".
+# $6 = "true" when the file exists.
 print_event_block() {
-    local label="$1" raw="$2" count="$3" limit="$4" filepath="$5"
+    local label="$1" raw="$2" count="$3" limit="$4" filepath="$5" found="${6:-true}"
     local heading entries line ts msg
     heading="${label}: ${count} matched"
     if (( count > 0 )); then
         heading="${heading}, newest ${limit} shown"
     fi
     printf "  ${DIM}%s${NC}\n" "$heading"
-    if [[ "${DG_DEBUG:-0}" == "1" && -n "$filepath" ]]; then
-        printf "    ${DIM}%s${NC}\n" "$filepath"
+    if [[ -z "$filepath" ]]; then
+        printf "    ${YELLOW}(log path unknown: V\$DIAG_INFO 'Diag Trace' returned nothing)${NC}\n"
+        return
+    fi
+    printf "    ${DIM}%s${NC}\n" "$filepath"
+    if [[ "$found" != true ]]; then
+        printf "    ${YELLOW}(file not found)${NC}\n"
+        return
     fi
     if (( count == 0 )); then
-        printf "    ${DIM}(none)${NC}\n"
+        printf "    ${DIM}(0 matched - file read, no Data Guard entries)${NC}\n"
         return
     fi
 
@@ -308,12 +329,30 @@ SQL
 collect_identity() {
     LOCAL_ID_SQL=$(run_local_sql "
 SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
-")
+" 2>&1)
 
     LOC_ID_STATUS=$(printf '%s\n' "$LOCAL_ID_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
     LOC_ROLE=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $1}' | xargs)
     LOC_DBUNIQ=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $2}' | xargs)
 
+    # H12: with the instance down, every field parses empty, every
+    # assessment below is gated on a non-empty role so none of them fire,
+    # and the tool that exists to answer "is the database OK?" used to
+    # answer "WARNING" (exit 1). Detect it explicitly here instead.
+    if [[ -z "$LOC_ROLE" ]]; then
+        LOCAL_INSTANCE_AVAILABLE=false
+        # Keep the first ORA-/TNS- diagnostic sqlplus printed; it is the
+        # single most useful line for the operator (ORA-01034 = not started,
+        # ORA-01109 = not open, TNS-/ORA-12547 = bad ORACLE_HOME/SID).
+        LOCAL_INSTANCE_ERROR=$(printf '%s\n' "$LOCAL_ID_SQL" \
+            | grep -E 'ORA-[0-9]|TNS-[0-9]|SP2-[0-9]' | head -1 | sed 's/^[[:space:]]*//')
+        IS_PRIMARY=false
+        LOC_LABEL="UNKNOWN"
+        PEER_LABEL="PEER"
+        return
+    fi
+
+    LOCAL_INSTANCE_AVAILABLE=true
     if printf '%s' "$LOC_ROLE" | grep -qi "PRIMARY"; then
         IS_PRIMARY=true
         LOC_LABEL="PRIMARY"
@@ -588,21 +627,32 @@ parse_remote_sql() {
 }
 
 collect_log_matches() {
-    LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" | xargs)
-    LOC_ALERT_FILE="${LOC_ALERT_TRACE}/alert_${ORACLE_SID}.log"
-    LOC_DRC_FILE="${LOC_ALERT_TRACE}/drc${ORACLE_SID}.log"
+    LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" 2>/dev/null | xargs)
+    # Guard against an empty/failed V$DIAG_INFO query producing paths like
+    # "/alert_cdb1.log" that would look like a plain "file not found".
+    if [[ -z "$LOC_ALERT_TRACE" ]]; then
+        LOC_ALERT_FILE=""
+        LOC_DRC_FILE=""
+    else
+        LOC_ALERT_FILE="${LOC_ALERT_TRACE}/alert_${ORACLE_SID}.log"
+        LOC_DRC_FILE="${LOC_ALERT_TRACE}/drc${ORACLE_SID}.log"
+    fi
 
     LOC_ALERT_MATCHES=""
     LOC_DRC_MATCHES=""
     LOC_ALERT_MATCH_COUNT=0
     LOC_DRC_MATCH_COUNT=0
+    LOC_ALERT_FILE_FOUND=false
+    LOC_DRC_FILE_FOUND=false
 
-    if [[ -f "$LOC_ALERT_FILE" ]]; then
+    if [[ -n "$LOC_ALERT_FILE" && -f "$LOC_ALERT_FILE" ]]; then
+        LOC_ALERT_FILE_FOUND=true
         LOC_ALERT_MATCHES=$(tail -2000 "$LOC_ALERT_FILE" | awk "$DG_ALERT_LOG_AWK_FILTER" 2>/dev/null)
         LOC_ALERT_MATCH_COUNT=$(printf '%s\n' "$LOC_ALERT_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
     fi
 
-    if [[ -f "$LOC_DRC_FILE" ]]; then
+    if [[ -n "$LOC_DRC_FILE" && -f "$LOC_DRC_FILE" ]]; then
+        LOC_DRC_FILE_FOUND=true
         LOC_DRC_MATCHES=$(tail -500 "$LOC_DRC_FILE" | awk "$DG_BROKER_LOG_AWK_FILTER" 2>/dev/null)
         LOC_DRC_MATCH_COUNT=$(printf '%s\n' "$LOC_DRC_MATCHES" | sed '/^$/d' | wc -l | tr -d ' ')
     fi
@@ -633,6 +683,10 @@ assign_role_views() {
         PRI_FRA_FILES="$LOC_FRA_FILES"
         PRI_SERVICES="$LOC_SERVICES"
         PRI_HOST=$(short_hostname)
+
+        # L17: dg_broker_start is only ever read locally (V$PARAMETER on
+        # this instance). Attribute it to the side we actually queried.
+        STB_BROKER=""
 
         STB_ROLE="$REM_ROLE"
         STB_OPEN="$REM_OPEN"
@@ -689,6 +743,12 @@ assign_role_views() {
         STB_FRA_FILES="$LOC_FRA_FILES"
         STB_SERVICES="$LOC_SERVICES"
         STB_HOST=$(short_hostname)
+        # L17: this is the STANDBY's own dg_broker_start (we are running on
+        # the standby). It used to be published as PRI_BROKER, so the tool
+        # reported "dg_broker_start is FALSE" against the primary - the
+        # wrong host entirely. The remote SQL never queries V$PARAMETER, so
+        # the primary's value is genuinely unknown from here.
+        STB_BROKER="$LOC_BROKER"
 
         PRI_ROLE="$REM_ROLE"
         PRI_OPEN="$REM_OPEN"
@@ -697,7 +757,7 @@ assign_role_views() {
         PRI_FORCE="$REM_FORCE"
         PRI_FLASH="$REM_FLASH"
         PRI_DBUNIQ="${REM_DBUNIQ:-${PEER_DBUNIQ:-?}}"
-        PRI_BROKER="${LOC_BROKER}"
+        PRI_BROKER=""
         PRI_REDO_CNT="$REM_REDO_CNT"
         PRI_REDO_MB="$REM_REDO_MB"
         PRI_SRL="$REM_SRL"
@@ -721,6 +781,17 @@ assign_role_views() {
 # truly-zero lag, raw value otherwise); the WARN/OK *decision* uses
 # dg_parse_lag_seconds against DG_LAG_WARN_SECONDS instead of an
 # any-nonzero check (WS4.3). See dg_render_common.sh.
+
+# H12: the loudest possible statement that the instance this tool was
+# pointed at is not answering. Runs first so it heads the findings list.
+assess_local_instance() {
+    if $LOCAL_INSTANCE_AVAILABLE; then
+        return
+    fi
+    local detail="${LOCAL_INSTANCE_ERROR:-sqlplus returned no rows from V\$DATABASE}"
+    add_summary_error "Local instance ${ORACLE_SID} is DOWN or not open: ${detail}"
+    add_summary_info "Check: ps -ef | grep ora_pmon_${ORACLE_SID} ; then 'sqlplus / as sysdba' and STARTUP MOUNT"
+}
 
 assess_primary() {
     PRI_OK=unknown
@@ -749,9 +820,12 @@ assess_primary() {
         add_summary_warning "Primary flashback is ${PRI_FLASH}"
     fi
 
+    # L17: this only ever holds a value when we are RUNNING on the primary
+    # (dg_broker_start is read from the local V$PARAMETER). The message now
+    # names the host it refers to.
     if [[ -n "${PRI_BROKER:-}" ]] && ! printf '%s' "$PRI_BROKER" | grep -qi "TRUE"; then
         PRI_OK=false
-        add_summary_error "dg_broker_start is ${PRI_BROKER}"
+        add_summary_error "Primary dg_broker_start is ${PRI_BROKER}"
     fi
 
     if [[ -n "${PRI_DEST2_STATUS:-}" ]] && [[ "${PRI_DEST2_STATUS}" != "VALID" ]]; then
@@ -862,6 +936,12 @@ assess_standby() {
         add_summary_warning "Standby flashback is ${STB_FLASH}"
     fi
 
+    # L17: only populated when we are running ON the standby.
+    if [[ -n "${STB_BROKER:-}" ]] && ! printf '%s' "$STB_BROKER" | grep -qi "TRUE"; then
+        STB_OK=false
+        add_summary_error "Standby dg_broker_start is ${STB_BROKER}"
+    fi
+
     if [[ -n "${STB_FRA_SIZE:-}" ]]; then
         STB_FRA_PCT=$(compute_fra_pct "$STB_FRA_SIZE" "$STB_FRA_USED" "$STB_FRA_RECLAIM")
         STB_FRA_EFFECTIVE_USED=$(compute_fra_effective "$STB_FRA_USED" "$STB_FRA_RECLAIM")
@@ -895,14 +975,30 @@ assess_broker() {
         add_summary_warning "Broker status could not be determined"
     fi
 
+    # M20: 19c prints a member's diagnosis on the line AFTER the member
+    # line ("  cdb1 - Primary database" / "    Error: ORA-16810: ..."), so
+    # the old member-line grep for Error/Warning could never fire and real
+    # member failures never reached the summary or the exit code. Carry the
+    # last member name forward and attribute the diagnosis to it.
+    local last_member="" diag_sev diag_text
     while IFS= read -r line; do
         line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-        if printf '%s' "$line" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'; then
+        if dg_is_broker_member_line "$line"; then
+            last_member=$(dg_broker_member_name "$line")
             if printf '%s' "$line_trimmed" | grep -qi "Error"; then
                 add_summary_error "Broker member issue: $line_trimmed"
             elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
                 add_summary_warning "Broker member warning: $line_trimmed"
             fi
+            continue
+        fi
+        diag_sev=$(dg_broker_diagnosis_severity "$line_trimmed")
+        [[ -z "$diag_sev" ]] && continue
+        diag_text=$(dg_broker_diagnosis_text "$line_trimmed")
+        if [[ "$diag_sev" == "error" ]]; then
+            add_summary_error "Broker member ${last_member:-configuration}: ${diag_text}"
+        else
+            add_summary_warning "Broker member ${last_member:-configuration}: ${diag_text}"
         fi
     done <<< "$DGMGRL_CONFIG"
 
@@ -913,8 +1009,13 @@ assess_broker() {
 
     if [[ -n "${FSFO_MODE:-}" ]]; then
         if printf '%s' "$FSFO_MODE" | grep -qi "Enabled"; then
-            if [[ "${LOC_FSFO_OBSERVER_PRESENT:-}" != "YES" ]]; then
-                add_summary_warning "FSFO is enabled but observer is not present"
+            # M17: FSFO enabled with no observer connected means automatic
+            # failover cannot happen - that is an error, not a warning, and
+            # dg_status.sh now grades it identically.
+            if [[ -n "${LOC_FSFO_OBSERVER_PRESENT:-}" && "${LOC_FSFO_OBSERVER_PRESENT}" != "YES" ]]; then
+                add_summary_error "FSFO is enabled but no observer is present (automatic failover will not happen)"
+            elif [[ -z "${LOC_FSFO_OBSERVER_PRESENT:-}" ]]; then
+                add_summary_warning "FSFO is enabled but observer presence could not be determined"
             fi
         else
             add_summary_warning "Fast-Start Failover disabled"
@@ -931,6 +1032,13 @@ assess_data_source() {
 }
 
 compute_state_labels() {
+    # H12
+    if $LOCAL_INSTANCE_AVAILABLE; then
+        LOCAL_INSTANCE_STATE="${GREEN}UP${NC}"
+    else
+        LOCAL_INSTANCE_STATE="${RED}DOWN${NC}"
+    fi
+
     if [[ $ERRORS -gt 0 ]]; then
         OVERALL_STATE="${RED}CRITICAL${NC}"
     elif [[ $WARNINGS -gt 0 ]]; then
@@ -973,7 +1081,9 @@ compute_state_labels() {
         PEER_SOURCE_STATE="${GREEN}RUNTIME SQL${NC}"
     fi
 
-    if $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
+    if ! $LOCAL_INSTANCE_AVAILABLE; then
+        REPL_STATE="${RED}UNKNOWN${NC}"
+    elif $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
         REPL_STATE="$PEER_SOURCE_STATE"
     elif [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
         REPL_STATE="${YELLOW}LAGGING${NC}"
@@ -995,6 +1105,7 @@ assess_all() {
     ERRORS=0
     WARNINGS=0
 
+    assess_local_instance
     assess_primary
     assess_standby
     assess_broker
@@ -1009,11 +1120,25 @@ print_title() {
         "$(short_hostname)" "${ORACLE_SID}" "${LOC_LABEL}" "${PEER_DBUNIQ:-unknown}" "${REMOTE_DATA_SOURCE_LABEL}"
 }
 
+# L18: SUMMARY_INFOS was populated (that's where the "-L skipped the peer"
+# explanation lives) but never rendered, so a `-L` run showed a red CHECK
+# with nothing explaining it. Printed dimmed, below errors/warnings, and
+# NOT subject to the top-findings cutoff - an info line that explains the
+# state is useless if it is the one that gets truncated away.
+print_summary_infos() {
+    local item
+    [[ ${#SUMMARY_INFOS[@]} -eq 0 ]] && return
+    for item in "${SUMMARY_INFOS[@]}"; do
+        row "Info" "$item" "${DIM}--${NC}"
+    done
+}
+
 print_top_findings() {
     local limit=5 count=0 item
     header "TOP FINDINGS"
     if [[ ${#SUMMARY_ERRORS[@]} -eq 0 && ${#SUMMARY_WARNINGS[@]} -eq 0 ]]; then
         row "Status" "No findings" "$CHK"
+        print_summary_infos
         return
     fi
 
@@ -1021,16 +1146,23 @@ print_top_findings() {
         for item in "${SUMMARY_ERRORS[@]}"; do
             row "Error" "$item" "$FAIL"
             count=$((count + 1))
-            (( count >= limit )) && return
+            if (( count >= limit )); then
+                print_summary_infos
+                return
+            fi
         done
     fi
     if [[ ${#SUMMARY_WARNINGS[@]} -gt 0 ]]; then
         for item in "${SUMMARY_WARNINGS[@]}"; do
             row "Warning" "$item" "$WARN"
             count=$((count + 1))
-            (( count >= limit )) && return
+            if (( count >= limit )); then
+                print_summary_infos
+                return
+            fi
         done
     fi
+    print_summary_infos
 }
 
 render_primary_triage() {
@@ -1041,7 +1173,14 @@ render_primary_triage() {
         row "Switchover" "${PRI_SWITCH:-?}" "$(warn_icon "${PRI_SWITCH:-}" "TO STANDBY" "SESSIONS ACTIVE")"
         row "Force Logging" "${PRI_FORCE:-?}" "$(status_icon "${PRI_FORCE:-}" "YES")"
         row "Flashback" "${PRI_FLASH:-?}" "$(warn_icon "${PRI_FLASH:-}" "YES")"
-        row "DG Broker" "${PRI_BROKER:-FALSE}" "$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")"
+        # L17: dg_broker_start comes from the LOCAL V$PARAMETER only. Show
+        # it here when we are on the primary; when we are on the standby it
+        # is genuinely unknown for this side, so say so.
+        if [[ -n "${PRI_BROKER:-}" ]]; then
+            row "DG Broker" "${PRI_BROKER}" "$(status_icon "${PRI_BROKER}" "TRUE")"
+        else
+            row "DG Broker" "unknown (dg_broker_start is only readable on the local instance)"
+        fi
         if [[ -n "${PRI_DEST2_STATUS:-}" ]]; then
             if [[ "${PRI_DEST2_STATUS}" == "VALID" ]]; then
                 row "Archive Dest 2" "${PRI_DEST2_STATUS}" "$CHK"
@@ -1077,13 +1216,18 @@ render_standby_triage() {
         row "Role" "${STB_ROLE:-?}" "$(status_icon "${STB_ROLE:-}" "PHYSICAL STANDBY")"
         row "Open Mode" "${STB_OPEN:-?}" "$(warn_icon "${STB_OPEN:-}" "MOUNTED" "READ ONLY")"
         row "Switchover" "${STB_SWITCH:-?}" "$(warn_icon "${STB_SWITCH:-}" "NOT ALLOWED" "SWITCHOVER PENDING")"
+        # L17: populated only when this tool runs ON the standby.
+        [[ -n "${STB_BROKER:-}" ]] && row "DG Broker" "${STB_BROKER}" "$(status_icon "${STB_BROKER}" "TRUE")"
         if [[ -n "${STB_MRP_STATUS:-}" ]]; then
             row "MRP Status" "${STB_MRP_STATUS} (seq# ${STB_MRP_SEQ:-?})" "$(status_icon "${STB_MRP_STATUS:-}" "APPLYING_LOG" "WAIT_FOR_LOG")"
         else
             row "MRP Status" "NOT RUNNING" "$FAIL"
         fi
         if [[ -n "${STB_RECOVERY_MODE:-}" ]]; then
-            row "Recovery Mode" "${STB_RECOVERY_MODE}" "$(status_icon "${STB_RECOVERY_MODE:-}" "REAL TIME")"
+            # L19: assess_standby counts non-real-time apply as a WARNING,
+            # and dg_status.sh renders it "!!" - use warn_icon here too so
+            # the icon, the summary and the sibling tool all agree.
+            row "Recovery Mode" "${STB_RECOVERY_MODE}" "$(warn_icon "${STB_RECOVERY_MODE:-}" "REAL TIME")"
         fi
 
         if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
@@ -1166,17 +1310,29 @@ render_broker_triage() {
         if [[ "${LOC_FSFO_OBSERVER_PRESENT}" == "YES" ]]; then
             row "Observer Present" "YES" "$CHK"
         else
-            row "Observer Present" "${LOC_FSFO_OBSERVER_PRESENT}" "$WARN"
+            # M17: red only when FSFO is actually enabled - with FSFO
+            # disabled, "no observer" is the expected state.
+            row "Observer Present" "${LOC_FSFO_OBSERVER_PRESENT}" "$(fsfo_observer_icon)"
         fi
     fi
     [[ -n "${LOC_FSFO_OBSERVER_HOST:-}" ]] && row "Observer Host" "${LOC_FSFO_OBSERVER_HOST}"
 }
 
+# Severity icon for a missing observer: an error while FSFO is enabled
+# (automatic failover cannot happen), otherwise merely informational.
+fsfo_observer_icon() {
+    if printf '%s' "${FSFO_MODE:-}" | grep -qi "Enabled"; then
+        printf '%b' "$FAIL"
+    else
+        printf '%b' "$WARN"
+    fi
+}
+
 render_recent_events_triage() {
     header "RECENT DG EVENTS"
-    print_event_block "Recent Alert Events" "$LOC_ALERT_MATCHES" "${LOC_ALERT_MATCH_COUNT:-0}" 3 "${LOC_ALERT_FILE}"
+    print_event_block "Recent Alert Events" "$LOC_ALERT_MATCHES" "${LOC_ALERT_MATCH_COUNT:-0}" 3 "${LOC_ALERT_FILE}" "$LOC_ALERT_FILE_FOUND"
     printf "\n"
-    print_event_block "Recent Broker Events" "$LOC_DRC_MATCHES" "${LOC_DRC_MATCH_COUNT:-0}" 3 "${LOC_DRC_FILE}"
+    print_event_block "Recent Broker Events" "$LOC_DRC_MATCHES" "${LOC_DRC_MATCH_COUNT:-0}" 3 "${LOC_DRC_FILE}" "$LOC_DRC_FILE_FOUND"
 }
 
 render_triage_output() {
@@ -1197,6 +1353,9 @@ render_triage_output() {
 
     header "AT A GLANCE"
     row "Overall" "errors=${ERRORS} warnings=${WARNINGS}" "$OVERALL_STATE"
+    if ! $LOCAL_INSTANCE_AVAILABLE; then
+        row "Local Instance" "${ORACLE_SID} - ${LOCAL_INSTANCE_ERROR:-no response from V\$DATABASE}" "$LOCAL_INSTANCE_STATE"
+    fi
     row "Primary" "${PRI_DBUNIQ:-?} / ${pri_summary_mode}" "$PRIMARY_STATE"
     row "Standby" "${STB_DBUNIQ:-?} / ${stb_summary_mode}" "$STANDBY_STATE"
     row "Broker" "${BROKER_CFG_NAME:-not configured}" "$BROKER_STATE"
@@ -1232,7 +1391,12 @@ render_primary_diag() {
         row "Flashback" "$PRI_FLASH" "$(warn_icon "$PRI_FLASH" "YES")"
 
         subheader "Services"
-        row "DG Broker" "${PRI_BROKER:-FALSE}" "$(status_icon "${PRI_BROKER:-FALSE}" "TRUE")"
+        # L17: see render_primary_triage.
+        if [[ -n "${PRI_BROKER:-}" ]]; then
+            row "DG Broker" "${PRI_BROKER}" "$(status_icon "${PRI_BROKER}" "TRUE")"
+        else
+            row "DG Broker" "unknown (dg_broker_start is only readable on the local instance)"
+        fi
         row "Running Services" "${PRI_SERVICES:-NONE}"
 
         subheader "Redo / Archive"
@@ -1280,6 +1444,8 @@ render_standby_diag() {
         row "Flashback" "${STB_FLASH:-unknown}" "$(warn_icon "${STB_FLASH:-unknown}" "YES")"
 
         subheader "Services"
+        # L17: populated only when this tool runs ON the standby.
+        [[ -n "${STB_BROKER:-}" ]] && row "DG Broker" "${STB_BROKER}" "$(status_icon "${STB_BROKER}" "TRUE")"
         row "Running Services" "${STB_SERVICES:-NONE}"
 
         subheader "Recovery / Apply"
@@ -1289,7 +1455,8 @@ render_standby_diag() {
             row "MRP Status" "NOT RUNNING" "$FAIL"
         fi
         if [[ -n "${STB_RECOVERY_MODE:-}" ]]; then
-            row "Recovery Mode" "$STB_RECOVERY_MODE" "$(status_icon "$STB_RECOVERY_MODE" "REAL TIME")"
+            # L19: warning, not error - see render_standby_triage.
+            row "Recovery Mode" "$STB_RECOVERY_MODE" "$(warn_icon "$STB_RECOVERY_MODE" "REAL TIME")"
         fi
 
         if [[ -n "${STB_TRANSPORT_LAG:-}" ]]; then
@@ -1345,16 +1512,31 @@ render_broker_diag() {
     row "Configuration" "${BROKER_CFG_NAME:-unknown}"
     [[ -n "${BROKER_OVERALL:-}" ]] && row "Overall Status" "${BROKER_OVERALL}" "$(status_icon "${BROKER_OVERALL:-}" "SUCCESS")"
 
+    # M20: attribute a following Error:/Warning: line to the member it
+    # belongs to (19c never puts the diagnosis on the member line itself).
+    local render_last_member="" render_diag_sev render_member_sev
     while IFS= read -r line; do
         line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-        if printf '%s' "$line" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'; then
-            if printf '%s' "$line_trimmed" | grep -qi "Error"; then
+        if dg_is_broker_member_line "$line"; then
+            render_last_member=$(dg_broker_member_name "$line")
+            # Grade the member line by the diagnosis lines that follow it,
+            # so it never shows a green OK directly above its own
+            # "Error: ORA-16810" line.
+            render_member_sev=$(dg_broker_member_severity "$DGMGRL_CONFIG" "$render_last_member")
+            if [[ "$render_member_sev" == "error" ]] || printf '%s' "$line_trimmed" | grep -qi "Error"; then
                 row "" "$line_trimmed" "$FAIL"
-            elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
+            elif [[ "$render_member_sev" == "warning" ]] || printf '%s' "$line_trimmed" | grep -qi "Warning"; then
                 row "" "$line_trimmed" "$WARN"
             else
                 row "" "$line_trimmed" "$CHK"
             fi
+            continue
+        fi
+        render_diag_sev=$(dg_broker_diagnosis_severity "$line_trimmed")
+        if [[ "$render_diag_sev" == "error" ]]; then
+            row "  ${render_last_member:-config}" "$line_trimmed" "$FAIL"
+        elif [[ "$render_diag_sev" == "warning" ]]; then
+            row "  ${render_last_member:-config}" "$line_trimmed" "$WARN"
         elif is_error_event "$line_trimmed"; then
             printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
         fi
@@ -1377,7 +1559,7 @@ render_broker_diag() {
         if [[ "${LOC_FSFO_OBSERVER_PRESENT}" == "YES" ]]; then
             row "Observer Present" "$LOC_FSFO_OBSERVER_PRESENT" "$CHK"
         else
-            row "Observer Present" "$LOC_FSFO_OBSERVER_PRESENT" "$WARN"
+            row "Observer Present" "$LOC_FSFO_OBSERVER_PRESENT" "$(fsfo_observer_icon)"
         fi
     fi
     [[ -n "${LOC_FSFO_OBSERVER_HOST:-}" ]] && row "Observer Host" "$LOC_FSFO_OBSERVER_HOST"
@@ -1385,9 +1567,9 @@ render_broker_diag() {
 
 render_events_diag() {
     header "RECENT ALERT LOG (DATA GUARD)"
-    print_event_block "Alert Log" "$LOC_ALERT_MATCHES" "${LOC_ALERT_MATCH_COUNT:-0}" 15 "${LOC_ALERT_FILE}"
+    print_event_block "Alert Log" "$LOC_ALERT_MATCHES" "${LOC_ALERT_MATCH_COUNT:-0}" 15 "${LOC_ALERT_FILE}" "$LOC_ALERT_FILE_FOUND"
     printf "\n"
-    print_event_block "Broker Log" "$LOC_DRC_MATCHES" "${LOC_DRC_MATCH_COUNT:-0}" 10 "${LOC_DRC_FILE}"
+    print_event_block "Broker Log" "$LOC_DRC_MATCHES" "${LOC_DRC_MATCH_COUNT:-0}" 10 "${LOC_DRC_FILE}" "$LOC_DRC_FILE_FOUND"
 }
 
 render_interpretation_diag() {
@@ -1415,6 +1597,9 @@ render_diag_output() {
 
     header "AT A GLANCE"
     row "Overall" "errors=${ERRORS} warnings=${WARNINGS}" "$OVERALL_STATE"
+    if ! $LOCAL_INSTANCE_AVAILABLE; then
+        row "Local Instance" "${ORACLE_SID} - ${LOCAL_INSTANCE_ERROR:-no response from V\$DATABASE}" "$LOCAL_INSTANCE_STATE"
+    fi
     row "Primary" "${PRI_DBUNIQ:-?} / ${pri_summary_mode}" "$PRIMARY_STATE"
     row "Standby" "${STB_DBUNIQ:-?} / ${stb_summary_mode}" "$STANDBY_STATE"
     row "Broker" "${BROKER_CFG_NAME:-not configured}" "$BROKER_STATE"
@@ -1443,6 +1628,7 @@ render_diag_output() {
             done
         fi
     fi
+    print_summary_infos
     printf "\n"
 }
 

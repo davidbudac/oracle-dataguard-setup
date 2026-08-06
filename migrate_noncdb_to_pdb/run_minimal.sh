@@ -34,6 +34,7 @@ DG
 
 echo ">> 2. describe non-CDB -> $MANIFEST"
 ORACLE_SID=dgnonc sqlplus -L / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
 BEGIN
   IF DBMS_PDB.DESCRIBE(pdb_descr_file => '$MANIFEST') THEN NULL; END IF;
 END;
@@ -48,6 +49,7 @@ DG
 
 echo ">> 4. CREATE PLUGGABLE DATABASE dgnonc_pdb"
 ORACLE_SID=dgcdb sqlplus -L / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
 CREATE PLUGGABLE DATABASE dgnonc_pdb
    USING '$MANIFEST'
    COPY
@@ -57,6 +59,7 @@ SQL
 
 echo ">> 5. noncdb_to_pdb.sql (long)"
 ORACLE_SID=dgcdb sqlplus -L / as sysdba <<SQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
 ALTER PLUGGABLE DATABASE dgnonc_pdb OPEN UPGRADE;
 ALTER SESSION SET CONTAINER=dgnonc_pdb;
 @?/rdbms/admin/noncdb_to_pdb.sql

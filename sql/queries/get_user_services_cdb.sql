@@ -15,6 +15,11 @@ FROM V$ACTIVE_SERVICES s
 JOIN V$CONTAINERS c ON c.CON_ID = s.CON_ID
 WHERE s.NAME NOT LIKE 'SYS$%'
   AND UPPER(s.NAME) NOT LIKE '%XDB%'
+  -- Broker-internal services: <db>_CFG is created by the Data Guard broker
+  -- and <db>_DGMGRL is the static listener service. Neither is a user
+  -- service - the role trigger must not start/stop them.
+  AND UPPER(s.NAME) NOT LIKE '%\_CFG' ESCAPE '\'
+  AND UPPER(s.NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
   AND c.NAME <> 'PDB$SEED'
   AND UPPER(s.NAME) <> UPPER(c.NAME)
   AND s.NAME NOT IN (

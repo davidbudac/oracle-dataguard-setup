@@ -40,22 +40,49 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # stays runnable from a bare jump-host checkout.
 source "${SCRIPT_DIR}/common/dg_render_common.sh"
 
+# -- Exit codes (WS4.1 + L1) ---------------------------------------------------
+# 0 healthy, 1 warnings only, 2 errors present, 3 usage/pre-flight error.
+# The distinct usage code keeps a mistyped flag or a missing config file from
+# being reported to a monitoring wrapper as "1 warning" / "2 errors".
+EXIT_USAGE=3
+
+usage() {
+    printf "Usage: bash dg_status.sh [-c config.env] [-s SID] [--no-color]\n"
+    printf "  -c, --config FILE   SSH connection config (default: tests/e2e/config.env)\n"
+    printf "  -s, --sid SID       Oracle SID (default: \$ORACLE_SID, then auto-detect)\n"
+    printf "  --no-color          Disable colored output (also honors NO_COLOR)\n"
+    printf "\n"
+    printf "Exit codes: 0 healthy, 1 warnings, 2 errors, %s usage/pre-flight error\n" "$EXIT_USAGE"
+}
+
 # -- Parse args ---------------------------------------------------------------
 CONFIG_FILE="${SCRIPT_DIR}/tests/e2e/config.env"
 ORACLE_SID_OVERRIDE=""
 NO_COLOR_FLAG=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -c|--config) CONFIG_FILE="$2"; shift 2 ;;
-        -s|--sid)    ORACLE_SID_OVERRIDE="$2"; shift 2 ;;
+        -c|--config)
+            if [[ $# -lt 2 ]]; then
+                printf "ERROR: %s requires a file argument\n" "$1" >&2
+                usage >&2
+                exit $EXIT_USAGE
+            fi
+            CONFIG_FILE="$2"; shift 2 ;;
+        -s|--sid)
+            if [[ $# -lt 2 ]]; then
+                printf "ERROR: %s requires a SID argument\n" "$1" >&2
+                usage >&2
+                exit $EXIT_USAGE
+            fi
+            ORACLE_SID_OVERRIDE="$2"; shift 2 ;;
         --no-color)  NO_COLOR_FLAG=true; shift ;;
         -h|--help)
-            printf "Usage: bash dg_status.sh [-c config.env] [-s SID] [--no-color]\n"
-            printf "  -c, --config FILE   SSH connection config (default: tests/e2e/config.env)\n"
-            printf "  -s, --sid SID       Oracle SID (default: \$ORACLE_SID, then auto-detect)\n"
-            printf "  --no-color          Disable colored output (also honors NO_COLOR)\n"
+            usage
             exit 0 ;;
-        *) printf "Unknown option: %s\n" "$1"; exit 1 ;;
+        *)
+            printf "Unknown option: %s\n" "$1" >&2
+            usage >&2
+            exit $EXIT_USAGE ;;
     esac
 done
 
@@ -67,8 +94,8 @@ done
 $NO_COLOR_FLAG && dg_render_init_colors 1
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
-    printf "ERROR: Config file not found: %s\n" "$CONFIG_FILE"
-    exit 1
+    printf "ERROR: Config file not found: %s\n" "$CONFIG_FILE" >&2
+    exit $EXIT_USAGE
 fi
 source "$CONFIG_FILE"
 
@@ -76,19 +103,27 @@ source "$CONFIG_FILE"
 # Verify the settings the rest of the script relies on are actually present.
 # Without this, a missing key surfaces later as a cryptic `set -u: unbound
 # variable` abort deep inside SSH setup or SQL generation.
-_REQUIRED_CONFIG_KEYS=(JUMP_HOST JUMP_USER PRIMARY_HOST STANDBY_HOST
+_REQUIRED_CONFIG_KEYS=(PRIMARY_HOST STANDBY_HOST
     PRIMARY_ORACLE_HOSTNAME STANDBY_ORACLE_HOSTNAME SSH_USER SSH_OPTS
     ORACLE_HOME ORACLE_BASE)
+# JUMP_HOST is deliberately NOT required: an empty JUMP_HOST means "connect
+# to the DB hosts directly" (same convention as the E2E harness), and the
+# jump-skip test below already degrades to no -J in that case. JUMP_USER is
+# only needed when a jump host is actually in play.
+if [[ -n "${JUMP_HOST:-}" && -z "${JUMP_USER:-}" ]]; then
+    printf "ERROR: Config file %s sets JUMP_HOST but not JUMP_USER\n" "$CONFIG_FILE" >&2
+    exit $EXIT_USAGE
+fi
 _MISSING_CONFIG_KEYS=()
 for _key in "${_REQUIRED_CONFIG_KEYS[@]}"; do
     [[ -z "${!_key:-}" ]] && _MISSING_CONFIG_KEYS+=("$_key")
 done
 if [[ ${#_MISSING_CONFIG_KEYS[@]} -gt 0 ]]; then
-    printf "ERROR: Config file %s is missing required setting(s):\n" "$CONFIG_FILE"
+    printf "ERROR: Config file %s is missing required setting(s):\n" "$CONFIG_FILE" >&2
     for _key in "${_MISSING_CONFIG_KEYS[@]}"; do
-        printf "  - %s\n" "$_key"
+        printf "  - %s\n" "$_key" >&2
     done
-    exit 1
+    exit $EXIT_USAGE
 fi
 unset _key _REQUIRED_CONFIG_KEYS _MISSING_CONFIG_KEYS
 
@@ -102,7 +137,7 @@ DB_SSH_KEY_OPT=""
 # Skip ProxyJump if we're already on the jump host
 _CURRENT_HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
 _CURRENT_HOST=${_CURRENT_HOST%%.*}
-if [[ "$_CURRENT_HOST" == "${JUMP_HOST}"* ]]; then
+if [[ -z "${JUMP_HOST:-}" || "$_CURRENT_HOST" == "${JUMP_HOST}"* ]]; then
     _JUMP_OPT=""
 else
     _JUMP_OPT="-J ${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}"
@@ -112,6 +147,16 @@ _ssh_raw() {
     local host="$1" port="$2" cmd="$3"
     ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${_JUMP_OPT} \
         -p "${port}" "${SSH_USER}@${host}" "${cmd}" 2>&1
+}
+
+# Same as _ssh_raw but WITHOUT merging the remote/ssh stderr into stdout.
+# Used for streams that get parsed (M23): an SSH login banner, an MOTD or a
+# "Warning: Permanently added ..." line printed on stderr must never end up
+# in data we run sed over.
+_ssh_raw_stdout() {
+    local host="$1" port="$2" cmd="$3"
+    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${_JUMP_OPT} \
+        -p "${port}" "${SSH_USER}@${host}" "${cmd}" 2>/dev/null
 }
 
 _ssh_ora() {
@@ -189,12 +234,29 @@ fi
 # Priority: -s flag > $ORACLE_SID > auto-detect from pmon
 _detect_pmon_sid() {
     local host="$1" port="$2"
-    local pmon_line sid
+    local raw pmon_line sid
     # `[o]ra_pmon_` keeps the grep's own process line from matching; the
     # explicit `+ASM` exclusion prevents an ASM instance pmon from being
     # picked up ahead of (or instead of) the real database instance.
-    pmon_line=$(_ssh_raw "${host}" "${port}" "ps -ef | grep '[o]ra_pmon_' | grep -v '+ASM' | head -1")
-    sid=$(printf '%s' "$pmon_line" | sed 's/.*ora_pmon_//')
+    #
+    # M23: the remote side tags every candidate line with a `DG_PMON|`
+    # marker and we filter on that marker LOCALLY before running sed.
+    # Without it, anything the login shell prints (a /etc/motd banner, a
+    # "Last login:" line, an sshd warning) lands in the same stream and the
+    # unanchored `sed 's/.*ora_pmon_//'` happily turns it into a "SID".
+    # _ssh_raw_stdout additionally keeps stderr out of the parsed stream.
+    raw=$(_ssh_raw_stdout "${host}" "${port}" \
+        "ps -ef 2>/dev/null | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'")
+    pmon_line=$(printf '%s\n' "$raw" | grep '^DG_PMON|' | grep 'ora_pmon_' | head -1)
+    [[ -z "$pmon_line" ]] && return 0
+    # Anchored extraction: in real `ps -ef` output `ora_pmon_<SID>` is the
+    # LAST token on the line, and a SID is [A-Za-z][A-Za-z0-9_$]*. Requiring
+    # both means a prose line that merely mentions ora_pmon_ yields nothing
+    # at all, instead of the old unanchored `s/.*ora_pmon_//` turning the
+    # rest of the sentence into a "SID".
+    sid=$(printf '%s' "$pmon_line" \
+        | sed 's/[[:space:]]*$//' \
+        | sed -n 's/.*ora_pmon_\([A-Za-z][A-Za-z0-9_$]*\)$/\1/p')
     printf '%s' "$sid"
 }
 
@@ -205,28 +267,35 @@ _validate_sid() {
 if [[ -n "$ORACLE_SID_OVERRIDE" ]]; then
     DETECTED_SID="$ORACLE_SID_OVERRIDE"
     if ! _validate_sid "$DETECTED_SID"; then
-        printf "ERROR: SID '%s' from -s/--sid looks invalid\n" "$DETECTED_SID"
-        exit 1
+        printf "ERROR: SID '%s' from -s/--sid looks invalid\n" "$DETECTED_SID" >&2
+        exit $EXIT_USAGE
     fi
 elif [[ -n "${ORACLE_SID:-}" ]]; then
     DETECTED_SID="$ORACLE_SID"
     if ! _validate_sid "$DETECTED_SID"; then
-        printf "ERROR: SID '%s' from \$ORACLE_SID looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID"
-        exit 1
+        printf "ERROR: SID '%s' from \$ORACLE_SID looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID" >&2
+        exit $EXIT_USAGE
     fi
 elif $PRIMARY_REACHABLE; then
     DETECTED_SID=$(_detect_pmon_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}")
     if [[ -z "$DETECTED_SID" ]]; then
-        printf "ERROR: No Oracle instance detected on primary (%s:%s)\n" "$PRIMARY_HOST" "$PRIMARY_SSH_PORT"
-        exit 1
+        # Reachable host, no pmon: the instance is down. That is a genuine
+        # finding, not an operator mistake - report it with the "errors
+        # present" code rather than the usage code.
+        printf "ERROR: No Oracle instance detected on primary (%s:%s) - no ora_pmon_ process is running\n" \
+            "$PRIMARY_HOST" "$PRIMARY_SSH_PORT" >&2
+        exit 2
     fi
     if ! _validate_sid "$DETECTED_SID"; then
-        printf "ERROR: Auto-detected primary SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID"
-        exit 1
+        printf "ERROR: Auto-detected primary SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID" >&2
+        exit $EXIT_USAGE
     fi
 else
-    printf "ERROR: cannot SSH to primary (%s:%s) to auto-detect the Oracle SID; use -s/--sid or set \$ORACLE_SID\n" "$PRIMARY_HOST" "$PRIMARY_SSH_PORT"
-    exit 1
+    # Primary unreachable: also a genuine finding (already counted as a
+    # summary error above), so exit 2 rather than the usage code.
+    printf "ERROR: cannot SSH to primary (%s:%s) to auto-detect the Oracle SID; use -s/--sid or set \$ORACLE_SID\n" \
+        "$PRIMARY_HOST" "$PRIMARY_SSH_PORT" >&2
+    exit 2
 fi
 
 # Detect standby SID (may differ)
@@ -234,9 +303,10 @@ if $STANDBY_REACHABLE; then
     DETECTED_SID_STB=$(_detect_pmon_sid "${STANDBY_HOST}" "${STANDBY_SSH_PORT}")
     if [[ -z "$DETECTED_SID_STB" ]]; then
         DETECTED_SID_STB="$DETECTED_SID"
+        add_summary_error "No Oracle instance detected on standby ${STANDBY_HOST}:${STANDBY_SSH_PORT} (no ora_pmon_ process)"
     elif ! _validate_sid "$DETECTED_SID_STB"; then
-        printf "ERROR: Auto-detected standby SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID_STB"
-        exit 1
+        printf "ERROR: Auto-detected standby SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID_STB" >&2
+        exit $EXIT_USAGE
     fi
 else
     DETECTED_SID_STB="$DETECTED_SID"
@@ -307,7 +377,9 @@ TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
     printf 'FILE|%s\n' \"\$ALERT_FILE\"
-    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15
+    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15 | sed 's/^/ENTRY|/'
+else
+    printf 'MISSING|%s\n' \"\$ALERT_FILE\"
 fi
 " > "$TMP/primary_alert" 2>/dev/null &
 fi
@@ -325,7 +397,9 @@ TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID_STB}.log\"
 if [ -f \"\$ALERT_FILE\" ]; then
     printf 'FILE|%s\n' \"\$ALERT_FILE\"
-    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15
+    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15 | sed 's/^/ENTRY|/'
+else
+    printf 'MISSING|%s\n' \"\$ALERT_FILE\"
 fi
 " > "$TMP/standby_alert" 2>/dev/null &
 fi
@@ -343,7 +417,9 @@ TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID}.log\"
 if [ -f \"\$DRC_FILE\" ]; then
     printf 'FILE|%s\n' \"\$DRC_FILE\"
-    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10
+    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10 | sed 's/^/ENTRY|/'
+else
+    printf 'MISSING|%s\n' \"\$DRC_FILE\"
 fi
 " > "$TMP/primary_drc" 2>/dev/null &
 fi
@@ -361,7 +437,9 @@ TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
 DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID_STB}.log\"
 if [ -f \"\$DRC_FILE\" ]; then
     printf 'FILE|%s\n' \"\$DRC_FILE\"
-    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10
+    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10 | sed 's/^/ENTRY|/'
+else
+    printf 'MISSING|%s\n' \"\$DRC_FILE\"
 fi
 " > "$TMP/standby_drc" 2>/dev/null &
 fi
@@ -399,6 +477,14 @@ PRI_FRA_USED=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $3}' | xargs)
 PRI_FRA_RECLAIM=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $4}' | xargs)
 PRI_FRA_FILES=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $5}' | xargs)
 PRI_SERVICES=$(format_services "$(printf '%s\n' "$PRI_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
+
+# FSFO runtime state from V$DATABASE (M17). The FSFODB row was collected all
+# along but never parsed, so an FSFO configuration whose observer had died
+# still rendered a green "Enabled" and exited 0.
+PRI_FSFODB=$(printf '%s\n' "$PRI_SQL" | grep '^FSFODB|' | head -1 | sed 's/^FSFODB|//')
+PRI_FSFO_STATUS=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $1}' | xargs)
+PRI_FSFO_OBSERVER_PRESENT=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $2}' | xargs)
+PRI_FSFO_OBSERVER_HOST=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $3}' | xargs)
 
 # -- Parse standby SQL --------------------------------------------------------
 STB_SQL=$(cat "$TMP/standby_sql" 2>/dev/null)
@@ -481,19 +567,43 @@ if $STB_OK; then STB_DOT="${GREEN}●${NC}"; else STB_DOT="${RED}●${NC}"; fi
 # Shown first (least urgent — historical context scrolls off the top)
 header "RECENT ALERT LOG (Data Guard)"
 
+# L20: the path that was checked is ALWAYS printed, and "the file is not
+# there" (wrong SID, non-default diagnostic_dest, log never created) is
+# rendered differently from "the file was read and nothing matched".
+# Previously both showed a bare "(none)".
+# $3 = "warn" to raise a summary warning when the file is missing (used for
+# the alert log, which must exist on a running instance; the broker log is
+# legitimately absent before the broker has ever started).
 _show_alert_entries() {
-    local label="$1" file="$2"
-    local raw filepath entries
+    local label="$1" file="$2" missing_severity="${3:-info}"
+    local raw filepath missingpath entries
     raw=$(cat "$file" 2>/dev/null | sed '/^$/d')
     filepath=$(printf '%s\n' "$raw" | grep '^FILE|' | head -1 | sed 's/^FILE|//')
-    entries=$(printf '%s\n' "$raw" | grep -v '^FILE|')
+    missingpath=$(printf '%s\n' "$raw" | grep '^MISSING|' | head -1 | sed 's/^MISSING|//')
+    # Only marker-tagged lines are real log content; anything else in the
+    # stream is SSH/login noise.
+    entries=$(printf '%s\n' "$raw" | grep '^ENTRY|' | sed 's/^ENTRY|//')
+
+    if [[ -n "$missingpath" ]]; then
+        printf "  ${DIM}%s${NC}\n" "$label"
+        printf "    ${YELLOW}(file not found: %s)${NC}\n" "$missingpath"
+        if [[ "$missing_severity" == "warn" ]]; then
+            add_summary_warning "${label} not found at ${missingpath}"
+        fi
+        return
+    fi
     if [[ -n "$filepath" ]]; then
         printf "  ${DIM}%s (%s)${NC}\n" "$label" "$filepath"
     else
         printf "  ${DIM}%s${NC}\n" "$label"
+        printf "    ${YELLOW}(path could not be determined; V\$DIAG_INFO query failed)${NC}\n"
+        if [[ "$missing_severity" == "warn" ]]; then
+            add_summary_warning "${label} path could not be determined (V\$DIAG_INFO 'Diag Trace' query returned nothing)"
+        fi
+        return
     fi
     if [[ -z "$entries" ]]; then
-        printf "    ${DIM}(none)${NC}\n"
+        printf "    ${DIM}(0 matched - file read, no Data Guard entries)${NC}\n"
     else
         while IFS= read -r line; do
             local ts="" msg="$line"
@@ -520,18 +630,18 @@ _show_alert_entries() {
 
 subheader "Primary (${PRIMARY_ORACLE_HOSTNAME})"
 if $PRIMARY_REACHABLE; then
-    _show_alert_entries "Alert Log" "$TMP/primary_alert"
+    _show_alert_entries "Primary alert log" "$TMP/primary_alert" warn
     printf "\n"
-    _show_alert_entries "Broker Log" "$TMP/primary_drc"
+    _show_alert_entries "Primary broker log" "$TMP/primary_drc"
 else
     printf "  ${RED}UNREACHABLE${NC} ${DIM}(SSH to primary failed; logs not collected)${NC}\n"
 fi
 
 subheader "Standby (${STANDBY_ORACLE_HOSTNAME})"
 if $STANDBY_REACHABLE; then
-    _show_alert_entries "Alert Log" "$TMP/standby_alert"
+    _show_alert_entries "Standby alert log" "$TMP/standby_alert" warn
     printf "\n"
-    _show_alert_entries "Broker Log" "$TMP/standby_drc"
+    _show_alert_entries "Standby broker log" "$TMP/standby_drc"
 else
     printf "  ${RED}UNREACHABLE${NC} ${DIM}(SSH to standby failed; logs not collected)${NC}\n"
 fi
@@ -727,31 +837,68 @@ elif printf '%s' "$DGMGRL_CONFIG" | grep -qE "ORA-16532|not yet available|not ex
 else
     row "Configuration" "${BROKER_CFG_NAME:-unknown}"
 
+    # M19: WARNING is a warning (exit 1) and ERROR is an error (exit 2) -
+    # the local triage/diag tools already grade it that way, and the two
+    # tools must not disagree about the same broker state.
     if [[ -n "${BROKER_OVERALL:-}" ]]; then
-        icon=$(status_icon "$BROKER_OVERALL" "SUCCESS")
-        [[ "$icon" == *"XX"* ]] && add_summary_error "Broker overall status is '$BROKER_OVERALL'"
-        row "Overall Status" "$BROKER_OVERALL" "$icon"
+        case "$BROKER_OVERALL" in
+            SUCCESS)
+                row "Overall Status" "$BROKER_OVERALL" "$CHK"
+                ;;
+            WARNING)
+                add_summary_warning "Broker overall status is WARNING"
+                row "Overall Status" "$BROKER_OVERALL" "$WARN"
+                ;;
+            *)
+                add_summary_error "Broker overall status is '$BROKER_OVERALL'"
+                row "Overall Status" "$BROKER_OVERALL" "$FAIL"
+                ;;
+        esac
     else
         row "Overall Status" "UNKNOWN (DGMGRL output could not be parsed)" "$WARN"
         add_summary_warning "Broker status could not be determined"
     fi
 
-    # Show members and their ORA errors/warnings from SHOW CONFIGURATION
+    # Show members and their ORA errors/warnings from SHOW CONFIGURATION.
+    # M20: 19c prints the diagnosis on the line AFTER the member line, so we
+    # carry the last member name forward and attribute the Error:/Warning:
+    # line to it. Without this the member line always looked clean and the
+    # ORA- detail never reached the summary or the exit code.
+    BROKER_LAST_MEMBER=""
     while IFS= read -r line; do
         line_trimmed=$(printf '%s' "$line" | sed 's/^[[:space:]]*//')
-        if printf '%s' "$line" | grep -qE '^[[:space:]]+[^[:space:]]+[[:space:]]+-[[:space:]]+'; then
-            # Member line (e.g. "cdb1 - Primary database")
+        if dg_is_broker_member_line "$line"; then
+            # Member line (e.g. "cdb1 - Primary database"). Its icon is
+            # decided by the diagnosis lines that follow it, so it can't
+            # render a green OK directly above its own "Error: ORA-…" line.
+            BROKER_LAST_MEMBER=$(dg_broker_member_name "$line")
+            _member_sev=$(dg_broker_member_severity "$DGMGRL_CONFIG" "$BROKER_LAST_MEMBER")
             if printf '%s' "$line_trimmed" | grep -qi "Error"; then
                 add_summary_error "Broker member issue: $line_trimmed"
                 row "" "$line_trimmed" "$FAIL"
             elif printf '%s' "$line_trimmed" | grep -qi "Warning"; then
                 add_summary_warning "Broker member warning: $line_trimmed"
                 row "" "$line_trimmed" "$WARN"
+            elif [[ "$_member_sev" == "error" ]]; then
+                row "" "$line_trimmed" "$FAIL"
+            elif [[ "$_member_sev" == "warning" ]]; then
+                row "" "$line_trimmed" "$WARN"
             else
                 row "" "$line_trimmed" "$CHK"
             fi
+            continue
+        fi
+
+        _diag_sev=$(dg_broker_diagnosis_severity "$line_trimmed")
+        _diag_text=$(dg_broker_diagnosis_text "$line_trimmed")
+        if [[ "$_diag_sev" == "error" ]]; then
+            add_summary_error "Broker member ${BROKER_LAST_MEMBER:-configuration}: ${_diag_text}"
+            printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
+        elif [[ "$_diag_sev" == "warning" ]]; then
+            add_summary_warning "Broker member ${BROKER_LAST_MEMBER:-configuration}: ${_diag_text}"
+            printf "  ${DIM}%-24s${NC} ${YELLOW}%s${NC}\n" "" "$line_trimmed"
         elif printf '%s' "$line" | grep -qi 'ORA-'; then
-            # ORA error/warning detail line
+            # ORA detail line without an Error:/Warning: prefix
             printf "  ${DIM}%-24s${NC} ${RED}%s${NC}\n" "" "$line_trimmed"
         fi
     done <<< "$DGMGRL_CONFIG"
@@ -772,6 +919,30 @@ else
             add_summary_warning "Fast-Start Failover is ${FSFO_MODE}"
         fi
     fi
+
+    # M17: FS_FAILOVER_OBSERVER_PRESENT from V$DATABASE is the authoritative
+    # "is an observer actually connected right now" answer - SHOW
+    # FAST_START FAILOVER's "Observer:" line only reports the configured
+    # observer name. FSFO enabled with no observer connected means no
+    # automatic failover will happen, so it is graded as an error here and
+    # in the local triage/diag tools alike.
+    if [[ -n "${PRI_FSFO_STATUS:-}" ]]; then
+        row "  FSFO Status (V\$DATABASE)" "$PRI_FSFO_STATUS"
+    fi
+    _fsfo_enabled=false
+    if printf '%s' "${FSFO_MODE:-}" | grep -qi "Enabled"; then
+        _fsfo_enabled=true
+    elif [[ -n "${PRI_FSFO_STATUS:-}" ]] && ! printf '%s' "$PRI_FSFO_STATUS" | grep -qi "DISABLED"; then
+        _fsfo_enabled=true
+    fi
+    if $_fsfo_enabled && [[ -n "${PRI_FSFO_OBSERVER_PRESENT:-}" ]]; then
+        if [[ "$PRI_FSFO_OBSERVER_PRESENT" == "YES" ]]; then
+            row "  Observer Present" "YES${PRI_FSFO_OBSERVER_HOST:+ (${PRI_FSFO_OBSERVER_HOST})}" "$CHK"
+        else
+            row "  Observer Present" "$PRI_FSFO_OBSERVER_PRESENT" "$FAIL"
+            add_summary_error "FSFO is enabled but no observer is present (automatic failover will not happen)"
+        fi
+    fi
 fi
 
 # -- Summary box (right before final summary) ---------------------------------
@@ -784,6 +955,55 @@ printf ' └%s┴%s┘\n' "$_BAR" "$_BAR"
 # =============================================================================
 # Summary
 # =============================================================================
+# The state labels are computed BEFORE the headline banner: REPL_STATE's
+# "no data" branch (M18) raises a warning, and the banner, the
+# "errors=/warnings=" row and the exit code all have to agree with it.
+
+if $PRI_OK; then
+    PRIMARY_STATE="${GREEN}OK${NC}"
+else
+    PRIMARY_STATE="${RED}CHECK${NC}"
+fi
+
+if $STB_OK; then
+    STANDBY_STATE="${GREEN}OK${NC}"
+else
+    STANDBY_STATE="${RED}CHECK${NC}"
+fi
+
+# M19: WARNING is amber here too, so the final-summary colour agrees with
+# the severity the check assigned above.
+if [[ "${BROKER_OVERALL:-}" == "SUCCESS" ]]; then
+    BROKER_STATE="${GREEN}${BROKER_OVERALL}${NC}"
+elif [[ "${BROKER_OVERALL:-}" == "WARNING" ]]; then
+    BROKER_STATE="${YELLOW}${BROKER_OVERALL}${NC}"
+elif [[ -n "${BROKER_OVERALL:-}" ]]; then
+    BROKER_STATE="${RED}${BROKER_OVERALL}${NC}"
+else
+    BROKER_STATE="${YELLOW}UNKNOWN${NC}"
+fi
+
+# M18: "IN SYNC" must be a conclusion, not a fall-through. With an
+# unreachable or down standby every lag/sequence field is empty, and the old
+# final `else` rendered that as a green IN SYNC.
+if ! $STANDBY_REACHABLE; then
+    # The unreachable host is already a summary error; don't double-count.
+    REPL_STATE="${YELLOW}UNKNOWN${NC}"
+elif [[ -z "${STB_TRANSPORT_LAG:-}" && -z "${STB_APPLY_LAG:-}" && -z "${SEQ_LAG:-}" ]]; then
+    REPL_STATE="${YELLOW}UNKNOWN${NC}"
+    add_summary_warning "Replication state unknown: no transport lag, apply lag or sequence data returned by the standby"
+elif [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
+    REPL_STATE="${YELLOW}LAGGING${NC}"
+elif [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
+    REPL_STATE="${YELLOW}LAGGING${NC}"
+elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_CRIT" ]]; then
+    REPL_STATE="${RED}BEHIND${NC}"
+elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_WARN" ]]; then
+    REPL_STATE="${YELLOW}BEHIND${NC}"
+else
+    REPL_STATE="${GREEN}IN SYNC${NC}"
+fi
+
 printf "\n ${DIM}────────────────────────────────────────────────────────────${NC}\n"
 
 if [[ $ERRORS -eq 0 ]] && [[ $WARNINGS -eq 0 ]]; then
@@ -802,38 +1022,6 @@ elif [[ $WARNINGS -gt 0 ]]; then
     OVERALL_STATE="${YELLOW}ATTENTION${NC}"
 else
     OVERALL_STATE="${GREEN}HEALTHY${NC}"
-fi
-
-if $PRI_OK; then
-    PRIMARY_STATE="${GREEN}OK${NC}"
-else
-    PRIMARY_STATE="${RED}CHECK${NC}"
-fi
-
-if $STB_OK; then
-    STANDBY_STATE="${GREEN}OK${NC}"
-else
-    STANDBY_STATE="${RED}CHECK${NC}"
-fi
-
-if [[ "${BROKER_OVERALL:-}" == "SUCCESS" ]]; then
-    BROKER_STATE="${GREEN}${BROKER_OVERALL}${NC}"
-elif [[ -n "${BROKER_OVERALL:-}" ]]; then
-    BROKER_STATE="${RED}${BROKER_OVERALL}${NC}"
-else
-    BROKER_STATE="${YELLOW}UNKNOWN${NC}"
-fi
-
-if [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
-    REPL_STATE="${YELLOW}LAGGING${NC}"
-elif [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
-    REPL_STATE="${YELLOW}LAGGING${NC}"
-elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_CRIT" ]]; then
-    REPL_STATE="${RED}BEHIND${NC}"
-elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_WARN" ]]; then
-    REPL_STATE="${YELLOW}BEHIND${NC}"
-else
-    REPL_STATE="${GREEN}IN SYNC${NC}"
 fi
 
 header "FINAL SUMMARY"
@@ -860,9 +1048,11 @@ fi
 
 printf "\n"
 
-# -- Exit code (WS4.1) --------------------------------------------------------
+# -- Exit code (WS4.1 + L1) ---------------------------------------------------
 # Monitoring-friendly convention, mirroring dg_local_status_exit_code() in
 # common/dg_local_status_common.sh: 0 healthy, 1 warnings-only, 2 errors.
+# Usage / pre-flight failures exit 3 (EXIT_USAGE) further up so a mistyped
+# flag or a missing config file is never reported as a health finding.
 # This lets cron/monitoring wrappers alert on `dg_status.sh`'s own exit
 # status instead of having to scrape the colour-coded text output.
 if [[ $ERRORS -gt 0 ]]; then

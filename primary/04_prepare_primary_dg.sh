@@ -97,29 +97,60 @@ if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
     exit 1
 fi
 
-if [[ -f "$TNSNAMES_ORA" ]]; then
-    backup_file "$TNSNAMES_ORA"
+# M2: the generated entries file contains BOTH the primary and standby
+# alias stanzas. The old check tested only the standby alias and, when
+# missing, appended the WHOLE file - if the primary alias happened to
+# already exist (e.g. a second run, or a hand-maintained tnsnames.ora),
+# that produced a DUPLICATE primary definition. Oracle's tnsnames
+# resolution takes the FIRST match, so the OLD (possibly stale)
+# definition would silently keep winning. Check and append each alias
+# independently instead.
+extract_tns_alias_block() {
+    # Prints alias $2's stanza (from its "<alias> =" line up to the
+    # next blank line, or EOF for the last stanza) from file $1.
+    local _file="$1" _alias="$2" _alias_re
+    _alias_re=$(printf '%s' "$_alias" | sed 's/[.]/\\./g')
+    sed -n "/^${_alias_re}[[:space:]]*=/,/^$/p" "$_file"
+}
 
-    # Check if entries already exist (anchor on an alias definition line;
-    # aliases may contain dots, so escape them for the regex)
-    STANDBY_ALIAS_RE=$(printf '%s' "$STANDBY_TNS_ALIAS" | sed 's/[.]/\\./g')
-    if grep -qiE "^[[:space:]]*${STANDBY_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA"; then
-        log_info "TNS entry for standby already exists"
+TNS_APPEND_BLOCKS=""
+for TNS_ALIAS_TO_CHECK in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
+    TNS_ALIAS_RE=$(printf '%s' "$TNS_ALIAS_TO_CHECK" | sed 's/[.]/\\./g')
+    if [[ -f "$TNSNAMES_ORA" ]] && grep -qiE "^[[:space:]]*${TNS_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA"; then
+        log_info "TNS entry for '$TNS_ALIAS_TO_CHECK' already exists"
     else
-        log_info "Adding TNS entries to tnsnames.ora"
-        confirm_approval_action "Append standby TNS entry on primary" "append Data Guard entries to $TNSNAMES_ORA" || exit 1
-        echo "" >> "$TNSNAMES_ORA"
-        echo "# Data Guard TNS entries - Added $(date)" >> "$TNSNAMES_ORA"
-        cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
-        log_info "TNS entries added successfully"
+        TNS_BLOCK=$(extract_tns_alias_block "$TNSNAMES_ENTRY_FILE" "$TNS_ALIAS_TO_CHECK")
+        if [[ -z "$TNS_BLOCK" ]]; then
+            log_error "Could not find the '$TNS_ALIAS_TO_CHECK' stanza in $TNSNAMES_ENTRY_FILE"
+            exit 1
+        fi
+        log_info "TNS entry for '$TNS_ALIAS_TO_CHECK' is missing - will be added"
+        TNS_APPEND_BLOCKS="${TNS_APPEND_BLOCKS}${TNS_BLOCK}
+"
     fi
+done
+
+if [[ -z "$TNS_APPEND_BLOCKS" ]]; then
+    log_info "All required TNS entries already exist"
+elif [[ -f "$TNSNAMES_ORA" ]]; then
+    backup_file "$TNSNAMES_ORA"
+    log_info "Adding missing TNS entries to tnsnames.ora"
+    confirm_approval_action "Append standby TNS entry on primary" "append Data Guard entries to $TNSNAMES_ORA" || exit 1
+    {
+        echo ""
+        echo "# Data Guard TNS entries - Added $(date)"
+        printf '%s\n' "$TNS_APPEND_BLOCKS"
+    } >> "$TNSNAMES_ORA"
+    log_info "TNS entries added successfully"
 else
     log_info "Creating new tnsnames.ora"
     confirm_approval_action "Create primary tnsnames.ora" "write $TNSNAMES_ORA" || exit 1
-    echo "# TNS Names for Data Guard" > "$TNSNAMES_ORA"
-    echo "# Created: $(date)" >> "$TNSNAMES_ORA"
-    echo "" >> "$TNSNAMES_ORA"
-    cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
+    {
+        echo "# TNS Names for Data Guard"
+        echo "# Created: $(date)"
+        echo ""
+        printf '%s\n' "$TNS_APPEND_BLOCKS"
+    } > "$TNSNAMES_ORA"
     log_info "tnsnames.ora created successfully"
 fi
 
@@ -161,6 +192,7 @@ if [[ -f "$LISTENER_ORA" ]]; then
         confirm_approval_action "Update primary listener.ora" "Insert primary SID_DESC entries into $LISTENER_ORA" || exit 1
         if add_sid_to_listener "$LISTENER_ORA" "$TEMP_SID_DESC"; then
             log_info "Missing SID_DESC entries added to existing SID_LIST_LISTENER"
+            LISTENER_CONFIG_CHANGED=1
         else
             log_warn "Could not auto-insert SID_DESC entry"
             log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
@@ -182,6 +214,7 @@ $(cat "$TEMP_SID_DESC")
   )
 EOF
         log_info "Listener entry added successfully"
+        LISTENER_CONFIG_CHANGED=1
     fi
 else
     # Create new listener.ora
@@ -206,13 +239,37 @@ $(cat "$TEMP_SID_DESC")
   )
 EOF
     log_info "listener.ora created successfully"
+    LISTENER_CONFIG_CHANGED=1
 fi
 
 rm -rf "$TEMP_SID_DESC_DIR"
 record_artifact "listener:${LISTENER_ORA}"
 
-log_info "Listener configuration updated (changes will take effect on next listener reload)"
-log_warn "NOTE: Listener was NOT restarted. Reload manually if needed: lsnrctl reload"
+# Reload the listener so the static _DGMGRL registration actually takes
+# effect. Without this, everything up to step 7 passes (nothing uses the
+# static service yet) and the gap only surfaces later: step 13's VALIDATE
+# DATABASE fails its StaticConnectIdentifier probe with ORA-12514, and a
+# real switchover would hit the same error - weeks after anyone looked at
+# this step. `lsnrctl reload` re-reads listener.ora without dropping
+# existing connections. Skipped when nothing was changed.
+if [[ "${LISTENER_CONFIG_CHANGED:-0}" -eq 1 ]]; then
+    confirm_approval_action "Reload primary listener" "$ORACLE_HOME/bin/lsnrctl reload  # activate the _DGMGRL static registration" || exit 1
+    log_info "Reloading the listener to activate the static registration..."
+    if "$ORACLE_HOME/bin/lsnrctl" reload >/dev/null 2>&1; then
+        sleep 3
+        if "$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null | grep -qi "$PRIMARY_DGMGRL_GLOBAL_NAME"; then
+            log_info "Listener reloaded - ${PRIMARY_DGMGRL_GLOBAL_NAME} static service is registered"
+        else
+            log_warn "Listener reloaded, but ${PRIMARY_DGMGRL_GLOBAL_NAME} is not visible in 'lsnrctl status' yet"
+            log_warn "Verify manually: lsnrctl status | grep -i ${PRIMARY_DGMGRL_GLOBAL_NAME}"
+        fi
+    else
+        log_warn "'lsnrctl reload' failed - reload the listener manually: lsnrctl reload"
+        log_warn "Until then, DGMGRL switchover connects to this database will fail with ORA-12514"
+    fi
+else
+    log_info "Listener configuration unchanged - no reload needed"
+fi
 
 # ============================================================
 # Check/Enable Force Logging
@@ -241,8 +298,21 @@ progress_step "Checking Standby Redo Logs"
 # Get current standby redo log count
 CURRENT_STBY_GROUPS=$(run_sql_query "get_standby_redo_count.sql")
 CURRENT_STBY_GROUPS=$(echo "$CURRENT_STBY_GROUPS" | tr -d '[:space:]')
+if ! is_numeric "$CURRENT_STBY_GROUPS"; then
+    log_error "get_standby_redo_count.sql returned a non-numeric result: '${CURRENT_STBY_GROUPS}'"
+    exit 1
+fi
 
 REQUIRED_STBY_GROUPS=$STANDBY_REDO_GROUPS
+# L13: an empty/non-numeric REQUIRED_STBY_GROUPS (e.g. a standby config
+# missing STANDBY_REDO_GROUPS) makes the "-lt" comparison below treat it
+# as 0 rather than error - "0 standby redo groups required" always
+# reads as satisfied and the step silently reports success with none
+# created.
+if ! is_numeric "$REQUIRED_STBY_GROUPS"; then
+    log_error "STANDBY_REDO_GROUPS from the standby config is not numeric: '${REQUIRED_STBY_GROUPS}' (re-run 02_generate_standby_config.sh)"
+    exit 1
+fi
 
 log_info "Current standby redo groups: $CURRENT_STBY_GROUPS"
 log_info "Required standby redo groups: $REQUIRED_STBY_GROUPS"
@@ -253,6 +323,10 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     # Get the max group number
     MAX_GROUP=$(run_sql_query "get_max_redo_group.sql")
     MAX_GROUP=$(echo "$MAX_GROUP" | tr -d '[:space:]')
+    if ! is_numeric "$MAX_GROUP"; then
+        log_error "get_max_redo_group.sql returned a non-numeric result: '${MAX_GROUP}'"
+        exit 1
+    fi
 
     # Determine where to place SRLs on the primary.
     # Prefer PRIMARY_SRL_PATH from the config (set at step 2, may differ
@@ -309,14 +383,21 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     # Calculate how many to create
     GROUPS_TO_CREATE=$((REQUIRED_STBY_GROUPS - CURRENT_STBY_GROUPS))
 
-    if [[ -z "$MAX_GROUP" || "$MAX_GROUP" -lt 0 ]]; then
-        log_error "Could not determine the current maximum redo group number"
-        exit 1
-    fi
-
     STANDBY_REDO_START_GROUP=$((MAX_GROUP + 1))
 
-    log_info "Creating $GROUPS_TO_CREATE standby redo log groups starting at group $STANDBY_REDO_START_GROUP..."
+    # Create SRLs assigned to this instance's redo thread. Without the
+    # THREAD clause they sit at THREAD#=0 until first use, and DGMGRL
+    # VALIDATE DATABASE then reports "standby redo logs not configured
+    # for thread N" - blocking step 13's MAXAVAILABILITY preflight even
+    # though the SRLs exist (found live in the E2E run).
+    REDO_THREAD=$(run_sql_query "get_instance_thread.sql")
+    REDO_THREAD=$(echo "$REDO_THREAD" | tr -d '[:space:]')
+    if ! is_numeric "$REDO_THREAD"; then
+        log_warn "Could not determine the instance redo thread ('${REDO_THREAD}') - defaulting to thread 1"
+        REDO_THREAD=1
+    fi
+
+    log_info "Creating $GROUPS_TO_CREATE standby redo log groups (thread ${REDO_THREAD}) starting at group $STANDBY_REDO_START_GROUP..."
 
     i=0
     while [ "$i" -lt "$GROUPS_TO_CREATE" ]; do
@@ -324,9 +405,9 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         STBY_LOG_FILE="${REDO_PATH}standby_redo${NEW_GROUP}.log"
 
         log_info "Creating standby redo log group $NEW_GROUP: $STBY_LOG_FILE"
-        log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
+        log_cmd "sqlplus / as sysdba:" "ALTER DATABASE ADD STANDBY LOGFILE THREAD ${REDO_THREAD} GROUP ${NEW_GROUP} ('${STBY_LOG_FILE}') SIZE ${REDO_LOG_SIZE_MB}M"
 
-        run_sql_command "add_standby_logfile.sql" "$NEW_GROUP" "$STBY_LOG_FILE" "$REDO_LOG_SIZE_MB"
+        run_sql_command "add_standby_logfile.sql" "$REDO_THREAD" "$NEW_GROUP" "$STBY_LOG_FILE" "$REDO_LOG_SIZE_MB"
         record_artifact "standby_redo_group:${NEW_GROUP}:${STBY_LOG_FILE}"
         i=$((i + 1))
     done
@@ -339,6 +420,30 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     run_sql_display "get_standby_redo_info.sql"
 else
     log_info "Sufficient standby redo logs already exist"
+
+    # M6: count alone doesn't catch UNDERSIZED pre-existing SRLs. Oracle
+    # rejects a standby redo log smaller than the largest online redo
+    # log for real-time apply, so an SRL set created before an ORL
+    # resize (or the H1 arbitrary-log-size bug this review also fixes)
+    # can pass this count check while defeating step 1's own advice to
+    # resize the ORLs before the standby exists. Compare, warn, and give
+    # the fix DDL - do not auto-drop existing standby redo log groups.
+    STBY_MIN_SIZE_MB=$(run_sql_query "get_standby_redo_min_size.sql")
+    STBY_MIN_SIZE_MB=$(echo "$STBY_MIN_SIZE_MB" | tr -d '[:space:]')
+    if is_numeric "$STBY_MIN_SIZE_MB" && is_numeric "${REDO_LOG_SIZE_MB:-}"; then
+        if [[ "$STBY_MIN_SIZE_MB" -lt "$REDO_LOG_SIZE_MB" ]]; then
+            log_warn "Existing standby redo logs are UNDERSIZED: smallest is ${STBY_MIN_SIZE_MB}MB, online redo logs are ${REDO_LOG_SIZE_MB}MB"
+            log_warn "  Oracle rejects standby redo logs smaller than the largest online redo log for"
+            log_warn "  real-time apply - transport silently falls back to archiver mode instead."
+            log_warn "  Fix (run manually - not applied automatically), for each undersized group:"
+            log_warn "    ALTER DATABASE DROP STANDBY LOGFILE GROUP <n>;"
+            log_warn "    ALTER DATABASE ADD STANDBY LOGFILE GROUP <n> ('<path>') SIZE ${REDO_LOG_SIZE_MB}M;"
+        else
+            log_info "Existing standby redo logs are sized adequately (>= ${REDO_LOG_SIZE_MB}MB)"
+        fi
+    else
+        log_warn "Could not verify existing standby redo log sizes (non-numeric query result) - check manually"
+    fi
 fi
 
 # ============================================================
@@ -484,6 +589,15 @@ echo "      configured automatically when the broker is enabled."
 # ============================================================
 # Summary
 # ============================================================
+
+# M5: re-read the values this step itself may have just changed.
+# FORCE_LOGGING and DG_BROKER_START were captured BEFORE the
+# enable/set steps above (used only to decide whether to act) - the
+# summary must reflect the actual post-change state, not show "NO"/
+# "FALSE" when both were in fact just turned on.
+FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
+FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d '[:space:]')
+DG_BROKER_START=$(get_db_parameter "dg_broker_start")
 
 print_summary "SUCCESS" "Primary configured for Data Guard"
 print_status_block "Primary Data Guard Readiness" \

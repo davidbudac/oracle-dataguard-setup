@@ -126,8 +126,11 @@ mkdir -p "$NFS_SHARE_PATH"
 mkdir -p "$NFS_SHARE_PATH/logs"
 
 # Set ownership and permissions. The share carries password file copies
-# and other Data Guard setup artifacts, so it is owned exclusively by the
-# Oracle software owner and not group/world-writable or -readable.
+# and other Data Guard setup artifacts: mode 750 keeps it fully closed to
+# world, writable only by its owner (normally "oracle"), and readable
+# (r-x) by its owning group (normally "oinstall") - the standard Oracle
+# software-owner/group split, needed because the primary and standby DB
+# hosts may run as different OS users in the same "oinstall" group.
 if chown "$NFS_OWNER" "$NFS_SHARE_PATH" "$NFS_SHARE_PATH/logs" 2>/dev/null; then
     log_info "Ownership set to $NFS_OWNER"
 else

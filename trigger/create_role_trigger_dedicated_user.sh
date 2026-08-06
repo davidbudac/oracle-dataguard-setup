@@ -82,7 +82,7 @@ check_db_connection || exit 1
 log_section "Verifying Database Role"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \t\n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -104,7 +104,7 @@ SELECT DB_UNIQUE_NAME FROM V$DATABASE;
 EXIT;
 EOSQL
 )
-PRIMARY_DB_UNIQUE_NAME=$(echo "$PRIMARY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+PRIMARY_DB_UNIQUE_NAME=$(echo "$PRIMARY_DB_UNIQUE_NAME" | tr -d ' \t\n\r')
 
 if [[ -z "$PRIMARY_DB_UNIQUE_NAME" ]]; then
     log_error "Could not determine the primary DB_UNIQUE_NAME from V\$DATABASE"
@@ -120,7 +120,7 @@ WHERE DB_UNIQUE_NAME <> '${PRIMARY_DB_UNIQUE_NAME}' AND ROWNUM = 1;
 EXIT;
 EOSQL
 )
-STANDBY_DB_UNIQUE_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr -d ' \n\r')
+STANDBY_DB_UNIQUE_NAME=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr -d ' \t\n\r')
 
 if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
     # Self-discovery could not find a peer in V$DATAGUARD_CONFIG. Fall back to
@@ -158,19 +158,32 @@ SELECT CDB FROM V$DATABASE;
 EXIT;
 EOSQL
 )
-IS_CDB=$(echo "$IS_CDB" | tr -d ' \n\r')
+IS_CDB=$(echo "$IS_CDB" | tr -d ' \t\n\r')
 
+# On a multitenant database V$ACTIVE_SERVICES (queried in CDB$ROOT) also
+# returns services that live inside PDBs. The package generated below calls
+# DBMS_SERVICE.START_SERVICE from CDB$ROOT, which fails with ORA-44304 for
+# every PDB service - and the failure is swallowed into the alert log, so the
+# trigger silently does nothing on each role change. Only the SYS-owned CDB
+# variant switches containers, so that is the supported path for a CDB.
 if [[ "$IS_CDB" == "YES" ]]; then
-    DEFAULT_SCHEMA="C##DG_ADMIN"
-    log_info "CDB detected - common user prefix C## required"
-else
-    DEFAULT_SCHEMA="DG_ADMIN"
+    log_error "This database is a CDB (V\$DATABASE.CDB = YES)"
+    log_error "This script only manages services in the current container, which"
+    log_error "silently fails (ORA-44304, logged to the alert log) for services"
+    log_error "that live inside PDBs."
+    log_error "Use the CDB / PDB-aware variant instead:"
+    log_error "    bash trigger/create_role_trigger_cdb.sh"
+    log_error "(that variant is SYS-owned; there is currently no dedicated-user"
+    log_error " equivalent for multitenant databases)"
+    exit 1
 fi
+
+DEFAULT_SCHEMA="DG_ADMIN"
 
 echo ""
 printf "Enter schema name for DG service objects [%s]: " "$DEFAULT_SCHEMA"
 read USER_SCHEMA
-USER_SCHEMA=$(echo "$USER_SCHEMA" | tr -d ' \n\r')
+USER_SCHEMA=$(echo "$USER_SCHEMA" | tr -d ' \t\n\r')
 if [[ -z "$USER_SCHEMA" ]]; then
     USER_SCHEMA="$DEFAULT_SCHEMA"
 fi
@@ -228,7 +241,7 @@ SELECT COUNT(*) FROM DBA_USERS WHERE USERNAME = '${USER_SCHEMA}';
 EXIT;
 EOSQL
 )
-USER_EXISTS=$(echo "$USER_EXISTS" | tr -d ' \n\r')
+USER_EXISTS=$(echo "$USER_EXISTS" | tr -d ' \t\n\r')
 
 CREATE_USER=true
 if [[ "$USER_EXISTS" != "0" ]]; then
@@ -241,7 +254,7 @@ SELECT COUNT(*) FROM DBA_SYS_PRIVS WHERE GRANTEE = '${USER_SCHEMA}' AND PRIVILEG
 EXIT;
 EOSQL
     )
-    PRIV_COUNT=$(echo "$PRIV_COUNT" | tr -d ' \n\r')
+    PRIV_COUNT=$(echo "$PRIV_COUNT" | tr -d ' \t\n\r')
 
     if [[ "$PRIV_COUNT" != "0" ]]; then
         log_info "User already has required privileges"
@@ -292,7 +305,7 @@ if [[ $HELPER_RC -ne 0 ]] || echo "$HELPER_RESULT" | grep -q "^ORA-"; then
     exit 1
 fi
 
-HELPER_STATUS=$(echo "$HELPER_RESULT" | grep "HELPER_STATUS=" | sed 's/HELPER_STATUS=//' | tr -d ' \n\r')
+HELPER_STATUS=$( { echo "$HELPER_RESULT" | grep "HELPER_STATUS=" || true; } | sed 's/.*HELPER_STATUS=//' | tr -d ' \t\n\r')
 if [[ "$HELPER_STATUS" == "VALID" ]]; then
     log_info "SYS.DG_ALERT_LOG_MSG: VALID"
 else
@@ -313,6 +326,23 @@ if [[ "$CREATE_USER" == "true" ]]; then
         log_error "Password cannot be empty"
         exit 1
     fi
+
+    # The password is interpolated into an UNQUOTED heredoc below, so bash
+    # expands it before sqlplus ever sees it: '$' truncates/substitutes,
+    # backticks are command-substituted ON THE DATABASE HOST, and backslashes
+    # are eaten. A password like Secr$et#1 would silently create the user with
+    # 'Secr#1' - the script reports success and nobody can log in. Reject the
+    # shell-special characters outright (same approach as
+    # primary/09_configure_fsfo.sh's observer-password check).
+    case "$USER_PASSWORD" in
+        *'"'*|*'$'*|*'`'*|*'\'*)
+            log_error "Password must not contain any of these characters: \" \$ \` \\"
+            log_error "They are interpreted by the shell before the password reaches the database,"
+            log_error "which would create the user with a different password than you typed."
+            log_error "Choose a password using other punctuation (e.g. # _ - % ! + =)."
+            exit 1
+            ;;
+    esac
 
     confirm_approval_action "Create user $USER_SCHEMA and grant privileges" "sqlplus -s / as sysdba <create user and grant privileges>" || exit 1
 
@@ -383,6 +413,87 @@ fi
 
 log_section "Discovering User-Defined Services"
 
+# ------------------------------------------------------------
+# Service-name helpers (shared by the add / clear prompts and the
+# final validation below) - kept in step with create_role_trigger.sh
+# ------------------------------------------------------------
+# Format check. Hyphens are allowed: domain-qualified service names such as
+# "orders.corp-eu.example.com" are legitimate and were previously rejected at
+# the very end of the run, after all interactive work.
+SERVICE_NAME_RE='^[A-Za-z][A-Za-z0-9_.$-]*$'
+SERVICE_NAME_RULE="Service names must start with a letter and contain only letters, numbers, underscore, dot, hyphen, and dollar sign"
+
+validate_service_name() {
+    local svc="$1"
+    if ! echo "$svc" | grep -q "$SERVICE_NAME_RE"; then
+        log_error "Invalid service name: $svc"
+        log_error "$SERVICE_NAME_RULE"
+        return 1
+    fi
+    if [[ ${#svc} -gt 64 ]]; then
+        log_error "Service name too long (max 64 chars): $svc"
+        return 1
+    fi
+    return 0
+}
+
+# Resolve a hand-entered service name against the names the database actually
+# knows, case-insensitively, and print the database's exact spelling. Oracle
+# service names are case-sensitive, so 'myapp' typed for a service created as
+# 'MYAPP' deploys cleanly and then fails ORA-44304 at the next role change.
+# Prints nothing (and returns 1) when there is no match.
+resolve_service_name() {
+    local input="$1" resolved
+    resolved=$(sqlplus -s / as sysdba << EOSQL
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT 'SVCNAME=' || name FROM (
+    SELECT name FROM DBA_SERVICES WHERE UPPER(name) = UPPER('${input}')
+    UNION
+    SELECT name FROM V\$ACTIVE_SERVICES WHERE UPPER(name) = UPPER('${input}')
+) WHERE ROWNUM = 1;
+EXIT;
+EOSQL
+)
+    resolved=$( { printf '%s\n' "$resolved" | grep 'SVCNAME=' || true; } \
+        | head -1 | sed 's/.*SVCNAME=//' | tr -d ' \t\n\r')
+    if [[ -z "$resolved" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$resolved"
+    return 0
+}
+
+# Validate + resolve a hand-entered service name and append it to
+# SERVICE_LIST. Unknown names are only accepted after explicit confirmation
+# (TTY-gated: a non-interactive run rejects them rather than deploying a
+# service list the database cannot honour).
+add_service_by_name() {
+    local svc="$1" resolved
+    validate_service_name "$svc" || return 1
+    if resolved=$(resolve_service_name "$svc"); then
+        SERVICE_LIST+=("$resolved")
+        if [[ "$resolved" != "$svc" ]]; then
+            log_info "Added service: $resolved (resolved from '$svc')"
+        else
+            log_info "Added service: $resolved"
+        fi
+        return 0
+    fi
+    log_warn "Service '$svc' was not found in DBA_SERVICES or V\$ACTIVE_SERVICES"
+    log_warn "A name the database does not know fails with ORA-44304 at the next role change (silently, in the alert log)."
+    if [[ ! -t 0 ]]; then
+        log_error "Not adding '$svc' (non-interactive run; create the service first, or re-run interactively to override)"
+        return 1
+    fi
+    if confirm_proceed "Add '$svc' anyway?"; then
+        SERVICE_LIST+=("$svc")
+        log_warn "Added unresolved service: $svc"
+        return 0
+    fi
+    log_info "Not added: $svc"
+    return 1
+}
+
 log_info "Querying active services (excluding system services)..."
 
 # Keep stderr visible: $(...) captures only stdout (the service names), so a
@@ -393,7 +504,7 @@ SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" || true)
 # Parse services into an array
 SERVICE_LIST=()
 while IFS= read -r line; do
-    line=$(echo "$line" | tr -d ' \n\r')
+    line=$(echo "$line" | tr -d ' \t\n\r')
     if [[ -n "$line" ]]; then
         SERVICE_LIST+=("$line")
     fi
@@ -454,16 +565,9 @@ while true; do
         a)
             printf "Enter service name to add: "
             read new_svc
-            new_svc=$(echo "$new_svc" | tr -d ' \n\r')
+            new_svc=$(echo "$new_svc" | tr -d ' \t\n\r')
             if [[ -n "$new_svc" ]]; then
-                # Validate service name
-                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
-                    SERVICE_LIST+=("$new_svc")
-                    log_info "Added service: $new_svc"
-                else
-                    log_error "Invalid service name: $new_svc"
-                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
-                fi
+                add_service_by_name "$new_svc" || true
             fi
             echo ""
             echo "Current services:"
@@ -519,17 +623,11 @@ while true; do
             while true; do
                 printf "  Service name: "
                 read new_svc
-                new_svc=$(echo "$new_svc" | tr -d ' \n\r')
+                new_svc=$(echo "$new_svc" | tr -d ' \t\n\r')
                 if [[ -z "$new_svc" ]]; then
                     break
                 fi
-                if echo "$new_svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
-                    SERVICE_LIST+=("$new_svc")
-                    log_info "Added service: $new_svc"
-                else
-                    log_error "Invalid service name: $new_svc"
-                    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
-                fi
+                add_service_by_name "$new_svc" || true
             done
             echo ""
             echo "Current services:"
@@ -559,15 +657,7 @@ fi
 
 # Final validation of all service names
 for svc in "${SERVICE_LIST[@]}"; do
-    if ! echo "$svc" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
-        log_error "Invalid service name: $svc"
-        log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
-        exit 1
-    fi
-    if [[ ${#svc} -gt 64 ]]; then
-        log_error "Service name too long (max 64 chars): $svc"
-        exit 1
-    fi
+    validate_service_name "$svc" || exit 1
 done
 
 log_info "Validated ${#SERVICE_LIST[@]} service name(s)"
@@ -584,7 +674,7 @@ SELECT COUNT(*) FROM DBA_OBJECTS WHERE OBJECT_NAME = 'DG_SERVICE_MGR' AND OWNER 
 EXIT;
 EOSQL
 )
-PKG_EXISTS=$(echo "$PKG_EXISTS" | tr -d ' \n\r')
+PKG_EXISTS=$(echo "$PKG_EXISTS" | tr -d ' \t\n\r')
 
 if [[ "$PKG_EXISTS" != "0" ]]; then
     log_warn "Package ${USER_SCHEMA}.DG_SERVICE_MGR already exists"
@@ -785,10 +875,15 @@ done
 
 log_section "Verifying Deployment"
 
-# Check package status
-PKG_STATUS=$(echo "$DEPLOY_RESULT" | grep "PKG_STATUS=" | sed 's/PKG_STATUS=//' | tr -d ' \n\r')
-TRG_ROLE_STATUS=$(echo "$DEPLOY_RESULT" | grep "TRG_ROLE_CHG=" | sed 's/TRG_ROLE_CHG=//' | tr -d ' \n\r')
-TRG_STARTUP_STATUS=$(echo "$DEPLOY_RESULT" | grep "TRG_STARTUP=" | sed 's/TRG_STARTUP=//' | tr -d ' \n\r')
+# Check package status.
+# The `|| true` inside each substitution is load-bearing: verbose mode turns
+# on `set -o pipefail`, so a deployment that produced no verification rows
+# would make grep (and therefore the whole assignment) fail and abort the
+# script under `set -e` - exactly when the DBA_ERRORS diagnostics below are
+# needed most.
+PKG_STATUS=$( { echo "$DEPLOY_RESULT" | grep "PKG_STATUS=" || true; } | sed 's/.*PKG_STATUS=//' | tr -d ' \t\n\r')
+TRG_ROLE_STATUS=$( { echo "$DEPLOY_RESULT" | grep "TRG_ROLE_CHG=" || true; } | sed 's/.*TRG_ROLE_CHG=//' | tr -d ' \t\n\r')
+TRG_STARTUP_STATUS=$( { echo "$DEPLOY_RESULT" | grep "TRG_STARTUP=" || true; } | sed 's/.*TRG_STARTUP=//' | tr -d ' \t\n\r')
 
 DEPLOY_OK=true
 

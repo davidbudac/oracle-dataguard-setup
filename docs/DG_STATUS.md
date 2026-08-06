@@ -52,6 +52,7 @@ bash dg_status.sh --no-color
 | Transport Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
 | Apply Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
 | Sequences | `V$ARCHIVED_LOG` | Lag <= 1 | Lag 2-5 | Lag > 5 |
+| Replication state (summary row) | derived | IN SYNC | LAGGING / BEHIND / **UNKNOWN** | BEHIND (> `DG_SEQ_GAP_CRIT`) |
 | Standby Redo Logs | `V$STANDBY_LOG` | Count > 0 | - | NONE |
 | Archive Gaps | `V$ARCHIVE_GAP` | 0 | - | > 0 |
 | FRA Usage | `V$RECOVERY_FILE_DEST` | < 80% | 80-89% | >= 90% |
@@ -61,10 +62,33 @@ bash dg_status.sh --no-color
 | Check | Source | OK | Warning | Error |
 |---|---|---|---|---|
 | Configuration | `SHOW CONFIGURATION` | Exists | - | ORA-16532 (not configured) |
-| Overall Status | `SHOW CONFIGURATION` | SUCCESS | WARNING | ERROR |
-| Per-member status | `SHOW CONFIGURATION` | No errors | Warning on member | Error on member |
-| ORA errors | `SHOW CONFIGURATION` | _(displayed in red)_ | | |
-| Fast-Start Failover | `SHOW FAST_START FAILOVER` | Enabled (with target/observer) | - | _(shown as disabled)_ |
+| Overall Status | `SHOW CONFIGURATION` | SUCCESS | WARNING | ERROR / anything else |
+| Per-member status | `SHOW CONFIGURATION` | No errors | `Warning:` line under the member | `Error:` line under the member |
+| ORA errors | `SHOW CONFIGURATION` | _(displayed in red and attributed to the member)_ | | |
+| Fast-Start Failover | `SHOW FAST_START FAILOVER` | Enabled (with target/observer) | Disabled | - |
+| Observer present | `V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT` | YES (when FSFO enabled) | - | FSFO enabled but no observer connected |
+
+**Broker member diagnosis (19c line layout).** DGMGRL does not put a member's
+diagnosis on the member line; it prints it on the line below:
+
+```
+  cdb1      - Primary database
+    Error: ORA-16810: multiple errors or warnings detected for the member
+
+    cdb1_stby - Physical standby database
+      Error: ORA-12154: TNS:could not resolve the connect identifier specified
+```
+
+The dashboard tracks the most recent member line and attributes any following
+`Error:` / `Warning:` line to it, so both the member line's icon and the final
+summary reflect the real state (`Broker member cdb1_stby: ORA-12154: ...`).
+`Error: 0` — DGMGRL's healthy value — is deliberately not treated as a finding.
+
+**Observer liveness.** `SHOW FAST_START FAILOVER` only reports the *configured*
+observer; `V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT` is what says whether one is
+actually connected. FSFO enabled with no observer present means automatic
+failover will not happen, and is graded as an **error** — the same grade
+`dg_triage_sid.sh` / `dg_diag_sid.sh` give it.
 
 ## Prerequisites
 
@@ -113,15 +137,52 @@ The Oracle SID is resolved in this order:
 
 The standby SID is always auto-detected from its own pmon process (it may differ from the primary SID).
 
+Auto-detection is deliberately paranoid about what it parses. The remote side runs
+
+```
+ps -ef | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'
+```
+
+and the local side keeps only `DG_PMON|`-marked lines, with SSH's stderr **not**
+merged into that stream. Anything the login shell prints on its own (an
+`/etc/motd` banner, a `Last login:` line, a security notice that happens to
+mention `ora_pmon_`) is therefore never mistaken for a process line. The SID
+itself is extracted with an anchored expression — `ora_pmon_<SID>` must be the
+last token on the line and `<SID>` must match `[A-Za-z][A-Za-z0-9_$]*` — so
+prose can never be turned into a "SID". See `tests/test_sid_detection.sh`.
+
 ## Exit Codes
 
 Monitoring-friendly, matching `dg_triage_sid.sh` / `dg_diag_sid.sh`:
 
 - `0` -- healthy (no errors, no warnings)
 - `1` -- warnings only
-- `2` -- one or more errors (including an unreachable host)
+- `2` -- one or more errors (including an unreachable host or a primary with no running instance)
+- `3` -- **usage / pre-flight error**: unknown flag, an option missing its
+  argument, config file not found, config file missing a required setting, or a
+  SID that fails validation. Nothing was checked.
 
-This lets cron/monitoring wrappers alert on the exit status instead of scraping the text output.
+This lets cron/monitoring wrappers alert on the exit status instead of scraping
+the text output. `3` is separate from `1`/`2` on purpose: a typo in the command
+line must not be reported as a Data Guard finding.
+
+## Reporting Rules Worth Knowing
+
+- **Replication state is never guessed.** With the standby unreachable, or when
+  it returns no transport lag, apply lag *and* no sequence data, the `Redo Apply`
+  summary row reads `UNKNOWN` (amber) rather than falling through to a green
+  `IN SYNC`. When there is genuinely no data and the host *is* reachable, a
+  warning is recorded too.
+- **Broker `WARNING` is a warning**, not an error — exit `1`, amber in the final
+  summary. `ERROR` (or any other non-`SUCCESS` value) is exit `2`. This matches
+  how `dg_triage_sid.sh` / `dg_diag_sid.sh` grade the same broker state.
+- **Log sections always name the file they read.** Each alert/broker log block
+  prints the full path it inspected, and distinguishes three outcomes:
+  the path could not be determined (`V$DIAG_INFO` returned nothing),
+  `(file not found: <path>)`, and `(0 matched - file read, no Data Guard
+  entries)`. A missing **alert** log raises a warning (a running instance must
+  have one); a missing **broker** log does not, since it legitimately does not
+  exist until the broker has started.
 
 ## Thresholds
 

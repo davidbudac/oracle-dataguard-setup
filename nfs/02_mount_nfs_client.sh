@@ -44,6 +44,52 @@ log_error() {
 }
 
 # ============================================================
+# Write access test helper
+# ============================================================
+# nfs/01_setup_nfs_server.sh exports with root_squash (deliberately - see
+# that script's comment), so a write test run as root is mapped to the
+# anonymous user and gets EACCES even on a perfectly writable share. This
+# script requires root (checked below), so the meaningful write test is
+# "can the oracle OS user write here", not "can root write here". Falls
+# back to testing as the invoking user if the oracle account doesn't exist
+# locally, or if neither su nor sudo is usable.
+test_nfs_write_access() {
+    local mount_path="$1"
+    local test_file="${mount_path}/.mount_test_$$"
+
+    if [ "$EUID" -ne 0 ]; then
+        # Not root (script normally enforces this, but keep the test
+        # meaningful if that check is ever relaxed): just test as ourselves.
+        touch "$test_file" 2>/dev/null && rm -f "$test_file" 2>/dev/null
+        return $?
+    fi
+
+    if ! id oracle >/dev/null 2>&1; then
+        log_warn "oracle OS user not found on this host - testing write access as root instead"
+        log_warn "(meaningful only if root_squash is NOT set on the NFS export)"
+        touch "$test_file" 2>/dev/null && rm -f "$test_file" 2>/dev/null
+        return $?
+    fi
+
+    if su - oracle -c "touch '$test_file' && rm -f '$test_file'" >/dev/null 2>&1; then
+        return 0
+    fi
+    if command -v sudo >/dev/null 2>&1 && sudo -u oracle touch "$test_file" >/dev/null 2>&1; then
+        sudo -u oracle rm -f "$test_file" >/dev/null 2>&1 || true
+        return 0
+    fi
+
+    log_error "Write test as the oracle OS user failed via both 'su - oracle' and 'sudo -u oracle'."
+    log_error "The NFS export uses root_squash (nfs/01_setup_nfs_server.sh does not disable it, by"
+    log_error "design), so root's own writes here are mapped to the anonymous user and denied even"
+    log_error "on a share that oracle can legitimately write to. Verify:"
+    log_error "  - the oracle user's UID/GID matches between this host and the NFS server"
+    log_error "  - /etc/exports on the NFS server grants rw to this host"
+    log_error "  - the share is owned oracle:oinstall with mode 750 (nfs/01_setup_nfs_server.sh)"
+    return 1
+}
+
+# ============================================================
 # Check root privileges
 # ============================================================
 
@@ -67,8 +113,7 @@ if mountpoint -q "$NFS_MOUNT_PATH" 2>/dev/null; then
     df -h "$NFS_MOUNT_PATH"
     echo ""
     log_info "Testing write access..."
-    TEST_FILE="$NFS_MOUNT_PATH/.mount_test_$$"
-    if touch "$TEST_FILE" 2>/dev/null && rm -f "$TEST_FILE"; then
+    if test_nfs_write_access "$NFS_MOUNT_PATH"; then
         log_info "Write access confirmed"
         echo ""
         echo "============================================================"
@@ -98,6 +143,61 @@ if [ -z "$NFS_SERVER" ]; then
 fi
 
 NFS_SOURCE="$NFS_SERVER:$NFS_MOUNT_PATH"
+
+# ============================================================
+# Detect running on the NFS server itself
+# ============================================================
+# The export path and the mount path are deliberately the same directory
+# (see 01_setup_nfs_server.sh), so on the server host the share is already
+# available locally and must NOT be NFS-mounted on top of itself: a
+# loopback NFS mount shadows the exported directory with an NFS
+# filesystem, and rpc.mountd then refuses every OTHER client with
+# "Cannot export ..., possibly unsupported filesystem or fsid= required"
+# (client-side symptom: mount.nfs4 "No such file or directory").
+# Found live: the walkthrough runs this script on both DB hosts, and the
+# NFS server is usually one of them.
+
+_is_local_nfs_server="no"
+if [ "$NFS_SERVER" = "$(hostname 2>/dev/null)" ] || [ "$NFS_SERVER" = "$(hostname -s 2>/dev/null)" ]; then
+    _is_local_nfs_server="yes"
+elif hostname -I >/dev/null 2>&1; then
+    # Linux: match against every local interface address
+    for _local_ip in $(hostname -I 2>/dev/null); do
+        if [ "$NFS_SERVER" = "$_local_ip" ]; then
+            _is_local_nfs_server="yes"
+            break
+        fi
+    done
+elif command -v ifconfig >/dev/null 2>&1; then
+    # AIX/other: fall back to ifconfig -a output
+    if ifconfig -a 2>/dev/null | grep -w "inet" | awk '{print $2}' | grep -qx "$NFS_SERVER"; then
+        _is_local_nfs_server="yes"
+    fi
+fi
+
+if [ "$_is_local_nfs_server" = "yes" ]; then
+    echo ""
+    log_info "This host IS the NFS server ($NFS_SERVER) - skipping the NFS mount."
+    log_info "The share directory $NFS_MOUNT_PATH is already available locally"
+    log_info "(the export path and the client mount path are the same directory)."
+    if [ ! -d "$NFS_MOUNT_PATH" ]; then
+        log_error "Export directory $NFS_MOUNT_PATH does not exist - run 01_setup_nfs_server.sh first"
+        exit 1
+    fi
+    log_info "Testing write access..."
+    if test_nfs_write_access "$NFS_MOUNT_PATH"; then
+        log_info "Write access confirmed"
+        echo ""
+        echo "============================================================"
+        echo "     NFS share is ready on the server host - no mount needed"
+        echo "============================================================"
+        exit 0
+    else
+        log_error "Write access test failed on the local share directory"
+        log_error "Check ownership/permissions of $NFS_MOUNT_PATH (expected owner oracle:oinstall, mode 750)"
+        exit 1
+    fi
+fi
 
 echo ""
 log_info "NFS source: $NFS_SOURCE"
@@ -170,11 +270,14 @@ fi
 
 log_info "Mounting NFS share..."
 
-if mount -t nfs4 "$NFS_SOURCE" "$NFS_MOUNT_PATH"; then
+# Mount with the same options that get written to /etc/fstab below, so the
+# interactive mount actually exercises what will be used on every reboot
+# instead of the (different) kernel defaults.
+if mount -t nfs4 -o "$FSTAB_OPTIONS" "$NFS_SOURCE" "$NFS_MOUNT_PATH"; then
     log_info "NFS share mounted successfully"
 else
     log_error "Failed to mount NFS share"
-    log_error "Try mounting manually: mount -t nfs4 $NFS_SOURCE $NFS_MOUNT_PATH"
+    log_error "Try mounting manually: mount -t nfs4 -o $FSTAB_OPTIONS $NFS_SOURCE $NFS_MOUNT_PATH"
     exit 1
 fi
 
@@ -184,8 +287,7 @@ fi
 
 log_info "Testing write access..."
 
-TEST_FILE="$NFS_MOUNT_PATH/.mount_test_$$"
-if touch "$TEST_FILE" 2>/dev/null && rm -f "$TEST_FILE"; then
+if test_nfs_write_access "$NFS_MOUNT_PATH"; then
     log_info "Write access confirmed"
 else
     log_error "Write access test failed"
@@ -243,13 +345,27 @@ log_info "Setting permissions for oracle user..."
 ORACLE_UID=$(id -u oracle 2>/dev/null || echo "")
 
 if [ -n "$ORACLE_UID" ]; then
-    chown oracle:oinstall "$NFS_MOUNT_PATH" 2>/dev/null || chown oracle:dba "$NFS_MOUNT_PATH" 2>/dev/null || true
+    # Both guarded: this host is root, and the export is root_squashed by
+    # design (see nfs/01_setup_nfs_server.sh) - a root-issued chown/chmod
+    # against the mounted share is squashed to the anonymous user and can
+    # fail with EACCES on a perfectly correctly-permissioned share. That is
+    # not fatal here (ownership/mode were already set by 01 on the server
+    # side); just warn instead of aborting under set -e.
+    if chown oracle:oinstall "$NFS_MOUNT_PATH" 2>/dev/null || chown oracle:dba "$NFS_MOUNT_PATH" 2>/dev/null; then
+        :
+    else
+        log_warn "chown oracle:oinstall $NFS_MOUNT_PATH failed (expected under root_squash - see nfs/01_setup_nfs_server.sh)"
+    fi
     # 750 (not 775): the mount point IS the exported share directory, so a
     # wider mode here would silently undo the 750 set by
     # nfs/01_setup_nfs_server.sh for every client that mounts it. The share
     # holds password-file copies and generated configs - keep others out.
-    chmod 750 "$NFS_MOUNT_PATH"
-    log_info "Permissions set for oracle user"
+    if chmod 750 "$NFS_MOUNT_PATH" 2>/dev/null; then
+        log_info "Permissions set for oracle user"
+    else
+        log_warn "chmod 750 $NFS_MOUNT_PATH failed (expected under root_squash - see nfs/01_setup_nfs_server.sh)"
+        log_warn "Permissions were already set to 750 on the NFS server side; this is informational only"
+    fi
 else
     log_warn "Oracle user not found on this system"
     log_warn "Please set appropriate ownership manually:"

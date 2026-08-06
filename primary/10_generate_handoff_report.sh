@@ -28,8 +28,14 @@ enable_verbose_mode "$@"
 # Helpers
 # ============================================================
 
+# Trim leading/trailing whitespace from every line, drop empty lines, then
+# join what is left. Internal spaces are preserved on purpose: display fields
+# such as "READ WRITE", "MAXIMUM AVAILABILITY" and "FAILED DESTINATION" end up
+# verbatim in the customer-facing report.
 clean_field() {
-    echo "$1" | tr -d ' \t\n\r'
+    printf '%s\n' "$1" | tr -d '\r' \
+        | sed -e 's/^[[:space:]][[:space:]]*//' -e 's/[[:space:]][[:space:]]*$//' -e '/^$/d' \
+        | tr -d '\n'
 }
 
 field_at() {
@@ -119,19 +125,48 @@ parse_broker_property() {
     '
 }
 
-extract_open_mode_from_broker() {
+# Derive the standby's readability from DGMGRL SHOW DATABASE output.
+# 19c DGMGRL does NOT print an "Open Mode" line for a standby - it prints
+# "Real Time Query: ON|OFF". ON means the standby is open READ ONLY WITH
+# APPLY (Active Data Guard); OFF means it is not readable (MOUNTED, or open
+# read-only without apply). Prints nothing when the line is absent.
+# Kept in step with dg_handoff.sh's copy of the same helper.
+extract_standby_open_mode_from_broker() {
     awk -F: '
         {
             line=tolower($0)
         }
-        line ~ /open[[:space:]]+mode/ {
-            value=$2
-            gsub(/^[[:space:]]*/, "", value)
-            gsub(/[[:space:]]*$/, "", value)
-            if (value != "") {
-                print value
+        line ~ /real[[:space:]]+time[[:space:]]+query/ {
+            value=tolower($2)
+            gsub(/[^a-z]/, "", value)
+            if (value == "on") {
+                print "READ ONLY WITH APPLY"
                 exit
             }
+            if (value == "off") {
+                print "MOUNTED"
+                exit
+            }
+        }
+    '
+}
+
+# Extract the "Configuration Status:" verdict (the value is printed on the
+# FOLLOWING line by 19c DGMGRL). Prints the upper-cased status or nothing.
+extract_configuration_status() {
+    printf '%s\n' "$1" | awk '
+        found && $0 !~ /^[[:space:]]*$/ {
+            gsub(/^[[:space:]]*/, "")
+            gsub(/[[:space:]].*$/, "")
+            print toupper($0)
+            exit
+        }
+        tolower($0) ~ /^[[:space:]]*configuration status:/ {
+            rest = $0
+            sub(/^[^:]*:[[:space:]]*/, "", rest)
+            gsub(/[[:space:]].*$/, "", rest)
+            if (rest != "") { print toupper(rest); exit }
+            found = 1
         }
     '
 }
@@ -258,13 +293,16 @@ build_visualizer_url() {
         async)    xpt_tok="async" ;;
     esac
     viz_add par logXptMode "$xpt_tok"
-    viz_add par threshold "$FSFO_THRESHOLD" num
 
     # Observer placement: the page models the primary site as dc1, the
     # standby site as dc2, a third site as dc3; 'none' = no observer.
+    # The failover threshold is only encoded while FSFO is actually
+    # enabled - otherwise the page would show a threshold for a
+    # configuration that has none.
     case "$(printf '%s' "${FSFO_STATUS:-}" | tr '[:lower:]' '[:upper:]')" in
         ''|DISABLED|N/A) obs_tok="none" ;;
         *)
+            viz_add par threshold "$FSFO_THRESHOLD" num
             if viz_same_host "$FSFO_OBSERVER_HOST" "$PRIMARY_HOSTNAME"; then
                 obs_tok="dc1"
             elif viz_same_host "$FSFO_OBSERVER_HOST" "$STANDBY_HOSTNAME"; then
@@ -353,6 +391,15 @@ FSFO_STATUS=$(field_at "$FSFO_RAW" 1)
 FSFO_OBSERVER=$(field_at "$FSFO_RAW" 2)
 FSFO_OBSERVER_HOST=$(field_at "$FSFO_RAW" 3)
 
+# Single source of truth for "is FSFO on?" - used to gate threshold discovery,
+# the threshold row in the report, and the visualizer payload.
+FSFO_STATUS_UPPER=$(printf '%s' "$FSFO_STATUS" | tr '[:lower:]' '[:upper:]')
+FSFO_ENABLED="NO"
+case "$FSFO_STATUS_UPPER" in
+    ''|DISABLED|N/A) ;;
+    *) FSFO_ENABLED="YES" ;;
+esac
+
 # Broker show (text capture, optional)
 BROKER_OUTPUT=""
 if [[ "$DG_BROKER_START" == "TRUE" ]]; then
@@ -366,15 +413,41 @@ if [[ "$DG_BROKER_START" == "TRUE" && -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
     STANDBY_LOGXPTMODE=$(run_dgmgrl "show_database_property.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "LogXptMode" 2>&1 | parse_broker_property || true)
     STANDBY_LOGXPTMODE=$(clean_field "${STANDBY_LOGXPTMODE:-unknown}")
 
+    # 19c prints "Real Time Query: ON|OFF" for a standby, never an
+    # "Open Mode" line.
     STANDBY_BROKER_OUTPUT=$(run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" 2>&1 || true)
-    STANDBY_OPEN_MODE=$(printf '%s\n' "$STANDBY_BROKER_OUTPUT" | extract_open_mode_from_broker)
+    STANDBY_OPEN_MODE=$(printf '%s\n' "$STANDBY_BROKER_OUTPUT" | extract_standby_open_mode_from_broker)
     STANDBY_OPEN_MODE="${STANDBY_OPEN_MODE:-unknown}"
 
-    FSFO_THRESHOLD=$(run_dgmgrl "show_database_property.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "FastStartFailoverThreshold" 2>&1 | parse_broker_property || true)
-    if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
-        FSFO_THRESHOLD=$(run_dgmgrl "show_fsfo_threshold.dgmgrl" 2>&1 | extract_fsfo_threshold || true)
+    # The failover threshold is only meaningful while FSFO is enabled.
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        FSFO_THRESHOLD=$(run_dgmgrl "show_database_property.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "FastStartFailoverThreshold" 2>&1 | parse_broker_property || true)
+        if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
+            FSFO_THRESHOLD=$(run_dgmgrl "show_fsfo_threshold.dgmgrl" 2>&1 | extract_fsfo_threshold || true)
+        fi
+        FSFO_THRESHOLD=$(clean_field "${FSFO_THRESHOLD:-unknown}")
     fi
-    FSFO_THRESHOLD=$(clean_field "${FSFO_THRESHOLD:-unknown}")
+fi
+
+# Direct standby query (best effort): the broker's Real Time Query flag
+# cannot tell MOUNTED apart from "open read-only, apply off". When an
+# auto-login wallet for the standby TNS alias exists (common/setup_dg_wallet.sh),
+# ask the standby itself. Any failure leaves the broker-derived value in place.
+if [[ -n "$STANDBY_TNS_ALIAS" ]]; then
+    STANDBY_OPEN_MODE_DIRECT=$(sqlplus -s -L /@"${STANDBY_TNS_ALIAS}" as sysdba <<'EOSQL' 2>/dev/null || true
+SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
+WHENEVER SQLERROR EXIT 1
+SELECT 'OPENMODE=' || OPEN_MODE FROM V$DATABASE;
+EXIT;
+EOSQL
+)
+    STANDBY_OPEN_MODE_DIRECT=$( { printf '%s\n' "$STANDBY_OPEN_MODE_DIRECT" | grep 'OPENMODE=' || true; } \
+        | sed 's/.*OPENMODE=//' | head -1)
+    STANDBY_OPEN_MODE_DIRECT=$(clean_field "$STANDBY_OPEN_MODE_DIRECT")
+    if [[ -n "$STANDBY_OPEN_MODE_DIRECT" ]]; then
+        log_info "Standby OPEN_MODE read directly from ${STANDBY_TNS_ALIAS}: ${STANDBY_OPEN_MODE_DIRECT}"
+        STANDBY_OPEN_MODE="$STANDBY_OPEN_MODE_DIRECT"
+    fi
 fi
 
 TRIGGER_STATUS=$(clean_field "$(run_sql_query "get_role_trigger_status.sql" || true)")
@@ -407,8 +480,7 @@ case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%
         ;;
 esac
 
-FSFO_STATUS_UPPER=$(printf '%s' "$FSFO_STATUS" | tr '[:lower:]' '[:upper:]')
-if [[ -n "$FSFO_STATUS_UPPER" && "$FSFO_STATUS_UPPER" != "DISABLED" && "$FSFO_STATUS_UPPER" != "N/A" ]]; then
+if [[ "$FSFO_ENABLED" == "YES" ]]; then
     if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
         OUTAGE_STATEMENT="FSFO is enabled: automatic failover begins after approximately ${FSFO_THRESHOLD}s of primary unreachability. Expect connection errors for roughly that window plus driver reconnect time, followed by a cold-cache brownout after the role change."
     else
@@ -421,7 +493,7 @@ fi
 DISCOVERY_NOTES=()
 [[ "$STANDBY_LOGXPTMODE" == "unknown" ]] && DISCOVERY_NOTES+=("Standby LogXptMode could not be discovered from broker; RPO text is conservative.")
 [[ "$STANDBY_OPEN_MODE" == "unknown" ]] && DISCOVERY_NOTES+=("Standby OPEN_MODE could not be discovered from broker; verify standby readability before using standby-only strings.")
-[[ "$FSFO_THRESHOLD" == "unknown" ]] && DISCOVERY_NOTES+=("FastStartFailoverThreshold could not be discovered from broker; outage text uses the configured-threshold wording.")
+[[ "$FSFO_ENABLED" == "YES" && "$FSFO_THRESHOLD" == "unknown" ]] && DISCOVERY_NOTES+=("FastStartFailoverThreshold could not be discovered from broker; outage text uses the configured-threshold wording.")
 if [[ -z "$TRIGGER_STATUS" ]]; then
     DISCOVERY_NOTES+=("Role-trigger status query returned no data; role-aware descriptor readiness is treated as not confirmed.")
 fi
@@ -436,13 +508,22 @@ progress_step "Discovering User Services"
 # missing-script (SP2-0310) or ORA- error surfaces instead of an empty result.
 SERVICE_OUTPUT=$(run_sql_query "get_user_services.sql" || true)
 SERVICE_LIST=()
+# Parallel array: YES when the role trigger actually manages this service
+# (i.e. it came out of the same discovery query the trigger scripts use).
+SERVICE_ROLE_AWARE=()
 while IFS= read -r line; do
     line=$(clean_field "$line")
-    [[ -n "$line" ]] && SERVICE_LIST+=("$line")
+    if [[ -n "$line" ]]; then
+        SERVICE_LIST+=("$line")
+        SERVICE_ROLE_AWARE+=("YES")
+    fi
 done <<< "$SERVICE_OUTPUT"
 
 # Always include the default db_unique_name service so users have at
-# least one entry, even before any user services are created.
+# least one entry, even before any user services are created. This service
+# is EXCLUDED by get_user_services.sql (and therefore by the role trigger),
+# so its descriptors are admin/default only - they do not follow the primary
+# after a switchover.
 DEFAULT_SVC="$PRIMARY_DB_UNIQUE_NAME"
 [[ -n "$DB_DOMAIN" ]] && DEFAULT_SVC="${PRIMARY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
 
@@ -455,7 +536,21 @@ for s in "${SERVICE_LIST[@]}"; do
 done
 if [[ "$DEFAULT_PRESENT" == "NO" ]]; then
     SERVICE_LIST=("$DEFAULT_SVC" "${SERVICE_LIST[@]}")
+    SERVICE_ROLE_AWARE=("NO" "${SERVICE_ROLE_AWARE[@]}")
 fi
+
+# Look up the role-aware flag for a service name (prints YES/NO)
+service_is_role_aware() {
+    local want="$1" i=0
+    while [[ $i -lt ${#SERVICE_LIST[@]} ]]; do
+        if [[ "${SERVICE_LIST[$i]}" == "$want" ]]; then
+            printf '%s\n' "${SERVICE_ROLE_AWARE[$i]}"
+            return 0
+        fi
+        i=$((i + 1))
+    done
+    printf 'NO\n'
+}
 
 log_info "Services in report: ${SERVICE_LIST[*]}"
 
@@ -491,6 +586,13 @@ escalate_verdict() {
         WARNING) if [[ "$VERDICT" != "ERROR" ]]; then VERDICT="WARNING"; fi ;;
     esac
 }
+# Apply-lag thresholds (sequences). Same env vars as dg_status.sh so a site
+# only has to tune them in one place.
+LAG_WARN_SEQ="${DG_SEQ_GAP_WARN:-1}"
+LAG_CRIT_SEQ="${DG_SEQ_GAP_CRIT:-5}"
+case "$LAG_WARN_SEQ" in ''|*[!0-9]*) LAG_WARN_SEQ=1 ;; esac
+case "$LAG_CRIT_SEQ" in ''|*[!0-9]*) LAG_CRIT_SEQ=5 ;; esac
+
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY")
@@ -502,6 +604,64 @@ fi
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Data Guard Broker is not started")
+fi
+
+# Redo apply progress: a standby that is many sequences behind is not a
+# usable failover target, no matter what the broker says.
+if [[ "$APPLY_LAG_SEQ" -gt "$LAG_CRIT_SEQ" ]]; then
+    escalate_verdict "ERROR"
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences (threshold ${LAG_CRIT_SEQ})")
+elif [[ "$APPLY_LAG_SEQ" -gt "$LAG_WARN_SEQ" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences")
+fi
+
+# Switchover readiness. On a healthy primary this is TO STANDBY / SESSIONS
+# ACTIVE; the gap and destination states below mean redo transport is broken.
+case "$(printf '%s' "$SWITCHOVER_STATUS" | tr '[:lower:]' '[:upper:]')" in
+    *"FAILED DESTINATION"*|*"UNRESOLVABLE GAP"*|*"LOG SWITCH GAP"*)
+        escalate_verdict "ERROR"
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        ;;
+    *"RESOLVABLE GAP"*|*"RECOVERY NEEDED"*|*"PREPARING"*)
+        escalate_verdict "WARNING"
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        ;;
+esac
+
+# The broker's own verdict. DGMGRL always exits 0, so the captured text is
+# the only signal - dgmgrl_output_has_error() comes from dg_functions.sh.
+if [[ -n "$BROKER_OUTPUT" ]]; then
+    BROKER_CONFIG_STATUS=$(extract_configuration_status "$BROKER_OUTPUT")
+    case "$BROKER_CONFIG_STATUS" in
+        ERROR)
+            escalate_verdict "ERROR"
+            VERDICT_NOTES+=("Broker Configuration Status is ERROR")
+            ;;
+        WARNING)
+            escalate_verdict "WARNING"
+            VERDICT_NOTES+=("Broker Configuration Status is WARNING")
+            ;;
+    esac
+    if dgmgrl_output_has_error "$BROKER_OUTPUT"; then
+        escalate_verdict "ERROR"
+        VERDICT_NOTES+=("Broker reported ORA-/DGM- errors (see Broker Configuration section)")
+    fi
+fi
+
+# Role-aware descriptors are only safe once the trigger is deployed.
+if [[ "$ROLE_TRIGGER_READY" != "YES" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Role-aware service trigger is not deployed/enabled")
+fi
+
+if [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Standby readability could not be determined")
+fi
+
+if [[ ${#VERDICT_NOTES[@]} -eq 0 ]]; then
+    VERDICT_NOTES+=("No role, transport, apply, broker or trigger issues detected")
 fi
 
 {
@@ -543,7 +703,9 @@ fi
     if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
         echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
     fi
-    echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    fi
     echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
     echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
     echo ""
@@ -605,13 +767,14 @@ fi
     echo "  automatically follow the active database after a switchover or failover."
     echo ""
     if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
-        echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
+        echo "**Role-aware trigger status:** deployed and enabled. Role-aware descriptors are safe to hand to applications **for the services the trigger manages** - each service section below states whether it is one of them."
     else
         echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
     fi
     echo ""
 
     for svc in "${SERVICE_LIST[@]}"; do
+        SVC_ROLE_AWARE=$(service_is_role_aware "$svc")
         # Build per-service alias names. Strip dots for alias use.
         local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
         ALIAS_PRI="${local_safe}_PRIMARY"
@@ -620,6 +783,10 @@ fi
 
         echo "### Service: \`${svc}\`"
         echo ""
+        if [[ "$SVC_ROLE_AWARE" != "YES" ]]; then
+            echo "> **Admin/default service — NOT managed by the role trigger.** \`${svc}\` is the database's own default service; \`trigger/create_role_trigger.sh\` deliberately excludes it, so it stays running on BOTH sides and does **not** follow the primary after a switchover or failover. Use the primary-only descriptor for admin/DBA access, and create a dedicated application service (see \`trigger/create_cdb_service.sh\` / \`trigger/create_pdb_service.sh\`) for anything handed to applications."
+            echo ""
+        fi
         echo "#### Primary-only"
         echo ""
         echo '```'
@@ -634,7 +801,7 @@ fi
         echo ""
         STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
         if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
-            echo "**Not currently usable:** standby is MOUNTED - these connections will fail until it is opened READ ONLY."
+            echo "**Not currently usable:** the standby is MOUNTED (not open read-only) - these connections will fail until it is opened READ ONLY WITH APPLY."
             echo ""
             echo '```'
             render_tns_single "$ALIAS_STB" "$STANDBY_HOSTNAME" "$PORT" "$svc"
@@ -662,6 +829,14 @@ fi
             fi
         fi
         echo "#### Role-aware (failover)"
+        echo ""
+        if [[ "$SVC_ROLE_AWARE" == "YES" && "$ROLE_TRIGGER_READY" == "YES" ]]; then
+            echo "Managed by the role trigger - safe to hand to applications."
+        elif [[ "$SVC_ROLE_AWARE" != "YES" ]]; then
+            echo "**Not role-aware:** \`${svc}\` is not in the role trigger's service list, so this descriptor can land on the standby and return ORA-16000 on writes. Do not hand it to applications."
+        else
+            echo "**Not yet role-aware:** deploy \`trigger/create_role_trigger.sh\` before handing this descriptor to applications."
+        fi
         echo ""
         echo '```'
         render_tns_ha "$ALIAS_HA" "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
@@ -744,6 +919,12 @@ print_list_block "Distribution" \
     "The role-aware descriptors require the role-aware service trigger (trigger/create_role_trigger.sh) to be deployed." \
     "Re-run this script after schema changes, listener changes, or new services to refresh the report." \
     "Once this handoff report has been verified, run common/cleanup_nfs_artifacts.sh to remove sensitive setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share."
+
+if [[ "$VERDICT" != "HEALTHY" ]]; then
+    for n in "${VERDICT_NOTES[@]}"; do
+        log_warn "${VERDICT}: ${n}"
+    done
+fi
 
 if [[ "$VERDICT" == "ERROR" ]]; then
     print_summary "ERROR" "Handoff report generated, but Data Guard issues were detected"

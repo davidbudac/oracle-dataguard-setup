@@ -14,5 +14,11 @@ WHERE NAME NOT IN (
 )
 AND NAME NOT LIKE 'SYS$%'
 AND UPPER(NAME) NOT LIKE '%XDB%'
+-- Broker-internal services: <db>_CFG is created by the Data Guard broker and
+-- <db>_DGMGRL is the static listener service. Neither is a user service - the
+-- role trigger must not start/stop them and the handoff report must not
+-- publish connect strings for them.
+AND UPPER(NAME) NOT LIKE '%\_CFG' ESCAPE '\'
+AND UPPER(NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
 ORDER BY NAME;
 EXIT;

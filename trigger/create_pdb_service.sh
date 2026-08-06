@@ -72,8 +72,16 @@ POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -p|--pdb)     PDB_NAME="$2"; shift 2 ;;
-        --service)    SERVICE_NAME="$2"; shift 2 ;;
+        -p|--pdb)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                printf "Option %s requires an argument\n\n" "$1"; usage; exit 1
+            fi
+            PDB_NAME="$2"; shift 2 ;;
+        --service)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                printf "Option %s requires an argument\n\n" "$1"; usage; exit 1
+            fi
+            SERVICE_NAME="$2"; shift 2 ;;
         --no-start)   DO_START=false; shift ;;
         --taf)        ENABLE_TAF=true; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -95,8 +103,8 @@ if [[ -z "$SERVICE_NAME" && $pos_idx -lt ${#POSITIONAL[@]} ]]; then
     SERVICE_NAME="${POSITIONAL[$pos_idx]}"; pos_idx=$((pos_idx + 1))
 fi
 
-PDB_NAME=$(echo "$PDB_NAME" | tr -d ' \n\r')
-SERVICE_NAME=$(echo "$SERVICE_NAME" | tr -d ' \n\r')
+PDB_NAME=$(echo "$PDB_NAME" | tr -d ' \t\n\r')
+SERVICE_NAME=$(echo "$SERVICE_NAME" | tr -d ' \t\n\r')
 
 # ============================================================
 # Main Script
@@ -158,7 +166,7 @@ check_db_connection || exit 1
 log_section "Verifying Database Role and Target PDB"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \t\n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -174,7 +182,7 @@ SELECT CDB FROM V$DATABASE;
 EXIT;
 EOSQL
 )
-IS_CDB=$(echo "$IS_CDB" | tr -d ' \n\r')
+IS_CDB=$(echo "$IS_CDB" | tr -d ' \t\n\r')
 
 if [[ "$IS_CDB" != "YES" ]]; then
     log_error "This database is not a CDB (V\$DATABASE.CDB = ${IS_CDB:-unknown})"
@@ -192,7 +200,7 @@ WHERE UPPER(NAME) = UPPER('${PDB_NAME}');
 EXIT;
 EOSQL
 )
-PDB_ACTUAL_NAME=$(echo "$PDB_INFO" | sed -n 's/.*PDBNAME=\([^|]*\)|.*/\1/p' | tr -d ' \n\r')
+PDB_ACTUAL_NAME=$(echo "$PDB_INFO" | sed -n 's/.*PDBNAME=\([^|]*\)|.*/\1/p' | tr -d ' \t\n\r')
 # OPEN_MODE contains an internal space ("READ WRITE", "READ ONLY") that must
 # be preserved for display. Strip CR/LF, then trim leading/trailing spaces
 # with literal-space BRE (AIX 7.2 sed has no PCRE / \s).
@@ -366,8 +374,11 @@ fi
 
 log_section "Verifying"
 
-SVC_DEFINED=$(echo "$DEPLOY_RESULT" | grep "SVC_DEFINED=" | sed 's/.*SVC_DEFINED=//' | tr -d ' \n\r')
-SVC_ACTIVE=$(echo "$DEPLOY_RESULT" | grep "SVC_ACTIVE=" | sed 's/.*SVC_ACTIVE=//' | tr -d ' \n\r')
+# `|| true` inside the substitutions: verbose mode enables `set -o pipefail`,
+# so a result set without the tagged rows would abort the script here under
+# `set -e` instead of reaching the diagnostics below.
+SVC_DEFINED=$( { echo "$DEPLOY_RESULT" | grep "SVC_DEFINED=" || true; } | sed 's/.*SVC_DEFINED=//' | tr -d ' \t\n\r')
+SVC_ACTIVE=$( { echo "$DEPLOY_RESULT" | grep "SVC_ACTIVE=" || true; } | sed 's/.*SVC_ACTIVE=//' | tr -d ' \t\n\r')
 
 DEPLOY_OK=true
 
@@ -406,7 +417,7 @@ SELECT COUNT(*) FROM DBA_OBJECTS WHERE OBJECT_NAME = 'DG_SERVICE_MGR' AND OWNER 
 EXIT;
 EOSQL
 )
-TRG_EXISTS=$(echo "$TRG_EXISTS" | tr -d ' \n\r')
+TRG_EXISTS=$(echo "$TRG_EXISTS" | tr -d ' \t\n\r')
 
 # ============================================================
 # Summary

@@ -70,7 +70,13 @@ ASSUME_YES=false
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -c|--config)  CONFIG_FILE_ARG="$2"; shift 2 ;;
+        -c|--config)
+            if [[ $# -lt 2 ]]; then
+                printf "Missing argument for %s\n\n" "$1"
+                usage
+                exit 1
+            fi
+            CONFIG_FILE_ARG="$2"; shift 2 ;;
         --all)        REMOVE_ALL=true; shift ;;
         -y|--yes)     ASSUME_YES=true; shift ;;
         -h|--help)    usage; exit 0 ;;

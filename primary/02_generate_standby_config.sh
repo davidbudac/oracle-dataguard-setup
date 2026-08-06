@@ -246,7 +246,16 @@ source "$STANDBY_CONFIG_FILE"
 # primary_info file in normal mode; map them from the config.
 DB_NAME="$PRIMARY_DB_NAME"
 DB_UNIQUE_NAME="$PRIMARY_DB_UNIQUE_NAME"
-LISTENER_PORT="${STANDBY_LISTENER_PORT:-${PRIMARY_LISTENER_PORT}}"
+# M1: PRIMARY_LISTENER_PORT and STANDBY_LISTENER_PORT are kept DISTINCT
+# throughout file generation below - collapsing them into one shared
+# LISTENER_PORT (the previous behavior) meant editing
+# STANDBY_LISTENER_PORT in the .env and regenerating silently re-pointed
+# the PRIMARY's own TNS entry at the standby's port too. Both names are
+# already written into standby_config_*.env by normal mode below; only
+# fall back to the other side (or 1521) for older config files that
+# predate this split.
+PRIMARY_LISTENER_PORT="${PRIMARY_LISTENER_PORT:-${STANDBY_LISTENER_PORT:-1521}}"
+STANDBY_LISTENER_PORT="${STANDBY_LISTENER_PORT:-${PRIMARY_LISTENER_PORT}}"
 RECOMMENDED_STBY_GROUPS="${STANDBY_REDO_GROUPS}"
 
 # Derive service names (same logic as normal flow)
@@ -297,13 +306,23 @@ elif [[ "$_can_rebuild_pairs" == "1" ]]; then
     # ignores edited path arrays (found by live asymmetric-layout E2E).
     # AIX-safe: no sed -i; write to a temp file and move into place.
     _env_tmp="${STANDBY_CONFIG_FILE}.tmp.$$"
-    awk -v db="DB_FILE_NAME_CONVERT=\"${DB_FILE_NAME_CONVERT}\"" \
+    if awk -v db="DB_FILE_NAME_CONVERT=\"${DB_FILE_NAME_CONVERT}\"" \
         -v lg="LOG_FILE_NAME_CONVERT=\"${LOG_FILE_NAME_CONVERT}\"" '
         /^DB_FILE_NAME_CONVERT=/  { print db; next }
         /^LOG_FILE_NAME_CONVERT=/ { print lg; next }
         { print }
-    ' "$STANDBY_CONFIG_FILE" > "$_env_tmp" && mv "$_env_tmp" "$STANDBY_CONFIG_FILE"
-    log_info "Updated convert strings persisted to $STANDBY_CONFIG_FILE"
+    ' "$STANDBY_CONFIG_FILE" > "$_env_tmp" && mv "$_env_tmp" "$STANDBY_CONFIG_FILE"; then
+        log_info "Updated convert strings persisted to $STANDBY_CONFIG_FILE"
+    else
+        # L11: an unchecked failure here (e.g. NFS share full or gone
+        # read-only mid-write) previously fell through to the success
+        # message anyway - exactly the silent-stale-convert-string
+        # failure this persistence step exists to prevent. Fail loudly
+        # instead, and don't leave a half-written temp file behind.
+        log_error "Failed to persist rebuilt convert strings to $STANDBY_CONFIG_FILE"
+        rm -f "$_env_tmp"
+        exit 1
+    fi
 else
     log_warn "PRIMARY_*/STANDBY_* path arrays are missing or length-mismatched in"
     log_warn "  $STANDBY_CONFIG_FILE"
@@ -342,6 +361,35 @@ log_info "Loading primary info from: $PRIMARY_INFO_FILE"
 # Source primary info
 source "$PRIMARY_INFO_FILE"
 
+# Fail fast (M14) if step 1 was run against a primary that did not meet
+# prerequisites. 01_gather_primary_info.sh writes primary_info_*.env
+# BEFORE evaluating its own PREREQ_PASS verdict, so a failed step 1 run
+# still leaves a config file here for step 2 to happily consume -
+# building convert pairs and a pfile for a standby that RMAN duplicate
+# cannot actually create from (no ARCHIVELOG mode / no shared password
+# file authentication).
+if [[ "$LOG_MODE" != "ARCHIVELOG" ]]; then
+    log_error "Primary is not in ARCHIVELOG mode (LOG_MODE=$LOG_MODE) per $PRIMARY_INFO_FILE"
+    log_error "Fix the primary (SHUTDOWN IMMEDIATE; STARTUP MOUNT; ALTER DATABASE ARCHIVELOG; ALTER DATABASE OPEN;)"
+    log_error "then re-run 01_gather_primary_info.sh before continuing."
+    exit 1
+fi
+if [[ "$REMOTE_LOGIN_PASSWORDFILE" != "EXCLUSIVE" && "$REMOTE_LOGIN_PASSWORDFILE" != "SHARED" ]]; then
+    log_error "Primary REMOTE_LOGIN_PASSWORDFILE is not EXCLUSIVE/SHARED (current: $REMOTE_LOGIN_PASSWORDFILE) per $PRIMARY_INFO_FILE"
+    log_error "Fix the primary (ALTER SYSTEM SET REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE SCOPE=SPFILE; then bounce the instance)"
+    log_error "then re-run 01_gather_primary_info.sh before continuing."
+    exit 1
+fi
+
+# M1: normal mode has only ever discovered a single listener port (the
+# primary's), so both artifacts start from the same value here - but
+# the two names are kept DISTINCT (not a shared LISTENER_PORT) so that
+# the file-generation section below, and the standby_config_*.env it
+# writes, are unambiguous about which port belongs to which host. See
+# the matching note in REGENERATE MODE above.
+PRIMARY_LISTENER_PORT="$LISTENER_PORT"
+STANDBY_LISTENER_PORT="$LISTENER_PORT"
+
 log_info "Primary database: $DB_UNIQUE_NAME on $PRIMARY_HOSTNAME"
 
 # Reinitialize log with primary DB name
@@ -374,8 +422,14 @@ if [ -z "$STANDBY_DB_UNIQUE_NAME" ]; then
     exit 1
 fi
 
-if [[ "$STANDBY_DB_UNIQUE_NAME" == "$DB_UNIQUE_NAME" ]]; then
-    log_error "Standby DB_UNIQUE_NAME must be different from primary"
+# Case-insensitive (M13): DB_UNIQUE_NAME collisions differing only in
+# case (e.g. PROD vs prod) pass this check, but the token remapper
+# below upper-cases both sides when building path replacements - an
+# "different" name that's really the same one produces IDENTITY convert
+# pairs (primary path == standby path) and RMAN duplicate fails with
+# ORA-16698 several steps later.
+if [[ "$(printf '%s' "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')" == "$(printf '%s' "$DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')" ]]; then
+    log_error "Standby DB_UNIQUE_NAME must be different from primary (case-insensitive: '$STANDBY_DB_UNIQUE_NAME' vs '$DB_UNIQUE_NAME')"
     exit 1
 fi
 
@@ -836,12 +890,35 @@ fi  # end STANDBY_STORAGE_MODE check
 
 progress_step "Generating TNS Configuration"
 
-# Use domain-qualified aliases if DB_DOMAIN is set
-# This handles NAMES.DEFAULT_DOMAIN in sqlnet.ora
-if [[ -n "$DB_DOMAIN" ]]; then
-    PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}.${DB_DOMAIN}"
-    STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}.${DB_DOMAIN}"
-    log_info "Using domain-qualified TNS aliases (DB_DOMAIN: $DB_DOMAIN)"
+# NAMES.DEFAULT_DOMAIN in the client-side sqlnet.ora is INDEPENDENT of the
+# database's DB_DOMAIN parameter: sqlnet appends its domain to every
+# unqualified alias at resolution time, so an unqualified entry we write
+# (e.g. "dgnonc_s =") becomes unresolvable ("dgnonc_s.world" is looked up
+# instead -> ORA-12154, surfacing as ORA-17627 mid-RMAN-duplicate from the
+# primary-side channel). Found live on a host with NAMES.DEFAULT_DOMAIN
+# set but DB_DOMAIN empty. A domain-qualified alias name resolves exactly
+# under BOTH sqlnet configurations (with or without a default domain), so
+# qualify with the sqlnet domain when it exists; DB_DOMAIN alone keeps the
+# old behavior.
+SQLNET_DEFAULT_DOMAIN=""
+_sqlnet_file="${TNS_ADMIN:-${ORACLE_HOME}/network/admin}/sqlnet.ora"
+if [[ -f "$_sqlnet_file" ]]; then
+    SQLNET_DEFAULT_DOMAIN=$(grep -i '^[[:space:]]*NAMES\.DEFAULT_DOMAIN[[:space:]]*=' "$_sqlnet_file" \
+        | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]#].*//')
+fi
+
+_ALIAS_DOMAIN="${SQLNET_DEFAULT_DOMAIN:-$DB_DOMAIN}"
+if [[ -n "$_ALIAS_DOMAIN" ]]; then
+    PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}.${_ALIAS_DOMAIN}"
+    STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}.${_ALIAS_DOMAIN}"
+    if [[ -n "$SQLNET_DEFAULT_DOMAIN" ]]; then
+        log_info "Using domain-qualified TNS aliases (sqlnet.ora NAMES.DEFAULT_DOMAIN: ${SQLNET_DEFAULT_DOMAIN})"
+        if [[ -n "$DB_DOMAIN" && "$DB_DOMAIN" != "$SQLNET_DEFAULT_DOMAIN" ]]; then
+            log_warn "DB_DOMAIN (${DB_DOMAIN}) differs from NAMES.DEFAULT_DOMAIN (${SQLNET_DEFAULT_DOMAIN}) - aliases use the sqlnet domain, since that is what name resolution appends"
+        fi
+    else
+        log_info "Using domain-qualified TNS aliases (DB_DOMAIN: $DB_DOMAIN)"
+    fi
 else
     PRIMARY_TNS_ALIAS="${DB_UNIQUE_NAME}"
     STANDBY_TNS_ALIAS="${STANDBY_DB_UNIQUE_NAME}"
@@ -909,7 +986,7 @@ PRIMARY_DB_UNIQUE_NAME="$DB_UNIQUE_NAME"
 PRIMARY_ORACLE_SID="$PRIMARY_ORACLE_SID"
 PRIMARY_ORACLE_HOME="$PRIMARY_ORACLE_HOME"
 PRIMARY_ORACLE_BASE="$PRIMARY_ORACLE_BASE"
-PRIMARY_LISTENER_PORT="$LISTENER_PORT"
+PRIMARY_LISTENER_PORT="$PRIMARY_LISTENER_PORT"
 PRIMARY_TNS_ALIAS="$PRIMARY_TNS_ALIAS"
 
 # --- Standby Database Info ---
@@ -919,7 +996,7 @@ STANDBY_DB_UNIQUE_NAME="$STANDBY_DB_UNIQUE_NAME"
 STANDBY_ORACLE_SID="$STANDBY_ORACLE_SID"
 STANDBY_ORACLE_HOME="$STANDBY_ORACLE_HOME"
 STANDBY_ORACLE_BASE="$STANDBY_ORACLE_BASE"
-STANDBY_LISTENER_PORT="$LISTENER_PORT"
+STANDBY_LISTENER_PORT="$STANDBY_LISTENER_PORT"
 STANDBY_TNS_ALIAS="$STANDBY_TNS_ALIAS"
 
 # --- Database Properties ---
@@ -1078,8 +1155,6 @@ STANDBY_ADMIN_DIR="$STANDBY_ADMIN_DIR"
 DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
 EOF
 
-log_info "Standby configuration written to: $STANDBY_CONFIG_FILE"
-
 fi  # end REGENERATE check
 
 # Backward compatibility: older config files may not have SRL paths.
@@ -1125,7 +1200,15 @@ fi
 # Generate Standby Init Parameter File
 # ============================================================
 
-log_success "Standby configuration written to: $STANDBY_CONFIG_FILE"
+# L12: regenerate mode only READ $STANDBY_CONFIG_FILE (possibly hand-
+# edited by the operator) - saying it was "written to" here is false
+# and was also a straight duplicate of normal mode's own write message
+# a few lines above (before this shared FILE GENERATION section).
+if [[ "$REGENERATE" == "1" ]]; then
+    log_success "Regenerated derived files from: $STANDBY_CONFIG_FILE"
+else
+    log_success "Standby configuration written to: $STANDBY_CONFIG_FILE"
+fi
 log_section "Generating Standby Init Parameter File"
 
 # Include DB_UNIQUE_NAME in filename to support concurrent builds
@@ -1201,10 +1284,9 @@ fi)
 *.remote_login_passwordfile=EXCLUSIVE
 
 # --- Local Listener ---
-*.local_listener='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${LISTENER_PORT}))'
+*.local_listener='(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))'
 EOF
 
-log_info "Standby pfile written to: $STANDBY_PFILE"
 log_success "Standby pfile written to: $STANDBY_PFILE"
 
 # ============================================================
@@ -1238,7 +1320,7 @@ cat > "$TNSNAMES_FILE" <<EOF
 
 ${PRIMARY_TNS_ALIAS} =
   (DESCRIPTION =
-    (ADDRESS = (PROTOCOL = TCP)(HOST = ${PRIMARY_HOSTNAME})(PORT = ${LISTENER_PORT}))
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${PRIMARY_HOSTNAME})(PORT = ${PRIMARY_LISTENER_PORT}))
     (CONNECT_DATA =
       (SERVER = DEDICATED)
       (SERVICE_NAME = ${PRIMARY_SERVICE_NAME})
@@ -1247,7 +1329,7 @@ ${PRIMARY_TNS_ALIAS} =
 
 ${STANDBY_TNS_ALIAS} =
   (DESCRIPTION =
-    (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${LISTENER_PORT}))
+    (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${STANDBY_LISTENER_PORT}))
     (CONNECT_DATA =
       (SERVER = DEDICATED)
       (SERVICE_NAME = ${STANDBY_SERVICE_NAME})
@@ -1255,7 +1337,6 @@ ${STANDBY_TNS_ALIAS} =
   )
 EOF
 
-log_info "TNS entries written to: $TNSNAMES_FILE"
 log_success "TNS entries written to: $TNSNAMES_FILE"
 
 # ============================================================
@@ -1294,12 +1375,11 @@ SID_LIST_LISTENER =
 LISTENER =
   (DESCRIPTION_LIST =
     (DESCRIPTION =
-      (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${LISTENER_PORT}))
+      (ADDRESS = (PROTOCOL = TCP)(HOST = ${STANDBY_HOSTNAME})(PORT = ${STANDBY_LISTENER_PORT}))
     )
   )
 EOF
 
-log_info "Listener entries written to: $LISTENER_FILE"
 log_success "Standby listener snippet written to: $LISTENER_FILE"
 
 # Note: no separate "listener entry for primary" snippet is generated here.
@@ -1343,7 +1423,6 @@ SHOW DATABASE '${DB_UNIQUE_NAME}';
 SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';
 EOF
 
-log_info "DGMGRL script written to: $DGMGRL_SCRIPT"
 log_success "DGMGRL script written to: $DGMGRL_SCRIPT"
 
 # ============================================================

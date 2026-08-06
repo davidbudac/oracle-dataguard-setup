@@ -2,7 +2,10 @@
 # ============================================================
 # Oracle Data Guard Setup - Step 7: Verify Data Guard
 # ============================================================
-# Run this script on the STANDBY (or PRIMARY) database server.
+# Run this script on the STANDBY database server (L14: it hard-codes
+# STANDBY_ORACLE_HOME/STANDBY_ORACLE_SID below, so running it on the
+# primary fails with a generic connection error - see the host guard
+# right after the config file is loaded).
 # It validates the Data Guard Broker configuration and reports status.
 # ============================================================
 
@@ -45,6 +48,21 @@ source "$STANDBY_CONFIG_FILE"
 
 # Reinitialize log with standby DB name
 init_log "07_verify_dataguard_${STANDBY_DB_UNIQUE_NAME}"
+
+# L14: this script hard-codes STANDBY_ORACLE_HOME/STANDBY_ORACLE_SID below,
+# so running it on the primary host silently points ORACLE_HOME/SID at a
+# SID that doesn't exist there and fails with a generic connection error a
+# few steps later. Guard explicitly and point at the right host.
+CURRENT_HOST=$(hostname 2>/dev/null)
+if [[ -n "${STANDBY_HOSTNAME:-}" ]] && ! hostnames_match "$CURRENT_HOST" "$STANDBY_HOSTNAME"; then
+    log_error "This script must run on the STANDBY host (${STANDBY_HOSTNAME}); current host is ${CURRENT_HOST}."
+    log_error "It hard-codes STANDBY_ORACLE_HOME/STANDBY_ORACLE_SID from the config file, so running it"
+    log_error "elsewhere (e.g. the primary) fails with a generic connection error instead of a useful one."
+    log_error "Run this on ${STANDBY_HOSTNAME}, or use dg_status.sh / dg_triage_sid.sh for cross-host checks."
+    exit 1
+elif [[ -z "${STANDBY_HOSTNAME:-}" ]]; then
+    log_warn "STANDBY_HOSTNAME not set in the config file - skipping the host guard"
+fi
 
 # Set Oracle environment
 export ORACLE_HOME="$STANDBY_ORACLE_HOME"
@@ -94,6 +112,11 @@ SYS_PASSWORD=$(prompt_password "Enter SYS password")
 
 if [ -z "$SYS_PASSWORD" ]; then
     log_warn "No SYS password provided - DGMGRL network validation will be skipped"
+elif [[ "$SYS_PASSWORD" == *'"'* ]]; then
+    # run_dgmgrl_with_password() below embeds this in sys/"<pw>"@...; an
+    # embedded quote breaks that syntax (L16, same failure mode as step 5).
+    log_error "SYS password must not contain a double-quote (\") character"
+    exit 1
 fi
 
 # ============================================================
@@ -111,7 +134,7 @@ ERRORS=0
 progress_step "Checking Database Role and Status"
 
 DB_INFO=$(run_sql_query "get_db_status_pipe.sql")
-DB_INFO=$(echo "$DB_INFO" | tr -d ' \n\r')
+DB_INFO=$(echo "$DB_INFO" | tr -d ' \t\n\r')
 
 # AIX-compatible: use awk instead of here-strings
 DB_ROLE=$(echo "$DB_INFO" | awk -F'|' '{print $1}')
@@ -159,7 +182,7 @@ if [[ -z "$MRP_INFO" || "$MRP_INFO" == *"no rows"* ]]; then
     ERRORS=$((ERRORS + 1))
 else
     # AIX-compatible: use awk instead of here-strings
-    MRP_INFO_CLEAN=$(echo "$MRP_INFO" | tr -d ' \n\r')
+    MRP_INFO_CLEAN=$(echo "$MRP_INFO" | tr -d ' \t\n\r')
     MRP_PROCESS=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $1}')
     MRP_STATUS=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $2}')
     MRP_SEQUENCE=$(echo "$MRP_INFO_CLEAN" | awk -F'|' '{print $3}')
@@ -190,7 +213,7 @@ run_sql_display "get_managed_standby_procs.sql"
 progress_step "Checking Archive Log Gaps"
 
 GAP_INFO=$(run_sql_query "get_archive_gap_count.sql")
-GAP_COUNT=$(echo "$GAP_INFO" | tr -d ' \n\r')
+GAP_COUNT=$(echo "$GAP_INFO" | tr -d ' \t\n\r')
 
 if [[ "$GAP_COUNT" -gt 0 ]]; then
     log_error "ARCHIVE GAP DETECTED: $GAP_COUNT gap(s) found"
@@ -213,7 +236,7 @@ progress_step "Checking Archive Log Apply Status"
 APPLY_INFO=$(run_sql_query "get_apply_info_pipe.sql")
 
 # AIX-compatible: use awk instead of here-strings
-APPLY_INFO_CLEAN=$(echo "$APPLY_INFO" | tr -d ' \n\r')
+APPLY_INFO_CLEAN=$(echo "$APPLY_INFO" | tr -d ' \t\n\r')
 LAST_APPLIED=$(echo "$APPLY_INFO_CLEAN" | awk -F'|' '{print $1}')
 LAST_RECEIVED=$(echo "$APPLY_INFO_CLEAN" | awk -F'|' '{print $2}')
 
@@ -246,24 +269,68 @@ fi
 
 progress_step "Checking Data Guard Broker Configuration"
 
+# H5: previously these four DGMGRL calls were printed and discarded
+# (`2>&1 || true`) without ever being inspected - a missing/broken broker
+# config (ORA-16532 right above "SHOW CONFIGURATION") never touched
+# ERRORS/WARNINGS, so the summary below still printed "OVERALL STATUS:
+# HEALTHY". Capture each output, print it exactly as before, and run it
+# through dgmgrl_output_has_error() (the same helper run_dgmgrl_checked
+# uses) so a broker failure is actually counted.
+
 echo ""
 echo "Broker Configuration Status:"
-run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true
+CONFIG_OUTPUT=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
+echo "$CONFIG_OUTPUT"
+
+if echo "$CONFIG_OUTPUT" | grep -q "ORA-16532"; then
+    log_error "No Data Guard Broker configuration found - run ./primary/06_configure_broker.sh first"
+    OVERALL_STATUS="ERROR"
+    ERRORS=$((ERRORS + 1))
+elif dgmgrl_output_has_error "$CONFIG_OUTPUT"; then
+    log_error "Broker configuration reported an error (see output above)"
+    OVERALL_STATUS="ERROR"
+    ERRORS=$((ERRORS + 1))
+else
+    log_info "PASS: Broker configuration is healthy"
+fi
 
 echo ""
 echo "Primary Database Status:"
-run_dgmgrl "show_database.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" 2>&1 || true
+PRIMARY_DB_OUTPUT=$(run_dgmgrl "show_database.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" 2>&1 || true)
+echo "$PRIMARY_DB_OUTPUT"
+if dgmgrl_output_has_error "$PRIMARY_DB_OUTPUT"; then
+    log_error "Broker reported an error for $PRIMARY_DB_UNIQUE_NAME (see output above)"
+    OVERALL_STATUS="ERROR"
+    ERRORS=$((ERRORS + 1))
+else
+    log_info "PASS: No broker errors reported for $PRIMARY_DB_UNIQUE_NAME"
+fi
 
 echo ""
 echo "Standby Database Status:"
-run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" 2>&1 || true
+STANDBY_DB_OUTPUT=$(run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" 2>&1 || true)
+echo "$STANDBY_DB_OUTPUT"
+if dgmgrl_output_has_error "$STANDBY_DB_OUTPUT"; then
+    log_error "Broker reported an error for $STANDBY_DB_UNIQUE_NAME (see output above)"
+    OVERALL_STATUS="ERROR"
+    ERRORS=$((ERRORS + 1))
+else
+    log_info "PASS: No broker errors reported for $STANDBY_DB_UNIQUE_NAME"
+fi
 
 echo ""
 echo "Network Configuration Validation:"
 if [[ -n "$SYS_PASSWORD" ]]; then
-    run_dgmgrl_with_password "$SYS_PASSWORD" "$STANDBY_TNS_ALIAS" "validate_network.dgmgrl" 2>&1 || true
+    NETWORK_VALIDATION_OUTPUT=$(run_dgmgrl_with_password "$SYS_PASSWORD" "$STANDBY_TNS_ALIAS" "validate_network.dgmgrl" 2>&1 || true)
+    echo "$NETWORK_VALIDATION_OUTPUT"
+    if dgmgrl_output_has_error "$NETWORK_VALIDATION_OUTPUT"; then
+        log_warn "Network validation reported an error (see output above) - validation did not complete successfully"
+        WARNINGS=$((WARNINGS + 1))
+    else
+        log_info "PASS: Network validation completed without errors"
+    fi
 else
-    log_warn "Skipping network validation (no SYS password provided)"
+    log_warn "Skipping network validation (no SYS password provided) - validation did not run"
 fi
 
 # ============================================================
@@ -288,7 +355,7 @@ run_sql_display "get_archive_dest_config.sql"
 
 # Check for errors in archive destinations
 DEST_ERRORS=$(run_sql_query "get_archive_dest_error_count.sql")
-DEST_ERROR_COUNT=$(echo "$DEST_ERRORS" | tr -d ' \n\r')
+DEST_ERROR_COUNT=$(echo "$DEST_ERRORS" | tr -d ' \t\n\r')
 
 if [[ "$DEST_ERROR_COUNT" -gt 0 ]]; then
     log_error "Archive destination error detected"

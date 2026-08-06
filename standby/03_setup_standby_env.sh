@@ -52,9 +52,12 @@ CURRENT_HOST=$(hostname 2>/dev/null)
 log_info "Current hostname: $CURRENT_HOST"
 log_info "Expected standby hostname: $STANDBY_HOSTNAME"
 
-if [[ "$CURRENT_HOST" != "$STANDBY_HOSTNAME" ]]; then
+if ! hostnames_match "$CURRENT_HOST" "$STANDBY_HOSTNAME"; then
     log_warn "Current hostname does not match expected standby hostname"
-    if ! confirm_proceed "Continue anyway?"; then
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # dying on an unseen/unanswered prompt, and a non-interactive real run
+    # aborts with an explicit message instead of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue anyway?"; then
         exit 1
     fi
 fi
@@ -140,6 +143,84 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
             fi
             _idx=$(( _idx + 1 ))
         done
+
+        # M9: also cover the redo/SRL mount(s). They normally live outside
+        # STANDBY_DATA_PATHS entirely (their own mount, by design), so
+        # without this the redo mount is never sized here at all - the
+        # check above only ever looked at STANDBY_DATA_PATHS - and RMAN
+        # DUPLICATE (step 5, not restartable) can die mid-run with
+        # ORA-19504 on a filesystem this step never examined.
+        if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
+           && is_numeric "${REDO_LOG_SIZE_MB:-}" \
+           && is_numeric "${ONLINE_REDO_GROUPS:-}" \
+           && is_numeric "${STANDBY_REDO_GROUPS:-}" \
+           && [[ -n "${STANDBY_REDO_PATH:-}" ]]; then
+
+            # ONLINE redo logs (ORLs) always live under STANDBY_REDO_PATH.
+            # Standby redo logs (SRLs) join them there too unless a
+            # distinct STANDBY_SRL_PATH is configured.
+            _redo_mount_mb=$(( ONLINE_REDO_GROUPS * REDO_LOG_SIZE_MB ))
+            if [[ -z "${STANDBY_SRL_PATH:-}" || "$STANDBY_SRL_PATH" == "$STANDBY_REDO_PATH" ]]; then
+                _redo_mount_mb=$(( _redo_mount_mb + STANDBY_REDO_GROUPS * REDO_LOG_SIZE_MB ))
+            fi
+
+            _redo_check_path="$STANDBY_REDO_PATH"
+            while [[ ! -d "$_redo_check_path" && "$_redo_check_path" != "/" ]]; do
+                _redo_check_path=$(dirname "$_redo_check_path")
+            done
+            _redo_mount=$(df -Pk "$_redo_check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
+            [[ -z "$_redo_mount" ]] && _redo_mount="$_redo_check_path"
+            log_info "  ${STANDBY_REDO_PATH}: ${_redo_mount_mb} MB (redo logs, filesystem: ${_redo_mount})"
+
+            _found=0
+            _m=0
+            while [[ $_m -lt ${#MOUNT_POINTS[@]} ]]; do
+                if [[ "${MOUNT_POINTS[$_m]}" == "$_redo_mount" ]]; then
+                    MOUNT_REQUIRED_MB[$_m]=$(( ${MOUNT_REQUIRED_MB[$_m]} + _redo_mount_mb ))
+                    _found=1
+                    break
+                fi
+                _m=$(( _m + 1 ))
+            done
+            if [[ $_found -eq 0 ]]; then
+                MOUNT_POINTS+=("$_redo_mount")
+                MOUNT_REQUIRED_MB+=("$_redo_mount_mb")
+                MOUNT_CHECK_PATHS+=("$_redo_check_path")
+            fi
+
+            # A distinct SRL path gets its own mount entry here too, so the
+            # single consolidated check loop below enforces it alongside
+            # every other mount (the dedicated SRL-filesystem check further
+            # below still runs independently as a second, redundant guard).
+            if [[ -n "${STANDBY_SRL_PATH:-}" && "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
+                _srl_mount_mb=$(( STANDBY_REDO_GROUPS * REDO_LOG_SIZE_MB ))
+                _srl_check_path="$STANDBY_SRL_PATH"
+                while [[ ! -d "$_srl_check_path" && "$_srl_check_path" != "/" ]]; do
+                    _srl_check_path=$(dirname "$_srl_check_path")
+                done
+                _srl_mount=$(df -Pk "$_srl_check_path" 2>/dev/null | tail -1 | awk '{print $NF}')
+                [[ -z "$_srl_mount" ]] && _srl_mount="$_srl_check_path"
+                log_info "  ${STANDBY_SRL_PATH}: ${_srl_mount_mb} MB (standby redo logs, filesystem: ${_srl_mount})"
+
+                _found=0
+                _m=0
+                while [[ $_m -lt ${#MOUNT_POINTS[@]} ]]; do
+                    if [[ "${MOUNT_POINTS[$_m]}" == "$_srl_mount" ]]; then
+                        MOUNT_REQUIRED_MB[$_m]=$(( ${MOUNT_REQUIRED_MB[$_m]} + _srl_mount_mb ))
+                        _found=1
+                        break
+                    fi
+                    _m=$(( _m + 1 ))
+                done
+                if [[ $_found -eq 0 ]]; then
+                    MOUNT_POINTS+=("$_srl_mount")
+                    MOUNT_REQUIRED_MB+=("$_srl_mount_mb")
+                    MOUNT_CHECK_PATHS+=("$_srl_check_path")
+                fi
+            fi
+        elif [[ "$STANDBY_STORAGE_MODE" != "OMF" ]]; then
+            log_info "REDO_LOG_SIZE_MB/ONLINE_REDO_GROUPS/STANDBY_REDO_GROUPS not available or non-numeric - the redo mount is not covered by this check; verify space there manually"
+        fi
 
         # Check every mount with the same +20% headroom factor the
         # aggregate REQUIRED_SPACE_MB carries, and report ALL

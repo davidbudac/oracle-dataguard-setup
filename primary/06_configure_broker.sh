@@ -22,7 +22,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 print_banner "Step 6: Configure Data Guard Broker"
-init_progress 9
+init_progress 10
 
 # Initialize logging (will reinitialize with DB name later)
 init_log "06_configure_broker"
@@ -246,6 +246,47 @@ fi
 log_info "Standby database added successfully"
 
 # ============================================================
+# Verify _DGMGRL Static Service Registration
+# ============================================================
+# The StaticConnectIdentifier set below points at the _DGMGRL service
+# registered in listener.ora by step 4 (primary) / step 3 (standby).
+# Step 4 deliberately does not reload the listener, so if nobody ran
+# 'lsnrctl reload' since then, the service is configured on disk but
+# NOT actually being served yet - StaticConnectIdentifier will look
+# correct but every switchover/FSFO connect attempt fails with
+# ORA-12514 the first time it's needed, weeks later (M15). Only the
+# PRIMARY's own listener can be checked from here; warn about the
+# standby too since the same gap applies there.
+# ============================================================
+
+progress_step "Verifying _DGMGRL Static Service Registration"
+
+_primary_dgmgrl_service="${PRIMARY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+_standby_dgmgrl_service="${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
+
+log_info "Checking primary listener for the ${_primary_dgmgrl_service} static service..."
+_lsnrctl_status=$("$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null || true)
+if echo "$_lsnrctl_status" | grep -qi "$_primary_dgmgrl_service"; then
+    log_info "Primary listener is serving ${_primary_dgmgrl_service}"
+else
+    log_warn "Primary listener does NOT show the ${_primary_dgmgrl_service} static service."
+    log_warn "listener.ora was updated in step 4, but the listener has not been reloaded since -"
+    log_warn "without it, DGMGRL switchover/failover connect attempts to this database will fail"
+    log_warn "with ORA-12514. Also confirm the standby listener serves ${_standby_dgmgrl_service}."
+    log_warn "Fix: lsnrctl reload   (run on both the primary and standby listeners)"
+    if [[ -t 0 ]]; then
+        if confirm_proceed "Continue setting up the broker configuration anyway?"; then
+            log_warn "Proceeding without a confirmed _DGMGRL registration - re-run 'lsnrctl reload' if switchover/FSFO later fails with ORA-12514."
+        else
+            log_error "Aborted. Run 'lsnrctl reload' on the primary (and standby) listener, then re-run this step."
+            exit 1
+        fi
+    else
+        log_warn "Non-interactive run: continuing. Run 'lsnrctl reload' on both listeners if switchover later fails with ORA-12514."
+    fi
+fi
+
+# ============================================================
 # Set Explicit StaticConnectIdentifier
 # ============================================================
 # DGMGRL auto-derives StaticConnectIdentifier from the local
@@ -257,9 +298,6 @@ log_info "Standby database added successfully"
 # ============================================================
 
 progress_step "Setting StaticConnectIdentifier on Both Databases"
-
-_primary_dgmgrl_service="${PRIMARY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
-_standby_dgmgrl_service="${STANDBY_DB_UNIQUE_NAME}_DGMGRL${DB_DOMAIN:+.${DB_DOMAIN}}"
 
 PRIMARY_STATIC_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${PRIMARY_HOSTNAME})(PORT=${PRIMARY_LISTENER_PORT}))(CONNECT_DATA=(SERVICE_NAME=${_primary_dgmgrl_service})(INSTANCE_NAME=${PRIMARY_ORACLE_SID})(SERVER=DEDICATED)))"
 STANDBY_STATIC_CONNECT="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_LISTENER_PORT}))(CONNECT_DATA=(SERVICE_NAME=${_standby_dgmgrl_service})(INSTANCE_NAME=${STANDBY_ORACLE_SID})(SERVER=DEDICATED)))"
@@ -294,9 +332,41 @@ if ! run_dgmgrl_checked "enable_configuration.dgmgrl"; then
     exit 1
 fi
 
-# Wait for configuration to stabilize
+# M4: a fixed 'sleep 10' here routinely reported a healthy configuration
+# as ERROR, because the broker often needs 30-60s (ORA-16610, "one or
+# more members are working on their tasks") to converge after ENABLE
+# CONFIGURATION. Poll SHOW CONFIGURATION instead, mirroring
+# 13_set_max_availability.sh's reference poll loop: every 10s, up to
+# ~120s, accepting SUCCESS or WARNING as stable and treating
+# ORA-16610/"in progress" (or any other transient output) as "keep
+# waiting" rather than a final verdict.
 log_info "Waiting for configuration to stabilize..."
-sleep 10
+CONFIG_STATUS=""
+BROKER_STATUS=""
+_poll_attempt=0
+_poll_max_attempts=12   # 12 * 10s = ~120s
+while [[ $_poll_attempt -lt $_poll_max_attempts ]]; do
+    CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
+    if echo "$CONFIG_STATUS" | grep -q "SUCCESS"; then
+        BROKER_STATUS="SUCCESS"
+        break
+    elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
+        BROKER_STATUS="WARNING"
+        break
+    fi
+    _poll_attempt=$((_poll_attempt + 1))
+    if [[ $_poll_attempt -lt $_poll_max_attempts ]]; then
+        if echo "$CONFIG_STATUS" | grep -Eqi "ORA-16610|in progress"; then
+            log_info "Broker configuration still converging (attempt ${_poll_attempt}/${_poll_max_attempts}) - retrying in 10s..."
+        else
+            log_info "Configuration not yet SUCCESS/WARNING (attempt ${_poll_attempt}/${_poll_max_attempts}) - retrying in 10s..."
+        fi
+        sleep 10
+    fi
+done
+if [[ -z "$BROKER_STATUS" ]]; then
+    BROKER_STATUS="ERROR"
+fi
 
 # ============================================================
 # Verify Configuration
@@ -307,7 +377,7 @@ progress_step "Verifying Broker Configuration"
 echo ""
 echo "Data Guard Broker Configuration:"
 echo "================================="
-run_dgmgrl "show_configuration.dgmgrl"
+echo "$CONFIG_STATUS"
 
 echo ""
 echo "Primary Database Details:"
@@ -325,20 +395,19 @@ run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
 
 log_section "Configuration Status Check"
 
-CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1)
-
-if echo "$CONFIG_STATUS" | grep -q "SUCCESS"; then
-    log_info "Configuration status: SUCCESS"
-    BROKER_STATUS="SUCCESS"
-elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
-    log_warn "Configuration status: WARNING"
-    log_warn "Check the configuration details above for warnings"
-    BROKER_STATUS="WARNING"
-else
-    log_error "Configuration status: ERROR or UNKNOWN"
-    log_error "Please check configuration details above"
-    BROKER_STATUS="ERROR"
-fi
+case "$BROKER_STATUS" in
+    SUCCESS)
+        log_info "Configuration status: SUCCESS"
+        ;;
+    WARNING)
+        log_warn "Configuration status: WARNING"
+        log_warn "Check the configuration details above for warnings"
+        ;;
+    *)
+        log_error "Configuration status: ERROR or UNKNOWN (did not reach SUCCESS/WARNING after ~120s)"
+        log_error "Please check configuration details above"
+        ;;
+esac
 
 # ============================================================
 # Force Log Switch to Test
@@ -393,3 +462,11 @@ print_list_block "Broker Management Commands" \
 
 print_list_block "Next Step" \
     "Run ./standby/07_verify_dataguard.sh."
+
+# M3: this step previously always exited 0, even with BROKER_STATUS=ERROR -
+# any wrapper (E2E, cron, a plain "06 && 07") would proceed against a
+# broken broker configuration. Print every block above first so the
+# operator sees the full picture, then fail loudly.
+if [[ "$BROKER_STATUS" != "SUCCESS" && "$BROKER_STATUS" != "WARNING" ]]; then
+    exit 1
+fi

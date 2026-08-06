@@ -10,7 +10,7 @@ dg_triage_sid.sh - Fast local Data Guard triage (run directly on DB host)
 dg_diag_sid.sh   - Deep local Data Guard diagnostics (run directly on DB host)
 dg_check_sid.sh  - Deprecated wrapper to dg_triage_sid.sh
 dg_handoff.sh    - Standalone handoff report generator (post-setup; no NFS/config dependencies)
-dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 error)
+dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 argument, pre-flight, or data-collection error). SRLs created without a THREAD clause sit at THREAD#=0 until first use (step 4 created them that way before 2026-08; it now assigns THREAD explicitly); the checker counts THREAD#=0 SRLs as a shared pool toward each thread's requirement instead of demanding duplicates, so both old and new builds check out correctly
 migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby (has its own README/WALKTHROUGH)
 nfs/             - NFS setup scripts (run before Data Guard setup)
 primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10, 13)
@@ -29,7 +29,7 @@ tests/           - Test scripts (unit tests and E2E test suite, including CDB va
 Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step reference): NFS setup is Step 0a/0b (prerequisite, not counted in the main 1-13 sequence), and observer wallet setup + start are both part of Step 10.
 
 0a. `nfs/01_setup_nfs_server.sh` - Setup NFS (on NFS server, requires sudo)
-0b. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo)
+0b. `nfs/02_mount_nfs_client.sh` - Mount NFS (on both servers, requires sudo). On the host that *is* the NFS server it detects itself and skips the mount - the export path and mount path are the same directory, and an NFS self-mount would shadow the export and make `rpc.mountd` refuse every other client ("fsid= required"). The write test runs as the share owner (oracle), since root is squashed to nobody on the 750 export
 1. `primary/01_gather_primary_info.sh` - Collect primary DB info
 2. `primary/02_generate_standby_config.sh` - Generate standby config (user reviews)
 3. `standby/03_setup_standby_env.sh` - Prepare standby environment
@@ -55,6 +55,8 @@ Recommended, run any time after Step 7 (not part of the walkthrough's numbered s
 2. Remove all standby data files, control files, and redo logs
 3. Re-run step 5
 
+**Step 8 hardening runs in two phases** - the SYS password rotation and the ACCOUNT LOCK are separate sqlplus calls with separate exit codes. If rotation succeeds but the lock fails, the script keeps going (the primary is already rotated, so the standby's password file copy is stale either way): it stages the refreshed password file, prints an ACTION REQUIRED block with the exact state SYS is in, and exits 1. It also refreshes the step-1 staged copy `orapw<PRIMARY_ORACLE_SID>` on the NFS share (not just the `_hardened` name), so a re-run of step 3 after hardening installs the *rotated* password file. The absence of ORA-16191 immediately after rotation is expected (existing transport connections stay authenticated until they reconnect) and is reported as such, not as proof transport survived.
+
 **Post-hardening re-clone limitation:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this at the password-verification step (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run `primary/08_security_hardening.sh` afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
 
 **Steps 6-7 are restartable** - the broker configuration can be removed with `REMOVE CONFIGURATION` in DGMGRL and recreated. Step 7 is read-only verification.
@@ -71,6 +73,7 @@ Recommended, run any time after Step 7 (not part of the walkthrough's numbered s
   - Known limitation (**now warned about, not silent**): primary with data+redo in ONE directory and a standby that splits them puts ORLs/SRLs in the standby data dir — both pairs share the same primary path, so the length sort can't separate them and Oracle's first-prefix match takes the datafile pair. `build_convert_pairs()` detects this (primary redo dir == a primary data dir, but their standby targets differ) and warns that the standby redo dir will stay unused. Unfixable by pair ordering: a convert pair remaps a primary *filename*, and nothing distinguishes an ORL from a datafile when they share one primary directory — a split standby needs a distinct primary redo dir too. Same root cause as the existing SRL-contradiction warning
   - `build_convert_pairs()` is **duplicated verbatim** in `tests/test_file_name_convert.sh`; the script is the source of truth and Test 11 fails on any drift (it diffs the two copies). Edit the script, then re-copy into the test
 - **Concurrent builds**: All generated files include DB_UNIQUE_NAME to support multiple DG setups
+- **TNS alias domain qualification**: step 2 qualifies the generated TNS aliases with `NAMES.DEFAULT_DOMAIN` from the primary's sqlnet.ora when set (falling back to `DB_DOMAIN`) - sqlnet appends its default domain to every unqualified alias at resolution time, so unqualified generated entries would be unresolvable on such hosts (surfaces as ORA-17627/ORA-12154 mid-RMAN-duplicate in step 5). A qualified alias name resolves exactly whether or not the resolving host sets a default domain
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)
 - **Storage mode choice**: Step 2 offers Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or OMF mode (`db_create_file_dest` + `db_recovery_file_dest`). OMF mode supports mixed-storage scenarios where primary uses regular file paths and standby uses FRA. OMF mode also protects against the post-setup new-PDB/new-datafile convert-pair gap: in Traditional mode a file created in a directory not covered by any `DB_FILE_NAME_CONVERT` pair becomes an `UNNAMED` placeholder on the standby and halts apply with ORA-01274 (see "Life After Setup" in docs/DATA_GUARD_WALKTHROUGH.md)
@@ -132,7 +135,7 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 
 **SID resolution:** `-s` flag > `$ORACLE_SID` > auto-detect from `ora_pmon_` process. Standby SID is always auto-detected.
 
-**Exit codes:** `0` healthy, `1` warnings only, `2` errors present - suitable for cron/monitoring wrappers instead of scraping the colored text output. An unreachable host is reported explicitly (`UNREACHABLE`) rather than rendered as blank fields with a healthy status.
+**Exit codes:** `0` healthy, `1` warnings only, `2` errors present, `3` usage/config error (bad flag, missing option argument, missing config keys, invalid SID) - suitable for cron/monitoring wrappers instead of scraping the colored text output. An unreachable host is reported explicitly (`UNREACHABLE`) rather than rendered as blank fields with a healthy status; an unreachable standby (or one returning no lag data) renders the replication state as `UNKNOWN`, never `IN SYNC`. When FSFO is enabled, a missing observer (`FS_FAILOVER_OBSERVER_PRESENT`) is an error. `JUMP_HOST` may be empty in the config - the DB hosts are then reached directly (same convention as the E2E harness).
 
 **Output control:** `--no-color` (or the `NO_COLOR` env var) disables ANSI color codes.
 
@@ -193,7 +196,7 @@ After Data Guard setup is complete, you can optionally configure Fast-Start Fail
 ```bash
 ./primary/09_configure_fsfo.sh
 ```
-This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mode, enables FSFO.
+This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mode, enables FSFO. On a multitenant primary (`V$DATABASE.CDB = YES`) the observer user must be a common user: the script detects this, accepts `#` in usernames, and auto-prefixes `C##` (TTY-confirmed; logged and applied automatically in non-interactive runs). SYSDG possession is checked via `V$PWFILE_USERS` (administrative privileges never appear in `DBA_ROLE_PRIVS`).
 
 **Step 10: Observer Setup (on OBSERVER server - can be standby or 3rd server)**
 ```bash
@@ -242,6 +245,8 @@ After Data Guard setup is complete, you can deploy triggers that automatically s
 This discovers running user services, creates PL/SQL package `SYS.DG_SERVICE_MGR` and two database triggers. Services are started on PRIMARY and stopped on STANDBY, triggered on both role change (switchover/failover) and database startup.
 
 Standalone: both `create_role_trigger.sh` and `create_role_trigger_dedicated_user.sh` self-discover the primary/standby topology from `V$DATABASE` / `V$DATAGUARD_CONFIG` and do not require `standby_config_*.env`. The NFS share is optional - the generated SQL is written there when available, otherwise falls back to `$PWD`.
+
+**Multitenant guard:** both scripts refuse to run on a CDB (`V$DATABASE.CDB = YES`) and point to `create_role_trigger_cdb.sh` - on a CDB their container-blind `DBMS_SERVICE` calls would silently mismanage PDB services. This makes the SYS-owned CDB variant the only multitenant path; a CDB-aware *dedicated-user* variant does not exist yet (known gap for shops that both run CDBs and disallow SYS objects). Manually entered service names are resolved case-insensitively against `DBA_SERVICES`/`V$ACTIVE_SERVICES` (canonical casing is used; unknown names need TTY confirmation), and hyphens are allowed for domain-qualified names.
 
 **Objects created:**
 - `SYS.DG_SERVICE_MGR` - PL/SQL package with `MANAGE_SERVICES` procedure
@@ -292,7 +297,7 @@ After Data Guard is verified (and ideally after FSFO and the role-aware service 
 ./primary/10_generate_handoff_report.sh
 ```
 
-The script collects a status snapshot for both DBAs and application teams: roles, open modes, protection mode, standby `LogXptMode`, MRP/apply lag, archive gaps, FSFO state and threshold, broker config, role-trigger deployment status, and server-side `SQLNET.EXPIRE_TIME`. It emits per-service connection info in three flavors:
+The script collects a status snapshot for both DBAs and application teams: roles, open modes, protection mode, standby `LogXptMode`, MRP/apply lag, archive gaps, FSFO state (threshold shown only when FSFO is enabled), broker config, role-trigger deployment status, and server-side `SQLNET.EXPIRE_TIME`. The report's **Verdict** is computed, with each reason named: ERROR on broker-config errors/ORA- diagnostics, failure-state switchover status, or apply lag beyond `DG_SEQ_GAP_CRIT` sequences; WARNING on lesser findings (broker warnings, role trigger not deployed, standby readability unknown); HEALTHY only when nothing fired. The standby's open mode is derived from the broker's `Real Time Query` field (19c DGMGRL prints no "Open Mode" line) plus, in the step-10 variant, a best-effort wallet connect. Hostname discovery prefers the broker's `HostName` property; `DGConnectIdentifier` is only trusted when it is a genuine easy-connect string, never a TNS alias. The default `<DB_UNIQUE_NAME>` service is flagged as NOT managed by the role trigger. It emits per-service connection info in three flavors:
 
 - **Primary-only** TNS + JDBC — writes / admin
 - **Standby-only** TNS + JDBC — read-only reporting against an open standby. If the standby is `MOUNTED`, the report marks these strings as not currently usable; if it is `READ ONLY WITH APPLY`, it includes the Active Data Guard licensing note, apply-lag/read-your-writes caveat, and ORA-16000 no-DML warning

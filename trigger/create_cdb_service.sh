@@ -73,7 +73,11 @@ POSITIONAL=()
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --service)    SERVICE_NAME="$2"; shift 2 ;;
+        --service)
+            if [[ $# -lt 2 || -z "$2" ]]; then
+                printf "Option %s requires an argument\n\n" "$1"; usage; exit 1
+            fi
+            SERVICE_NAME="$2"; shift 2 ;;
         --no-start)   DO_START=false; shift ;;
         --taf)        ENABLE_TAF=true; shift ;;
         -h|--help)    usage; exit 0 ;;
@@ -90,7 +94,7 @@ if [[ -z "$SERVICE_NAME" && ${#POSITIONAL[@]} -gt 0 ]]; then
     SERVICE_NAME="${POSITIONAL[0]}"
 fi
 
-SERVICE_NAME=$(echo "$SERVICE_NAME" | tr -d ' \n\r')
+SERVICE_NAME=$(echo "$SERVICE_NAME" | tr -d ' \t\n\r')
 
 # ============================================================
 # Main Script
@@ -143,7 +147,7 @@ check_db_connection || exit 1
 log_section "Verifying Database Role and Container Type"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \t\n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -159,7 +163,7 @@ SELECT CDB FROM V$DATABASE;
 EXIT;
 EOSQL
 )
-IS_CDB=$(echo "$IS_CDB" | tr -d ' \n\r')
+IS_CDB=$(echo "$IS_CDB" | tr -d ' \t\n\r')
 
 if [[ "$IS_CDB" != "YES" ]]; then
     log_error "This database is not a CDB (V\$DATABASE.CDB = ${IS_CDB:-unknown})"
@@ -252,9 +256,15 @@ if [[ "$ENABLE_TAF" == "true" ]]; then
         failover_delay    => 5);"
 fi
 
+# V$ACTIVE_SERVICES queried in CDB$ROOT lists the services of EVERY
+# container, so a same-named service running inside a PDB would make the
+# count non-zero and the root service would silently never be started (and
+# then be reported as RUNNING). Restrict every count to this container.
 PLSQL_START=""
 if [[ "$DO_START" == "true" ]]; then
-    PLSQL_START="    SELECT COUNT(*) INTO l_cnt FROM v\$active_services WHERE name = '${SERVICE_NAME}';
+    PLSQL_START="    SELECT COUNT(*) INTO l_cnt FROM v\$active_services
+     WHERE name = '${SERVICE_NAME}'
+       AND con_id = SYS_CONTEXT('USERENV', 'CON_ID');
     IF l_cnt = 0 THEN
         DBMS_SERVICE.START_SERVICE('${SERVICE_NAME}');
     END IF;"
@@ -286,9 +296,12 @@ ${PLSQL_START}
 END;
 /
 
--- Verification (CDB\$ROOT container)
+-- Verification (CDB\$ROOT container only - V\$ACTIVE_SERVICES in the root
+-- otherwise also counts identically-named services running inside PDBs)
 SELECT 'SVC_DEFINED=' || COUNT(*) FROM DBA_SERVICES WHERE NAME = '${SERVICE_NAME}';
-SELECT 'SVC_ACTIVE='  || COUNT(*) FROM V\$ACTIVE_SERVICES WHERE NAME = '${SERVICE_NAME}';
+SELECT 'SVC_ACTIVE='  || COUNT(*) FROM V\$ACTIVE_SERVICES
+ WHERE NAME = '${SERVICE_NAME}'
+   AND CON_ID = SYS_CONTEXT('USERENV', 'CON_ID');
 
 EXIT;
 EOSQL
@@ -313,8 +326,11 @@ fi
 
 log_section "Verifying"
 
-SVC_DEFINED=$(echo "$DEPLOY_RESULT" | grep "SVC_DEFINED=" | sed 's/.*SVC_DEFINED=//' | tr -d ' \n\r')
-SVC_ACTIVE=$(echo "$DEPLOY_RESULT" | grep "SVC_ACTIVE=" | sed 's/.*SVC_ACTIVE=//' | tr -d ' \n\r')
+# `|| true` inside the substitutions: verbose mode enables `set -o pipefail`,
+# so a result set without the tagged rows would abort the script here under
+# `set -e` instead of reaching the diagnostics below.
+SVC_DEFINED=$( { echo "$DEPLOY_RESULT" | grep "SVC_DEFINED=" || true; } | sed 's/.*SVC_DEFINED=//' | tr -d ' \t\n\r')
+SVC_ACTIVE=$( { echo "$DEPLOY_RESULT" | grep "SVC_ACTIVE=" || true; } | sed 's/.*SVC_ACTIVE=//' | tr -d ' \t\n\r')
 
 DEPLOY_OK=true
 
@@ -353,7 +369,7 @@ SELECT COUNT(*) FROM DBA_OBJECTS WHERE OBJECT_NAME = 'DG_SERVICE_MGR' AND OWNER 
 EXIT;
 EOSQL
 )
-TRG_EXISTS=$(echo "$TRG_EXISTS" | tr -d ' \n\r')
+TRG_EXISTS=$(echo "$TRG_EXISTS" | tr -d ' \t\n\r')
 
 # ============================================================
 # Summary

@@ -165,14 +165,55 @@ sql_scalar() {
     run_sql "$sid" "$sql" | tr -d '[:space:]'
 }
 
-# Run a DGMGRL script
+# Inspect captured DGMGRL output for failure patterns. dgmgrl scripts always
+# end in EXIT; below, so the process exit code is 0 even when a command
+# inside the script failed - the only reliable signal is the text DGMGRL
+# printed. Matches real ORA-/DGM- error codes and "Error:"/"Failed." lines,
+# while deliberately NOT matching benign broker report lines such as
+# "Error: 0" (no error) that appear in SHOW CONFIGURATION / SHOW DATABASE
+# output, or property names/values that merely contain the word "error".
+#
+# This mirrors common/dg_functions.sh's dgmgrl_output_has_error() - kept as
+# a manual copy (not sourced) because this subproject is deliberately
+# standalone (see README/WALKTHROUGH); keep both in sync if either changes.
+# Usage: dgmgrl_output_has_error <output>
+dgmgrl_output_has_error() {
+    local output="$1"
+    # Real Oracle/broker error codes anywhere in the output.
+    if printf '%s\n' "$output" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+        return 0
+    fi
+    # A standalone "Error:" line with a nonzero code. "Error: 0" is the
+    # benign per-member status line in SHOW CONFIGURATION/SHOW DATABASE.
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Error:[[:space:]]*[1-9]'; then
+        return 0
+    fi
+    # DGMGRL prints a standalone "Failed." line for some failed operations.
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Failed\.[[:space:]]*$'; then
+        return 0
+    fi
+    return 1
+}
+
+# Run a DGMGRL script. dgmgrl scripts always end in EXIT; so the process's
+# own exit code is 0 even when a command inside the script failed (e.g. an
+# EDIT DATABASE / REMOVE CONFIGURATION that errored) - scan the captured
+# output for failure patterns and return non-zero when found, so callers
+# relying on the return code (and existing "|| log_warn" fallbacks) work.
 run_dgmgrl() {
     local sid="$1"; shift
     local script="$*"
-    ORACLE_SID="$sid" "$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1
+    local output
+    output=$(ORACLE_SID="$sid" "$ORACLE_HOME/bin/dgmgrl" -silent / <<EOF 2>&1
 ${script}
 EXIT;
 EOF
+)
+    printf '%s\n' "$output"
+    if dgmgrl_output_has_error "$output"; then
+        return 1
+    fi
+    return 0
 }
 
 # Mirror text into the log (and through stdout)

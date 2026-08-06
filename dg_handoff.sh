@@ -92,7 +92,14 @@ EXIT;
 EOF
 }
 
-clean() { tr -d ' \r' | sed '/^$/d'; }
+# Trim leading/trailing whitespace (spaces, tabs, CR) from every line and
+# drop empty lines. Internal spaces are preserved on purpose: display fields
+# such as "READ WRITE", "MAXIMUM AVAILABILITY" and "FAILED DESTINATION" end up
+# verbatim in the customer-facing report.
+clean() {
+    tr -d '\r' \
+        | sed -e 's/^[[:space:]][[:space:]]*//' -e 's/[[:space:]][[:space:]]*$//' -e '/^$/d'
+}
 field()  { awk -F'|' -v i="$2" '{print $i}' <<< "$1"; }
 
 # ============================================================
@@ -122,6 +129,46 @@ EXIT;
 EOF
 }
 
+# Local copy of common/dg_functions.sh's dgmgrl_output_has_error() - this
+# script is deliberately standalone and does not source dg_functions.sh.
+# DGMGRL always exits 0, so the captured text is the only failure signal.
+# Returns 0 (true) when the output contains a real broker/Oracle error.
+broker_output_has_error() {
+    local output="$1"
+    if printf '%s\n' "$output" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+        return 0
+    fi
+    # A standalone "Error:" line with a nonzero code. "Error: 0" is the
+    # benign per-member status line in SHOW CONFIGURATION/SHOW DATABASE.
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Error:[[:space:]]*[1-9]'; then
+        return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Failed\.[[:space:]]*$'; then
+        return 0
+    fi
+    return 1
+}
+
+# Extract the "Configuration Status:" verdict (the value is printed on the
+# FOLLOWING line by 19c DGMGRL). Prints the upper-cased status or nothing.
+extract_configuration_status() {
+    printf '%s\n' "$1" | awk '
+        found && $0 !~ /^[[:space:]]*$/ {
+            gsub(/^[[:space:]]*/, "")
+            gsub(/[[:space:]].*$/, "")
+            print toupper($0)
+            exit
+        }
+        tolower($0) ~ /^[[:space:]]*configuration status:/ {
+            rest = $0
+            sub(/^[^:]*:[[:space:]]*/, "", rest)
+            gsub(/[[:space:]].*$/, "", rest)
+            if (rest != "") { print toupper(rest); exit }
+            found = 1
+        }
+    '
+}
+
 parse_broker_property() {
     awk -F= '
         /[A-Za-z0-9_]+[[:space:]]*=/ {
@@ -136,17 +183,25 @@ parse_broker_property() {
     '
 }
 
-extract_open_mode_from_broker() {
+# Derive the standby's readability from DGMGRL SHOW DATABASE output.
+# 19c DGMGRL does NOT print an "Open Mode" line for a standby - it prints
+# "Real Time Query: ON|OFF". ON means the standby is open READ ONLY WITH
+# APPLY (Active Data Guard); OFF means it is not readable (MOUNTED, or open
+# read-only without apply). Prints nothing when the line is absent.
+extract_standby_open_mode_from_broker() {
     awk -F: '
         {
             line=tolower($0)
         }
-        line ~ /open[[:space:]]+mode/ {
-            value=$2
-            gsub(/^[[:space:]]*/, "", value)
-            gsub(/[[:space:]]*$/, "", value)
-            if (value != "") {
-                print value
+        line ~ /real[[:space:]]+time[[:space:]]+query/ {
+            value=tolower($2)
+            gsub(/[^a-z]/, "", value)
+            if (value == "on") {
+                print "READ ONLY WITH APPLY"
+                exit
+            }
+            if (value == "off") {
+                print "MOUNTED"
                 exit
             }
         }
@@ -286,6 +341,15 @@ FSFO_STATUS=$(field        "$FSFO_RAW" 1)
 FSFO_OBSERVER=$(field      "$FSFO_RAW" 2)
 FSFO_OBSERVER_HOST=$(field "$FSFO_RAW" 3)
 
+# Single source of truth for "is FSFO on?" - used to gate threshold discovery,
+# the threshold row in the report, and the visualizer payload.
+FSFO_STATUS_UPPER=$(printf '%s' "$FSFO_STATUS" | tr '[:lower:]' '[:upper:]')
+FSFO_ENABLED="NO"
+case "$FSFO_STATUS_UPPER" in
+    ''|DISABLED|N/A) ;;
+    *) FSFO_ENABLED="YES" ;;
+esac
+
 if ! TRIGGER_STATUS=$(run_sql "
 WITH pkg AS (
     SELECT owner
@@ -350,29 +414,53 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
     BROKER_OUTPUT=$(run_dgmgrl_cmd "SHOW CONFIGURATION;" || true)
 
     extract_host_from_show_db() {
-        # SHOW DATABASE VERBOSE prints a "DGConnectIdentifier = '...'" line.
-        # That value is either an easy-connect string (host:port/service) or
-        # a TNS alias. Extract the first hostname-looking token.
-        # AIX-portable: avoid GNU regex extensions; use POSIX BRE
-        # with [[:space:]] character classes and `\(...\)` capture groups.
-        local db="$1" out
+        # SHOW DATABASE VERBOSE prints the broker's own "HostName = '...'"
+        # property - that is the authoritative hostname and the only value
+        # that belongs in a connect descriptor.
+        #
+        # It also prints "DGConnectIdentifier = '...'", which is USUALLY a
+        # TNS alias (e.g. 'cdb1_stby.world'). A TNS alias is not a hostname:
+        # using it produced fully unusable TNS/JDBC strings. It is therefore
+        # only accepted when it is genuinely an easy-connect string, i.e. it
+        # carries a ":port" and/or a "/service" part.
+        #
+        # AIX-portable: avoid GNU regex extensions; use POSIX BRE with
+        # [[:space:]] character classes and `\(...\)` capture groups.
+        local db="$1" out host dgci
         out=$(run_dgmgrl_cmd "SHOW DATABASE VERBOSE '${db}';" 2>/dev/null || true)
-        # Try DGConnectIdentifier easy-connect form
-        local dgci
-        dgci=$(echo "$out" | grep -i "DGConnectIdentifier" | head -1 \
-            | sed -e "s/.*=[[:space:]]*//" \
+
+        # 1. HostName property (preferred)
+        host=$(printf '%s\n' "$out" \
+            | grep -i '^[[:space:]]*HostName[[:space:]]*=' | head -1 \
+            | sed -e "s/^[^=]*=[[:space:]]*//" \
                   -e "s/^'//" \
-                  -e "s/'[[:space:]]*$//" \
+                  -e "s/'.*$//" \
                   -e "s/[[:space:]]*$//")
-        if [[ "$dgci" =~ ^([A-Za-z0-9._-]+)(:[0-9]+)?(/.*)?$ ]] && [[ "$dgci" == *.* || "$dgci" == *:* || "$dgci" == */* ]]; then
-            echo "${BASH_REMATCH[1]}"
-            return
+        if [[ -n "$host" ]]; then
+            printf '%s\n' "$host"
+            return 0
         fi
-        # Fallback: parse "Host Name:" or "(HOST = ...)" lines
-        echo "$out" | grep -i -E "Host Name|HOST *=" | head -1 \
+
+        # 2. DGConnectIdentifier, only in genuine easy-connect form
+        dgci=$(printf '%s\n' "$out" \
+            | grep -i '^[[:space:]]*DGConnectIdentifier[[:space:]]*=' | head -1 \
+            | sed -e "s/^[^=]*=[[:space:]]*//" \
+                  -e "s/^'//" \
+                  -e "s/'.*$//" \
+                  -e "s/[[:space:]]*$//")
+        case "$dgci" in
+            *:[0-9]*|*/?*)
+                printf '%s\n' "${dgci%%[:/]*}"
+                return 0
+                ;;
+        esac
+
+        # 3. Fallback: "Host Name:" text or an embedded "(HOST = ...)"
+        printf '%s\n' "$out" | grep -i -E "Host Name|HOST[[:space:]]*=" | head -1 \
             | sed -e "s/.*[Hh]ost *[Nn]ame[: ]*//" \
                   -e "s/.*HOST *= *\([A-Za-z0-9._-][A-Za-z0-9._-]*\).*/\1/" \
             | tr -d ' '
+        return 0
     }
 
     [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]] && PRIMARY_HOSTNAME=$(extract_host_from_show_db "$PRIMARY_DB_UNIQUE_NAME")
@@ -384,21 +472,29 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
             note_discovery_failure "standby LogXptMode (broker)"
         fi
         STANDBY_SHOW_OUTPUT=$(run_dgmgrl_cmd "SHOW DATABASE '${STANDBY_DB_UNIQUE_NAME}';" || true)
-        STANDBY_OPEN_MODE=$(printf '%s\n' "$STANDBY_SHOW_OUTPUT" | extract_open_mode_from_broker)
+        # 19c prints "Real Time Query: ON|OFF", never an "Open Mode" line.
+        # An absent line is a legitimate outcome (broker cannot reach the
+        # standby), so it is reported inline in the report rather than as a
+        # discovery failure.
+        STANDBY_OPEN_MODE=$(printf '%s\n' "$STANDBY_SHOW_OUTPUT" | extract_standby_open_mode_from_broker)
         if [[ -z "$STANDBY_OPEN_MODE" ]]; then
             STANDBY_OPEN_MODE="unknown"
-            note_discovery_failure "standby open mode (broker)"
         fi
     fi
-    if [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]]; then
-        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}' 'FastStartFailoverThreshold';" | parse_broker_property || true)
-    fi
-    if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
-        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
-    fi
-    if [[ -z "$FSFO_THRESHOLD" ]]; then
-        FSFO_THRESHOLD="unknown"
-        note_discovery_failure "fast-start failover threshold (broker)"
+    # The failover threshold is only meaningful while FSFO is enabled;
+    # querying (and reporting) it otherwise produced a spurious value and a
+    # spurious discovery warning on every non-FSFO configuration.
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        if [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]]; then
+            FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}' 'FastStartFailoverThreshold';" | parse_broker_property || true)
+        fi
+        if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
+            FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
+        fi
+        if [[ -z "$FSFO_THRESHOLD" ]]; then
+            FSFO_THRESHOLD="unknown"
+            note_discovery_failure "fast-start failover threshold (broker)"
+        fi
     fi
 else
     warn "DG broker is not started (dg_broker_start=${DG_BROKER_START:-FALSE}); cannot auto-discover peer hostname."
@@ -472,8 +568,7 @@ case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%
         ;;
 esac
 
-FSFO_STATUS_UPPER=$(printf '%s' "$FSFO_STATUS" | tr '[:lower:]' '[:upper:]')
-if [[ -n "$FSFO_STATUS_UPPER" && "$FSFO_STATUS_UPPER" != "DISABLED" && "$FSFO_STATUS_UPPER" != "N/A" ]]; then
+if [[ "$FSFO_ENABLED" == "YES" ]]; then
     if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
         OUTAGE_STATEMENT="FSFO is enabled: automatic failover begins after approximately ${FSFO_THRESHOLD}s of primary unreachability. Expect connection errors for roughly that window plus driver reconnect time, followed by a cold-cache brownout after the role change."
     else
@@ -606,13 +701,16 @@ build_visualizer_url() {
         async)    xpt_tok="async" ;;
     esac
     viz_add par logXptMode "$xpt_tok"
-    viz_add par threshold "$FSFO_THRESHOLD" num
 
     # Observer placement: the page models the primary site as dc1, the
     # standby site as dc2, a third site as dc3; 'none' = no observer.
+    # The failover threshold is only encoded while FSFO is actually
+    # enabled - otherwise the page would show a threshold for a
+    # configuration that has none.
     case "$(printf '%s' "${FSFO_STATUS:-}" | tr '[:lower:]' '[:upper:]')" in
         ''|DISABLED|N/A) obs_tok="none" ;;
         *)
+            viz_add par threshold "$FSFO_THRESHOLD" num
             if viz_same_host "$FSFO_OBSERVER_HOST" "$PRIMARY_HOSTNAME"; then
                 obs_tok="dc1"
             elif viz_same_host "$FSFO_OBSERVER_HOST" "$STANDBY_HOSTNAME"; then
@@ -649,6 +747,13 @@ escalate_verdict() {
         WARNING) if [[ "$VERDICT" != "ERROR" ]]; then VERDICT="WARNING"; fi ;;
     esac
 }
+# Apply-lag thresholds (sequences). Same env vars as dg_status.sh so a site
+# only has to tune them in one place.
+LAG_WARN_SEQ="${DG_SEQ_GAP_WARN:-1}"
+LAG_CRIT_SEQ="${DG_SEQ_GAP_CRIT:-5}"
+case "$LAG_WARN_SEQ" in ''|*[!0-9]*) LAG_WARN_SEQ=1 ;; esac
+case "$LAG_CRIT_SEQ" in ''|*[!0-9]*) LAG_CRIT_SEQ=5 ;; esac
+
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY")
@@ -660,6 +765,64 @@ fi
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Data Guard Broker is not started")
+fi
+
+# Redo apply progress: a standby that is many sequences behind is not a
+# usable failover target, no matter what the broker says.
+if [[ "$APPLY_LAG_SEQ" -gt "$LAG_CRIT_SEQ" ]]; then
+    escalate_verdict "ERROR"
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences (threshold ${LAG_CRIT_SEQ})")
+elif [[ "$APPLY_LAG_SEQ" -gt "$LAG_WARN_SEQ" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences")
+fi
+
+# Switchover readiness. On a healthy primary this is TO STANDBY / SESSIONS
+# ACTIVE; the gap and destination states below mean redo transport is broken.
+case "$(printf '%s' "$SWITCHOVER_STATUS" | tr '[:lower:]' '[:upper:]')" in
+    *"FAILED DESTINATION"*|*"UNRESOLVABLE GAP"*|*"LOG SWITCH GAP"*)
+        escalate_verdict "ERROR"
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        ;;
+    *"RESOLVABLE GAP"*|*"RECOVERY NEEDED"*|*"PREPARING"*)
+        escalate_verdict "WARNING"
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        ;;
+esac
+
+# The broker's own verdict. DGMGRL always exits 0, so the captured text is
+# the only signal - scan it the same way the setup scripts do.
+if [[ -n "$BROKER_OUTPUT" ]]; then
+    BROKER_CONFIG_STATUS=$(extract_configuration_status "$BROKER_OUTPUT")
+    case "$BROKER_CONFIG_STATUS" in
+        ERROR)
+            escalate_verdict "ERROR"
+            VERDICT_NOTES+=("Broker Configuration Status is ERROR")
+            ;;
+        WARNING)
+            escalate_verdict "WARNING"
+            VERDICT_NOTES+=("Broker Configuration Status is WARNING")
+            ;;
+    esac
+    if broker_output_has_error "$BROKER_OUTPUT"; then
+        escalate_verdict "ERROR"
+        VERDICT_NOTES+=("Broker reported ORA-/DGM- errors (see Broker Configuration section)")
+    fi
+fi
+
+# Role-aware descriptors are only safe once the trigger is deployed.
+if [[ "$ROLE_TRIGGER_READY" != "YES" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Role-aware service trigger is not deployed/enabled")
+fi
+
+if [[ -n "$STANDBY_DB_UNIQUE_NAME" && "$STANDBY_OPEN_MODE" == "unknown" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Standby readability could not be determined from the broker")
+fi
+
+if [[ ${#VERDICT_NOTES[@]} -eq 0 ]]; then
+    VERDICT_NOTES+=("No role, transport, apply, broker or trigger issues detected")
 fi
 
 # ============================================================
@@ -730,7 +893,9 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
     if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
         echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
     fi
-    echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    fi
     echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
     echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
     echo ""
@@ -809,7 +974,7 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
             render_driver_table "$EASY_HA"
             STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
             if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
-                echo "Standby-only note: standby is MOUNTED - direct standby connections will fail until it is opened READ ONLY."
+                echo "Standby-only note: the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
                 echo ""
             elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
                 echo "Standby-only note: READ ONLY WITH APPLY requires the appropriate Active Data Guard license. Reads can lag primary commits, read-your-writes is not guaranteed, and DML fails with ORA-16000."
@@ -878,6 +1043,11 @@ if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
     done
 fi
 info "Verdict: ${VERDICT}  |  Apply lag: ${APPLY_LAG_SEQ}  |  Gaps: ${GAP_COUNT}  |  Services: ${#SERVICE_LIST[@]}"
+if [[ "$VERDICT" != "HEALTHY" ]]; then
+    for n in "${VERDICT_NOTES[@]}"; do
+        warn "  ${VERDICT}: ${n}"
+    done
+fi
 
 case "$VERDICT" in
     ERROR)   exit 1 ;;

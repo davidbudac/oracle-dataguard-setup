@@ -66,9 +66,17 @@ get_config() {
     # Set wallet directory (env override, then config, then ORACLE_HOME default)
     WALLET_DIR="${WALLET_DIR:-${OBSERVER_WALLET_DIR:-${ORACLE_HOME}/network/admin/wallet}}"
 
-    # Set PID and log file paths
+    # Set PID and log file paths.
+    # Two separate log files, deliberately: OBSERVER_LOG_FILE is the dgmgrl
+    # observer process's own stdout/stderr, which holds FSFO failover
+    # history and must never be truncated on a later start/restart.
+    # LOG_FILE is dg_functions.sh's global log target for this script's own
+    # log_info/log_warn/log_error messages - if it shared OBSERVER_LOG_FILE's
+    # path, do_start()'s truncating redirect into that path would wipe the
+    # observer's history every time (the bug this split fixes).
     PID_FILE="${NFS_SHARE}/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.pid"
-    LOG_FILE="${NFS_SHARE}/logs/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.log"
+    OBSERVER_LOG_FILE="${NFS_SHARE}/logs/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.log"
+    LOG_FILE="${NFS_SHARE}/logs/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}_script.log"
 }
 
 check_wallet_exists() {
@@ -323,7 +331,17 @@ EOF
     # is a known limitation of the mkstore CLI, not something this script
     # can route around; the exposure is a one-time setup event, not a
     # persistent service argv.
+    #
+    # Delete-then-create (mirrors common/setup_dg_wallet.sh's
+    # add_credential()): re-running setup into an existing wallet (e.g. to
+    # rotate the observer password) otherwise hits "Failed to add
+    # credential" because -createCredential refuses to overwrite an alias
+    # that's already present. The delete is a no-op (ignored) when the
+    # entry doesn't exist yet.
     log_info "Adding credential for $PRIMARY_TNS_ALIAS..."
+    "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -deleteCredential "$PRIMARY_TNS_ALIAS" << EOF 2>/dev/null || true
+${WALLET_PASSWORD}
+EOF
     if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$PRIMARY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
@@ -333,8 +351,12 @@ EOF
         exit 1
     fi
 
-    # Add credential for standby (same mkstore argv caveat as above)
+    # Add credential for standby (same mkstore argv caveat and
+    # delete-then-create pattern as above)
     log_info "Adding credential for $STANDBY_TNS_ALIAS..."
+    "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -deleteCredential "$STANDBY_TNS_ALIAS" << EOF 2>/dev/null || true
+${WALLET_PASSWORD}
+EOF
     if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$STANDBY_TNS_ALIAS" "$OBSERVER_USER" "$OBSERVER_PASSWORD" << EOF
 ${WALLET_PASSWORD}
 EOF
@@ -398,7 +420,12 @@ SQLNET.WALLET_OVERRIDE = TRUE
 "
 
     if [[ -f "$SQLNET_FILE" ]]; then
-        if grep -q "WALLET_LOCATION" "$SQLNET_FILE"; then
+        # Anchored to only match a WALLET_LOCATION entry, not
+        # ENCRYPTION_WALLET_LOCATION (TDE keystore) - a plain substring grep
+        # matches both, so on a TDE host (e.g. cdb1 on dbmint) this used to
+        # report the TDE keystore as the "existing" observer wallet and skip
+        # adding the real WALLET_LOCATION entry entirely.
+        if grep -Eq '^[[:space:]]*WALLET_LOCATION' "$SQLNET_FILE"; then
             log_warn "WALLET_LOCATION already exists in sqlnet.ora"
             log_warn "Please verify it points to: $WALLET_DIR"
         else
@@ -516,13 +543,23 @@ do_start() {
     fi
 
     # Ensure log directory exists
-    mkdir -p "$(dirname "$LOG_FILE")"
+    mkdir -p "$(dirname "$OBSERVER_LOG_FILE")"
 
     # Start observer in background using wallet authentication
     log_info "Starting observer process..."
-    log_info "Log file: $LOG_FILE"
+    log_info "Observer log file: $OBSERVER_LOG_FILE"
 
-    nohup "$ORACLE_HOME/bin/dgmgrl" "/@${PRIMARY_TNS_ALIAS}" "START OBSERVER" > "$LOG_FILE" 2>&1 &
+    # Append (never truncate): OBSERVER_LOG_FILE accumulates the dgmgrl
+    # observer's own stdout/stderr across every start/restart, including
+    # FSFO failover records from previous runs. A leading marker makes each
+    # run's boundary visible in the accumulated file.
+    {
+        printf '\n============================================================\n'
+        printf 'Observer starting: %s (host: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)"
+        printf '============================================================\n'
+    } >> "$OBSERVER_LOG_FILE"
+
+    nohup "$ORACLE_HOME/bin/dgmgrl" "/@${PRIMARY_TNS_ALIAS}" "START OBSERVER" >> "$OBSERVER_LOG_FILE" 2>&1 &
     OBSERVER_PID=$!
 
     # Save host:PID (pidfile lives on the NFS share, PIDs are host-local)
@@ -537,16 +574,16 @@ do_start() {
         echo "Observer is now monitoring the Data Guard configuration."
         echo ""
         echo "To check status: ./observer.sh status"
-        echo "To view logs:    tail -f $LOG_FILE"
+        echo "To view logs:    tail -f $OBSERVER_LOG_FILE"
         echo "To stop:         ./observer.sh stop"
     else
         log_error "Observer failed to start"
-        log_error "Check log file: $LOG_FILE"
+        log_error "Check observer log file: $OBSERVER_LOG_FILE"
 
-        if [[ -f "$LOG_FILE" ]]; then
+        if [[ -f "$OBSERVER_LOG_FILE" ]]; then
             echo ""
             echo "Last 10 lines of log:"
-            tail -10 "$LOG_FILE"
+            tail -10 "$OBSERVER_LOG_FILE"
         fi
 
         rm -f "$PID_FILE"
@@ -589,17 +626,35 @@ do_stop() {
         count=$((count + 1))
     done
 
+    # kill -0 only proves *some* process still owns this PID. After the up
+    # to ~33s wait across this function, the PID could have been recycled
+    # by an unrelated process - re-validate it's still a dgmgrl process
+    # (same check as is_observer_running()) immediately before each signal,
+    # not just once at entry, or a PID-reuse race could kill the wrong
+    # process.
+    _pid_is_dgmgrl() {
+        ps -p "$1" -o args= 2>/dev/null | grep -qi 'dgmgrl'
+    }
+
     # Force kill if still running
     if kill -0 "$pid" 2>/dev/null; then
-        log_warn "Observer did not stop gracefully, sending SIGTERM..."
-        kill -TERM "$pid" 2>/dev/null || true
-        sleep 2
+        if _pid_is_dgmgrl "$pid"; then
+            log_warn "Observer did not stop gracefully, sending SIGTERM..."
+            kill -TERM "$pid" 2>/dev/null || true
+            sleep 2
+        else
+            log_warn "PID $pid is no longer a dgmgrl process (PID reuse?) - not sending SIGTERM"
+        fi
     fi
 
     if kill -0 "$pid" 2>/dev/null; then
-        log_warn "Observer still running, sending SIGKILL..."
-        kill -KILL "$pid" 2>/dev/null || true
-        sleep 1
+        if _pid_is_dgmgrl "$pid"; then
+            log_warn "Observer still running, sending SIGKILL..."
+            kill -KILL "$pid" 2>/dev/null || true
+            sleep 1
+        else
+            log_warn "PID $pid is no longer a dgmgrl process (PID reuse?) - not sending SIGKILL"
+        fi
     fi
 
     # Cleanup PID file
@@ -607,6 +662,9 @@ do_stop() {
 
     if ! kill -0 "$pid" 2>/dev/null; then
         log_info "Observer stopped successfully"
+    elif ! _pid_is_dgmgrl "$pid"; then
+        log_warn "PID $pid is still running but is no longer a dgmgrl process (PID reuse) - left alone"
+        log_info "The observer process itself already exited"
     else
         log_error "Failed to stop observer (PID: $pid)"
         exit 1
@@ -628,7 +686,8 @@ do_status() {
             echo "Process Status : RUNNING (PID: $OBSERVER_PID)"
         fi
         echo "PID File       : $PID_FILE"
-        echo "Log File       : $LOG_FILE"
+        echo "Observer Log   : $OBSERVER_LOG_FILE"
+        echo "Script Log     : $LOG_FILE"
     else
         echo "Process Status : NOT RUNNING"
         if [[ -f "$PID_FILE" ]]; then

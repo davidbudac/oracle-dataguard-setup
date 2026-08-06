@@ -189,32 +189,32 @@ else
     RANDOM_PWD=$(od -An -tx1 -N 16 /dev/urandom | tr -d '[:space:]' | cut -c1-30)
 fi
 
-log_info "Changing SYS password and locking account..."
+log_info "Changing SYS password..."
 log_cmd "sqlplus / as sysdba:" "ALTER USER SYS IDENTIFIED BY '********'"
-log_cmd "sqlplus / as sysdba:" "ALTER USER SYS ACCOUNT LOCK"
 
-# Change SYS password and lock the account. WHENEVER SQLERROR EXIT
-# SQL.SQLCODE ensures a failed password change (e.g. rejected by a password
-# verify function) aborts BEFORE the ACCOUNT LOCK statement runs, so we
-# never lock SYS while leaving the old password in place. The exit code
-# (not a 'SUCCESS' marker in captured output) is the authoritative result.
-confirm_approval_action "Run SQL command" "ALTER USER SYS IDENTIFIED BY ******** ; ALTER USER SYS ACCOUNT LOCK" || exit 1
+# H6: password rotation and account lock run as two SEPARATE sqlplus calls
+# with separate exit codes, so a failure after rotation can be told apart
+# from a failure before anything changed. WHENEVER SQLERROR EXIT
+# SQL.SQLCODE makes each call's exit code the authoritative result.
+confirm_approval_action "Run SQL command" "ALTER USER SYS IDENTIFIED BY ********" || exit 1
 pause_verbose_trace
-SECURE_SYS_RC=0
-sqlplus -s / as sysdba <<EOF || SECURE_SYS_RC=$?
+PASSWORD_CHANGE_RC=0
+sqlplus -s / as sysdba <<EOF || PASSWORD_CHANGE_RC=$?
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
 ALTER USER SYS IDENTIFIED BY "${RANDOM_PWD}";
-ALTER USER SYS ACCOUNT LOCK;
 EXIT SUCCESS;
 EOF
 resume_verbose_trace
-if [[ "$SECURE_SYS_RC" -eq 0 ]]; then
-    log_success "SYS account secured successfully"
-else
-    log_error "Failed to secure SYS account"
-    log_error "Please secure manually:"
+
+if [[ "$PASSWORD_CHANGE_RC" -ne 0 ]]; then
+    # Nothing changed: SYS still has its previous password and is still
+    # unlocked. Safe to wipe the never-applied random password and bail
+    # out before touching the account lock or standby propagation.
+    log_error "Failed to change the SYS password (rc=${PASSWORD_CHANGE_RC}) - SYS account is UNCHANGED"
+    log_error "SYS still has its previous password and is still unlocked; nothing was propagated to the standby."
+    log_error "Please investigate and secure manually if desired:"
     log_error "  ALTER USER SYS IDENTIFIED BY '<random_password>';"
     log_error "  ALTER USER SYS ACCOUNT LOCK;"
     RANDOM_PWD=""
@@ -222,7 +222,43 @@ else
     exit 1
 fi
 
-# Clear the password variable immediately
+log_info "SYS password changed. Locking the account..."
+log_cmd "sqlplus / as sysdba:" "ALTER USER SYS ACCOUNT LOCK"
+pause_verbose_trace
+LOCK_RC=0
+sqlplus -s / as sysdba <<EOF || LOCK_RC=$?
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER OSERROR EXIT FAILURE
+SET HEADING OFF FEEDBACK OFF VERIFY OFF
+ALTER USER SYS ACCOUNT LOCK;
+EXIT SUCCESS;
+EOF
+resume_verbose_trace
+
+# H6: SYS_LOCK_FAILED tracks the partial-failure state (password rotated,
+# lock did not apply) through the rest of the script - propagation and the
+# ACTION REQUIRED block below must still run either way, since the primary
+# side is already rotated and the standby's copy is already stale
+# regardless of whether the lock succeeded.
+SYS_LOCK_FAILED=0
+if [[ "$LOCK_RC" -eq 0 ]]; then
+    log_success "SYS account secured successfully (password rotated and locked)"
+else
+    SYS_LOCK_FAILED=1
+    log_error "SYS password was changed successfully, but ACCOUNT LOCK failed (rc=${LOCK_RC})"
+    log_error "CURRENT STATE OF SYS: password has been ROTATED to a new random value (never stored or"
+    log_error "displayed) and the account is still UNLOCKED. No one can authenticate as SYS with a"
+    log_error "password until you lock it below (OS authentication - '/ as sysdba' - still works)."
+    log_error "Run this manually on the primary as soon as possible:"
+    log_error "  sqlplus / as sysdba"
+    log_error "  ALTER USER SYS ACCOUNT LOCK;"
+    log_warn "Continuing: the password file will still be propagated to the standby below, since the"
+    log_warn "password was already rotated on the primary and the standby's copy is stale either way."
+fi
+
+# Clear the password variable immediately - it is never needed again
+# regardless of the lock outcome above (H6: the password itself is never
+# printed, logged, or stored anywhere).
 RANDOM_PWD=""
 unset RANDOM_PWD
 
@@ -266,6 +302,13 @@ progress_step "Propagating Password File to Standby"
 
 ORAPW_FILE="${ORACLE_HOME}/dbs/orapw${ORACLE_SID}"
 NFS_ORAPW_STAGING="${NFS_SHARE}/orapw${STANDBY_ORACLE_SID}_hardened"
+# L6: step 1 also staged the primary's password file under this name
+# (orapw<PRIMARY_ORACLE_SID> - see 01_gather_primary_info.sh), and step 3
+# reads exactly that filename when (re-)installing the standby's password
+# file. Refresh it here too, not just the _hardened copy - otherwise a
+# re-run of step 3 after hardening silently re-installs the PRE-rotation
+# password file on the standby.
+NFS_ORAPW_CANONICAL="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID:-}"
 
 if [[ -f "$ORAPW_FILE" ]]; then
     log_info "Staging refreshed password file on the NFS share..."
@@ -275,11 +318,29 @@ if [[ -f "$ORAPW_FILE" ]]; then
     log_success "Password file staged at: $NFS_ORAPW_STAGING"
     record_artifact "password_file_hardened:${NFS_ORAPW_STAGING}"
 
+    if [[ -n "${PRIMARY_ORACLE_SID:-}" ]]; then
+        confirm_approval_action "Refresh step-1 staged primary password file on NFS share" "cp $ORAPW_FILE $NFS_ORAPW_CANONICAL && chmod 600 $NFS_ORAPW_CANONICAL" || exit 1
+        ( umask 077; cp "$ORAPW_FILE" "$NFS_ORAPW_CANONICAL" )
+        chmod 600 "$NFS_ORAPW_CANONICAL"
+        log_success "Refreshed step-1 staged copy: $NFS_ORAPW_CANONICAL"
+        record_artifact "password_file_refreshed:${NFS_ORAPW_CANONICAL}"
+    else
+        log_warn "PRIMARY_ORACLE_SID not set in the config file - could not refresh the step-1 staged password file (${NFS_SHARE}/orapw<PRIMARY_ORACLE_SID>)"
+    fi
+
     print_list_block "ACTION REQUIRED on STANDBY (${STANDBY_DB_UNIQUE_NAME})" \
         "Copy the refreshed password file from the NFS share to the standby's dbs directory:" \
         "  cp ${NFS_ORAPW_STAGING} <STANDBY_ORACLE_HOME>/dbs/orapw${STANDBY_ORACLE_SID}" \
         "  chmod 640 <STANDBY_ORACLE_HOME>/dbs/orapw${STANDBY_ORACLE_SID}" \
         "Until this is done, redo transport will fail with ORA-16191 on the next reconnect or restart."
+
+    if [[ "$SYS_LOCK_FAILED" -eq 1 ]]; then
+        print_list_block "ACTION REQUIRED on PRIMARY (${DB_UNIQUE_NAME})" \
+            "SYS is UNLOCKED with a freshly-rotated, unrecorded password - nobody can authenticate as SYS via" \
+            "password until you act (OS authentication still works)." \
+            "Run: sqlplus / as sysdba, then: ALTER USER SYS ACCOUNT LOCK;" \
+            "Re-run this step afterward if you want the checks below to re-confirm the locked state."
+    fi
 else
     log_error "Primary password file not found: $ORAPW_FILE"
     log_error "Cannot stage a refreshed password file for the standby."
@@ -323,14 +384,23 @@ if [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
         echo "$ARCHIVE_DEST_ERRORS"
     fi
 else
-    log_info "PASS: No ORA-16191 transport errors detected"
+    # M12: absence of ORA-16191 immediately after rotation is EXPECTED, not
+    # proof the standby's copy is already refreshed - existing transport
+    # connections stay authenticated on the password already in use and
+    # only fail on the *next* reconnect/restart. Word this so it doesn't
+    # contradict the ACTION REQUIRED block above.
+    log_info "No ORA-16191 transport errors detected yet - expected right after rotation, since existing"
+    log_info "transport connections stay authenticated until they reconnect. Install the staged password"
+    log_info "file on the standby (see ACTION REQUIRED above) before the next reconnect or restart."
 fi
 
 # ============================================================
 # Summary
 # ============================================================
 
-if [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
+if [[ "$SYS_LOCK_FAILED" -eq 1 ]]; then
+    print_summary "ERROR" "SYS password rotated but ACCOUNT LOCK failed - SYS is UNLOCKED with an unrecorded password; run 'ALTER USER SYS ACCOUNT LOCK;' manually (see ACTION REQUIRED above)"
+elif [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
     print_summary "ERROR" "Security hardening applied, but redo transport is failing with ORA-16191 until the standby's password file is refreshed"
 else
     print_summary "SUCCESS" "Security hardening complete"
@@ -342,12 +412,25 @@ print_status_block "Security State" \
     "OS Authentication" "$(if echo "$TEST_RESULT" | grep -q "OS_AUTH_OK"; then echo OK; else echo CHECK_MANUALLY; fi)" \
     "Redo Transport" "$TRANSPORT_STATUS"
 
-print_list_block "Completed Actions" \
-    "Changed the SYS password to a random value that is not stored." \
-    "Locked the SYS account." \
-    "Staged the refreshed password file on the NFS share for the standby."
+if [[ "$SYS_LOCK_FAILED" -eq 1 ]]; then
+    print_list_block "Completed Actions" \
+        "Changed the SYS password to a random value that is not stored." \
+        "ACCOUNT LOCK failed - SYS is still unlocked (see ACTION REQUIRED above)." \
+        "Staged the refreshed password file on the NFS share for the standby."
+else
+    print_list_block "Completed Actions" \
+        "Changed the SYS password to a random value that is not stored." \
+        "Locked the SYS account." \
+        "Staged the refreshed password file on the NFS share for the standby."
+fi
 
-if [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
+if [[ "$SYS_LOCK_FAILED" -eq 1 ]]; then
+    print_list_block "Important Notes" \
+        "Use OS authentication for DBA access right now: sqlplus / as sysdba" \
+        "SYS is UNLOCKED with a freshly-rotated, unrecorded password - lock it manually (see ACTION REQUIRED above)." \
+        "Redo transport will fail with ORA-16191 on the next reconnect/restart until the standby's password file is refreshed." \
+        "Consider locking other privileged accounts such as SYSTEM."
+elif [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
     print_list_block "Important Notes" \
         "Use OS authentication for future DBA access: sqlplus / as sysdba" \
         "Redo transport is currently BROKEN (ORA-16191) - install the staged password file on the standby now (see ACTION REQUIRED above)." \
@@ -356,14 +439,15 @@ if [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
 else
     print_list_block "Important Notes" \
         "Use OS authentication for future DBA access: sqlplus / as sysdba" \
-        "Data Guard redo transport still works through the password file." \
+        "Redo transport will fail with ORA-16191 on the next reconnect/restart until the standby's password file is refreshed (see ACTION REQUIRED above)." \
         "To unlock SYS later: ALTER USER SYS ACCOUNT UNLOCK; ALTER USER SYS IDENTIFIED BY '<new_password>';" \
         "Consider locking other privileged accounts such as SYSTEM."
 fi
 
-# Fail loudly (non-zero exit) when redo transport is confirmed broken so
-# automation/orchestration notices immediately, even though the account
-# change itself already succeeded and cannot be rolled back from here.
-if [[ "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
+# Fail loudly (non-zero exit) when redo transport is confirmed broken, or
+# when SYS was rotated but left unlocked, so automation/orchestration
+# notices immediately - even though the account change itself already
+# succeeded (fully or partially) and cannot be rolled back from here.
+if [[ "$SYS_LOCK_FAILED" -eq 1 || "$TRANSPORT_STATUS" == "ORA-16191" ]]; then
     exit 1
 fi

@@ -624,7 +624,7 @@ get_db_parameter() {
     local param_name="$1"
     local value
     value=$(run_sql_query "get_db_parameter.sql" "$param_name")
-    echo "$value" | tr -d ' \n\r'
+    echo "$value" | tr -d ' \t\n\r'
 }
 
 # Get a database property value
@@ -633,7 +633,7 @@ get_db_property() {
     local prop_name="$1"
     local value
     value=$(run_sql_query "get_db_property.sql" "$prop_name")
-    echo "$value" | tr -d ' \n\r'
+    echo "$value" | tr -d ' \t\n\r'
 }
 
 # ============================================================
@@ -922,6 +922,12 @@ prompt_and_verify_local_sys_password() {
         pw=$(prompt_password "$prompt_text")
         if [[ -z "$pw" ]]; then
             log_warn "SYS password cannot be empty (attempt ${attempt}/${max_attempts})"
+        elif [[ "$pw" == *'"'* ]]; then
+            # verify_sys_password() (and RMAN's CONNECT string) embed the
+            # password inside double quotes (sys/"<pw>"@...) - an embedded
+            # quote breaks that syntax and would otherwise be misreported as
+            # a plain "Invalid SYS password" a few lines below (L16).
+            log_warn "SYS password must not contain a double-quote (\") character - it breaks the sys/\"<pw>\"@ connect syntax (attempt ${attempt}/${max_attempts})"
         elif verify_sys_password "$pw" "$probe_target"; then
             log_success "SYS password verified against the local primary database"
             export SYS_PASSWORD="$pw"
@@ -1266,6 +1272,51 @@ confirm_proceed() {
             return 1
             ;;
     esac
+}
+
+# Guard a confirm_proceed()-style validation gate so it never blocks a
+# --check/-n run before it reaches the preflight summary, and never blocks
+# silently on a non-interactive stdin (M8).
+#
+#   - CHECK_ONLY=1: the finding is logged and this returns 0 ("continue") -
+#     safe because CHECK_ONLY callers only run read-only work between here
+#     and their own finish_check_mode exit; no mutation happens either way.
+#   - CHECK_ONLY=0 and stdin is not a TTY: default to "no" (abort) with an
+#     explicit message rather than silently consuming/misreading whatever
+#     is next on stdin. Points the operator at -n/--check.
+#   - CHECK_ONLY=0 and stdin is a TTY: behaves exactly like confirm_proceed
+#     (interactive prompt).
+#
+# Usage: confirm_proceed_or_check "<message>" && ... (same calling
+# convention as confirm_proceed - non-zero return means "do not proceed").
+# Compare two hostnames tolerantly: case-insensitive, and a short name
+# matches its own FQDN (config files usually carry the short name while
+# `hostname` returns the FQDN, or vice versa). Only the first label is
+# compared when either side is unqualified; two different domains with the
+# same short name still match - acceptable for a "am I on the right host?"
+# sanity check, not for security decisions.
+hostnames_match() {
+    local a b
+    a=$(printf '%s' "${1%%.*}" | tr '[:upper:]' '[:lower:]')
+    b=$(printf '%s' "${2%%.*}" | tr '[:upper:]' '[:lower:]')
+    [[ -n "$a" && "$a" == "$b" ]]
+}
+
+confirm_proceed_or_check() {
+    local message="$1"
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_warn "$message (check mode - continuing to the preflight summary without prompting)"
+        return 0
+    fi
+
+    if [[ ! -t 0 ]]; then
+        log_warn "$message"
+        log_warn "Non-interactive stdin: aborting (re-run with -n/--check to preview without prompting, or attach a TTY to confirm interactively)."
+        return 1
+    fi
+
+    confirm_proceed "$message"
 }
 
 confirm_typed_value() {

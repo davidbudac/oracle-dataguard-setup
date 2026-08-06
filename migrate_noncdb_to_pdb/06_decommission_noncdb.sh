@@ -39,8 +39,18 @@ fi
 
 # Sanity: do not decommission if the new PDB hasn't been verified
 if [[ "$(read_state verify_done)" != "true" ]]; then
-    log_error "Step 05 has not been recorded as completed. Refusing to decommission."
+    log_error "Step 05 has not been recorded as completed successfully. Refusing to decommission."
     log_error "If you are sure, edit ${MIGRATE_STATE_FILE} or run 05_verify_pdb_dataguard.sh."
+    exit 1
+fi
+
+# Belt-and-braces: verify_done is only set "true" by 05 when FAIL==0, but
+# check verify_failures independently too in case the state file was ever
+# hand-edited or written by an older version of 05.
+VERIFY_FAILURES="$(read_state verify_failures)"
+if [[ -n "$VERIFY_FAILURES" && "$VERIFY_FAILURES" != "0" ]]; then
+    log_error "Step 05 recorded ${VERIFY_FAILURES} verification failure(s). Refusing to decommission."
+    log_error "Fix the failures and re-run 05_verify_pdb_dataguard.sh until it reports 0 failures."
     exit 1
 fi
 

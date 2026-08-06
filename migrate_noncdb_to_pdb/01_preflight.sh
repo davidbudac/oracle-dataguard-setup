@@ -159,20 +159,43 @@ fi
 log_info "Checking source non-CDB Data Guard ..."
 SRC_DG="$(run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW CONFIGURATION;")" || true
 echo "$SRC_DG" | tee_into_log
-echo "$SRC_DG" | grep -qiE "ORA-|Error" && fail "Source DG broker has errors"
+dgmgrl_output_has_error "$SRC_DG" && fail "Source DG broker has errors"
 echo "$SRC_DG" | grep -qi "SUCCESS" || log_warn "Source DG status not SUCCESS"
 
 log_info "Checking target CDB Data Guard ..."
 TGT_DG="$(run_dgmgrl "$TARGET_CDB_ORACLE_SID" "SHOW CONFIGURATION;")" || true
 echo "$TGT_DG" | tee_into_log
-echo "$TGT_DG" | grep -qiE "ORA-|Error" && fail "Target DG broker has errors"
+dgmgrl_output_has_error "$TGT_DG" && fail "Target DG broker has errors"
 echo "$TGT_DG" | grep -qi "SUCCESS" || log_warn "Target DG status not SUCCESS"
 
-# Apply lag must be 0 on both standbys (we'll show, then check transport/apply)
+# Apply lag must be 0 on both standbys before we call this ready. Previously
+# SHOW DATABASE output was printed and discarded here - the banner promised
+# "apply lag = 0, no active gaps" but nothing actually checked it.
 log_info "Apply / transport lag (source standby ${SOURCE_STANDBY_UNIQUE_NAME}) ..."
-run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW DATABASE '${SOURCE_STANDBY_UNIQUE_NAME}';" | tee_into_log || true
+SRC_STBY_DG="$(run_dgmgrl "$SOURCE_ORACLE_SID" "SHOW DATABASE '${SOURCE_STANDBY_UNIQUE_NAME}';")" || true
+echo "$SRC_STBY_DG" | tee_into_log
+SRC_APPLY_LAG=$(echo "$SRC_STBY_DG" | awk -F: '/Apply Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
+SRC_TPT_LAG=$(echo "$SRC_STBY_DG" | awk -F: '/Transport Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
+if [[ -z "$SRC_APPLY_LAG" || -z "$SRC_TPT_LAG" ]]; then
+    fail "Could not parse apply/transport lag for source standby ${SOURCE_STANDBY_UNIQUE_NAME} from broker output"
+elif ! echo "$SRC_APPLY_LAG" | grep -qE "^0 second|^00:00:00" || ! echo "$SRC_TPT_LAG" | grep -qE "^0 second|^00:00:00"; then
+    fail "Source standby ${SOURCE_STANDBY_UNIQUE_NAME} is not caught up (apply='${SRC_APPLY_LAG}', transport='${SRC_TPT_LAG}')"
+else
+    log_success "Source standby is caught up (apply=0, transport=0)"
+fi
+
 log_info "Apply / transport lag (target CDB standby ${TARGET_CDB_STANDBY_UNIQUE_NAME}) ..."
-run_dgmgrl "$TARGET_CDB_ORACLE_SID" "SHOW DATABASE '${TARGET_CDB_STANDBY_UNIQUE_NAME}';" | tee_into_log || true
+TGT_STBY_DG="$(run_dgmgrl "$TARGET_CDB_ORACLE_SID" "SHOW DATABASE '${TARGET_CDB_STANDBY_UNIQUE_NAME}';")" || true
+echo "$TGT_STBY_DG" | tee_into_log
+TGT_APPLY_LAG=$(echo "$TGT_STBY_DG" | awk -F: '/Apply Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
+TGT_TPT_LAG=$(echo "$TGT_STBY_DG" | awk -F: '/Transport Lag/{gsub(/^[ \t]+|[ \t]+$/,"",$2); print $2; exit}')
+if [[ -z "$TGT_APPLY_LAG" || -z "$TGT_TPT_LAG" ]]; then
+    fail "Could not parse apply/transport lag for target CDB standby ${TARGET_CDB_STANDBY_UNIQUE_NAME} from broker output"
+elif ! echo "$TGT_APPLY_LAG" | grep -qE "^0 second|^00:00:00" || ! echo "$TGT_TPT_LAG" | grep -qE "^0 second|^00:00:00"; then
+    fail "Target CDB standby ${TARGET_CDB_STANDBY_UNIQUE_NAME} is not caught up (apply='${TGT_APPLY_LAG}', transport='${TGT_TPT_LAG}')"
+else
+    log_success "Target CDB standby is caught up (apply=0, transport=0)"
+fi
 
 # ---- 6. Datafile target dir on CDB primary ---------------------------------
 mkdir -p "${TARGET_PDB_DATAFILE_DIR}/${NEW_PDB_NAME}" 2>/dev/null || \

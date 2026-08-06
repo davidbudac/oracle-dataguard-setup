@@ -60,7 +60,15 @@ if [[ ! -s "$MIGRATE_MANIFEST" ]]; then
     log_error "Manifest file not produced or empty: ${MIGRATE_MANIFEST}"
     exit 1
 fi
-log_success "Manifest written: $(stat -c%s "$MIGRATE_MANIFEST" 2>/dev/null || stat -f%z "$MIGRATE_MANIFEST") bytes"
+
+# file_size_bytes: AIX 7.2 has no stat(1) at all (neither the GNU -c%s nor
+# the BSD -f%z flavor), so a stat/stat fallback chain still fails there.
+# wc -c is POSIX and available everywhere this project targets.
+file_size_bytes() {
+    wc -c < "$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+log_success "Manifest written: $(file_size_bytes "$MIGRATE_MANIFEST") bytes"
 
 # ---- 2. Collect datafile list ---------------------------------------------
 log_info "Collecting source datafile list ..."
@@ -80,6 +88,26 @@ DF_COUNT=$(wc -l < "$DF_FILE" | tr -d '[:space:]')
 log_info "Datafile count: ${DF_COUNT}"
 [[ "$DF_COUNT" == "0" ]] && { log_error "No datafiles found"; exit 1; }
 
+# ---- 2b. Detect duplicate basenames -----------------------------------------
+# Staging is a flat directory keyed by basename (stage_one() below). Two
+# datafiles with the same basename from different source directories would
+# silently clobber or skip each other there, plugging the PDB from a
+# mismatched datafile image. Catch it up front, before touching the stage.
+DUP_BASENAMES="$(awk -F/ '{print $NF}' "$DF_FILE" | sort | uniq -d)"
+if [[ -n "$DUP_BASENAMES" ]]; then
+    log_error "Duplicate datafile basenames found across different source directories:"
+    while IFS= read -r dup; do
+        [[ -z "$dup" ]] && continue
+        log_error "  ${dup}:"
+        grep -F "/${dup}" "$DF_FILE" | while IFS= read -r full; do
+            log_error "    ${full}"
+        done
+    done <<< "$DUP_BASENAMES"
+    log_error "Flat staging cannot disambiguate these - rename/relocate one of each pair on the"
+    log_error "source before re-running, or extend stage_one() to preserve a directory-qualified name."
+    exit 1
+fi
+
 # ---- 3. Stage datafiles to NFS ---------------------------------------------
 log_info "Staging datafiles to ${MIGRATE_DATAFILE_STAGE} ..."
 
@@ -90,8 +118,8 @@ stage_one() {
     local dst="${MIGRATE_DATAFILE_STAGE}/${base}"
     if [[ -f "$dst" ]]; then
         local s_size d_size
-        s_size=$(stat -c%s "$src" 2>/dev/null || stat -f%z "$src")
-        d_size=$(stat -c%s "$dst" 2>/dev/null || stat -f%z "$dst")
+        s_size=$(file_size_bytes "$src")
+        d_size=$(file_size_bytes "$dst")
         if [[ "$s_size" == "$d_size" ]]; then
             log_info "  already staged: ${base} (${s_size} bytes)"
             return 0

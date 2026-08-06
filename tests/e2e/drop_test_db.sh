@@ -171,8 +171,13 @@ SQLEOF
 
     # Remove DG broker files
     rm -f '${ORACLE_BASE}/oradata/dg_broker_config_'*.dat 2>/dev/null || true
-    rm -f '${ORACLE_HOME}/dbs/dr1'*.dat 2>/dev/null || true
-    rm -f '${ORACLE_HOME}/dbs/dr2'*.dat 2>/dev/null || true
+    # Only THIS test DB's broker files - a bare dr1*.dat glob would also
+    # delete the broker configuration of any OTHER database sharing this
+    # ORACLE_HOME (e.g. the persistent cdb1 pair on the test VMs).
+    rm -f '${ORACLE_HOME}/dbs/dr1${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+    rm -f '${ORACLE_HOME}/dbs/dr2${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+    rm -f '${ORACLE_HOME}/dbs/dr1${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+    rm -f '${ORACLE_HOME}/dbs/dr2${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
 
     # Remove DG TNS entries from tnsnames.ora and listener.ora
     for f in tnsnames.ora listener.ora; do
@@ -182,7 +187,25 @@ SQLEOF
             sed -i '/^# DG Listener/,\$d' \"\${local_f}\" 2>/dev/null || true
         fi
     done
-    sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
+    # Remove whole SID_DESC blocks that reference the test SID. A plain
+    # line-delete ('/sid/d') leaves behind invalid '(SID_DESC = (ORACLE_HOME'
+    # husks that make the next 'lsnrctl reload' fail with TNS-01155. Also
+    # drop blocks with no SID_NAME at all (husks left by older cleanups).
+    _lsnr='${ORACLE_HOME}/network/admin/listener.ora'
+    if [[ -f \"\${_lsnr}\" ]]; then
+        awk -v sid='${TEST_ORACLE_SID}' '
+            /^[[:space:]]*\\(SID_DESC/ && blk==0 { blk=1; depth=0; drop=0; hasname=0; n=0 }
+            blk==1 {
+                buf[++n]=\$0
+                for (i=1;i<=length(\$0);i++) { c=substr(\$0,i,1); if (c==\"(\") depth++; else if (c==\")\") depth-- }
+                if (index(tolower(\$0), tolower(sid)) > 0) drop=1
+                if (tolower(\$0) ~ /sid_name/) hasname=1
+                if (depth<=0) { blk=0; if (!drop && hasname) for (i=1;i<=n;i++) print buf[i] }
+                next
+            }
+            { print }
+        ' \"\${_lsnr}\" > \"\${_lsnr}.tmp\" && mv \"\${_lsnr}.tmp\" \"\${_lsnr}\" || rm -f \"\${_lsnr}.tmp\"
+    fi
 
     # Remove oratab entry
     if [[ -f /etc/oratab ]]; then
@@ -237,8 +260,11 @@ SQLEOF
 
         # Remove DG broker files
         rm -f '${ORACLE_BASE}/oradata/dg_broker_config_'*.dat 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr1'*.dat 2>/dev/null || true
-        rm -f '${ORACLE_HOME}/dbs/dr2'*.dat 2>/dev/null || true
+        # Only THIS test DB's broker files - see the primary-cleanup comment.
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr1${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
+        rm -f '${ORACLE_HOME}/dbs/dr2${TEST_STANDBY_DB_UNIQUE_NAME}.dat' 2>/dev/null || true
 
         # Remove wallet
         rm -rf '${ORACLE_HOME}/network/admin/wallet' 2>/dev/null || true
@@ -251,7 +277,22 @@ SQLEOF
                 sed -i '/^# DG Listener/,\$d' \"\${local_f}\" 2>/dev/null || true
             fi
         done
-        sed -i '/${TEST_ORACLE_SID}/d' '${ORACLE_HOME}/network/admin/listener.ora' 2>/dev/null || true
+        # Block-aware SID_DESC removal - see the primary-cleanup comment above.
+        _lsnr='${ORACLE_HOME}/network/admin/listener.ora'
+        if [[ -f \"\${_lsnr}\" ]]; then
+            awk -v sid='${TEST_ORACLE_SID}' '
+                /^[[:space:]]*\\(SID_DESC/ && blk==0 { blk=1; depth=0; drop=0; hasname=0; n=0 }
+                blk==1 {
+                    buf[++n]=\$0
+                    for (i=1;i<=length(\$0);i++) { c=substr(\$0,i,1); if (c==\"(\") depth++; else if (c==\")\") depth-- }
+                    if (index(tolower(\$0), tolower(sid)) > 0) drop=1
+                    if (tolower(\$0) ~ /sid_name/) hasname=1
+                    if (depth<=0) { blk=0; if (!drop && hasname) for (i=1;i<=n;i++) print buf[i] }
+                    next
+                }
+                { print }
+            ' \"\${_lsnr}\" > \"\${_lsnr}.tmp\" && mv \"\${_lsnr}.tmp\" \"\${_lsnr}\" || rm -f \"\${_lsnr}.tmp\"
+        fi
 
         # Remove oratab entry
         if [[ -f /etc/oratab ]]; then

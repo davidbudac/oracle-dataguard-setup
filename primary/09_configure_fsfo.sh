@@ -36,7 +36,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
-init_progress 13
+init_progress 14
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -75,7 +75,7 @@ init_log "09_configure_fsfo_${STANDBY_DB_UNIQUE_NAME}"
 progress_step "Verifying Database Role"
 
 DB_ROLE=$(run_sql_query "get_db_role.sql")
-DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \n\r')
+DB_ROLE=$(echo "$DB_ROLE" | tr -d ' \t\n\r')
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     log_error "This script must be run on the PRIMARY database"
@@ -106,7 +106,10 @@ elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
     echo ""
     echo "$CONFIG_STATUS"
     echo ""
-    if ! confirm_proceed "Continue with FSFO configuration?"; then
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # prompting, and a non-interactive real run aborts explicitly instead
+    # of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue with FSFO configuration?"; then
         log_info "FSFO configuration cancelled by user"
         exit 0
     fi
@@ -154,6 +157,29 @@ CURRENT_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' |
 log_info "Current protection mode: $CURRENT_MODE"
 
 # ============================================================
+# Detect Multitenant (CDB) Configuration
+# ============================================================
+# M11: on a CDB, CREATE USER without a C## prefix raises ORA-65096 (common
+# user names must start with C##/c##), and the observer needs to be
+# created as a common user anyway since dgmgrl connects at the root.
+
+progress_step "Detecting Multitenant (CDB) Configuration"
+
+IS_CDB=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT CDB FROM V$DATABASE;
+EXIT;
+EOSQL
+)
+IS_CDB=$(echo "$IS_CDB" | tr -d ' \t\n\r')
+
+if [[ "$IS_CDB" == "YES" ]]; then
+    log_info "Multitenant (CDB) database detected - the observer user must be a common (C##) user"
+else
+    log_info "Non-CDB (single-container) database detected"
+fi
+
+# ============================================================
 # Configuration Summary
 # ============================================================
 
@@ -192,17 +218,40 @@ echo "The observer requires a database user with SYSDG privilege."
 echo "You can use any username (e.g., dg_observer, fsfo_user, etc.)"
 echo ""
 
-# Default username suggestion
+# Default username suggestion (M11: a common-user prefix on a CDB)
 DEFAULT_OBSERVER_USER="dg_observer"
+[[ "$IS_CDB" == "YES" ]] && DEFAULT_OBSERVER_USER="c##dg_observer"
 
 prompt_with_default "Enter username for observer" "$DEFAULT_OBSERVER_USER" OBSERVER_USER
 
 # Convert to uppercase for Oracle
 OBSERVER_USER=$(echo "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
 
-if ! echo "$OBSERVER_USER" | grep -q '^[A-Za-z][A-Za-z0-9_$]*$' || [[ ${#OBSERVER_USER} -gt 30 ]]; then
+# M11: on a CDB, a common user name must start with C##. Auto-prefix
+# rather than reject outright - interactively, confirm first; in a
+# non-interactive run (e.g. piped automation), auto-prefix and log it
+# clearly rather than adding an unconditional new prompt.
+if [[ "$IS_CDB" == "YES" && "$OBSERVER_USER" != C##* ]]; then
+    log_warn "This is a CDB - a common user name must start with C##"
+    if [[ -t 0 ]]; then
+        if confirm_proceed "Auto-prefix the username as C##${OBSERVER_USER}?"; then
+            OBSERVER_USER="C##${OBSERVER_USER}"
+        else
+            log_error "Observer user must be a common user (C##...) on a CDB"
+            exit 1
+        fi
+    else
+        log_warn "Non-interactive stdin: auto-prefixing the observer username as C##${OBSERVER_USER}"
+        OBSERVER_USER="C##${OBSERVER_USER}"
+    fi
+fi
+
+# Validation regex allows '#' (needed for the CDB C## prefix) in addition
+# to letters/digits/underscore/dollar. 30-char cap is Oracle's identifier
+# limit.
+if ! echo "$OBSERVER_USER" | grep -q '^[A-Za-z][A-Za-z0-9_$#]*$' || [[ ${#OBSERVER_USER} -gt 30 ]]; then
     log_error "Invalid observer username: $OBSERVER_USER"
-    log_error "Usernames must start with a letter, contain only letters, numbers, underscore, and dollar sign, and be at most 30 characters"
+    log_error "Usernames must start with a letter, contain only letters, numbers, underscore, dollar sign, and (on a CDB) '#', and be at most 30 characters"
     exit 1
 fi
 
@@ -237,19 +286,23 @@ SELECT COUNT(*) FROM dba_users WHERE username = '${OBSERVER_USER}';
 EXIT;
 EOF
 )
-USER_EXISTS=$(echo "$USER_EXISTS" | tr -d ' \n\r')
+USER_EXISTS=$(echo "$USER_EXISTS" | tr -d ' \t\n\r')
 
 if [[ "$USER_EXISTS" == "1" ]]; then
     log_info "User $OBSERVER_USER already exists"
 
-    # Check if user has SYSDG privilege
+    # Check if user has SYSDG privilege. L5: SYSDG is a password-file/admin
+    # privilege - it never shows up in DBA_ROLE_PRIVS (that only lists
+    # regular roles). V$PWFILE_USERS is where it actually appears, so the
+    # old query was always false here and could never detect a SYSDG grant
+    # lost when step 8 replaced the password file.
     HAS_SYSDG=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
-SELECT COUNT(*) FROM dba_role_privs WHERE grantee = '${OBSERVER_USER}' AND granted_role = 'SYSDG';
+SELECT COUNT(*) FROM V\$PWFILE_USERS WHERE USERNAME = '${OBSERVER_USER}' AND SYSDG = 'TRUE';
 EXIT;
 EOF
 )
-    HAS_SYSDG=$(echo "$HAS_SYSDG" | tr -d ' \n\r')
+    HAS_SYSDG=$(echo "$HAS_SYSDG" | tr -d ' \t\n\r')
 
     if [[ "$HAS_SYSDG" == "1" ]]; then
         log_info "User $OBSERVER_USER already has SYSDG privilege"
@@ -385,7 +438,14 @@ if [[ "$CURRENT_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then
     log_info "Protection mode is already MAXIMUM AVAILABILITY"
 else
     log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROTECTION MODE AS MAXAVAILABILITY"
-    if ! DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl" 2>&1); then
+    # M7: no 2>&1 here - this is a mutating dgmgrl script, so run_dgmgrl's
+    # own confirm_approval_action prompt goes to stderr; merging it into
+    # this capture would swallow the prompt into $DGMGRL_OUTPUT invisibly
+    # while still blocking on `read`, which looks like a silent hang in
+    # approval mode. dgmgrl itself writes its output to stdout (same
+    # assumption run_dgmgrl_checked already relies on), so dropping the
+    # merge does not lose any diagnostic text.
+    if ! DGMGRL_OUTPUT=$(run_dgmgrl "set_maxavailability.dgmgrl"); then
         log_error "DGMGRL command failed:"
         echo ""
         echo "$DGMGRL_OUTPUT"
@@ -403,7 +463,7 @@ else
 
     # Verify change
     sleep 3
-    NEW_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \n\r')
+    NEW_MODE=$(run_sql_query "get_db_status_pipe.sql" | awk -F'|' '{print $3}' | tr -d ' \t\n\r')
     NEW_MODE_NORMALIZED=$(echo "$NEW_MODE" | tr -d ' ')
 
     if [[ "$NEW_MODE_NORMALIZED" == "MAXIMUMAVAILABILITY" ]]; then
@@ -441,7 +501,10 @@ log_info "FSFO target set to ${STANDBY_DB_UNIQUE_NAME}"
 progress_step "Enabling Fast-Start Failover"
 
 log_cmd "dgmgrl / :" "ENABLE FAST_START FAILOVER"
-ENABLE_RESULT=$(run_dgmgrl "enable_fsfo.dgmgrl" 2>&1 || true)
+# M7: no 2>&1 (see the set_maxavailability.dgmgrl call above) - this is
+# also a mutating dgmgrl script, so merging stderr would swallow the
+# approval-mode prompt into $ENABLE_RESULT while still blocking on `read`.
+ENABLE_RESULT=$(run_dgmgrl "enable_fsfo.dgmgrl" || true)
 
 if echo "$ENABLE_RESULT" | grep -qiE "error|fail"; then
     log_error "Failed to enable Fast-Start Failover"
