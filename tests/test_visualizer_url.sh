@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================
 # Test script for the dataguard-doc visualizer link helpers
-# embedded in dg_handoff.sh and primary/10_generate_handoff_report.sh
+# embedded in dg_handoff.sh, primary/10_generate_handoff_report.sh
+# and dg_viz_url.sh
 # ============================================================
 # Usage: bash tests/test_visualizer_url.sh
 #
@@ -9,8 +10,8 @@
 # the interactive Data Guard configuration explorer
 # (https://github.com/davidbudac/dataguard-doc, published at
 # https://davidbudac.cz/dataguard/). The block is duplicated in both
-# handoff scripts; this test:
-#   1. diffs the two copies (they must stay byte-identical)
+# handoff scripts and in the standalone link generator; this test:
+#   1. diffs all copies (they must stay byte-identical)
 #   2. sources the extracted block and checks the generated URL:
 #      base64url alphabet, decodable payload, correct JSON members,
 #      omission of unknown fields, protection-mode/transport mapping,
@@ -78,28 +79,38 @@ decode_cfg() {
 }
 
 # ============================================================
-# Test 1: the two embedded copies are byte-identical
+# Test 1: every embedded copy is byte-identical
 # ============================================================
-echo "Test 1: helper block identical in both handoff scripts"
+# dg_handoff.sh is the reference copy; each other script carrying the
+# block is diffed against it.
+echo "Test 1: helper block identical in every script that embeds it"
 BLOCK_A=$(extract_block "${REPO_DIR}/dg_handoff.sh")
-BLOCK_B=$(extract_block "${REPO_DIR}/primary/10_generate_handoff_report.sh")
-
 TMP_A="${TMPDIR:-/tmp}/viz_block_a.$$"
-TMP_B="${TMPDIR:-/tmp}/viz_block_b.$$"
 printf '%s\n' "$BLOCK_A" > "$TMP_A"
-printf '%s\n' "$BLOCK_B" > "$TMP_B"
-if [[ -z "$BLOCK_A" || -z "$BLOCK_B" ]]; then
-    echo "  FAIL: helper block markers not found in one of the scripts"
-    FAIL=$((FAIL + 1))
-elif diff "$TMP_A" "$TMP_B" >/dev/null; then
-    echo "  PASS: blocks are identical"
-    PASS=$((PASS + 1))
-else
-    echo "  FAIL: blocks differ between dg_handoff.sh and primary/10_generate_handoff_report.sh"
-    diff "$TMP_A" "$TMP_B" | head -20
+
+if [[ -z "$BLOCK_A" ]]; then
+    echo "  FAIL: helper block markers not found in dg_handoff.sh"
     FAIL=$((FAIL + 1))
 fi
-rm -f "$TMP_A" "$TMP_B"
+
+for OTHER in "primary/10_generate_handoff_report.sh" "dg_viz_url.sh"; do
+    BLOCK_B=$(extract_block "${REPO_DIR}/${OTHER}")
+    TMP_B="${TMPDIR:-/tmp}/viz_block_b.$$"
+    printf '%s\n' "$BLOCK_B" > "$TMP_B"
+    if [[ -z "$BLOCK_A" || -z "$BLOCK_B" ]]; then
+        echo "  FAIL: helper block markers not found in ${OTHER}"
+        FAIL=$((FAIL + 1))
+    elif diff "$TMP_A" "$TMP_B" >/dev/null; then
+        echo "  PASS: ${OTHER} matches dg_handoff.sh"
+        PASS=$((PASS + 1))
+    else
+        echo "  FAIL: block differs between dg_handoff.sh and ${OTHER}"
+        diff "$TMP_A" "$TMP_B" | head -20
+        FAIL=$((FAIL + 1))
+    fi
+    rm -f "$TMP_B"
+done
+rm -f "$TMP_A"
 
 # Everything below exercises the real code from dg_handoff.sh
 eval "$BLOCK_A"

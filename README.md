@@ -50,6 +50,7 @@ dataguard_setup/
 ├── dg_diag_sid.sh               # Deep local diagnostics (run on DB host)
 ├── dg_check_sid.sh              # Deprecated wrapper - prefer triage/diag
 ├── dg_handoff.sh                # Standalone handoff report (no setup-time deps)
+├── dg_viz_url.sh                # Standalone interactive-diagram link for an existing configuration
 ├── dg_check_srl.sh              # Standby redo log checker - prints fix DDL for missing/undersized SRLs
 │
 ├── docs/
@@ -131,6 +132,10 @@ bash common/setup_dg_wallet.sh
 # Handoff report regeneration (no NFS / no setup config required)
 ./dg_handoff.sh
 ./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
+
+# Interactive diagram link for an existing configuration (run on a DB host)
+./dg_viz_url.sh                  # summary on stderr, URL on stdout
+./dg_viz_url.sh -q               # URL only
 ```
 
 References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/DG_CHECK.md), [`docs/WALLET_SETUP.md`](docs/WALLET_SETUP.md).

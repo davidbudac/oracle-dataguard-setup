@@ -10,6 +10,7 @@ dg_triage_sid.sh - Fast local Data Guard triage (run directly on DB host)
 dg_diag_sid.sh   - Deep local Data Guard diagnostics (run directly on DB host)
 dg_check_sid.sh  - Deprecated wrapper to dg_triage_sid.sh
 dg_handoff.sh    - Standalone handoff report generator (post-setup; no NFS/config dependencies)
+dg_viz_url.sh    - Standalone generator for the interactive dataguard-doc visualizer link of an existing configuration (sqlplus / as sysdba; flags --primary-host/--standby-host/--observer-host/--port/--service/--base-url, -q for URL-only output)
 dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 argument, pre-flight, or data-collection error). SRLs created without a THREAD clause sit at THREAD#=0 until first use (step 4 created them that way before 2026-08; it now assigns THREAD explicitly); the checker counts THREAD#=0 SRLs as a shared pool toward each thread's requirement instead of demanding duplicates, so both old and new builds check out correctly
 migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby (has its own README/WALKTHROUGH)
 nfs/             - NFS setup scripts (run before Data Guard setup)
@@ -166,7 +167,7 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 - `tests/test_df_parsing.sh` - Tests `parse_df_available_kb` / `get_available_space_kb`; guards the `df -Pk` (POSIX format) requirement for AIX compatibility
 - `tests/test_grep_portability.sh` - Tests broker-output detection patterns and sweeps the repo for GNU-grep-only usage (`grep -P`, `\s`, BRE `\|` alternation)
 - `tests/test_sid_detection.sh` - Tests the SID-detection/validation pipeline used by `dg_status.sh` (`_detect_pmon_sid` / `_validate_sid`)
-- `tests/test_visualizer_url.sh` - Tests the dataguard-doc visualizer link helpers embedded in both handoff scripts (block-drift diff, base64url payload, field mapping/omission, JSON escaping)
+- `tests/test_visualizer_url.sh` - Tests the dataguard-doc visualizer link helpers embedded in both handoff scripts and `dg_viz_url.sh` (block-drift diff across all three copies, base64url payload, field mapping/omission, JSON escaping)
 
 ### End-to-End Tests
 - `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator
@@ -309,7 +310,15 @@ It also copies `docs/DG_APPLICATION_IMPACT.html` to `${NFS_SHARE}/dg_application
 
 User-visible services are discovered from `V$ACTIVE_SERVICES` (same logic as the role trigger), with the default `<DB_UNIQUE_NAME>` service always included. Output: `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` plus stdout. Re-run after listener changes, new services, or topology changes to refresh the report.
 
-Both handoff scripts also emit an **"Interactive diagram"** link in the report header: the discovered topology (DB unique names, hosts, observer host/placement, first service, port, protection mode, LogXptMode, FSFO threshold — never credentials) is encoded as `#cfg=<base64url(JSON)>` for the interactive Data Guard configuration explorer (source repo `davidbudac/dataguard-doc`, published at `https://davidbudac.cz/dataguard/`; base overridable via `DG_DOC_BASE_URL`). Unknown/undiscovered fields are omitted so the page falls back to its defaults; the link is skipped entirely if neither `base64` nor `openssl` exists on the host. The helper block is duplicated **byte-identically** in `dg_handoff.sh` and `primary/10_generate_handoff_report.sh` between `# ---- begin/end dataguard-doc visualizer helpers ----` markers — `tests/test_visualizer_url.sh` diffs the two copies and fails on drift, so edit one and re-copy into the other.
+Both handoff scripts also emit an **"Interactive diagram"** link in the report header: the discovered topology (DB unique names, hosts, observer host/placement, first service, port, protection mode, LogXptMode, FSFO threshold — never credentials) is encoded as `#cfg=<base64url(JSON)>` for the interactive Data Guard configuration explorer (source repo `davidbudac/dataguard-doc`, published at `https://davidbudac.cz/dataguard/`; base overridable via `DG_DOC_BASE_URL`). Unknown/undiscovered fields are omitted so the page falls back to its defaults; the link is skipped entirely if neither `base64` nor `openssl` exists on the host. The helper block is duplicated **byte-identically** in `dg_handoff.sh`, `primary/10_generate_handoff_report.sh` and `dg_viz_url.sh` between `# ---- begin/end dataguard-doc visualizer helpers ----` markers — `tests/test_visualizer_url.sh` diffs every copy against the one in `dg_handoff.sh` (the reference) and fails on drift, so edit that one and re-copy into the others.
+
+**Link only, on demand: `dg_viz_url.sh`** (root of repo)
+```bash
+./dg_viz_url.sh                                   # summary on stderr, URL on stdout
+./dg_viz_url.sh -q                                # URL only (URL=$(./dg_viz_url.sh -q))
+./dg_viz_url.sh --standby-host stb --port 1521    # fill in what discovery missed
+```
+Generates the same visualizer link for **any existing** Data Guard configuration without producing a handoff report. Connects with `sqlplus / as sysdba` and discovers the topology from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, `V$ACTIVE_SERVICES` and `DGMGRL SHOW DATABASE`; standalone (no `standby_config_*.env`, no `common/dg_functions.sh`, no NFS share), so it can be copied to a DB host on its own. Runs from either side — on a standby it swaps the roles and reports the local host as the standby. Overrides: `--primary-host`, `--standby-host`, `--observer-host`, `--port`, `--service`, `--base-url`. Undiscovered fields are omitted (page defaults apply) and every query is best-effort; only a failed `sqlplus / as sysdba` connection or a host with neither `base64` nor `openssl` is fatal.
 
 **Standalone variant: `dg_handoff.sh`** (root of repo)
 ```bash
