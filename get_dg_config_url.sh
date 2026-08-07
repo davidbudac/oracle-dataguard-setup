@@ -18,7 +18,7 @@
 #     FSFO threshold discovery; otherwise pass them via flags
 #
 # The URL is printed on stdout, the discovery summary on stderr, so
-#   URL=$(./dg_viz_url.sh)
+#   URL=$(./get_dg_config_url.sh)
 # captures just the link.
 #
 # Only topology is encoded (DB unique names, hosts, port, first
@@ -26,9 +26,9 @@
 # observer placement) - never credentials.
 #
 # Usage:
-#   ./dg_viz_url.sh
-#   ./dg_viz_url.sh -q
-#   ./dg_viz_url.sh --standby-host stb.example.com --port 1521
+#   ./get_dg_config_url.sh
+#   ./get_dg_config_url.sh -q
+#   ./get_dg_config_url.sh --standby-host stb.example.com --port 1521
 # ============================================================
 
 set -e
@@ -88,9 +88,12 @@ die()  { echo "ERROR: $*" >&2; exit 1; }
 warn() { [[ "$QUIET" == "YES" ]] || echo "WARN:  $*" >&2; }
 info() { [[ "$QUIET" == "YES" ]] || echo "INFO:  $*" >&2; }
 
+info "Starting: ORACLE_SID=${ORACLE_SID:-unset}, ORACLE_HOME=${ORACLE_HOME:-unset}"
+
 [[ -n "$ORACLE_SID" ]]  || die "ORACLE_SID is not set."
 [[ -n "$ORACLE_HOME" ]] || die "ORACLE_HOME is not set."
 command -v sqlplus >/dev/null || die "sqlplus not on PATH ($ORACLE_HOME/bin/sqlplus expected)."
+info "Pre-flight checks passed."
 
 # ============================================================
 # SQL / broker helpers
@@ -208,9 +211,11 @@ extract_host_from_show_db() {
 # Connectivity check
 # ============================================================
 
+info "Checking connectivity via 'sqlplus / as sysdba'..."
 if ! run_sql "SELECT 'OK' FROM DUAL;" | clean | grep -q '^OK$'; then
     die "Could not connect via 'sqlplus / as sysdba' (ORACLE_SID=${ORACLE_SID})."
 fi
+info "Connected."
 
 # ============================================================
 # Discover topology
@@ -286,6 +291,7 @@ done <<< "$SERVICE_OUTPUT"
 if [[ -n "$SERVICE_OVERRIDE" ]]; then
     SERVICE_LIST=("$SERVICE_OVERRIDE")
 fi
+info "Topology discovered: primary=${PRIMARY_DB_UNIQUE_NAME:-unknown}, standby=${STANDBY_DB_UNIQUE_NAME:-unknown}, port=${PORT}."
 
 # ============================================================
 # Broker-only fields (hostnames, transport mode, FSFO threshold)
@@ -297,6 +303,7 @@ STANDBY_LOGXPTMODE="unknown"
 FSFO_THRESHOLD="unknown"
 
 if [[ "$DG_BROKER_START" == "TRUE" ]]; then
+    info "DG broker is running; querying dgmgrl for hostnames, LogXptMode and FSFO threshold..."
     [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]] && PRIMARY_HOSTNAME=$(extract_host_from_show_db "$PRIMARY_DB_UNIQUE_NAME")
     [[ -n "$STANDBY_DB_UNIQUE_NAME" ]] && STANDBY_HOSTNAME=$(extract_host_from_show_db "$STANDBY_DB_UNIQUE_NAME")
 
@@ -447,6 +454,7 @@ build_visualizer_url() {
 # Output
 # ============================================================
 
+info "Building the visualizer link..."
 if ! VIZ_URL=$(build_visualizer_url); then
     die "Could not build the link: neither 'base64' nor 'openssl' is available to encode the payload."
 fi

@@ -2,7 +2,7 @@
 # ============================================================
 # Test script for the dataguard-doc visualizer link helpers
 # embedded in dg_handoff.sh, primary/10_generate_handoff_report.sh
-# and dg_viz_url.sh
+# and get_dg_config_url.sh
 # ============================================================
 # Usage: bash tests/test_visualizer_url.sh
 #
@@ -93,7 +93,7 @@ if [[ -z "$BLOCK_A" ]]; then
     FAIL=$((FAIL + 1))
 fi
 
-for OTHER in "primary/10_generate_handoff_report.sh" "dg_viz_url.sh"; do
+for OTHER in "primary/10_generate_handoff_report.sh" "get_dg_config_url.sh"; do
     BLOCK_B=$(extract_block "${REPO_DIR}/${OTHER}")
     TMP_B="${TMPDIR:-/tmp}/viz_block_b.$$"
     printf '%s\n' "$BLOCK_B" > "$TMP_B"
