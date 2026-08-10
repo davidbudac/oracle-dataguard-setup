@@ -7,9 +7,10 @@
 # ('log file sync') the remote acknowledgment adds, and what that
 # adds up to across the workload.
 #
-# The naive "subtract the remote wait" is wrong: since 12c the
+# The naive "subtract the remote wait" is wrong: since 11g R2 the
 # local redo write and the network send to the standby run IN
-# PARALLEL, so the redo-write phase of a commit lasts
+# PARALLEL (LGWR starts the remote write before issuing the local
+# one), so the redo-write phase of a commit lasts about
 # max(local write, remote ack) - not their sum. This script
 # therefore estimates
 #
@@ -334,9 +335,10 @@ ORDER BY DEST_ID;") \
     || { _out=""; degraded "remote destinations (V\$ARCHIVE_DEST)"; }
 DESTS_RAW=$(printf '%s\n' "$_out" | trim | grep '^DEST[|]' || true)
 
-# Classify destinations. TRANSMIT_MODE is the instance-level truth:
-# SYNCHRONOUS (SYNC AFFIRM) and PARALLELSYNC (SYNC NOAFFIRM / FASTSYNC)
-# are both synchronous transport; ASYNCHRONOUS is not.
+# Classify destinations. TRANSMIT_MODE reflects only the SYNC/ASYNC
+# attribute: SYNCHRONOUS and PARALLELSYNC are both synchronous
+# transport, ASYNCHRONOUS is not. AFFIRM vs NOAFFIRM (FASTSYNC) is NOT
+# encoded in TRANSMIT_MODE - only the separate AFFIRM column carries it.
 SYNC_DEST_COUNT=0
 SYNC_TARGETS=""
 SYNC_AFFIRM_ANY="NO"
@@ -422,10 +424,11 @@ DBTIME_STARTUP_S=$(stat_val 'DB time (s)')
 # ============================================================
 # Collect: histogram convolution E[max(L,R)] (Layer 2)
 # ============================================================
-# V$EVENT_HISTOGRAM_MICRO buckets are (upper/2, upper]; the geometric
-# midpoint of such a bucket is upper/sqrt(2), which is what both the
-# means and the E[max] cross-join below use. Independence of L and R is
-# assumed (stated in the report).
+# V$EVENT_HISTOGRAM_MICRO buckets are [upper/2, upper) - WAIT_TIME_MICRO
+# is a documented EXCLUSIVE upper bound ("waits of duration < num"); the
+# geometric midpoint of such a bucket is upper/sqrt(2), which is what
+# both the means and the E[max] cross-join below use. Independence of L
+# and R is assumed (stated in the report).
 
 EMAX_RAW=""
 if [[ "$SYNC_DEST_COUNT" -gt 0 ]]; then
@@ -475,6 +478,7 @@ SELECT 'PCT|'||EVENT
   ||'|'||NVL(TO_CHAR(MIN(CASE WHEN CUM >= 0.50*TOT THEN UB END)),'-')
   ||'|'||NVL(TO_CHAR(MIN(CASE WHEN CUM >= 0.90*TOT THEN UB END)),'-')
   ||'|'||NVL(TO_CHAR(MIN(CASE WHEN CUM >= 0.99*TOT THEN UB END)),'-')
+  ||'|'||NVL(TO_CHAR(MAX(CASE WHEN CNT > 0 THEN UB END)),'-')
   ||'|'||NVL(MAX(TOT),0)
 FROM h
 WHERE TOT > 0
@@ -484,7 +488,7 @@ PCT_RAW=$(printf '%s\n' "$_out" | trim | grep '^PCT[|]' || true)
 
 info "Collecting per-destination SYNC response histogram..."
 _out=$(run_sql "-- QTAG:RESPHIST
-SELECT 'RESP|'||DEST_ID||'|'||DURATION||'|'||FREQUENCY
+SELECT 'RESP|'||DEST_ID||'|'||DURATION||'|'||FREQUENCY||'|'||NVL(TIME,'-')
 FROM V\$REDO_DEST_RESP_HISTOGRAM
 WHERE FREQUENCY > 0
 ORDER BY DEST_ID, DURATION;") \
@@ -1088,7 +1092,7 @@ emit_report() {
         printf '\n'
         printf 'Reading: an average commit currently waits ~%s on `log file sync` (%s);\n' "$(fmt_or_na "$W_LFS_AVG" " ms")" "$W_SOURCE"
         printf 'without synchronous transport the model puts it at ~%s ms less. The estimate is\n' "$(fmt_or_na "${SCALE_MS:-}")"
-        printf 'based on the %s; see section 8 for assumptions.\n\n' "${SCALE_BASIS:-event averages}"
+        printf 'based on the %s; see section 9 for assumptions.\n\n' "${SCALE_BASIS:-event averages}"
     fi
 
     # ---- 3. LGWR pipeline ----
@@ -1111,8 +1115,9 @@ emit_report() {
         printf 'Derived context:\n\n'
         printf -- '- Group-commit ratio (user commits / redo writes): **%s**\n' "$(fmt_or_na "$GROUP_COMMIT_RATIO")"
         printf -- '- Avg `redo synch time overhead` per synch write: **%s** - the scheduling/post\n' "$(fmt_or_na "$SYNCH_OVERHEAD_AVG_MS" " ms")"
-        printf '  portion of log file sync that is NOT transport (high values point at CPU\n'
-        printf '  starvation, not at Data Guard)\n'
+        printf '  portion of log file sync that is NOT transport (undocumented statistic,\n'
+        printf '  community-established meaning; high values point at CPU starvation, not\n'
+        printf '  at Data Guard)\n'
         printf -- '- Uptime: %s s; log file sync waits since startup: %s (avg %s)\n' "$(fmt_or_na "$UPTIME_SECONDS")" "$(fmt_or_na "$LFS_CNT")" "$(fmt_or_na "$LFS_AVG" " ms")"
         printf '\n'
     fi
@@ -1122,12 +1127,13 @@ emit_report() {
     if [[ -z "$PCT_RAW" ]]; then
         printf '_Histogram data unavailable._\n\n'
     else
-        printf 'Percentiles are bucket upper bounds from `V$EVENT_HISTOGRAM_MICRO` ("<= value").\n\n'
-        printf '| Event | p50 (ms) | p90 (ms) | p99 (ms) | Samples |\n'
-        printf '|-------|----------|----------|----------|---------|\n'
-        printf '%s\n' "$PCT_RAW" | rows PCT | while IFS='|' read -r _ev _p50 _p90 _p99 _n; do
-            printf '| %s | <= %s | <= %s | <= %s | %s |\n' \
-                "$_ev" "$(us_to_ms "$_p50")" "$(us_to_ms "$_p90")" "$(us_to_ms "$_p99")" "$_n"
+        printf 'Percentiles are bucket upper bounds from `V$EVENT_HISTOGRAM_MICRO` ("<= value");\n'
+        printf '`max` is the highest non-empty bucket - the slowest wait since startup fell in it.\n\n'
+        printf '| Event | p50 (ms) | p90 (ms) | p99 (ms) | max (ms) | Samples |\n'
+        printf '|-------|----------|----------|----------|----------|---------|\n'
+        printf '%s\n' "$PCT_RAW" | rows PCT | while IFS='|' read -r _ev _p50 _p90 _p99 _max _n; do
+            printf '| %s | <= %s | <= %s | <= %s | <= %s | %s |\n' \
+                "$_ev" "$(us_to_ms "$_p50")" "$(us_to_ms "$_p90")" "$(us_to_ms "$_p99")" "$(us_to_ms "$_max")" "$_n"
         done
         printf '\n'
     fi
@@ -1140,12 +1146,15 @@ emit_report() {
         printf '\n'
     fi
     if [[ -n "$RESP_RAW" ]]; then
-        printf 'Per-destination SYNC response histogram (`V$REDO_DEST_RESP_HISTOGRAM`,\n'
-        printf 'bucket duration as reported by the view):\n\n'
-        printf '| Dest | Duration bucket | Responses |\n'
-        printf '|------|-----------------|-----------|\n'
-        printf '%s\n' "$RESP_RAW" | rows RESP | while IFS='|' read -r _d _dur _f; do
-            printf '| %s | %s | %s |\n' "$_d" "$_dur" "$_f"
+        printf 'Per-destination SYNC response histogram (`V$REDO_DEST_RESP_HISTOGRAM`).\n'
+        printf 'Durations are rounded UP to whole seconds, so every sub-second response\n'
+        printf 'lands in bucket 1 - on a fast network this view only surfaces outliers and\n'
+        printf 'cannot corroborate a sub-second estimate. `Last at` is the most recent\n'
+        printf 'response that landed in the bucket:\n\n'
+        printf '| Dest | Duration bucket (s) | Responses | Last at |\n'
+        printf '|------|---------------------|-----------|---------|\n'
+        printf '%s\n' "$RESP_RAW" | rows RESP | while IFS='|' read -r _d _dur _f _tm; do
+            printf '| %s | %s | %s | %s |\n' "$_d" "$_dur" "$_f" "${_tm:-n/a}"
         done
         printf '\n'
     fi
@@ -1168,8 +1177,60 @@ emit_report() {
         printf '\n'
     fi
 
-    # ---- 6. baseline ----
-    printf '## 6. Baseline comparison (before vs after synchronous transport)\n\n'
+    # ---- 6. top latency spikes ----
+    printf '## 6. Top latency spikes\n\n'
+    if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
+        printf '_Not applicable - no synchronous destination is active._\n\n'
+    else
+        if [[ -z "$RESP_RAW" ]]; then
+            printf '_Slowest-response ranking unavailable (V$REDO_DEST_RESP_HISTOGRAM query\n'
+            printf 'failed or empty)._\n\n'
+        else
+            printf '**Slowest SYNC transport responses** (top 10 non-empty buckets of\n'
+            printf '`V$REDO_DEST_RESP_HISTOGRAM`, worst first; durations rounded up to whole\n'
+            printf 'seconds, so bucket 1 holds everything sub-second - these are the actual\n'
+            printf 'worst remote acks, including e.g. standby restarts and network stalls,\n'
+            printf 'capped at NET_TIMEOUT):\n\n'
+            printf '| Dest | Response time bucket (s) | Responses | Last at |\n'
+            printf '|------|--------------------------|-----------|---------|\n'
+            printf '%s\n' "$RESP_RAW" | rows RESP | sort -t'|' -k2,2nr | head -10 \
+                | while IFS='|' read -r _d _dur _f _tm; do
+                printf '| %s | %s | %s | %s |\n' "$_d" "$_dur" "$_f" "${_tm:-n/a}"
+            done
+            printf '\n'
+        fi
+        if [[ "$NO_PACK" == "YES" ]]; then
+            printf '_AWR snapshot spike ranking skipped (`--no-pack`)._\n\n'
+        elif [[ -z "$TREND_RAW" ]]; then
+            printf '_AWR snapshot spike ranking unavailable (no AWR trend data - see section 5)._\n\n'
+        else
+            local spikes
+            spikes=$(printf '%s\n' "$TREND_RAW" | rows TREND | awk -F'|' '
+                $5 != "-" && $6 != "-" {
+                    ovh = $6 - $5; if (ovh < 0) ovh = 0
+                    printf "%.3f|%s\n", ovh, $0
+                }' | sort -t'|' -k1,1nr | head -10)
+            if [[ -z "$spikes" ]]; then
+                printf '_AWR snapshot spike ranking unavailable (no snapshot has both local\n'
+                printf 'write and remote ack averages)._\n\n'
+            else
+                printf '**Worst AWR snapshots by estimated added latency per commit** (last %s\n' "$AWR_DAYS"
+                printf 'day(s); lower-bound estimator max(0, avg remote ack - avg local write),\n'
+                printf 'worst first - these are snapshot-interval averages, so a sustained bad\n'
+                printf 'period, not a single slow commit):\n\n'
+                printf '| Snap | End time | Added ms/commit (est) | lfs avg ms | local wr ms | remote ack ms | lfs waits | est added s |\n'
+                printf '|------|----------|-----------------------|------------|-------------|---------------|-----------|-------------|\n'
+                printf '%s\n' "$spikes" | while IFS='|' read -r _ovh _s _t _c _l _pw _rw _cs _dbt _est; do
+                    printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
+                        "$_s" "$_t" "$_ovh" "$_l" "$_pw" "$_rw" "$_c" "$_est"
+                done
+                printf '\n'
+            fi
+        fi
+    fi
+
+    # ---- 7. baseline ----
+    printf '## 7. Baseline comparison (before vs after synchronous transport)\n\n'
     if [[ -z "$BASELINE_MODE" && "$AUTO_BASELINE" != "YES" ]]; then
         printf '_No baseline window supplied. Re-run with `--baseline-begin`/`--baseline-end`\n'
         printf 'covering a pre-SYNC period (or with `--auto-baseline` to detect one from AWR\n'
@@ -1264,8 +1325,8 @@ emit_report() {
         printf '\n'
     fi
 
-    # ---- 7. ASH ----
-    printf '## 7. ASH attribution: who pays (last %s hour(s))\n\n' "$ASH_HOURS"
+    # ---- 8. ASH ----
+    printf '## 8. ASH attribution: who pays (last %s hour(s))\n\n' "$ASH_HOURS"
     if [[ "$NO_PACK" == "YES" ]]; then
         printf '_Skipped (`--no-pack`)._\n\n'
     elif [[ -z "$ASH_RAW" ]]; then
@@ -1335,13 +1396,18 @@ emit_report() {
         fi
     fi
 
-    # ---- 8. method notes ----
-    printf '## 8. Method notes and caveats\n\n'
-    printf -- '- **Overlap model:** since 12c the local redo write (L) and the network send to a\n'
-    printf '  SYNC standby run in parallel; a commit'"'"'s redo-write phase lasts max(L,R). The\n'
-    printf '  refined estimate is E[max(L,R)] - E[L], computed by cross-joining the\n'
+    # ---- 9. method notes ----
+    printf '## 9. Method notes and caveats\n\n'
+    printf -- '- **Overlap model:** since 11g R2 the local redo write (L) and the network send to a\n'
+    printf '  SYNC standby run in parallel - LGWR starts the remote write, then issues the\n'
+    printf '  local one, then waits for both - so a commit'"'"'s redo-write phase lasts about\n'
+    printf '  max(L,R) (plus small serial pre/post costs not attributed to transport here).\n'
+    printf '  The refined estimate is E[max(L,R)] - E[L], computed by cross-joining the\n'
     printf '  `V$EVENT_HISTOGRAM_MICRO` distributions of `log file parallel write` (L) and\n'
     printf '  `SYNC Remote Write` (R) with geometric bucket midpoints.\n'
+    printf -- '- **Why not plain averages:** Oracle'"'"'s own HA tuning guide warns that for SYNC\n'
+    printf '  impact "the averages can be very deceiving" - E[max] of the distributions is\n'
+    printf '  not derivable from the two averages, hence the histogram model.\n'
     printf -- '- **Independence assumption:** the convolution assumes L and R are independent.\n'
     printf '  Shared load (a storage/network burst hitting both) makes the estimate optimistic.\n'
     printf -- '- **AFFIRM vs NOAFFIRM:** with AFFIRM, R includes the standby SRL disk write; with\n'
@@ -1354,6 +1420,10 @@ emit_report() {
     printf '  AWR sections cover their stated windows. Numbers are labeled with their source.\n'
     printf -- '- **ASH sampling:** 1-second samples estimate total wait time fairly, but under-count\n'
     printf '  short waits; do not read the sample counts as wait counts.\n'
+    printf -- '- **Spike dilution:** the AWR spike ranking (section 6) works on snapshot-interval\n'
+    printf '  averages - a single multi-second stall inside an otherwise quiet interval barely\n'
+    printf '  moves that snapshot. Individual slow acks show up in the response histogram\n'
+    printf '  buckets and the `max` column of section 4 instead.\n'
     printf -- '- **Scope:** single-instance primary; AWR data is CDB-level when run in a CDB root.\n'
     if [[ "${#DEGRADED_NOTES[@]}" -gt 0 ]]; then
         printf '\n**Collection warnings:** the following data could not be collected -\n'

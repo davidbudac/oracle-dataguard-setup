@@ -48,16 +48,22 @@ POSIX-awk filter, so both formats always carry identical content.
 
 ## Why "log file sync minus the remote wait" is wrong
 
-Since 12c, LGWR does not serialize the local write and the network send.
-When a commit is issued:
+Since 11g Release 2, LGWR does not serialize the local write and the
+network send. Per Oracle's 19c HA guide commit sequence, when a commit is
+issued:
 
-1. LGWR issues the **local** redo write (`log file parallel write`, call it **L**), and
-2. **in parallel**, hands the redo to the NSS process which ships it to the
-   SYNC standby and waits for the acknowledgment (`SYNC Remote Write`, call it **R**).
+1. LGWR **starts the remote write** to the SYNC standby (shipped by the
+   NSSn network server; LGWR's wait is `SYNC Remote Write`, call it **R**), then
+2. issues the **local** redo write (`log file parallel write`, call it **L**),
+3. and waits for **both** to finish.
 
-The commit is acknowledged when **both** finish, so the redo-write phase of
-a commit lasts `max(L, R)` - not `L + R`. The true cost of synchronous
-transport per redo write is therefore
+So the redo-write phase of a commit lasts about `max(L, R)` - not `L + R`
+(a small serial remainder - redo preprocessing, I/O status checks, the
+foreground post - exists on top and is not attributed to transport). The
+same guide explicitly warns that for measuring SYNC impact "the averages
+can be very deceiving", which is exactly why this script models the
+distributions. The true cost of synchronous transport per redo write is
+therefore
 
 ```
 overhead = E[max(L, R)] - E[L]
@@ -83,12 +89,15 @@ max(0, avg R - avg L)  <=  overhead per redo write  <=  avg R
 **Layer 2 - the refined estimate** (`V$EVENT_HISTOGRAM_MICRO`). The full
 distributions of L and R are available in microsecond power-of-2 buckets.
 The script normalizes both histograms, takes geometric bucket midpoints
-(`bucket_upper / sqrt(2)`, since a bucket covers `(upper/2, upper]`), and
+(`bucket_upper / sqrt(2)`, since a bucket covers `[upper/2, upper)` -
+`WAIT_TIME_MICRO` is a documented exclusive upper bound), and
 computes `E[max(L,R)]` by cross-joining the two distributions **under an
 independence assumption**. This is the headline number. The
 `V$REDO_DEST_RESP_HISTOGRAM` per-destination response histogram is printed
-alongside as corroboration (it also separates multiple SYNC standbys,
-which the event histogram cannot).
+alongside (it also separates multiple SYNC standbys, which the event
+histogram cannot) - but note its durations are rounded **up** to whole
+seconds, so on a fast network every response lands in bucket 1 and the
+view can only surface outliers, never corroborate a sub-second estimate.
 
 **Layer 3 - workload scaling and validation** (Diagnostics Pack):
 
@@ -103,6 +112,14 @@ which the event histogram cannot).
   The per-snapshot overhead column uses the **lower bound** estimator -
   AWR's millisecond-resolution histograms are too coarse for the E[max]
   model on a sub-millisecond LAN.
+- *Top latency spikes*: the top 10 slowest SYNC transport responses ever
+  recorded (`V$REDO_DEST_RESP_HISTOGRAM` non-empty buckets, worst first,
+  each with the timestamp of its most recent occurrence - a free V\$ view,
+  so this survives `--no-pack`) plus the top 10 AWR snapshots of the
+  `--days` window ranked by the lower-bound added-latency-per-commit
+  estimate. The micro-histogram percentile table also carries a `max`
+  column: the highest non-empty bucket, i.e. the slowest single wait since
+  instance startup.
 - *Baseline comparison*: with `--baseline-begin/--baseline-end` covering a
   pre-SYNC window, the report compares avg latencies, commit rates, and
   `log file sync` percentile shift (`DBA_HIST_EVENT_HISTOGRAM`), and puts
@@ -136,7 +153,7 @@ near-idle snapshots (fewer than 50 redo writes) or restart artifacts
 `NOSYNC` snapshots** before the last `SYNC` snapshot as the baseline
 (`IDLE`/`MIXED` snapshots break a run - gaps are never silently bridged)
 and feeds it into the same comparison machinery as the manual flags. The
-report's section 6 states the detected window, the apparent transition
+report's section 7 states the detected window, the apparent transition
 snapshot, and the classification counts.
 
 If every classified snapshot is `SYNC` (the transition predates AWR
@@ -158,11 +175,19 @@ be combined with `--no-pack`).
 | 1 Configuration | Which destinations are synchronous; AFFIRM vs NOAFFIRM decides what R contains |
 | 2 Headline | The refined per-commit estimate with its bounds; s/hour; % of DB time |
 | 3 LGWR pipeline | `redo synch time overhead` - the part of log file sync that is scheduling/CPU, **not** transport. If this dominates, fix CPU starvation, not Data Guard |
-| 4 Distributions | p50/p90/p99 for lfs, L and R; the E[max] model inputs; per-destination SYNC response histogram |
+| 4 Distributions | p50/p90/p99 **and max** for lfs, L and R; the E[max] model inputs; per-destination SYNC response histogram (with each bucket's last-occurrence time) |
 | 5 AWR trend | Per-snapshot averages; spot the hours where the overhead column spikes |
-| 6 Baseline | Empirical before/after delta vs the model estimate - they should roughly agree |
-| 7 ASH | Which SQL/services/modules actually sit in `log file sync`, and when |
-| 8 Method notes | The assumptions, restated; any collection warnings |
+| 6 Top latency spikes | Top 10 slowest SYNC responses ever recorded (`V$REDO_DEST_RESP_HISTOGRAM`, worst bucket first, with when each last happened) and the top 10 AWR snapshots by estimated added ms/commit |
+| 7 Baseline | Empirical before/after delta vs the model estimate - they should roughly agree |
+| 8 ASH | Which SQL/services/modules actually sit in `log file sync`, and when |
+| 9 Method notes | The assumptions, restated; any collection warnings |
+
+Section 6's two rankings answer "how bad does it get?" from opposite ends:
+the response histogram catches **individual** slow acks (a standby restart, a
+network stall - real seconds-long spikes, cumulative since the destination
+came up), while the AWR ranking catches **sustained** bad intervals inside
+the `--days` window (snapshot averages, so a single slow commit is diluted -
+see the spike-dilution method note).
 
 ## Caveats
 
@@ -172,8 +197,12 @@ be combined with `--no-pack`).
 - **Window mismatch**: micro-histograms are cumulative since instance
   startup; AWR/ASH sections cover their stated windows. Every number is
   labeled with its source.
-- **ASH sampling**: 1-second samples estimate total wait *time* fairly but
+- **ASH sampling**: 1-second samples estimate total wait *time* fairly (when
+  counting samples - never sum `TIME_WAITED`, it is biased high) but
   under-count short waits - never read sample counts as wait counts.
+- **`redo synch time overhead (usec)`** is not documented by Oracle; its
+  interpretation as post/scheduling overhead is community-established and
+  consistent with the documented commit sequence, but not an Oracle statement.
 - **`SYNC Remote Write` missing**: if a SYNC destination is active but the
   event has no waits (version quirk), the refined estimate is skipped and
   the raw `V$REDO_DEST_RESP_HISTOGRAM` is all you get - the bounds still hold.

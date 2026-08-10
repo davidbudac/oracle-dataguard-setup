@@ -112,14 +112,15 @@ case "$IN" in
     ;;
 *QTAG:HISTPCT*)
     fail_if HISTPCT
-    echo "PCT|log file sync|1024|2048|4096|3600000"
-    echo "PCT|log file parallel write|512|1024|2048|3000000"
-    echo "PCT|SYNC Remote Write|512|1024|4096|3000000"
+    echo "PCT|log file sync|1024|2048|4096|8192|3600000"
+    echo "PCT|log file parallel write|512|1024|2048|4096|3000000"
+    echo "PCT|SYNC Remote Write|512|1024|4096|16384|3000000"
     ;;
 *QTAG:RESPHIST*)
     fail_if RESPHIST
-    echo "RESP|2|1|2999000"
-    echo "RESP|2|2|1000"
+    echo "RESP|2|1|2999000|08/09/2026 11:59:02"
+    echo "RESP|2|2|1000|08/09/2026 03:12:45"
+    echo "RESP|2|26|3|08/05/2026 02:11:07"
     ;;
 *QTAG:AWRSNAP*)
     fail_if AWRSNAP
@@ -182,6 +183,7 @@ case "$IN" in
     fail_if TREND
     echo "TREND|101|2026-08-03 11:00|12000|1.05|.5|.7|3.3|300|2.4"
     echo "TREND|102|2026-08-03 12:00|13000|1.1|.52|.72|3.6|310|2.6"
+    echo "TREND|103|2026-08-03 13:00|11000|9.5|.5|9.2|3.1|420|95.7"
     ;;
 *QTAG:ASH*)
     fail_if ASH
@@ -278,9 +280,10 @@ assert_contains "section 2" "$OUT" "## 2. Headline"
 assert_contains "section 3" "$OUT" "## 3. LGWR pipeline decomposition"
 assert_contains "section 4" "$OUT" "## 4. Latency distributions"
 assert_contains "section 5" "$OUT" "## 5. AWR trend"
-assert_contains "section 6" "$OUT" "## 6. Baseline comparison"
-assert_contains "section 7" "$OUT" "## 7. ASH attribution"
-assert_contains "section 8" "$OUT" "## 8. Method notes and caveats"
+assert_contains "section 6" "$OUT" "## 6. Top latency spikes"
+assert_contains "section 7" "$OUT" "## 7. Baseline comparison"
+assert_contains "section 8" "$OUT" "## 8. ASH attribution"
+assert_contains "section 9" "$OUT" "## 9. Method notes and caveats"
 # Configuration
 assert_contains "dest table row" "$OUT" "| 2 | cdb1_stby | PARALLELSYNC | NO | 30 | VALID |"
 assert_contains "FASTSYNC classification" "$OUT" "NOAFFIRM (FASTSYNC)"
@@ -298,12 +301,22 @@ assert_contains "reading line uses AWR window avg" "$OUT" "waits ~1.05 ms"
 assert_contains "group-commit ratio" "$OUT" "**1.800**"
 assert_contains "redo synch overhead avg" "$OUT" "**0.100 ms**"
 assert_contains "event table row" "$OUT" "| SYNC Remote Write | 3000000 | 2100.0 | .7 |"
-# Distributions: 1024us -> 1.024ms buckets
-assert_contains "lfs percentiles" "$OUT" "| log file sync | <= 1.024 | <= 2.048 | <= 4.096 | 3600000 |"
+# Distributions: 1024us -> 1.024ms buckets; max = highest non-empty bucket
+assert_contains "lfs percentiles" "$OUT" "| log file sync | <= 1.024 | <= 2.048 | <= 4.096 | <= 8.192 | 3600000 |"
+assert_contains "srw max bucket" "$OUT" "| SYNC Remote Write | <= 0.512 | <= 1.024 | <= 4.096 | <= 16.384 | 3000000 |"
 assert_contains "overlap model result" "$OUT" "E[max(L,R)] - E[L] = **0.330 ms**"
-assert_contains "resp histogram row" "$OUT" "| 2 | 1 | 2999000 |"
+assert_contains "resp histogram row" "$OUT" "| 2 | 1 | 2999000 | 08/09/2026 11:59:02 |"
 # AWR trend
 assert_contains "trend row" "$OUT" "| 101 | 2026-08-03 11:00 | 12000 | 1.05 | .5 | .7 | 3.3 | 300 | 2.4 |"
+# Top latency spikes: resp buckets sorted worst-first; AWR snaps ranked by
+# max(0, remote ack - local write): snap 103 -> 9.2-.5 = 8.700 on top
+assert_contains "spike resp row" "$OUT" "| 2 | 26 | 3 | 08/05/2026 02:11:07 |"
+SPIKES_SECTION=$(printf '%s\n' "$OUT" | sed -n '/^## 6\./,/^## 7\./p')
+TOP_RESP_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 2 [|] [0-9]+ [|]' | head -1)
+assert_contains "resp spikes sorted desc" "$TOP_RESP_SPIKE" "| 2 | 26 | 3 |"
+assert_contains "awr spike row" "$OUT" "| 103 | 2026-08-03 13:00 | 8.700 | 9.5 | .5 | 9.2 | 11000 | 95.7 |"
+TOP_AWR_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 10[0-9] [|]' | head -1)
+assert_contains "awr spikes sorted desc" "$TOP_AWR_SPIKE" "| 103 |"
 # Baseline not requested
 assert_contains "baseline hint" "$OUT" "No baseline window supplied"
 # ASH: 1500/10000 = 15.000 %
@@ -386,6 +399,9 @@ assert_not_contains "no ASH content" "$OUT" "orders_svc"
 assert_not_contains "no trend content" "$OUT" "| 101 | 2026-08-03 11:00"
 # The free-view sections still work
 assert_contains "no-pack still has headline" "$OUT" "**0.330 ms**"
+# Spikes: the free resp-histogram ranking stays, the AWR ranking is skipped
+assert_contains "no-pack spike resp row" "$OUT" "| 2 | 26 | 3 | 08/05/2026 02:11:07 |"
+assert_contains "no-pack awr spike note" "$OUT" "AWR snapshot spike ranking skipped"
 
 # ==== Test 9: no synchronous destination ====
 echo "Test 9: no SYNC destination - report degrades to observation mode"
@@ -397,6 +413,8 @@ assert_eq "no-sync rc" "0" "$RC"
 assert_contains "no-sync note" "$OUT" "No synchronous destination is active"
 assert_contains "no-sync headline" "$OUT" "Not applicable - no synchronous destination"
 assert_contains "still shows lfs stats" "$OUT" "| log file sync | 3600000 |"
+NOSYNC_SPIKES=$(printf '%s\n' "$OUT" | sed -n '/^## 6\./,/^## 7\./p')
+assert_contains "no-sync spikes n/a" "$NOSYNC_SPIKES" "Not applicable - no synchronous destination"
 
 # ==== Test 10: per-section degradation ====
 echo "Test 10: a failing query degrades its section, not the run"
