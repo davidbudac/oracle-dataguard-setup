@@ -4,7 +4,11 @@
 # embedded in dg_handoff.sh, primary/10_generate_handoff_report.sh
 # and get_dg_config_url.sh
 # ============================================================
-# Usage: bash tests/test_visualizer_url.sh
+# Usage: bash tests/test_visualizer_url.sh [-b|--base-url <url>]
+#
+# -b/--base-url overrides the visualizer base URL the helpers build on
+# (same effect as exporting DG_DOC_BASE_URL); the generated URLs are then
+# asserted against that base instead of the published default.
 #
 # The helpers build the "#cfg=<base64url(JSON)>" share URL consumed by
 # the interactive Data Guard configuration explorer
@@ -22,6 +26,33 @@
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
+
+DEFAULT_BASE_URL="https://davidbudac.cz/dataguard/"
+BASE_URL="${DG_DOC_BASE_URL:-$DEFAULT_BASE_URL}"
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -b|--base-url)
+            if [[ -z "$2" ]]; then
+                echo "ERROR: $1 requires a URL argument" >&2
+                exit 2
+            fi
+            BASE_URL="$2"
+            shift 2
+            ;;
+        -h|--help)
+            echo "Usage: bash tests/test_visualizer_url.sh [-b|--base-url <url>]"
+            exit 0
+            ;;
+        *)
+            echo "ERROR: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+# The helper block reads DG_DOC_BASE_URL at eval time
+export DG_DOC_BASE_URL="$BASE_URL"
 
 PASS=0
 FAIL=0
@@ -132,7 +163,7 @@ FSFO_STATUS="SYNCHRONIZED"
 FSFO_THRESHOLD="45"
 
 URL=$(build_visualizer_url)
-assert_contains "URL uses the published base"      "$URL" "https://davidbudac.cz/dataguard/#cfg="
+assert_contains "URL uses the configured base"     "$URL" "${BASE_URL}#cfg="
 PAYLOAD="${URL#*#cfg=}"
 if printf '%s' "$PAYLOAD" | LC_ALL=C grep -q '[^A-Za-z0-9_-]'; then
     echo "  FAIL: payload contains characters outside the base64url alphabet"
