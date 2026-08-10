@@ -52,11 +52,13 @@ dataguard_setup/
 ├── dg_handoff.sh                # Standalone handoff report (no setup-time deps)
 ├── get_dg_config_url.sh         # Standalone interactive-diagram link for an existing configuration
 ├── dg_check_srl.sh              # Standby redo log checker - prints fix DDL for missing/undersized SRLs
+├── dg_sync_impact.sh            # Standalone SYNC/FASTSYNC commit-latency impact report (ASH/AWR + histogram model)
 │
 ├── docs/
 │   ├── DATA_GUARD_WALKTHROUGH.md   # Detailed walkthrough with manual equivalents
 │   ├── DG_STATUS.md                # dg_status.sh reference
 │   ├── DG_CHECK.md                 # dg_triage / dg_diag reference
+│   ├── DG_SYNC_IMPACT.md           # dg_sync_impact.sh reference + methodology
 │   └── WALLET_SETUP.md             # Oracle Wallet for peer connectivity
 │
 └── tests/                       # Unit tests + E2E test suite
@@ -136,9 +138,15 @@ bash common/setup_dg_wallet.sh
 # Interactive diagram link for an existing configuration (run on a DB host)
 ./get_dg_config_url.sh           # summary on stderr, URL on stdout
 ./get_dg_config_url.sh -q        # URL only
+
+# What is synchronous transport costing commits? (run on PRIMARY)
+./dg_sync_impact.sh                          # ASH last 24h, AWR last 7 days
+./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' --baseline-end '2026-07-08 00:00'
+./dg_sync_impact.sh --no-pack                # no Diagnostics Pack license
+./dg_sync_impact.sh --html -o impact.html    # self-contained HTML report
 ```
 
-References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/DG_CHECK.md), [`docs/WALLET_SETUP.md`](docs/WALLET_SETUP.md).
+References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/DG_CHECK.md), [`docs/DG_SYNC_IMPACT.md`](docs/DG_SYNC_IMPACT.md), [`docs/WALLET_SETUP.md`](docs/WALLET_SETUP.md).
 
 ## Common DGMGRL Commands
 
