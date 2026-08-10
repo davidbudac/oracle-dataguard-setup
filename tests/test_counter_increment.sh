@@ -93,7 +93,9 @@ cd "$REPO_ROOT" || exit 1
 # in comments and echo strings for documentation purposes, which are not
 # real usages of the banned construct.
 VIOLATIONS=""
-mapfile -t SH_FILES < <(find . -path ./.git -prune -o -type f -name '*.sh' -print | sed 's#^\./##' | grep -v '^tests/test_counter_increment\.sh$')
+# .claude is excluded for the same reason as .git: tool-managed worktrees
+# under it can hold a full repo copy that double-reports every finding.
+mapfile -t SH_FILES < <(find . \( -path ./.git -o -path ./.claude \) -prune -o -type f -name '*.sh' -print | sed 's#^\./##' | grep -v '^tests/test_counter_increment\.sh$')
 
 for f in "${SH_FILES[@]}"; do
     while IFS=: read -r lineno line; do

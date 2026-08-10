@@ -109,13 +109,15 @@ cd "$REPO_ROOT" || exit 1
 SWEEP_FAIL=0
 VIOLATIONS=""
 
-# Collect all shell scripts, excluding .git and this test file itself.
-# This test file necessarily mentions "grep -P", "\s", "\S" and "\|" in its
-# own comments/strings (to describe what it looks for and to report
-# findings) - those are not real production grep invocations, so exclude
-# it from the sweep rather than trying to out-clever false positives on
-# our own source.
-mapfile -t SH_FILES < <(find . -path ./.git -prune -o -type f -name '*.sh' -print | sed 's#^\./##' | grep -v '^tests/test_grep_portability\.sh$')
+# Collect all shell scripts, excluding .git, .claude (tool-managed
+# worktrees/config can hold a full repo copy, including a copy of this
+# test at a path the self-exclusion below would miss) and this test file
+# itself. This test file necessarily mentions "grep -P", "\s", "\S" and
+# "\|" in its own comments/strings (to describe what it looks for and to
+# report findings) - those are not real production grep invocations, so
+# exclude it from the sweep rather than trying to out-clever false
+# positives on our own source.
+mapfile -t SH_FILES < <(find . \( -path ./.git -o -path ./.claude \) -prune -o -type f -name '*.sh' -print | sed 's#^\./##' | grep -v '^tests/test_grep_portability\.sh$')
 
 for f in "${SH_FILES[@]}"; do
     # Candidate lines: strip pure comment lines (first non-blank char is #)
