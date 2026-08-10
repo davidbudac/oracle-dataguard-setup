@@ -142,6 +142,7 @@ bash common/setup_dg_wallet.sh
 # What is synchronous transport costing commits? (run on PRIMARY)
 ./dg_sync_impact.sh                          # ASH last 24h, AWR last 7 days
 ./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' --baseline-end '2026-07-08 00:00'
+./dg_sync_impact.sh --auto-baseline          # detect the pre-SYNC baseline from AWR
 ./dg_sync_impact.sh --no-pack                # no Diagnostics Pack license
 ./dg_sync_impact.sh --html -o impact.html    # self-contained HTML report
 ```

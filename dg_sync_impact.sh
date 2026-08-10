@@ -37,6 +37,7 @@
 #   ./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' \
 #                       --baseline-end   '2026-07-08 00:00'
 #   ./dg_sync_impact.sh --baseline-begin 12000 --baseline-end 12168
+#   ./dg_sync_impact.sh --auto-baseline
 #   ./dg_sync_impact.sh --no-pack
 #   ./dg_sync_impact.sh -o /tmp/sync_impact.md
 # ============================================================
@@ -48,9 +49,18 @@ ASH_HOURS=24
 AWR_DAYS=7
 BASELINE_BEGIN=""
 BASELINE_END=""
+AUTO_BASELINE="NO"
 NO_PACK="NO"
 OUTPUT_FILE=""
 OUTPUT_FORMAT="md"
+
+# --auto-baseline classification thresholds (env-overridable). A snapshot
+# is SYNC when 'SYNC Remote Write' waits / redo writes >= DG_SI_SYNC_RATIO,
+# NOSYNC when <= DG_SI_NOSYNC_RATIO, IDLE below DG_SI_MIN_WRITES redo
+# writes (or on a restart's negative delta), MIXED otherwise.
+DG_SI_SYNC_RATIO="${DG_SI_SYNC_RATIO:-0.5}"
+DG_SI_NOSYNC_RATIO="${DG_SI_NOSYNC_RATIO:-0.05}"
+DG_SI_MIN_WRITES="${DG_SI_MIN_WRITES:-50}"
 
 usage() {
     cat <<EOF
@@ -66,6 +76,7 @@ Options:
                             pure-digit AWR snapshot ID. Enables the empirical
                             before/after comparison against a pre-SYNC period.
       --baseline-end V      Baseline window end (same formats; both or neither)
+      --auto-baseline       Detect the pre-SYNC baseline window from AWR history
       --no-pack             Skip AWR/ASH sections (no Diagnostics Pack license);
                             only freely usable V\$ views are queried
       --html                Emit a self-contained HTML page instead of Markdown
@@ -108,6 +119,7 @@ while [[ $# -gt 0 ]]; do
         --days)             AWR_DAYS="$2"; shift 2 ;;
         --baseline-begin)   BASELINE_BEGIN="$2"; shift 2 ;;
         --baseline-end)     BASELINE_END="$2"; shift 2 ;;
+        --auto-baseline)    AUTO_BASELINE="YES"; shift ;;
         --no-pack)          NO_PACK="YES"; shift ;;
         --html)             OUTPUT_FORMAT="html"; shift ;;
         -o|--output)        OUTPUT_FILE="$2"; shift 2 ;;
@@ -139,6 +151,13 @@ if [[ -n "$BASELINE_BEGIN" || -n "$BASELINE_END" ]]; then
     if [[ "$BASELINE_MODE" == "snap" && "$BASELINE_BEGIN" -ge "$BASELINE_END" ]]; then
         arg_error "--baseline-begin snapshot must be lower than --baseline-end."
     fi
+fi
+
+if [[ "$AUTO_BASELINE" == "YES" ]]; then
+    [[ -z "$BASELINE_BEGIN" && -z "$BASELINE_END" ]] \
+        || arg_error "--auto-baseline cannot be combined with --baseline-begin/--baseline-end."
+    [[ "$NO_PACK" == "NO" ]] \
+        || arg_error "--auto-baseline requires AWR and cannot be combined with --no-pack."
 fi
 
 # ============================================================
@@ -484,6 +503,12 @@ CURHPCT_RAW=""
 BASEWIN_RAW=""
 BASEAGG_RAW=""
 BASEHPCT_RAW=""
+AUTOBASE_NOTE=""
+AB_TRANS_SNAP=""
+AB_TRANS_TIME=""
+AB_N_SYNC=""
+AB_N_NOSYNC=""
+AB_N_OTHER=""
 
 # collect_awr_agg MIN_SNAP MAX_SNAP -> XAGG row on stdout
 collect_awr_agg() {
@@ -700,7 +725,118 @@ WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
   AND END_INTERVAL_TIME <= TO_DATE('${BASELINE_END}','YYYY-MM-DD HH24:MI') + CASE WHEN LENGTH('${BASELINE_END}') = 10 THEN 1 ELSE 0 END;" | trim | grep '^BASEWIN|' | head -1) \
                 || { BASEWIN_RAW=""; degraded "baseline snapshot window (DBA_HIST_SNAPSHOT)"; }
         fi
+    elif [[ "$AUTO_BASELINE" == "YES" ]]; then
+        # ---- auto-detected baseline window ----
+        # Oracle does not historize the transport mode, but synchronous
+        # transport leaves a behavioral fingerprint: while it is active,
+        # LGWR records a 'SYNC Remote Write' wait for essentially every
+        # redo write, so the per-snapshot ratio of those waits to redo
+        # writes is ~1 under sync transport and ~0 without it. Classify
+        # every retained snapshot (not just the --days window - the
+        # transition usually predates it) and take the most recent run
+        # of consecutive no-sync snapshots as the baseline.
+        info "Scanning AWR history for the pre-SYNC baseline window (--auto-baseline)..."
+        _out=$(run_sql "-- QTAG:AUTOBASE
+WITH sn AS (
+  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET
+  FROM DBA_HIST_SNAPSHOT
+  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
+),
+srw AS (
+  SELECT SNAP_ID,
+         TOTAL_WAITS - LAG(TOTAL_WAITS) OVER (ORDER BY SNAP_ID) DW
+  FROM DBA_HIST_SYSTEM_EVENT
+  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND EVENT_NAME='SYNC Remote Write'
+),
+rw AS (
+  SELECT SNAP_ID,
+         VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DV
+  FROM DBA_HIST_SYSSTAT
+  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND STAT_NAME='redo writes'
+)
+SELECT 'CLS|'||sn.SNAP_ID
+  ||'|'||TO_CHAR(sn.ET,'YYYY-MM-DD HH24:MI')
+  ||'|'||NVL(srw.DW,0)
+  ||'|'||NVL(rw.DV,0)
+  ||'|'||CASE
+       WHEN rw.DV IS NULL OR rw.DV < ${DG_SI_MIN_WRITES} OR NVL(srw.DW,0) < 0 THEN 'IDLE'
+       WHEN NVL(srw.DW,0)/rw.DV >= ${DG_SI_SYNC_RATIO}  THEN 'SYNC'
+       WHEN NVL(srw.DW,0)/rw.DV <= ${DG_SI_NOSYNC_RATIO} THEN 'NOSYNC'
+       ELSE 'MIXED'
+     END
+FROM sn
+LEFT JOIN srw ON srw.SNAP_ID = sn.SNAP_ID
+LEFT JOIN rw  ON rw.SNAP_ID  = sn.SNAP_ID
+ORDER BY sn.SNAP_ID;") \
+            || { _out=""; degraded "auto-baseline classification (DBA_HIST_SYSTEM_EVENT)"; }
+        AUTOBASE_RAW=$(printf '%s\n' "$_out" | trim | grep '^CLS[|]' || true)
 
+        if [[ -z "$AUTOBASE_RAW" ]]; then
+            AUTOBASE_NOTE="snapshot classification unavailable (query failed or no AWR history)"
+            warn "Auto-baseline: classification query returned no data; skipping the comparison."
+        else
+            # Walk the classified snapshots in snap order: locate the last
+            # SYNC snapshot (end of the current regime), then the most
+            # recent run of >= 2 consecutive NOSYNC snapshots before it
+            # (IDLE/MIXED snaps break a run - gaps are never bridged), and
+            # the first SYNC snapshot after that run (the transition).
+            AB_LINE=$(printf '%s\n' "$AUTOBASE_RAW" | rows CLS | awk -F'|' '
+                { n = n + 1; snap[n] = $1; tm[n] = $2; cls[n] = $5
+                  if ($5 == "SYNC") ns = ns + 1
+                  else if ($5 == "NOSYNC") nn = nn + 1
+                  else no = no + 1 }
+                END {
+                  lastsync = 0
+                  for (i = 1; i <= n; i++) if (cls[i] == "SYNC") lastsync = i
+                  if (lastsync == 0) {
+                    printf "NOSYNC||||||||%d|%d|%d\n", ns, nn, no; exit
+                  }
+                  runlen = 0; runstart = 0; bs = 0; be = 0
+                  for (i = 1; i < lastsync; i++) {
+                    if (cls[i] == "NOSYNC") {
+                      if (runlen == 0) runstart = i
+                      runlen = runlen + 1
+                    } else {
+                      if (runlen >= 2) { bs = runstart; be = i - 1 }
+                      runlen = 0
+                    }
+                  }
+                  if (runlen >= 2) { bs = runstart; be = lastsync - 1 }
+                  if (bs == 0) {
+                    printf "NOBASE||||||||%d|%d|%d\n", ns, nn, no; exit
+                  }
+                  ti = 0
+                  for (j = be + 1; j <= n; j++) if (cls[j] == "SYNC") { ti = j; break }
+                  printf "OK|%s|%s|%d|%s|%s|%s|%s|%d|%d|%d\n",
+                    snap[bs], snap[be], be - bs + 1, tm[bs], tm[be],
+                    snap[ti], tm[ti], ns, nn, no
+                }')
+            AB_STATUS=$(field   "$AB_LINE" 1)
+            AB_N_SYNC=$(field   "$AB_LINE" 9)
+            AB_N_NOSYNC=$(field "$AB_LINE" 10)
+            AB_N_OTHER=$(field  "$AB_LINE" 11)
+            case "$AB_STATUS" in
+                OK)
+                    AB_TRANS_SNAP=$(field "$AB_LINE" 7)
+                    AB_TRANS_TIME=$(field "$AB_LINE" 8)
+                    BASEWIN_RAW="BASEWIN|$(field "$AB_LINE" 2)|$(field "$AB_LINE" 3)|$(field "$AB_LINE" 4)|$(field "$AB_LINE" 5)|$(field "$AB_LINE" 6)"
+                    ;;
+                NOSYNC)
+                    AUTOBASE_NOTE="no synchronous-transport snapshots in AWR retention - there is no SYNC period to compare against"
+                    warn "Auto-baseline: no synchronous-transport snapshots in AWR retention; skipping the comparison."
+                    ;;
+                *)
+                    AUTOBASE_NOTE="SYNC transport predates AWR retention (no run of 2+ consecutive no-sync snapshots before the SYNC period); no baseline found"
+                    warn "Auto-baseline: SYNC transport predates AWR retention; no baseline found."
+                    ;;
+            esac
+        fi
+    fi
+
+    # ---- shared baseline collection (manual and auto converge here) ----
+    if [[ -n "$BASELINE_MODE" || ( "$AUTO_BASELINE" == "YES" && -n "$BASEWIN_RAW" ) ]]; then
         BASE_MIN=$(field "$BASEWIN_RAW" 2)
         BASE_MAX=$(field "$BASEWIN_RAW" 3)
         BASE_CNT=$(field "$BASEWIN_RAW" 4)
@@ -1034,9 +1170,12 @@ emit_report() {
 
     # ---- 6. baseline ----
     printf '## 6. Baseline comparison (before vs after synchronous transport)\n\n'
-    if [[ -z "$BASELINE_MODE" ]]; then
+    if [[ -z "$BASELINE_MODE" && "$AUTO_BASELINE" != "YES" ]]; then
         printf '_No baseline window supplied. Re-run with `--baseline-begin`/`--baseline-end`\n'
-        printf 'covering a pre-SYNC period to add the empirical before/after comparison._\n\n'
+        printf 'covering a pre-SYNC period (or with `--auto-baseline` to detect one from AWR\n'
+        printf 'history) to add the empirical before/after comparison._\n\n'
+    elif [[ "$AUTO_BASELINE" == "YES" && -n "$AUTOBASE_NOTE" ]]; then
+        printf '_Auto-baseline detection: %s - comparison skipped._\n\n' "$AUTOBASE_NOTE"
     elif [[ -z "$BASEAGG_RAW" ]]; then
         printf '_Baseline window has no usable AWR data (fewer than 2 snapshots, or the query\n'
         printf 'failed) - comparison skipped._\n\n'
@@ -1050,6 +1189,22 @@ emit_report() {
         b_srw_avg=$(field  "$BASEAGG_RAW" 7)
         b_commits=$(field  "$BASEAGG_RAW" 8)
         b_dbtime=$(field   "$BASEAGG_RAW" 9)
+
+        if [[ "$AUTO_BASELINE" == "YES" ]]; then
+            printf -- '- Baseline window **auto-detected** from AWR: snapshots %s-%s (%s snaps,\n' \
+                "$(field "$BASEWIN_RAW" 2)" "$(field "$BASEWIN_RAW" 3)" "$(field "$BASEWIN_RAW" 4)"
+            printf '  %s .. %s), classified by the per-snapshot ratio of `SYNC Remote Write`\n' \
+                "$(field "$BASEWIN_RAW" 5)" "$(field "$BASEWIN_RAW" 6)"
+            printf '  waits to redo writes.\n'
+            printf -- '- Synchronous transport first observed at snap %s (%s).\n' \
+                "$(fmt_or_na "$AB_TRANS_SNAP")" "${AB_TRANS_TIME:-n/a}"
+            printf -- '- Snapshots scanned: %s SYNC, %s NOSYNC, %s IDLE/MIXED.\n' \
+                "$(fmt_or_na "$AB_N_SYNC")" "$(fmt_or_na "$AB_N_NOSYNC")" "$(fmt_or_na "$AB_N_OTHER")"
+            printf -- '- **Detection is behavioral, not configurational:** periods where a SYNC\n'
+            printf '  destination existed but the standby was unreachable count as no-sync -\n'
+            printf '  valid for latency comparison, but check the window makes sense.\n'
+            printf '\n'
+        fi
 
         printf 'Baseline: snapshots %s-%s (%s), %s .. %s\n\n' \
             "$(field "$BASEWIN_RAW" 2)" "$(field "$BASEWIN_RAW" 3)" "$(field "$BASEWIN_RAW" 4)" \

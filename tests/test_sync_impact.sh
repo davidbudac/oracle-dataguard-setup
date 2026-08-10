@@ -9,6 +9,8 @@
 #   STUB_ROLE       database role in the DBINFO row (default PRIMARY)
 #   STUB_NO_SYNC    YES -> the remote destination is ASYNCHRONOUS
 #   STUB_FAIL_QTAG  QTAG name whose query exits 1 (simulated ORA- error)
+#   STUB_AUTOBASE   AUTOBASE classification scenario: default (NOSYNC run
+#                   40-49, MIXED 50, SYNC 51-90), ALLSYNC, or NOSYNCONLY
 #
 # Usage: bash tests/test_sync_impact.sh
 #
@@ -125,7 +127,7 @@ case "$IN" in
     ;;
 *QTAG:AWRAGG*)
     fail_if AWRAGG
-    if [[ "$IN" == *"BETWEEN 50 AND 90"* ]]; then
+    if [[ "$IN" == *"BETWEEN 50 AND 90"* || "$IN" == *"BETWEEN 40 AND 49"* ]]; then
         echo "XAGG|604800|1800000|.6|.48|0|-|2700000|48000"
     else
         echo "XAGG|604800|2000000|1.05|.5|1900000|.7|3000000|50000"
@@ -133,11 +135,44 @@ case "$IN" in
     ;;
 *QTAG:BASEHIST*)
     fail_if BASEHIST
-    if [[ "$IN" == *"BETWEEN 50 AND 90"* ]]; then
+    if [[ "$IN" == *"BETWEEN 50 AND 90"* || "$IN" == *"BETWEEN 40 AND 49"* ]]; then
         echo "HPCT|1|1|2|1800000"
     else
         echo "HPCT|1|2|4|2000000"
     fi
+    ;;
+*QTAG:AUTOBASE*)
+    fail_if AUTOBASE
+    case "${STUB_AUTOBASE:-}" in
+    ALLSYNC)
+        i=40
+        while [[ $i -le 90 ]]; do
+            echo "CLS|$i|2026-05-01 00:00|1000|1000|SYNC"
+            i=$((i+1))
+        done
+        ;;
+    NOSYNCONLY)
+        i=40
+        while [[ $i -le 90 ]]; do
+            echo "CLS|$i|2026-05-01 00:00|0|1000|NOSYNC"
+            i=$((i+1))
+        done
+        ;;
+    *)
+        i=40
+        while [[ $i -le 49 ]]; do
+            printf 'CLS|%s|2026-05-%02d 00:00|0|1000|NOSYNC\n' "$i" $((i-39))
+            i=$((i+1))
+        done
+        echo "CLS|50|2026-05-11 00:00|300|1000|MIXED"
+        echo "CLS|51|2026-05-12 00:00|980|1000|SYNC"
+        i=52
+        while [[ $i -le 90 ]]; do
+            echo "CLS|$i|2026-06-01 00:00|1000|1000|SYNC"
+            i=$((i+1))
+        done
+        ;;
+    esac
     ;;
 *QTAG:BASEWIN*)
     fail_if BASEWIN
@@ -293,6 +328,52 @@ assert_contains "model cross-check" "$OUT" "Model estimate for comparison: 0.330
 # Workloads are comparable in the canned data - no warnings expected
 assert_not_contains "no commit-rate warning" "$OUT" "commit rate differs by more than 2x"
 assert_not_contains "no local-write warning" "$OUT" "LOCAL redo write latency also shifted"
+
+# ==== Test 7b: --auto-baseline ====
+echo "Test 7b: --auto-baseline detects the pre-SYNC window"
+run_script --auto-baseline
+assert_eq "auto-baseline rc" "0" "$RC"
+assert_contains "auto-detected provenance" "$OUT" "auto-detected"
+assert_contains "auto-detected window" "$OUT" "snapshots 40-49"
+assert_contains "transition snap line" "$OUT" "Synchronous transport first observed at snap 51 (2026-05-12 00:00)"
+assert_contains "classification counts" "$OUT" "40 SYNC, 10 NOSYNC, 1 IDLE/MIXED"
+assert_contains "behavioral disclosure" "$OUT" "behavioral, not configurational"
+assert_contains "auto baseline window line" "$OUT" "Baseline: snapshots 40-49 (10), 2026-05-01 00:00 .. 2026-05-10 00:00"
+# Empirical delta from the canned 40-49 aggregates: 1.05 - .6 = 0.450
+assert_contains "auto empirical delta" "$OUT" "Empirical added latency per commit: 0.450 ms"
+assert_contains "auto baseline percentiles" "$OUT" "| lfs p50 / p90 / p99 (<= ms buckets) | 1 / 1 / 2 | 1 / 2 / 4 |"
+
+echo "Test 7b: --auto-baseline flag conflicts exit 2"
+run_script --auto-baseline --baseline-begin 50 --baseline-end 90
+assert_eq "auto + manual baseline rc" "2" "$RC"
+run_script --auto-baseline --no-pack
+assert_eq "auto-baseline with --no-pack rc" "2" "$RC"
+
+echo "Test 7b: --auto-baseline detection-failure scenarios"
+STUB_AUTOBASE=ALLSYNC
+export STUB_AUTOBASE
+run_script --auto-baseline
+unset STUB_AUTOBASE
+assert_eq "all-sync rc" "0" "$RC"
+assert_contains "all-sync note" "$OUT" "predates AWR retention"
+assert_contains "all-sync skips comparison" "$OUT" "comparison skipped"
+
+STUB_AUTOBASE=NOSYNCONLY
+export STUB_AUTOBASE
+run_script --auto-baseline
+unset STUB_AUTOBASE
+assert_eq "no-sync-snaps rc" "0" "$RC"
+assert_contains "no-sync-snaps note" "$OUT" "no synchronous-transport snapshots in AWR retention"
+
+echo "Test 7b: --auto-baseline classification query degradation"
+STUB_FAIL_QTAG=AUTOBASE
+export STUB_FAIL_QTAG
+run_script --auto-baseline
+unset STUB_FAIL_QTAG
+assert_eq "degraded autobase rc" "0" "$RC"
+assert_contains "autobase degraded note" "$OUT" "snapshot classification unavailable"
+assert_contains "autobase collection warning" "$OUT" "auto-baseline classification"
+assert_contains "autobase other sections intact" "$OUT" "**0.330 ms**"
 
 # ==== Test 8: --no-pack skips AWR and ASH ====
 echo "Test 8: --no-pack restricts to free V\$ views"

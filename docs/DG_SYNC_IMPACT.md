@@ -26,6 +26,7 @@ NFS share) - copy the one file to the primary host and run it.
    ./dg_sync_impact.sh --ash-hours 6 --days 14
    ./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' --baseline-end '2026-07-08 00:00'
    ./dg_sync_impact.sh --baseline-begin 12000 --baseline-end 12168     # snap-ID form
+   ./dg_sync_impact.sh --auto-baseline          # detect the pre-SYNC baseline from AWR
    ./dg_sync_impact.sh --no-pack                # no Diagnostics Pack license
    ./dg_sync_impact.sh -o /tmp/sync_impact.md
    ./dg_sync_impact.sh --html -o /tmp/sync_impact.html   # self-contained HTML page
@@ -111,6 +112,45 @@ which the event histogram cannot).
 - *ASH attribution* (`V$ACTIVE_SESSION_HISTORY`): who pays - top SQL,
   modules, services, and the hourly profile of `log file sync` weight.
 
+## Auto-detected baseline (`--auto-baseline`)
+
+If you don't know when synchronous transport was enabled, `--auto-baseline`
+detects the pre-SYNC window from AWR history instead. Oracle does not
+historize the transport configuration (no `DBA_HIST_` view holds
+`TRANSMIT_MODE` or the protection mode), but synchronous transport leaves a
+reliable behavioral fingerprint: while it is active, LGWR records a
+`SYNC Remote Write` wait for essentially every redo write, so the
+per-snapshot ratio
+
+```
+SYNC Remote Write waits (delta) / redo writes (delta)
+```
+
+is ~1 under sync transport and ~0 without it. The script classifies **every
+retained snapshot** (not just the `--days` window - the transition usually
+predates it): `SYNC` at ratio >= 0.5, `NOSYNC` at ratio <= 0.05, `IDLE` for
+near-idle snapshots (fewer than 50 redo writes) or restart artifacts
+(negative deltas), `MIXED` in between. The thresholds are env-overridable:
+`DG_SI_SYNC_RATIO` (0.5), `DG_SI_NOSYNC_RATIO` (0.05), `DG_SI_MIN_WRITES`
+(50). It then takes the **most recent run of at least 2 consecutive
+`NOSYNC` snapshots** before the last `SYNC` snapshot as the baseline
+(`IDLE`/`MIXED` snapshots break a run - gaps are never silently bridged)
+and feeds it into the same comparison machinery as the manual flags. The
+report's section 6 states the detected window, the apparent transition
+snapshot, and the classification counts.
+
+If every classified snapshot is `SYNC` (the transition predates AWR
+retention) or none is (sync transport never observed), the report says so
+and the comparison is skipped - the rest of the report is unaffected.
+
+**Caveat - detection is behavioral, not configurational**: a period where a
+SYNC destination was *configured* but the standby was *down* classifies as
+no-sync, because commits genuinely paid no remote ack then. That makes it a
+valid latency baseline, but sanity-check that the detected window makes
+sense for your history. `--auto-baseline` is mutually exclusive with
+`--baseline-begin`/`--baseline-end` and, like them, requires AWR (it cannot
+be combined with `--no-pack`).
+
 ## Reading the report
 
 | Section | What to look at |
@@ -148,4 +188,6 @@ which the event histogram cannot).
 `tests/test_sync_impact.sh` covers the script with a stubbed `sqlplus`
 (dispatching on the `-- QTAG:` markers embedded in every query): argument
 validation, fatal paths, derived-number correctness, per-section
-degradation, `--no-pack`, and the no-SYNC-destination mode.
+degradation, `--no-pack`, the no-SYNC-destination mode, and the
+`--auto-baseline` scenarios (happy-path window pick, all-SYNC and
+no-SYNC-snapshots retention edge cases, flag conflicts, degradation).
