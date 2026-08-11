@@ -1443,6 +1443,14 @@ emit_report() {
 # pipe tables, bullets with two-space continuations, blockquotes,
 # whole-line _italics_, **bold**, `code`) into HTML. POSIX awk only -
 # no gensub, AIX-safe.
+#
+# Two graphical upgrades happen here (the Markdown itself is unchanged):
+# - the headline "| Measure | Value |" table renders as a row of KPI cards;
+# - other tables get proportional inline bars behind numeric columns
+#   (scaled to the column max). A column qualifies only when every non-"-"
+#   cell is a plain number, at least two are, and its header is not ordinal
+#   (Snap, Hour, bucket, Dest, SQL_ID, NET_TIMEOUT); non-qualifying cells
+#   keep the exact plain <td>/<th> markup.
 
 md_to_html() {
     awk '
@@ -1488,10 +1496,64 @@ md_to_html() {
     function flush_bq() {
         if (bqbuf != "") { print "<blockquote><p>" inline_fmt(bqbuf) "</p></blockquote>"; bqbuf = "" }
     }
+    # Emit the buffered table. Buffering (rather than streaming rows out)
+    # is what allows per-column maxima for the inline bars.
+    function emit_table(   r, j, tag, row, hdr1, h, v, ok, numc, pct, maxc) {
+        if (tnr == 0) return
+        if (tsep && tnr >= 2 && tnc[1] == 2 && tcell[1,1] == "Measure" && tcell[1,2] == "Value") {
+            print "<div class=\"kpis\">"
+            for (r = 2; r <= tnr; r++)
+                print "<div class=\"kpi\"><span class=\"kpi-l\">" inline_fmt(tcell[r,1]) "</span><span class=\"kpi-v\">" inline_fmt(tcell[r,2]) "</span></div>"
+            print "</div>"
+            tnr = 0; tsep = 0
+            return
+        }
+        maxc = 0
+        for (r = 1; r <= tnr; r++) if (tnc[r] > maxc) maxc = tnc[r]
+        for (j = 1; j <= maxc; j++) { barcol[j] = 0; barmax[j] = 0 }
+        hdr1 = tolower(tcell[1,1])
+        if (tsep && tnr >= 3 && hdr1 !~ /measure|statistic/) {
+            for (j = 1; j <= maxc; j++) {
+                h = tolower(tcell[1,j])
+                if (h ~ /snap|hour|bucket|dest|sql_id|net_timeout/) continue
+                ok = 1; numc = 0
+                for (r = 2; r <= tnr; r++) {
+                    v = tcell[r,j]
+                    if (v == "" || v == "-" || v == "n/a") continue
+                    # Oracle prints sub-1 values with a bare leading dot (.5)
+                    if (v !~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) { ok = 0; break }
+                    numc = numc + 1
+                    if (v + 0 > barmax[j]) barmax[j] = v + 0
+                }
+                if (ok && numc >= 2 && barmax[j] > 0) barcol[j] = 1
+            }
+        }
+        print "<table>"
+        for (r = 1; r <= tnr; r++) {
+            tag = (tsep && r == 1) ? "th" : "td"
+            row = "<tr>"
+            for (j = 1; j <= tnc[r]; j++) {
+                v = tcell[r,j]
+                if (tag == "td" && barcol[j] && v ~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) {
+                    pct = (v + 0) / barmax[j] * 100
+                    if (pct < 0) pct = 0
+                    if (pct > 0 && pct < 3) pct = 3
+                    row = row "<td class=\"bar\"><span class=\"fill\" style=\"width:" sprintf("%.1f", pct) "%\"></span><span class=\"v\">" v "</span></td>"
+                } else if (tag == "td" && barcol[j]) {
+                    row = row "<td class=\"bar\"><span class=\"v\">" inline_fmt(v) "</span></td>"
+                } else {
+                    row = row "<" tag ">" inline_fmt(v) "</" tag ">"
+                }
+            }
+            print row "</tr>"
+        }
+        print "</table>"
+        tnr = 0; tsep = 0
+    }
     function close_blocks() {
         flush_li(); flush_p(); flush_bq()
-        if (inul)    { print "</ul>"; inul = 0 }
-        if (intable) { print "</table>"; intable = 0; tbody = 0 }
+        if (inul)   { print "</ul>"; inul = 0 }
+        if (tnr > 0) emit_table()
     }
     {
         line = esc($0)
@@ -1507,16 +1569,16 @@ md_to_html() {
         if (line ~ /^\|/) {
             flush_li(); flush_p(); flush_bq()
             if (inul) { print "</ul>"; inul = 0 }
-            if (line ~ /^\|[-| :]+\|$/) { tbody = 1; next }
-            if (!intable) { print "<table>"; intable = 1; tbody = 0 }
+            if (line ~ /^\|[-| :]+\|$/) { if (tnr > 0) tsep = 1; next }
             n = split(line, cells, /\|/)
-            tag = tbody ? "td" : "th"
-            row = "<tr>"
-            for (i = 2; i < n; i++) row = row "<" tag ">" inline_fmt(trimcell(cells[i])) "</" tag ">"
-            print row "</tr>"
+            tnr = tnr + 1; tnc[tnr] = 0
+            for (i = 2; i < n; i++) {
+                tnc[tnr] = tnc[tnr] + 1
+                tcell[tnr, tnc[tnr]] = trimcell(cells[i])
+            }
             next
         }
-        if (intable) { print "</table>"; intable = 0; tbody = 0 }
+        if (tnr > 0) emit_table()
         if (line ~ /^- /) {
             flush_p(); flush_bq(); flush_li()
             if (!inul) { print "<ul>"; inul = 1 }
@@ -1547,26 +1609,29 @@ emit_html() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sync Data Guard Impact - ${DB_UNIQUE_NAME}</title>
 <style>
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:62em;margin:2em auto;padding:0 1em;line-height:1.5;color:#1a1a2e;background:#fff}
-h1{border-bottom:3px solid #16537e;padding-bottom:.3em}
-h2{border-bottom:1px solid #c5d5e0;margin-top:1.8em;padding-bottom:.2em;color:#16537e}
-table{border-collapse:collapse;margin:.9em 0;font-size:.92em}
-th,td{border:1px solid #b8c4cc;padding:.3em .7em;text-align:left}
-th{background:#e8eff4}
-tr:nth-child(even) td{background:#f6f9fb}
-code{background:#eef1f4;padding:0 .3em;border-radius:3px;font-size:.94em}
-blockquote{border-left:4px solid #d98e04;background:#fdf6e3;margin:.9em 0;padding:.6em 1em}
-blockquote p{margin:.2em 0}
-em{color:#666}
+:root{--bg:#fbfcfe;--fg:#1c2733;--muted:#5c6b7a;--accent:#16537e;--line:#dfe6ed;--thbg:#eaf1f7;--stripe:#f3f7fa;--card:#f1f6fa;--bar:#8fc1e3;--code:#eceff3;--warnbg:#fdf6e3;--warnbd:#d98e04}
 @media (prefers-color-scheme: dark){
-body{background:#14161a;color:#d8dce2}
-h1{border-color:#4a90c2}h2{color:#7ab3d9;border-color:#324049}
-th{background:#20262c}tr:nth-child(even) td{background:#191e23}
-th,td{border-color:#3a444d}
-code{background:#232a31}
-blockquote{background:#2a2412;border-color:#b07708}
-em{color:#9aa4ae}
+:root{--bg:#14161a;--fg:#d8dce2;--muted:#98a3ae;--accent:#6fb1dd;--line:#303a44;--thbg:#1e252c;--stripe:#191e23;--card:#1a2129;--bar:#2f5a7e;--code:#232a31;--warnbg:#2a2412;--warnbd:#b07708}
 }
+body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:70em;margin:2em auto;padding:0 1.2em;line-height:1.55;color:var(--fg);background:var(--bg)}
+h1{font-size:1.7em;border-bottom:3px solid var(--accent);padding-bottom:.35em}
+h2{font-size:1.2em;color:var(--accent);border-left:5px solid var(--accent);border-bottom:1px solid var(--line);padding:.15em 0 .25em .55em;margin-top:2.2em}
+table{border-collapse:collapse;margin:1em 0;font-size:.92em;display:block;overflow-x:auto;max-width:100%}
+th,td{border-bottom:1px solid var(--line);padding:.34em .8em;text-align:left;white-space:nowrap}
+th{background:var(--thbg);border-bottom:2px solid var(--accent)}
+tr:nth-child(even) td{background:var(--stripe)}
+td.bar{position:relative;text-align:right;font-variant-numeric:tabular-nums;min-width:6.5em}
+td.bar .fill{position:absolute;left:2px;top:22%;height:56%;background:var(--bar);opacity:.5;border-radius:2px}
+td.bar .v{position:relative}
+.kpis{display:flex;flex-wrap:wrap;gap:.8em;margin:1.1em 0}
+.kpi{flex:1 1 13em;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:.65em .9em}
+.kpi-l{display:block;font-size:.78em;color:var(--muted);margin-bottom:.2em}
+.kpi-v{display:block;font-size:1.3em;font-weight:600}
+.kpi-v strong{color:var(--accent)}
+code{background:var(--code);padding:0 .3em;border-radius:3px;font-size:.94em}
+blockquote{border-left:4px solid var(--warnbd);background:var(--warnbg);margin:.9em 0;padding:.6em 1em;border-radius:0 6px 6px 0}
+blockquote p{margin:.2em 0}
+em{color:var(--muted)}
 </style>
 </head>
 <body>

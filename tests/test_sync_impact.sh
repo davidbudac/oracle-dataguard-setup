@@ -468,6 +468,13 @@ assert_contains "closing tag" "$OUT" "</html>"
 # Multi-line italic note renders as <em> without literal underscores
 assert_contains "italic note" "$OUT" "<p><em>No baseline window supplied."
 assert_not_contains "no leftover underscores" "$OUT" "_No baseline window supplied"
+# Graphical upgrades: the headline Measure|Value table becomes KPI cards,
+# numeric table columns get proportional inline bars, ordinal columns
+# (Snap, Hour, bucket, Dest) and Statistic|Value tables stay plain cells
+assert_contains "kpi card" "$OUT" '<span class="kpi-l">Added latency per commit (refined estimate)</span><span class="kpi-v"><strong>0.330 ms</strong></span>'
+assert_contains "inline bar" "$OUT" '<span class="fill" style="width:'
+assert_contains "snap column not barred" "$OUT" "<td>101</td>"
+assert_contains "statistic table plain" "$OUT" "<td>user commits</td>"
 
 STUB_NO_SYNC=YES
 export STUB_NO_SYNC

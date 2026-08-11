@@ -44,7 +44,15 @@ report produced (read the report - warnings live there), `1` fatal
 `--html` renders the same report as a standalone HTML page (inline CSS,
 light/dark aware, no external assets) - the Markdown emitter remains the
 single definition of the report and is converted with a built-in
-POSIX-awk filter, so both formats always carry identical content.
+POSIX-awk filter, so both formats always carry identical content. The
+HTML adds two purely presentational upgrades on top: the headline
+`| Measure | Value |` table renders as a row of KPI cards, and numeric
+table columns get proportional inline bars scaled to the column maximum
+(so latency spikes and skewed histograms are visible at a glance). A
+column only qualifies for bars when every populated cell is a plain
+number, at least two are, and its header is not ordinal (`Snap`, `Hour`,
+`bucket`, `Dest`, `SQL_ID`, `NET_TIMEOUT`); everything else keeps plain
+table cells.
 
 ## Why "log file sync minus the remote wait" is wrong
 
