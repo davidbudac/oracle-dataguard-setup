@@ -181,9 +181,9 @@ case "$IN" in
     ;;
 *QTAG:TREND*)
     fail_if TREND
-    echo "TREND|101|2026-08-03 11:00|12000|1.05|.5|.7|3.3|300|2.4"
-    echo "TREND|102|2026-08-03 12:00|13000|1.1|.52|.72|3.6|310|2.6"
-    echo "TREND|103|2026-08-03 13:00|11000|9.5|.5|9.2|3.1|420|95.7"
+    echo "TREND|101|2026-08-03 11:00|12000|1.05|.5|.7|3.3|300|2400"
+    echo "TREND|102|2026-08-03 12:00|13000|1.1|.52|.72|3.6|310|2600"
+    echo "TREND|103|2026-08-03 13:00|11000|9.5|.5|9.2|3.1|420|95700"
     ;;
 *QTAG:ASH*)
     fail_if ASH
@@ -307,14 +307,16 @@ assert_contains "srw max bucket" "$OUT" "| SYNC Remote Write | <= 0.512 | <= 1.0
 assert_contains "overlap model result" "$OUT" "E[max(L,R)] - E[L] = **0.330 ms**"
 assert_contains "resp histogram row" "$OUT" "| 2 | 1 | 2999000 | 08/09/2026 11:59:02 |"
 # AWR trend
-assert_contains "trend row" "$OUT" "| 101 | 2026-08-03 11:00 | 12000 | 1.05 | .5 | .7 | 3.3 | 300 | 2.4 |"
+assert_contains "trend row" "$OUT" "| 101 | 2026-08-03 11:00 | 12000 | 1.05 | .5 | .7 | 3.3 | 300 | 2400 |"
+assert_contains "trend ovh header in ms" "$OUT" "| est ovh (ms) |"
 # Top latency spikes: resp buckets sorted worst-first; AWR snaps ranked by
 # max(0, remote ack - local write): snap 103 -> 9.2-.5 = 8.700 on top
 assert_contains "spike resp row" "$OUT" "| 2 | 26 | 3 | 08/05/2026 02:11:07 |"
 SPIKES_SECTION=$(printf '%s\n' "$OUT" | sed -n '/^## 6\./,/^## 7\./p')
 TOP_RESP_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 2 [|] [0-9]+ [|]' | head -1)
 assert_contains "resp spikes sorted desc" "$TOP_RESP_SPIKE" "| 2 | 26 | 3 |"
-assert_contains "awr spike row" "$OUT" "| 103 | 2026-08-03 13:00 | 8.700 | 9.5 | .5 | 9.2 | 11000 | 95.7 |"
+assert_contains "awr spike row" "$OUT" "| 103 | 2026-08-03 13:00 | 8.700 | 9.5 | .5 | 9.2 | 11000 | 95700 |"
+assert_contains "awr spike header in ms" "$OUT" "| est added ms |"
 TOP_AWR_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 10[0-9] [|]' | head -1)
 assert_contains "awr spikes sorted desc" "$TOP_AWR_SPIKE" "| 103 |"
 # Baseline not requested

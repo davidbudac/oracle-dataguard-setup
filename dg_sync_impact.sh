@@ -686,15 +686,15 @@ p AS (
 SELECT 'TREND|'||SNAP_ID
   ||'|'||TO_CHAR(ET,'YYYY-MM-DD HH24:MI')
   ||'|'||NVL(TO_CHAR(LFS_CNT),'-')
-  ||'|'||NVL(TO_CHAR(ROUND(LFS_MS,2)),'-')
-  ||'|'||NVL(TO_CHAR(ROUND(LFPW_MS,2)),'-')
-  ||'|'||NVL(TO_CHAR(ROUND(SRW_MS,2)),'-')
+  ||'|'||NVL(TO_CHAR(ROUND(LFS_MS,3)),'-')
+  ||'|'||NVL(TO_CHAR(ROUND(LFPW_MS,3)),'-')
+  ||'|'||NVL(TO_CHAR(ROUND(SRW_MS,3)),'-')
   ||'|'||CASE WHEN COMMITS >= 0 AND SECS > 0
               THEN TO_CHAR(ROUND(COMMITS/SECS,1)) ELSE '-' END
   ||'|'||CASE WHEN DBTIME_S >= 0
               THEN TO_CHAR(ROUND(DBTIME_S)) ELSE '-' END
   ||'|'||CASE WHEN SRW_MS IS NOT NULL AND LFPW_MS IS NOT NULL AND LFS_CNT > 0
-              THEN TO_CHAR(ROUND(GREATEST(0,SRW_MS-LFPW_MS)*LFS_CNT/1000,1)) ELSE '-' END
+              THEN TO_CHAR(ROUND(GREATEST(0,SRW_MS-LFPW_MS)*LFS_CNT,1)) ELSE '-' END
 FROM p
 WHERE ET >= SYSDATE - ${AWR_DAYS}
 ORDER BY SNAP_ID;") \
@@ -1166,9 +1166,10 @@ emit_report() {
     elif [[ -z "$TREND_RAW" ]]; then
         printf '_AWR trend unavailable (query failed or no data)._\n\n'
     else
-        printf 'Per-snapshot averages; `est ovh (s)` = max(0, avg R - avg L) x lfs waits - a\n'
-        printf 'lower-bound estimate (ms-resolution AWR data is too coarse for the E[max] model).\n\n'
-        printf '| Snap | End time | lfs waits | lfs avg ms | local wr ms | remote ack ms | commits/s | DB time s | est ovh (s) |\n'
+        printf 'Per-snapshot averages; `est ovh (ms)` = max(0, avg R - avg L) x lfs waits, in\n'
+        printf 'milliseconds - a lower-bound estimate (AWR carries no histograms fine enough\n'
+        printf 'for the E[max] model, but the microsecond event totals keep the averages exact).\n\n'
+        printf '| Snap | End time | lfs waits | lfs avg ms | local wr ms | remote ack ms | commits/s | DB time s | est ovh (ms) |\n'
         printf '|------|----------|-----------|------------|-------------|---------------|-----------|-----------|-------------|\n'
         printf '%s\n' "$TREND_RAW" | rows TREND | while IFS='|' read -r _s _t _c _l _pw _rw _cs _dbt _ovh; do
             printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
@@ -1218,7 +1219,7 @@ emit_report() {
                 printf 'day(s); lower-bound estimator max(0, avg remote ack - avg local write),\n'
                 printf 'worst first - these are snapshot-interval averages, so a sustained bad\n'
                 printf 'period, not a single slow commit):\n\n'
-                printf '| Snap | End time | Added ms/commit (est) | lfs avg ms | local wr ms | remote ack ms | lfs waits | est added s |\n'
+                printf '| Snap | End time | Added ms/commit (est) | lfs avg ms | local wr ms | remote ack ms | lfs waits | est added ms |\n'
                 printf '|------|----------|-----------------------|------------|-------------|---------------|-----------|-------------|\n'
                 printf '%s\n' "$spikes" | while IFS='|' read -r _ovh _s _t _c _l _pw _rw _cs _dbt _est; do
                     printf '| %s | %s | %s | %s | %s | %s | %s | %s |\n' \
