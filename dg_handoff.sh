@@ -553,29 +553,29 @@ info "Services in report: ${SERVICE_LIST[*]}"
 
 SQLNET_EXPIRE_TIME=$(get_sqlnet_expire_time)
 
-RPO_STATEMENT="Data-loss exposure is unknown because protection mode or standby transport mode could not be discovered."
+RPO_STATEMENT="RPO unknown: protection mode or standby transport mode could not be discovered. Treat every failover as potentially lossy until the DBA team confirms the transport mode."
 case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%s' "$STANDBY_LOGXPTMODE" | tr '[:lower:]' '[:upper:]')" in
     *MAXIMUM*AVAILABILITY*'|'SYNC|*MAXIMUM*AVAILABILITY*'|'FASTSYNC)
-        RPO_STATEMENT="Protection is ${PROTECTION_MODE} with standby transport ${STANDBY_LOGXPTMODE}: a failover loses no committed transactions. SYNC/FASTSYNC can add commit latency, which is most visible for chatty transaction patterns."
+        RPO_STATEMENT="RPO = 0 while synchronized: protection is ${PROTECTION_MODE}, standby transport ${STANDBY_LOGXPTMODE}. A commit is not acknowledged to the client until the standby confirms redo receipt (FASTSYNC acknowledges on receipt into standby memory, before the standby disk write), so a failover loses no committed transactions. If the standby becomes unreachable the primary continues alone; a failover during that window loses the redo generated since the disconnect. Cost: every commit carries one primary-to-standby network round trip."
         ;;
     *MAXIMUM*PERFORMANCE*'|'ASYNC)
-        RPO_STATEMENT="Protection is ${PROTECTION_MODE} with standby transport ${STANDBY_LOGXPTMODE}: a failover may lose the last few seconds of committed transactions - design idempotency and reconciliation accordingly."
+        RPO_STATEMENT="RPO > 0: protection is ${PROTECTION_MODE}, standby transport ${STANDBY_LOGXPTMODE}. Redo ships asynchronously, so a failover loses whatever had not reached the standby at failure time - normally a few seconds, unbounded if transport falls behind. Committed, client-acknowledged transactions can disappear in a failover: exactly-once workflows need idempotency keys or post-failover reconciliation."
         ;;
     *)
         if [[ "$STANDBY_LOGXPTMODE" != "unknown" ]]; then
-            RPO_STATEMENT="Protection is ${PROTECTION_MODE:-unknown} with standby transport ${STANDBY_LOGXPTMODE}; confirm exact RPO with the DBA team. SYNC/FASTSYNC can add commit latency for chatty transaction patterns."
+            RPO_STATEMENT="Protection is ${PROTECTION_MODE:-unknown} with standby transport ${STANDBY_LOGXPTMODE}; confirm the exact RPO with the DBA team. SYNC/FASTSYNC adds a standby round trip to every commit; ASYNC allows data loss bounded by transport lag at failover."
         fi
         ;;
 esac
 
 if [[ "$FSFO_ENABLED" == "YES" ]]; then
     if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
-        OUTAGE_STATEMENT="FSFO is enabled: automatic failover begins after approximately ${FSFO_THRESHOLD}s of primary unreachability. Expect connection errors for roughly that window plus driver reconnect time, followed by a cold-cache brownout after the role change."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled with a ${FSFO_THRESHOLD}s threshold. App-visible outage on primary loss = ${FSFO_THRESHOLD}s detection + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3). Budget 1-3 minutes of connection errors."
     else
-        OUTAGE_STATEMENT="FSFO is enabled, but the failover threshold could not be discovered. Expect connection errors for the configured threshold plus driver reconnect time, followed by a cold-cache brownout after the role change."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled but the threshold could not be discovered. App-visible outage = detection threshold + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3)."
     fi
 else
-    OUTAGE_STATEMENT="FSFO is not enabled or could not be confirmed: failover is a manual DBA action, so outage lasts until it is performed. Expect a cold-cache brownout after the role change."
+    OUTAGE_STATEMENT="FSFO is not enabled or could not be confirmed: failover is a manual DBA action and the outage lasts until it is executed and the service starts on the new primary. A planned switchover interrupts connections for the role transition (typically 1-2 minutes) plus client reconnect."
 fi
 
 # ============================================================
@@ -848,6 +848,14 @@ fi
 # Best-effort: no base64/openssl on the host just drops the link
 VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
 
+# Easy Connect Plus string used by the end-to-end verification example;
+# degrades to a primary-only address when the standby host is unknown.
+if [[ -n "$STANDBY_HOSTNAME" ]]; then
+    VERIFY_EZ=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "${SERVICE_LIST[0]:-service_name}")
+else
+    VERIFY_EZ="${PRIMARY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+fi
+
 {
     echo "# Data Guard Handoff Report"
     echo ""
@@ -909,9 +917,23 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
     echo ""
     echo "- ${RPO_STATEMENT}"
     echo "- ${OUTAGE_STATEMENT}"
-    echo "- FORCE LOGGING is ${FORCE_LOGGING:-unknown}; NOLOGGING batch jobs can still create unrecoverable standby gaps if force logging is disabled for maintenance."
-    echo "- Sequence values can have gaps after switchover/failover because cached values on the old primary are discarded."
-    echo "- Application firewalls must allow the app tier to reach both database hosts on listener port ${PORT} before go-live."
+    echo "- After any role change the new primary starts with a largely cold buffer cache and shared pool: elevated physical reads and hard parsing for the first minutes. Queries succeed but latency degrades (brownout, not blackout)."
+    echo "- FORCE LOGGING is ${FORCE_LOGGING:-unknown}. Direct-path/NOLOGGING loads generate no redo when force logging is off: the affected blocks are unrecoverable on the standby and raise ORA-26040 when read after a failover. Any NOLOGGING batch job needs DBA sign-off."
+    echo "- Every application host must resolve and reach BOTH database hosts on port ${PORT} before go-live - the standby address is only exercised when it is already an emergency."
+    echo ""
+
+    echo "### Errors During Role Transitions"
+    echo ""
+    echo "| Error | When it appears | Client action |"
+    echo "|-------|-----------------|---------------|"
+    echo "| ORA-12514 | Listener up, service not registered - normal on the standby address, and on both hosts mid-failover | Retryable: driver moves to the next address / retry pass |"
+    echo "| ORA-12541, ORA-12170, ORA-12535 | No listener / TCP connect timeout - host or listener down | Retryable: next address |"
+    echo "| ORA-01033 | Instance starting or mounting (mid-role-change) | Retryable with backoff |"
+    echo "| ORA-03113, ORA-03114, ORA-01089 | Existing session killed by failover/shutdown | Reconnect; the role-aware descriptor re-routes to the surviving side |"
+    echo "| ORA-25402 | TAF (where the DBA configured it on the service) failed the session over mid-transaction | ROLLBACK, then re-run the transaction |"
+    echo "| ORA-16000 | DML sent to a read-only standby | Not retryable: routing bug - service running on the standby without the role trigger, or a standby-only string handed to a writer |"
+    echo ""
+    echo "**Commit ambiguity:** a dropped connection (e.g. ORA-03113) while a COMMIT is in flight leaves the outcome unknown - the transaction may or may not be committed on the surviving database. Blind re-execution double-applies it. Use idempotency keys / unique business keys and verify state after reconnect. Oracle Transaction Guard resolves the outcome programmatically but requires a service with COMMIT_OUTCOME=TRUE and a 12c+ driver - not configured by this setup; request it from the DBA team if you need it."
     echo ""
 
     echo "### Adding Datafiles or PDBs After Setup (DBA Note)"
@@ -935,17 +957,30 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
     echo ""
     echo "## 3. Connection Strings"
     echo ""
-    echo "- **Role-aware (failover)** — single descriptor with both hosts. Best"
-    echo "  for the application tier when the role-aware service trigger"
-    echo "  (\`trigger/create_role_trigger.sh\`) is deployed and enabled: the"
-    echo "  service is only up on whichever side is primary, so clients"
-    echo "  automatically follow the active database after a switchover or failover."
+    echo "**Role-aware (failover)** descriptors: both hosts in one ADDRESS_LIST. The service runs only on the current primary (stopped on the standby by the role trigger), so clients follow the primary across switchover/failover with no config change. Use this for the application tier."
     echo ""
     if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
         echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
     else
         echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
     fi
+    echo ""
+    echo "### Descriptor Parameters"
+    echo ""
+    echo "| Parameter | Value | Effect |"
+    echo "|-----------|-------|--------|"
+    echo "| LOAD_BALANCE | OFF | Addresses tried in listed order: primary host first, then standby |"
+    echo "| TRANSPORT_CONNECT_TIMEOUT | 3 s | TCP connect budget per address |"
+    echo "| CONNECT_TIMEOUT | 10 s | Total budget per address (TCP + listener handshake + session creation) |"
+    echo "| RETRY_COUNT / RETRY_DELAY | 3 / 3 s | After the whole ADDRESS_LIST fails, it is retried 3 more times, 3 s apart |"
+    echo ""
+    echo "This descriptor configures no TAF (\`FAILOVER_MODE\`): after a session drop, reconnecting is the pool's or application's job unless the DBA has set TAF attributes on the service itself."
+    echo ""
+    echo "Worst-case connect times these values produce:"
+    echo ""
+    echo "- Both hosts unreachable (TCP timeout): 2 addresses x 3 s per pass, 4 passes, 3 x 3 s delays = **about 33 s** until the driver returns an error."
+    echo "- Primary host down, standby listener up (service stopped there): about 3 s TCP timeout + immediate ORA-12514 per pass = **about 21 s** until error."
+    echo "- Failover in progress: attempts cycle (each bounded as above) until the service registers on the new primary, then the next attempt succeeds."
     echo ""
 
     for svc in "${SERVICE_LIST[@]}"; do
@@ -977,7 +1012,7 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
                 echo "Standby-only note: the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
                 echo ""
             elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
-                echo "Standby-only note: READ ONLY WITH APPLY requires the appropriate Active Data Guard license. Reads can lag primary commits, read-your-writes is not guaranteed, and DML fails with ORA-16000."
+                echo "Standby-only note: the standby is READ ONLY WITH APPLY (Active Data Guard - separately licensed). Reads see committed data as of the apply point (staleness = apply lag; read-your-writes across the two databases is not guaranteed). Bound staleness per session with \`ALTER SESSION SET STANDBY_MAX_DATA_DELAY = <seconds>\` (queries then raise ORA-03172 instead of returning stale data); \`ALTER SESSION SYNC WITH PRIMARY\` blocks until caught up (requires SYNC transport and real-time apply). DML and DDL fail with ORA-16000 (exception: DML on global temporary tables)."
                 echo ""
             elif [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
                 echo "Standby-only note: standby readability could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
@@ -991,21 +1026,24 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
     if [[ -n "$IMPACT_REFERENCE" ]]; then
         echo "- Full application behavior briefing: \`${IMPACT_REFERENCE}\`."
     fi
-    echo "- What changes for your application: SYNC/FASTSYNC can add commit latency; NOLOGGING batch jobs need DBA review; sequence caches can create gaps after role change; expect a cold-cache brownout; firewalls must reach both hosts."
-    echo "- The role-aware descriptor relies on the service being **stopped on"
-    echo "  the standby** by \`trigger/create_role_trigger.sh\`. Without it,"
-    echo "  clients may attach to a read-only standby and receive ORA-16000 on writes."
-    echo "- TAF settings reconnect SELECT cursors only when configured by the service or descriptor; active DML transactions still need application-level retry."
+    echo "- The role-aware descriptor works only because \`trigger/create_role_trigger.sh\` stops the service on the standby. With the trigger disabled, both hosts accept connections and writers landing on the standby get ORA-16000."
+    echo "- Sequences: NOORDER/CACHE sequences (default CACHE 20) discard cached values at role change - expect gaps of up to the CACHE size per sequence, and no ordering guarantee across a failover. Never use sequence values as gapless or strictly-ordered business keys."
+    echo "- TAF (where configured on the service) replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 2."
+    echo "- Application Continuity (12.2+ drivers) can replay in-flight transactions, but requires \`FAILOVER_TYPE=TRANSACTION\` and \`COMMIT_OUTCOME=TRUE\` on the service - not configured by this setup; coordinate with the DBA team."
+    echo "- After a switchover nothing changes for clients on the role-aware descriptor. Host-specific strings silently point at the wrong database until this report is regenerated."
     echo ""
-    echo "## 5. Recommended Client and Pool Settings"
+    echo "## 5. Client and Pool Settings"
     echo ""
-    echo "- [ ] Use the provided descriptor timeouts: \`CONNECT_TIMEOUT=10\`, \`TRANSPORT_CONNECT_TIMEOUT=3\`, and retry counts to bound connect hangs."
-    echo "- [ ] Set driver connection timeout to 5-10 seconds and read/call timeout to the smallest value your request SLO allows."
-    echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}; also enable TCP keepalive on client hosts."
-    echo "- [ ] Enable pool validation on borrow or an equivalent lightweight connection check before handing out idle connections."
-    echo "- [ ] TAF is SELECT-only replay; in-flight DML, commits, and non-idempotent calls require application retry/reconciliation."
+    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 3). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
+    echo "- [ ] Read/call timeout on every request path (JDBC \`oracle.jdbc.ReadTimeout\`, python-oracledb \`call_timeout\`, ODP.NET \`CommandTimeout\`): without one, a failover can leave in-flight calls hanging until TCP gives up (minutes)."
+    echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}. Add \`(ENABLE=BROKEN)\` inside DESCRIPTION to enable OS TCP keepalive on the session socket, and tune client keepalive below any firewall idle timeout."
+    echo "- [ ] Validate on borrow (JDBC \`isValid()\`, python-oracledb pool \`ping_interval\`, ODP.NET \`Validate Connection=true\`): after a failover every idle pooled connection is dead and must be detected before first use."
+    echo "- [ ] Cap pool max size and reconnect concurrency: after a failover all clients reconnect at once, and an uncapped logon storm slows the new primary during the cold-cache window."
+    echo "- [ ] Set max connection lifetime/recycle below any firewall or load-balancer idle timeout between the app tier and the database hosts."
     echo ""
-    echo "## 6. Quick Verification"
+    echo "## 6. Verification"
+    echo ""
+    echo "Reachability - both hosts, from every application host (the standby address is only exercised when it is already an emergency):"
     echo ""
     echo '```bash'
     echo "tnsping ${PRIMARY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
@@ -1017,6 +1055,19 @@ VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
         echo "nc -z ${STANDBY_HOSTNAME} ${PORT}"
     fi
     echo '```'
+    echo ""
+    echo "\`tnsping\` and \`nc\` prove listener reachability only. End-to-end check - also the pass criterion for a switchover drill (re-run it after the switchover; DB_UNIQUE_NAME and SERVER_HOST must swap while DATABASE_ROLE stays PRIMARY):"
+    echo ""
+    echo '```'
+    echo "sqlplus app_user/<pwd>@'${VERIFY_EZ}'"
+    echo ""
+    echo "SELECT SYS_CONTEXT('USERENV','DB_UNIQUE_NAME') db_unique_name,"
+    echo "       SYS_CONTEXT('USERENV','DATABASE_ROLE')  database_role,"
+    echo "       SYS_CONTEXT('USERENV','SERVER_HOST')    server_host"
+    echo "FROM dual;"
+    echo '```'
+    echo ""
+    echo "Expected now: \`${PRIMARY_DB_UNIQUE_NAME}\` / \`PRIMARY\` / \`${PRIMARY_HOSTNAME}\`."
 
     if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
         echo ""
