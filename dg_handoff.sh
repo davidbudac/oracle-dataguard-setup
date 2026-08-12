@@ -734,6 +734,319 @@ build_visualizer_url() {
 }
 # ---- end dataguard-doc visualizer helpers ----
 
+# ---- begin handoff html renderer ----
+# Kept byte-identical in dg_handoff.sh and
+# primary/10_generate_handoff_report.sh (tests/test_handoff_html.sh
+# diffs the two copies). The Markdown emitter stays the single
+# definition of the report; handoff_md_to_html converts exactly the
+# Markdown subset it produces (h1-h4, pipe tables, bullets with
+# two-space continuations and "- [ ]" checklist items, fenced code
+# blocks, blockquotes, **bold**, `code`, [text](url) links) into HTML.
+# POSIX awk only - no gensub, AIX-safe.
+#
+# Presentation upgrades happen here (the Markdown itself is unchanged):
+# the meta list under the H1 becomes a chip strip (CSS h1+ul), the
+# "**Verdict:** X" paragraph becomes a colored status pill, "**WARNING:**"
+# paragraphs and blockquotes become amber callouts, "- [ ]" items render
+# as checklist boxes, and every fenced block gets a copy button.
+
+handoff_md_to_html() {
+    awk '
+    function esc(s) {
+        gsub(/&/, "\\&amp;", s)
+        gsub(/</, "\\&lt;", s)
+        gsub(/>/, "\\&gt;", s)
+        return s
+    }
+    function inline_fmt(s,   out, m, p, txt, url) {
+        out = ""
+        while (match(s, /\[[^\]]+\]\([^)]+\)/)) {
+            m = substr(s, RSTART, RLENGTH)
+            p = index(m, "](")
+            txt = substr(m, 2, p - 2)
+            url = substr(m, p + 2, length(m) - p - 2)
+            out = out substr(s, 1, RSTART-1) "<a href=\"" url "\">" txt "</a>"
+            s = substr(s, RSTART+RLENGTH)
+        }
+        s = out s
+        out = ""
+        while (match(s, /\*\*[^*]+\*\*/)) {
+            out = out substr(s, 1, RSTART-1) "<strong>" substr(s, RSTART+2, RLENGTH-4) "</strong>"
+            s = substr(s, RSTART+RLENGTH)
+        }
+        s = out s
+        out = ""
+        while (match(s, /`[^`]+`/)) {
+            out = out substr(s, 1, RSTART-1) "<code>" substr(s, RSTART+1, RLENGTH-2) "</code>"
+            s = substr(s, RSTART+RLENGTH)
+        }
+        return out s
+    }
+    function trimcell(s) {
+        sub(/^[ \t]+/, "", s)
+        sub(/[ \t]+$/, "", s)
+        return s
+    }
+    function flush_li() {
+        if (li != "") {
+            if (li ~ /^\[ \] /)
+                print "<li class=\"task\">" inline_fmt(substr(li, 5)) "</li>"
+            else
+                print "<li>" inline_fmt(li) "</li>"
+            li = ""
+        }
+    }
+    function flush_p(   status, cls) {
+        if (pbuf != "") {
+            if (pbuf ~ /^\*\*Verdict:\*\* /) {
+                status = substr(pbuf, 14)
+                cls = "warning"
+                if (status ~ /HEALTHY/) cls = "healthy"
+                if (status ~ /ERROR/)   cls = "error"
+                print "<p class=\"verdict\"><strong>Verdict</strong> <span class=\"pill pill-" cls "\">" status "</span></p>"
+            } else if (pbuf ~ /^\*\*WARNING:\*\*/) {
+                print "<p class=\"warn\">" inline_fmt(pbuf) "</p>"
+            } else {
+                print "<p>" inline_fmt(pbuf) "</p>"
+            }
+            pbuf = ""
+        }
+    }
+    function flush_bq() {
+        if (bqbuf != "") { print "<blockquote><p>" inline_fmt(bqbuf) "</p></blockquote>"; bqbuf = "" }
+    }
+    # Emit the buffered table (buffering distinguishes header rows).
+    function emit_table(   r, j, tag, row) {
+        if (tnr == 0) return
+        print "<div class=\"twrap\"><table>"
+        for (r = 1; r <= tnr; r++) {
+            tag = (tsep && r == 1) ? "th" : "td"
+            row = "<tr>"
+            for (j = 1; j <= tnc[r]; j++)
+                row = row "<" tag ">" inline_fmt(tcell[r,j]) "</" tag ">"
+            print row "</tr>"
+        }
+        print "</table></div>"
+        tnr = 0; tsep = 0
+    }
+    function close_blocks() {
+        flush_li(); flush_p(); flush_bq()
+        if (inul)   { print "</ul>"; inul = 0 }
+        if (tnr > 0) emit_table()
+    }
+    {
+        line = esc($0)
+
+        # fenced code blocks pass through verbatim (escaped, no inline fmt)
+        if (line ~ /^```/) {
+            if (infence) { print "</code></pre>"; infence = 0 }
+            else { close_blocks(); printf "<pre><code>"; infence = 1 }
+            next
+        }
+        if (infence) { print line; next }
+
+        # bullet continuation (two-space indent while a bullet is open)
+        if (li != "" && line ~ /^  [^ ]/) {
+            sub(/^[ \t]+/, "", line)
+            li = li " " line
+            next
+        }
+        if (line ~ /^#### /) { close_blocks(); print "<h4>" inline_fmt(substr(line,6)) "</h4>"; next }
+        if (line ~ /^### /)  { close_blocks(); print "<h3>" inline_fmt(substr(line,5)) "</h3>"; next }
+        if (line ~ /^## /)   { close_blocks(); print "<h2>" inline_fmt(substr(line,4)) "</h2>"; next }
+        if (line ~ /^# /)    { close_blocks(); print "<h1>" inline_fmt(substr(line,3)) "</h1>"; next }
+        if (line ~ /^\|/) {
+            flush_li(); flush_p(); flush_bq()
+            if (inul) { print "</ul>"; inul = 0 }
+            if (line ~ /^\|[-| :]+\|$/) { if (tnr > 0) tsep = 1; next }
+            n = split(line, cells, /\|/)
+            tnr = tnr + 1; tnc[tnr] = 0
+            for (i = 2; i < n; i++) {
+                tnc[tnr] = tnc[tnr] + 1
+                tcell[tnr, tnc[tnr]] = trimcell(cells[i])
+            }
+            next
+        }
+        if (tnr > 0) emit_table()
+        if (line ~ /^- /) {
+            flush_p(); flush_bq(); flush_li()
+            if (!inul) { print "<ul>"; inul = 1 }
+            li = substr(line, 3)
+            next
+        }
+        if (inul) { flush_li(); print "</ul>"; inul = 0 }
+        if (line ~ /^&gt; ?/) {
+            flush_p()
+            sub(/^&gt; ?/, "", line)
+            bqbuf = (bqbuf == "") ? line : bqbuf " " line
+            next
+        }
+        flush_bq()
+        if (line ~ /^[ \t]*$/) { flush_p(); next }
+        pbuf = (pbuf == "") ? line : pbuf " " line
+    }
+    END { if (infence) print "</code></pre>"; close_blocks() }
+    '
+}
+
+# Markdown report on stdin -> self-contained styled HTML page on stdout.
+render_handoff_html() {
+    cat <<HTMLHEAD
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Data Guard Handoff - ${PRIMARY_DB_UNIQUE_NAME:-report}</title>
+<style>
+:root{
+  --bg:#f6f9f7;--fg:#1e2a26;--muted:#5f7068;--accent:#0d6b5b;--accent-ink:#0a5347;
+  --line:#dce5e0;--card:#edf3ef;--chipbg:#e7efeb;--thbg:#e3ede8;--stripe:#f0f5f2;
+  --code:#e7efeb;--codefg:#173f36;--pre:#14231e;--prefg:#d8e7e0;--preline:#24382f;
+  --ok:#177245;--okbg:#dff1e6;--warn:#8a5a00;--warnbg:#f7eed7;--err:#a8231b;--errbg:#f7e3e1;
+}
+@media (prefers-color-scheme: dark){
+:root{
+  --bg:#111816;--fg:#d6e1db;--muted:#8fa39a;--accent:#54b3a0;--accent-ink:#7cc7b8;
+  --line:#28342f;--card:#18211d;--chipbg:#1a2520;--thbg:#1c2823;--stripe:#151e1a;
+  --code:#1e2b26;--codefg:#a9cec2;--pre:#0c1512;--prefg:#cfe0d8;--preline:#22322b;
+  --ok:#63c78d;--okbg:#122a1c;--warn:#d9a13b;--warnbg:#2a2210;--err:#e5776f;--errbg:#2b1513;
+}
+}
+*{box-sizing:border-box}
+body{
+  font-family:system-ui,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  max-width:72em;margin:0 auto;padding:2.2em 1.4em 4em;
+  line-height:1.6;color:var(--fg);background:var(--bg);
+}
+h1{
+  font-size:2em;font-weight:700;letter-spacing:-.015em;line-height:1.15;
+  margin:.2em 0 .55em;padding-bottom:.4em;border-bottom:3px solid var(--accent);
+}
+h1+ul{
+  list-style:none;display:flex;flex-wrap:wrap;gap:.5em;margin:0 0 2em;padding:0;
+}
+h1+ul li{
+  background:var(--chipbg);border:1px solid var(--line);border-radius:999px;
+  padding:.28em .95em;font-size:.83em;color:var(--muted);
+}
+h1+ul li strong{color:var(--fg);font-weight:600}
+h1+ul li a{color:var(--accent-ink)}
+h2{
+  font-size:1.28em;font-weight:650;letter-spacing:-.01em;color:var(--accent-ink);
+  margin:2.6em 0 .7em;padding-bottom:.3em;border-bottom:1px solid var(--line);
+}
+h3{font-size:1.05em;font-weight:650;margin:1.9em 0 .5em}
+h4{
+  font-size:.76em;font-weight:650;text-transform:uppercase;letter-spacing:.09em;
+  color:var(--muted);margin:1.7em 0 .45em;
+}
+p,ul{max-width:62em}
+ul{padding-left:1.3em;margin:.6em 0 1em}
+li{margin:.3em 0}
+li.task{list-style:none;position:relative;padding-left:.4em}
+li.task::before{
+  content:"";position:absolute;left:-1.25em;top:.36em;width:.75em;height:.75em;
+  border:2px solid var(--accent);border-radius:3px;
+}
+a{color:var(--accent-ink)}
+code{
+  font-family:ui-monospace,"SF Mono",Menlo,Consolas,"Liberation Mono",monospace;
+  font-size:.9em;background:var(--code);color:var(--codefg);
+  padding:.08em .35em;border-radius:4px;
+}
+pre{
+  background:var(--pre);color:var(--prefg);
+  border:1px solid var(--preline);border-radius:8px;
+  padding:.9em 1.1em;margin:.8em 0 1.1em;overflow-x:auto;
+  font-size:.86em;line-height:1.5;
+}
+pre code{background:none;color:inherit;padding:0;border-radius:0;font-size:1em}
+.prewrap{position:relative}
+.prewrap .copy{
+  position:absolute;top:.55em;right:.6em;
+  font:inherit;font-size:.8em;letter-spacing:.04em;
+  color:var(--prefg);background:transparent;border:1px solid var(--preline);
+  border-radius:5px;padding:.15em .7em;cursor:pointer;opacity:.75;
+}
+.prewrap .copy:hover,.prewrap .copy:focus-visible{opacity:1;border-color:var(--prefg);outline:none}
+.twrap{overflow-x:auto;margin:.8em 0 1.2em}
+table{border-collapse:collapse;font-size:.9em;min-width:34em}
+th,td{
+  border-bottom:1px solid var(--line);padding:.42em .9em;text-align:left;
+  vertical-align:top;font-variant-numeric:tabular-nums;
+}
+th{
+  background:var(--thbg);border-bottom:2px solid var(--accent);
+  font-weight:650;white-space:nowrap;
+}
+tr:nth-child(even) td{background:var(--stripe)}
+td code{white-space:nowrap}
+.verdict{margin:1.2em 0 .6em;font-size:1.02em}
+.pill{
+  display:inline-block;border-radius:999px;padding:.14em .85em;
+  font-weight:650;font-size:.9em;letter-spacing:.02em;
+}
+.pill-healthy{color:var(--ok);background:var(--okbg)}
+.pill-warning{color:var(--warn);background:var(--warnbg)}
+.pill-error{color:var(--err);background:var(--errbg)}
+p.warn,blockquote{
+  border-left:4px solid var(--warn);background:var(--warnbg);
+  margin:.9em 0;padding:.65em 1em;border-radius:0 8px 8px 0;max-width:62em;
+}
+blockquote p{margin:.2em 0}
+@media (prefers-reduced-motion: no-preference){
+  .prewrap .copy{transition:opacity .15s ease,border-color .15s ease}
+}
+</style>
+</head>
+<body>
+HTMLHEAD
+    handoff_md_to_html
+    cat <<'HTMLFOOT'
+<script>
+document.querySelectorAll('pre').forEach(function (pre) {
+  var codeEl = pre.querySelector('code');
+  if (!codeEl) return;
+  var wrap = document.createElement('div');
+  wrap.className = 'prewrap';
+  pre.parentNode.insertBefore(wrap, pre);
+  wrap.appendChild(pre);
+  var btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'copy';
+  btn.textContent = 'Copy';
+  btn.addEventListener('click', function () {
+    var text = codeEl.innerText.replace(/\n$/, '');
+    function done() {
+      btn.textContent = 'Copied';
+      setTimeout(function () { btn.textContent = 'Copy'; }, 1400);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(done, function () { fallback(); });
+    } else {
+      fallback();
+    }
+    function fallback() {
+      var ta = document.createElement('textarea');
+      ta.value = text;
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand('copy'); done(); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+  });
+  wrap.appendChild(btn);
+});
+</script>
+</body>
+</html>
+HTMLFOOT
+}
+# ---- end handoff html renderer ----
+
 # ============================================================
 # Verdict
 # ============================================================
@@ -867,8 +1180,7 @@ fi
         echo "- **Configuration:** ${PRIMARY_DB_UNIQUE_NAME} (no peer detected)"
     fi
     if [[ -n "$VIZ_URL" ]]; then
-        echo "- **Interactive diagram:** [open this configuration in the Data Guard visualizer](${VIZ_URL})"
-        echo "  (the link encodes only the topology shown in this report - no credentials)"
+        echo "- **Interactive diagram:** [open in the Data Guard visualizer](${VIZ_URL}) - topology only, no credentials"
     fi
     echo ""
     echo "## 1. Connection Strings"
@@ -1085,6 +1397,12 @@ fi
 } > "$OUTPUT_FILE"
 
 info "Report written: $OUTPUT_FILE"
+
+# Styled, self-contained HTML twin of the Markdown report
+HTML_FILE="${OUTPUT_FILE%.md}.html"
+[[ "$HTML_FILE" == "$OUTPUT_FILE" ]] && HTML_FILE="${OUTPUT_FILE}.html"
+render_handoff_html < "$OUTPUT_FILE" > "$HTML_FILE"
+info "HTML report written: $HTML_FILE"
 echo ""
 cat "$OUTPUT_FILE"
 echo ""
