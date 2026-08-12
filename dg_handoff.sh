@@ -570,9 +570,9 @@ esac
 
 if [[ "$FSFO_ENABLED" == "YES" ]]; then
     if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
-        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled with a ${FSFO_THRESHOLD}s threshold. App-visible outage on primary loss = ${FSFO_THRESHOLD}s detection + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3). Budget 1-3 minutes of connection errors."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled with a ${FSFO_THRESHOLD}s threshold. App-visible outage on primary loss = ${FSFO_THRESHOLD}s detection + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 1). Budget 1-3 minutes of connection errors."
     else
-        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled but the threshold could not be discovered. App-visible outage = detection threshold + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3)."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled but the threshold could not be discovered. App-visible outage = detection threshold + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 1)."
     fi
 else
     OUTAGE_STATEMENT="FSFO is not enabled or could not be confirmed: failover is a manual DBA action and the outage lasts until it is executed and the service starts on the new primary. A planned switchover interrupts connections for the role transition (typically 1-2 minutes) plus client reconnect."
@@ -871,7 +871,73 @@ fi
         echo "  (the link encodes only the topology shown in this report - no credentials)"
     fi
     echo ""
-    echo "## 1. Topology"
+    echo "## 1. Connection Strings"
+    echo ""
+    echo "**Role-aware (failover)** descriptors: both hosts in one ADDRESS_LIST. The service runs only on the current primary (stopped on the standby by the role trigger), so clients follow the primary across switchover/failover with no config change. Use this for the application tier."
+    echo ""
+    if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
+        echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
+    else
+        echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
+    fi
+    echo ""
+    echo "### Descriptor Parameters"
+    echo ""
+    echo "| Parameter | Value | Effect |"
+    echo "|-----------|-------|--------|"
+    echo "| LOAD_BALANCE | OFF | Addresses tried in listed order: primary host first, then standby |"
+    echo "| TRANSPORT_CONNECT_TIMEOUT | 3 s | TCP connect budget per address |"
+    echo "| CONNECT_TIMEOUT | 10 s | Total budget per address (TCP + listener handshake + session creation) |"
+    echo "| RETRY_COUNT / RETRY_DELAY | 3 / 3 s | After the whole ADDRESS_LIST fails, it is retried 3 more times, 3 s apart |"
+    echo ""
+    echo "This descriptor configures no TAF (\`FAILOVER_MODE\`): after a session drop, reconnecting is the pool's or application's job unless the DBA has set TAF attributes on the service itself."
+    echo ""
+    echo "Worst-case connect times these values produce:"
+    echo ""
+    echo "- Both hosts unreachable (TCP timeout): 2 addresses x 3 s per pass, 4 passes, 3 x 3 s delays = **about 33 s** until the driver returns an error."
+    echo "- Primary host down, standby listener up (service stopped there): about 3 s TCP timeout + immediate ORA-12514 per pass = **about 21 s** until error."
+    echo "- Failover in progress: attempts cycle (each bounded as above) until the service registers on the new primary, then the next attempt succeeds."
+    echo ""
+
+    for svc in "${SERVICE_LIST[@]}"; do
+        local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
+        ALIAS_HA="${local_safe}_HA"
+
+        echo "### Service: \`${svc}\`"
+        echo ""
+
+        if [[ -n "$STANDBY_HOSTNAME" ]]; then
+            echo '```'
+            render_tns_ha "$ALIAS_HA" "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
+            echo '```'
+            echo ""
+            echo '```'
+            echo "JDBC: $(render_jdbc_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")"
+            echo '```'
+            echo ""
+            EASY_HA=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")
+            echo "Easy Connect Plus (19c+ clients):"
+            echo ""
+            echo '```'
+            echo "$EASY_HA"
+            echo '```'
+            echo ""
+            render_driver_table "$EASY_HA"
+            STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
+            if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
+                echo "Standby-only note: the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
+                echo ""
+            elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
+                echo "Standby-only note: the standby is READ ONLY WITH APPLY (Active Data Guard - separately licensed). Reads see committed data as of the apply point (staleness = apply lag; read-your-writes across the two databases is not guaranteed). Bound staleness per session with \`ALTER SESSION SET STANDBY_MAX_DATA_DELAY = <seconds>\` (queries then raise ORA-03172 instead of returning stale data); \`ALTER SESSION SYNC WITH PRIMARY\` blocks until caught up (requires SYNC transport and real-time apply). DML and DDL fail with ORA-16000 (exception: DML on global temporary tables)."
+                echo ""
+            elif [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
+                echo "Standby-only note: standby readability could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
+                echo ""
+            fi
+        fi
+    done
+    echo ""
+    echo "## 2. Topology"
     echo ""
     echo "| Role    | DB_UNIQUE_NAME              | Hostname              | Listener |"
     echo "|---------|-----------------------------|-----------------------|----------|"
@@ -880,7 +946,7 @@ fi
         echo "| Standby | ${STANDBY_DB_UNIQUE_NAME}   | ${STANDBY_HOSTNAME:-UNKNOWN} | ${PORT}  |"
     fi
     echo ""
-    echo "## 2. Status Snapshot"
+    echo "## 3. Status Snapshot"
     echo ""
     echo "| Item                  | Value |"
     echo "|-----------------------|-------|"
@@ -955,71 +1021,6 @@ fi
     fi
 
     echo ""
-    echo "## 3. Connection Strings"
-    echo ""
-    echo "**Role-aware (failover)** descriptors: both hosts in one ADDRESS_LIST. The service runs only on the current primary (stopped on the standby by the role trigger), so clients follow the primary across switchover/failover with no config change. Use this for the application tier."
-    echo ""
-    if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
-        echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
-    else
-        echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
-    fi
-    echo ""
-    echo "### Descriptor Parameters"
-    echo ""
-    echo "| Parameter | Value | Effect |"
-    echo "|-----------|-------|--------|"
-    echo "| LOAD_BALANCE | OFF | Addresses tried in listed order: primary host first, then standby |"
-    echo "| TRANSPORT_CONNECT_TIMEOUT | 3 s | TCP connect budget per address |"
-    echo "| CONNECT_TIMEOUT | 10 s | Total budget per address (TCP + listener handshake + session creation) |"
-    echo "| RETRY_COUNT / RETRY_DELAY | 3 / 3 s | After the whole ADDRESS_LIST fails, it is retried 3 more times, 3 s apart |"
-    echo ""
-    echo "This descriptor configures no TAF (\`FAILOVER_MODE\`): after a session drop, reconnecting is the pool's or application's job unless the DBA has set TAF attributes on the service itself."
-    echo ""
-    echo "Worst-case connect times these values produce:"
-    echo ""
-    echo "- Both hosts unreachable (TCP timeout): 2 addresses x 3 s per pass, 4 passes, 3 x 3 s delays = **about 33 s** until the driver returns an error."
-    echo "- Primary host down, standby listener up (service stopped there): about 3 s TCP timeout + immediate ORA-12514 per pass = **about 21 s** until error."
-    echo "- Failover in progress: attempts cycle (each bounded as above) until the service registers on the new primary, then the next attempt succeeds."
-    echo ""
-
-    for svc in "${SERVICE_LIST[@]}"; do
-        local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
-        ALIAS_HA="${local_safe}_HA"
-
-        echo "### Service: \`${svc}\`"
-        echo ""
-
-        if [[ -n "$STANDBY_HOSTNAME" ]]; then
-            echo '```'
-            render_tns_ha "$ALIAS_HA" "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
-            echo '```'
-            echo ""
-            echo '```'
-            echo "JDBC: $(render_jdbc_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")"
-            echo '```'
-            echo ""
-            EASY_HA=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")
-            echo "Easy Connect Plus (19c+ clients):"
-            echo ""
-            echo '```'
-            echo "$EASY_HA"
-            echo '```'
-            echo ""
-            render_driver_table "$EASY_HA"
-            STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
-            if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
-                echo "Standby-only note: the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
-                echo ""
-            elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
-                echo "Standby-only note: the standby is READ ONLY WITH APPLY (Active Data Guard - separately licensed). Reads see committed data as of the apply point (staleness = apply lag; read-your-writes across the two databases is not guaranteed). Bound staleness per session with \`ALTER SESSION SET STANDBY_MAX_DATA_DELAY = <seconds>\` (queries then raise ORA-03172 instead of returning stale data); \`ALTER SESSION SYNC WITH PRIMARY\` blocks until caught up (requires SYNC transport and real-time apply). DML and DDL fail with ORA-16000 (exception: DML on global temporary tables)."
-                echo ""
-            elif [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
-                echo "Standby-only note: standby readability could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
-                echo ""
-            fi
-        fi
-    done
 
     echo "## 4. Notes for Client Teams"
     echo ""
@@ -1028,13 +1029,13 @@ fi
     fi
     echo "- The role-aware descriptor works only because \`trigger/create_role_trigger.sh\` stops the service on the standby. With the trigger disabled, both hosts accept connections and writers landing on the standby get ORA-16000."
     echo "- Sequences: NOORDER/CACHE sequences (default CACHE 20) discard cached values at role change - expect gaps of up to the CACHE size per sequence, and no ordering guarantee across a failover. Never use sequence values as gapless or strictly-ordered business keys."
-    echo "- TAF (where configured on the service) replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 2."
+    echo "- TAF (where configured on the service) replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 3."
     echo "- Application Continuity (12.2+ drivers) can replay in-flight transactions, but requires \`FAILOVER_TYPE=TRANSACTION\` and \`COMMIT_OUTCOME=TRUE\` on the service - not configured by this setup; coordinate with the DBA team."
     echo "- After a switchover nothing changes for clients on the role-aware descriptor. Host-specific strings silently point at the wrong database until this report is regenerated."
     echo ""
     echo "## 5. Client and Pool Settings"
     echo ""
-    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 3). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
+    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 1). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
     echo "- [ ] Read/call timeout on every request path (JDBC \`oracle.jdbc.ReadTimeout\`, python-oracledb \`call_timeout\`, ODP.NET \`CommandTimeout\`): without one, a failover can leave in-flight calls hanging until TCP gives up (minutes)."
     echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}. Add \`(ENABLE=BROKEN)\` inside DESCRIPTION to enable OS TCP keepalive on the session socket, and tune client keepalive below any firewall idle timeout."
     echo "- [ ] Validate on borrow (JDBC \`isValid()\`, python-oracledb pool \`ping_interval\`, ODP.NET \`Validate Connection=true\`): after a failover every idle pooled connection is dead and must be detected before first use."

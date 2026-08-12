@@ -482,9 +482,9 @@ esac
 
 if [[ "$FSFO_ENABLED" == "YES" ]]; then
     if [[ "$FSFO_THRESHOLD" != "unknown" ]]; then
-        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled with a ${FSFO_THRESHOLD}s threshold. App-visible outage on primary loss = ${FSFO_THRESHOLD}s detection + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3). Budget 1-3 minutes of connection errors."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled with a ${FSFO_THRESHOLD}s threshold. App-visible outage on primary loss = ${FSFO_THRESHOLD}s detection + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 1). Budget 1-3 minutes of connection errors."
     else
-        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled but the threshold could not be discovered. App-visible outage = detection threshold + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 3)."
+        OUTAGE_STATEMENT="Automatic failover (FSFO) is enabled but the threshold could not be discovered. App-visible outage = detection threshold + failover execution (typically under 60s) + service startup on the new primary + client reconnect (bounded by the descriptor retry window, section 1)."
     fi
 else
     OUTAGE_STATEMENT="FSFO is not enabled or could not be confirmed: failover is a manual DBA action and the outage lasts until it is executed and the service starts on the new primary. A planned switchover interrupts connections for the role transition (typically 1-2 minutes) plus client reconnect."
@@ -678,98 +678,7 @@ fi
         echo "  (the link encodes only the topology shown in this report - no credentials)"
     fi
     echo ""
-    echo "## 1. Topology"
-    echo ""
-    echo "| Role    | DB_UNIQUE_NAME              | Hostname              | SID                   | Listener |"
-    echo "|---------|-----------------------------|-----------------------|-----------------------|----------|"
-    echo "| Primary | ${PRIMARY_DB_UNIQUE_NAME}   | ${PRIMARY_HOSTNAME}   | ${PRIMARY_ORACLE_SID} | ${PORT}  |"
-    echo "| Standby | ${STANDBY_DB_UNIQUE_NAME}   | ${STANDBY_HOSTNAME}   | ${STANDBY_ORACLE_SID} | ${PORT}  |"
-    echo ""
-    echo "## 2. Status Snapshot"
-    echo ""
-    echo "| Item                  | Value |"
-    echo "|-----------------------|-------|"
-    echo "| Local role            | ${DB_ROLE} |"
-    echo "| Open mode             | ${OPEN_MODE} |"
-    echo "| Protection mode       | ${PROTECTION_MODE} |"
-    echo "| Standby LogXptMode    | ${STANDBY_LOGXPTMODE:-unknown} |"
-    echo "| Standby open mode     | ${STANDBY_OPEN_MODE:-unknown} |"
-    echo "| Switchover status     | ${SWITCHOVER_STATUS} |"
-    echo "| Force logging         | ${FORCE_LOGGING} |"
-    echo "| Broker started        | ${DG_BROKER_START} |"
-    echo "| Last received seq#    | ${LAST_RECEIVED:-N/A} |"
-    echo "| Last applied seq#     | ${LAST_APPLIED:-N/A} |"
-    echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
-    echo "| Archive gaps          | ${GAP_COUNT} |"
-    echo "| FSFO status           | ${FSFO_STATUS:-N/A} |"
-    echo "| FSFO observer present | ${FSFO_OBSERVER:-N/A} |"
-    if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
-        echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
-    fi
-    if [[ "$FSFO_ENABLED" == "YES" ]]; then
-        echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
-    fi
-    echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
-    echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
-    echo ""
-    echo "**Verdict:** ${VERDICT}"
-    if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
-        for n in "${VERDICT_NOTES[@]}"; do
-            echo "- ${n}"
-        done
-    fi
-
-    echo ""
-    echo "### Application Impact Summary"
-    echo ""
-    echo "- ${RPO_STATEMENT}"
-    echo "- ${OUTAGE_STATEMENT}"
-    echo "- After any role change the new primary starts with a largely cold buffer cache and shared pool: elevated physical reads and hard parsing for the first minutes. Queries succeed but latency degrades (brownout, not blackout)."
-    echo "- FORCE LOGGING is ${FORCE_LOGGING:-unknown}. Direct-path/NOLOGGING loads generate no redo when force logging is off: the affected blocks are unrecoverable on the standby and raise ORA-26040 when read after a failover. Any NOLOGGING batch job needs DBA sign-off."
-    echo "- Every application host must resolve and reach BOTH database hosts on port ${PORT} before go-live - the standby address is only exercised when it is already an emergency."
-    if [[ ${#DISCOVERY_NOTES[@]} -gt 0 ]]; then
-        echo ""
-        echo "Discovery notes:"
-        for n in "${DISCOVERY_NOTES[@]}"; do
-            echo "- ${n}"
-        done
-    fi
-    echo ""
-
-    echo "### Errors During Role Transitions"
-    echo ""
-    echo "| Error | When it appears | Client action |"
-    echo "|-------|-----------------|---------------|"
-    echo "| ORA-12514 | Listener up, service not registered - normal on the standby address, and on both hosts mid-failover | Retryable: driver moves to the next address / retry pass |"
-    echo "| ORA-12541, ORA-12170, ORA-12535 | No listener / TCP connect timeout - host or listener down | Retryable: next address |"
-    echo "| ORA-01033 | Instance starting or mounting (mid-role-change) | Retryable with backoff |"
-    echo "| ORA-03113, ORA-03114, ORA-01089 | Existing session killed by failover/shutdown | Reconnect; the role-aware descriptor re-routes to the surviving side |"
-    echo "| ORA-25402 | TAF failed the session over mid-transaction | ROLLBACK, then re-run the transaction |"
-    echo "| ORA-16000 | DML sent to a read-only standby | Not retryable: routing bug - service running on the standby without the role trigger, or a standby-only string handed to a writer |"
-    echo ""
-    echo "**Commit ambiguity:** a dropped connection (e.g. ORA-03113) while a COMMIT is in flight leaves the outcome unknown - the transaction may or may not be committed on the surviving database. Blind re-execution double-applies it. Use idempotency keys / unique business keys and verify state after reconnect. Oracle Transaction Guard resolves the outcome programmatically but requires a service with COMMIT_OUTCOME=TRUE and a 12c+ driver - not configured by this setup; request it from the DBA team if you need it."
-    echo ""
-
-    echo "### Adding Datafiles or PDBs After Setup (DBA Note)"
-    echo ""
-    echo "- New datafiles and PDBs replicate to the standby automatically only when their primary-side paths fall under a directory prefix covered by the standby's \`DB_FILE_NAME_CONVERT\` pairs. OMF-mode standbys (\`db_create_file_dest\` set) are immune."
-    echo "- A file added in an uncovered directory is created as \`UNNAMEDnnnnn\` in \`\$ORACLE_HOME/dbs\` on the standby; MRP stops with ORA-01274 and redo apply halts until manually repaired."
-    echo "- Before creating a PDB or adding a datafile in a new directory, keep paths under a covered prefix, or use \`CREATE PLUGGABLE DATABASE ... FILE_NAME_CONVERT\` / PDB-level OMF."
-    echo "- After any addition, verify the standby: \`dg_status.sh\` flags UNNAMED datafiles; also check \`V\$RECOVER_FILE\` and the standby alert log."
-    echo "- Repair sequence (\`STANDBY_FILE_MANAGEMENT=MANUAL\`, \`ALTER DATABASE CREATE DATAFILE ... AS ...\`, back to \`AUTO\`, restart apply): see \"Life After Setup: Adding Datafiles and PDBs\" in \`docs/DATA_GUARD_WALKTHROUGH.md\`."
-    echo ""
-
-    if [[ -n "$BROKER_OUTPUT" ]]; then
-        echo ""
-        echo "### Broker Configuration"
-        echo ""
-        echo '```'
-        echo "$BROKER_OUTPUT"
-        echo '```'
-    fi
-
-    echo ""
-    echo "## 3. Connection Strings"
+    echo "## 1. Connection Strings"
     echo ""
     echo "Three flavors per service:"
     echo ""
@@ -886,6 +795,98 @@ fi
         echo ""
         render_driver_table "$svc" "$EASY_HA"
     done
+    echo ""
+    echo "## 2. Topology"
+    echo ""
+    echo "| Role    | DB_UNIQUE_NAME              | Hostname              | SID                   | Listener |"
+    echo "|---------|-----------------------------|-----------------------|-----------------------|----------|"
+    echo "| Primary | ${PRIMARY_DB_UNIQUE_NAME}   | ${PRIMARY_HOSTNAME}   | ${PRIMARY_ORACLE_SID} | ${PORT}  |"
+    echo "| Standby | ${STANDBY_DB_UNIQUE_NAME}   | ${STANDBY_HOSTNAME}   | ${STANDBY_ORACLE_SID} | ${PORT}  |"
+    echo ""
+    echo "## 3. Status Snapshot"
+    echo ""
+    echo "| Item                  | Value |"
+    echo "|-----------------------|-------|"
+    echo "| Local role            | ${DB_ROLE} |"
+    echo "| Open mode             | ${OPEN_MODE} |"
+    echo "| Protection mode       | ${PROTECTION_MODE} |"
+    echo "| Standby LogXptMode    | ${STANDBY_LOGXPTMODE:-unknown} |"
+    echo "| Standby open mode     | ${STANDBY_OPEN_MODE:-unknown} |"
+    echo "| Switchover status     | ${SWITCHOVER_STATUS} |"
+    echo "| Force logging         | ${FORCE_LOGGING} |"
+    echo "| Broker started        | ${DG_BROKER_START} |"
+    echo "| Last received seq#    | ${LAST_RECEIVED:-N/A} |"
+    echo "| Last applied seq#     | ${LAST_APPLIED:-N/A} |"
+    echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
+    echo "| Archive gaps          | ${GAP_COUNT} |"
+    echo "| FSFO status           | ${FSFO_STATUS:-N/A} |"
+    echo "| FSFO observer present | ${FSFO_OBSERVER:-N/A} |"
+    if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
+        echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
+    fi
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
+    fi
+    echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
+    echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
+    echo ""
+    echo "**Verdict:** ${VERDICT}"
+    if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
+        for n in "${VERDICT_NOTES[@]}"; do
+            echo "- ${n}"
+        done
+    fi
+
+    echo ""
+    echo "### Application Impact Summary"
+    echo ""
+    echo "- ${RPO_STATEMENT}"
+    echo "- ${OUTAGE_STATEMENT}"
+    echo "- After any role change the new primary starts with a largely cold buffer cache and shared pool: elevated physical reads and hard parsing for the first minutes. Queries succeed but latency degrades (brownout, not blackout)."
+    echo "- FORCE LOGGING is ${FORCE_LOGGING:-unknown}. Direct-path/NOLOGGING loads generate no redo when force logging is off: the affected blocks are unrecoverable on the standby and raise ORA-26040 when read after a failover. Any NOLOGGING batch job needs DBA sign-off."
+    echo "- Every application host must resolve and reach BOTH database hosts on port ${PORT} before go-live - the standby address is only exercised when it is already an emergency."
+    if [[ ${#DISCOVERY_NOTES[@]} -gt 0 ]]; then
+        echo ""
+        echo "Discovery notes:"
+        for n in "${DISCOVERY_NOTES[@]}"; do
+            echo "- ${n}"
+        done
+    fi
+    echo ""
+
+    echo "### Errors During Role Transitions"
+    echo ""
+    echo "| Error | When it appears | Client action |"
+    echo "|-------|-----------------|---------------|"
+    echo "| ORA-12514 | Listener up, service not registered - normal on the standby address, and on both hosts mid-failover | Retryable: driver moves to the next address / retry pass |"
+    echo "| ORA-12541, ORA-12170, ORA-12535 | No listener / TCP connect timeout - host or listener down | Retryable: next address |"
+    echo "| ORA-01033 | Instance starting or mounting (mid-role-change) | Retryable with backoff |"
+    echo "| ORA-03113, ORA-03114, ORA-01089 | Existing session killed by failover/shutdown | Reconnect; the role-aware descriptor re-routes to the surviving side |"
+    echo "| ORA-25402 | TAF failed the session over mid-transaction | ROLLBACK, then re-run the transaction |"
+    echo "| ORA-16000 | DML sent to a read-only standby | Not retryable: routing bug - service running on the standby without the role trigger, or a standby-only string handed to a writer |"
+    echo ""
+    echo "**Commit ambiguity:** a dropped connection (e.g. ORA-03113) while a COMMIT is in flight leaves the outcome unknown - the transaction may or may not be committed on the surviving database. Blind re-execution double-applies it. Use idempotency keys / unique business keys and verify state after reconnect. Oracle Transaction Guard resolves the outcome programmatically but requires a service with COMMIT_OUTCOME=TRUE and a 12c+ driver - not configured by this setup; request it from the DBA team if you need it."
+    echo ""
+
+    echo "### Adding Datafiles or PDBs After Setup (DBA Note)"
+    echo ""
+    echo "- New datafiles and PDBs replicate to the standby automatically only when their primary-side paths fall under a directory prefix covered by the standby's \`DB_FILE_NAME_CONVERT\` pairs. OMF-mode standbys (\`db_create_file_dest\` set) are immune."
+    echo "- A file added in an uncovered directory is created as \`UNNAMEDnnnnn\` in \`\$ORACLE_HOME/dbs\` on the standby; MRP stops with ORA-01274 and redo apply halts until manually repaired."
+    echo "- Before creating a PDB or adding a datafile in a new directory, keep paths under a covered prefix, or use \`CREATE PLUGGABLE DATABASE ... FILE_NAME_CONVERT\` / PDB-level OMF."
+    echo "- After any addition, verify the standby: \`dg_status.sh\` flags UNNAMED datafiles; also check \`V\$RECOVER_FILE\` and the standby alert log."
+    echo "- Repair sequence (\`STANDBY_FILE_MANAGEMENT=MANUAL\`, \`ALTER DATABASE CREATE DATAFILE ... AS ...\`, back to \`AUTO\`, restart apply): see \"Life After Setup: Adding Datafiles and PDBs\" in \`docs/DATA_GUARD_WALKTHROUGH.md\`."
+    echo ""
+
+    if [[ -n "$BROKER_OUTPUT" ]]; then
+        echo ""
+        echo "### Broker Configuration"
+        echo ""
+        echo '```'
+        echo "$BROKER_OUTPUT"
+        echo '```'
+    fi
+
+    echo ""
 
     echo "## 4. Notes for Client Teams"
     echo ""
@@ -896,13 +897,13 @@ fi
     fi
     echo "- The role-aware descriptor works only because \`trigger/create_role_trigger.sh\` stops the service on the standby. With the trigger disabled, both hosts accept connections and writers landing on the standby get ORA-16000."
     echo "- Sequences: NOORDER/CACHE sequences (default CACHE 20) discard cached values at role change - expect gaps of up to the CACHE size per sequence, and no ordering guarantee across a failover. Never use sequence values as gapless or strictly-ordered business keys."
-    echo "- TAF replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 2."
+    echo "- TAF replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 3."
     echo "- Application Continuity (12.2+ drivers) can replay in-flight transactions, but requires \`FAILOVER_TYPE=TRANSACTION\` and \`COMMIT_OUTCOME=TRUE\` on the service - not configured by this setup; coordinate with the DBA team."
     echo "- After a switchover nothing changes for clients on the role-aware descriptor. Primary-only and standby-only strings silently point at the wrong database until this report is regenerated."
     echo ""
     echo "## 5. Client and Pool Settings"
     echo ""
-    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 3). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
+    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 1). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
     echo "- [ ] Read/call timeout on every request path (JDBC \`oracle.jdbc.ReadTimeout\`, python-oracledb \`call_timeout\`, ODP.NET \`CommandTimeout\`): without one, a failover can leave in-flight calls hanging until TCP gives up (minutes)."
     echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}. Add \`(ENABLE=BROKEN)\` inside DESCRIPTION to enable OS TCP keepalive on the session socket, and tune client keepalive below any firewall idle timeout."
     echo "- [ ] Validate on borrow (JDBC \`isValid()\`, python-oracledb pool \`ping_interval\`, ODP.NET \`Validate Connection=true\`): after a failover every idle pooled connection is dead and must be detected before first use."
