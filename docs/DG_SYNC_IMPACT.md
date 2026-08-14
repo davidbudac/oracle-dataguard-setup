@@ -41,18 +41,47 @@ configuration changes), so it is safe on production. Exit codes: `0`
 report produced (read the report - warnings live there), `1` fatal
 (environment/connection problem, or not a PRIMARY), `2` bad arguments.
 
+**Units:** every duration in the report is in **milliseconds**. That
+includes the ones Oracle exposes in other units - `V$SYSTEM_EVENT`
+totals and `DB time` are divided down from microseconds, and the
+`V$REDO_DEST_RESP_HISTOGRAM` buckets (the view counts in whole seconds)
+are multiplied up, so its finest bucket appears as `1000` ms and holds
+every sub-second response. The two exceptions are rates (`commits/s`)
+and instance uptime, which stay in seconds because they are not
+latencies. Statistic names are printed as Oracle names them, so
+`redo synch time (usec)` keeps its own unit.
+
+**Provenance:** each section opens with a one-line `Source:` naming the
+views it reads, and every table is followed by the **exact query** that
+produced it - recorded verbatim as it was sent to `sqlplus`, so it can
+be copied and re-run by hand. In Markdown these are fenced `sql` blocks;
+in HTML they are collapsed `<details>` panels that stay out of the way
+until you open them. The queries are captured in a temporary directory
+that is removed when the script exits; if it cannot be created, the
+report simply omits the blocks.
+
 `--html` renders the same report as a standalone HTML page (inline CSS,
-light/dark aware, no external assets) - the Markdown emitter remains the
+light/dark aware, no external assets - text is set in IBM Plex Sans and
+every figure, label and query in IBM Plex Mono where those are installed,
+falling back to the platform's own faces; nothing is fetched) - the Markdown emitter remains the
 single definition of the report and is converted with a built-in
 POSIX-awk filter, so both formats always carry identical content. The
 HTML adds two purely presentational upgrades on top: the headline
-`| Measure | Value |` table renders as a row of KPI cards, and numeric
-table columns get proportional inline bars scaled to the column maximum
-(so latency spikes and skewed histograms are visible at a glance). A
-column only qualifies for bars when every populated cell is a plain
-number, at least two are, and its header is not ordinal (`Snap`, `Hour`,
-`bucket`, `Dest`, `SQL_ID`, `NET_TIMEOUT`); everything else keeps plain
-table cells.
+`| Measure | Value |` table renders as a row of KPI cards, and every
+other table is followed by a strip of charts - one per plottable column,
+each on its own scale, so latency spikes and skewed histograms are
+visible at a glance while the cells above stay plain (numbers merely
+right-aligned in tabular figures). A column is plottable when every
+populated cell is a number (the `<= 1.024` percentile bounds count), at
+least two are, its maximum is above zero, and its header is not an
+ordinal or identifier (`Snap`, `Hour`, `bucket`, `Dest`, `SQL_ID`,
+`NET_TIMEOUT`); the `Measure`/`Statistic` tables mix units down the
+column and are never charted. Categories are taken from the first
+non-plotted column that varies, and a snapshot/hour axis with at least
+six points is drawn as a time series rather than a ranking: one bar per
+snapshot oldest-to-newest, on a `0 .. max` y axis, with the window ends
+labelled from the table's time column and a caption that spells out what
+a single bar is - it is a trend over time, not a frequency histogram.
 
 ## Why "log file sync minus the remote wait" is wrong
 

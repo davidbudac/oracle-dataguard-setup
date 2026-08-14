@@ -185,8 +185,30 @@ info "Pre-flight checks passed."
 # decimal separator regardless of the server locale - the report math
 # below (awk) depends on it.
 
+# Every query is kept verbatim so the report can show exactly what it ran.
+# A directory, not shell variables: collectors run inside $(...) subshells,
+# so a variable set in run_sql would never reach the emitter. Best-effort -
+# without a writable temp dir the report simply omits the query blocks.
+QDIR=""
+if QDIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_sync_impact.XXXXXX" 2>/dev/null); then
+    trap 'rm -rf "$QDIR"' EXIT INT TERM
+else
+    QDIR=""
+fi
+
+# recorded_sql TAG -> the exact text of the TAG query, empty if unrecorded
+recorded_sql() {
+    [[ -n "$QDIR" && -f "$QDIR/$1.sql" ]] || return 0
+    cat "$QDIR/$1.sql"
+}
+
 run_sql() {
     local sql="$1"
+    local tag
+    if [[ -n "$QDIR" ]]; then
+        tag=$(printf '%s\n' "$sql" | sed -n 's/^-- QTAG:\([A-Za-z0-9_]*\).*/\1/p' | head -1)
+        [[ -n "$tag" ]] && printf '%s\n' "$sql" > "$QDIR/$tag.sql"
+    fi
     sqlplus -s -L / as sysdba <<EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 WHENEVER SQLERROR EXIT 1
@@ -225,6 +247,18 @@ fmt_or_na() {
     else
         printf 'n/a'
     fi
+}
+
+# qblock TAG... - fenced SQL block(s) carrying the exact text of the query
+# that produced the table above. A fenced block in the Markdown; the HTML
+# renderer turns it into a collapsed <details>.
+qblock() {
+    local _t _sql
+    for _t in "$@"; do
+        _sql=$(recorded_sql "$_t")
+        [[ -n "$_sql" ]] || continue
+        printf '```sql\n%s\n```\n\n' "$_sql"
+    done
 }
 
 run_dgmgrl_cmd() {
@@ -379,7 +413,7 @@ info "Collecting since-startup wait events and redo statistics..."
 _out=$(run_sql "-- QTAG:EVENTS
 SELECT 'EVT|'||EVENT
   ||'|'||TOTAL_WAITS
-  ||'|'||ROUND(TIME_WAITED_MICRO/1000000,1)
+  ||'|'||ROUND(TIME_WAITED_MICRO/1000,1)
   ||'|'||NVL(TO_CHAR(ROUND(TIME_WAITED_MICRO/NULLIF(TOTAL_WAITS,0)/1000,3)),'-')
 FROM V\$SYSTEM_EVENT
 WHERE EVENT IN ('log file sync','log file parallel write','SYNC Remote Write',
@@ -389,12 +423,12 @@ SELECT 'STAT|'||NAME||'|'||VALUE
 FROM V\$SYSSTAT
 WHERE NAME IN ('user commits','redo writes','redo synch writes','redo size',
                'redo synch time (usec)','redo synch time overhead (usec)');
-SELECT 'STAT|DB time (s)|'||ROUND(VALUE/1000000)
+SELECT 'STAT|DB time (ms)|'||ROUND(VALUE/1000)
 FROM V\$SYS_TIME_MODEL WHERE STAT_NAME='DB time';") \
     || { _out=""; degraded "wait events / sysstats (V\$SYSTEM_EVENT, V\$SYSSTAT)"; }
 EVENTS_RAW=$(printf '%s\n' "$_out" | trim | grep -E '^(EVT|STAT)[|]' || true)
 
-# evt_val EVENT FIELD  (FIELD: 2=waits, 3=total s, 4=avg ms)
+# evt_val EVENT FIELD  (FIELD: 2=waits, 3=total ms, 4=avg ms)
 # Both helpers must succeed even when the row is absent (empty output),
 # or the `set -e` + pipefail combination would abort the script on a
 # degraded EVENTS collection.
@@ -406,7 +440,7 @@ stat_val() {
 }
 
 LFS_CNT=$(evt_val  'log file sync' 2)
-LFS_SEC=$(evt_val  'log file sync' 3)
+LFS_TOT_MS=$(evt_val  'log file sync' 3)
 LFS_AVG=$(evt_val  'log file sync' 4)
 LFPW_CNT=$(evt_val 'log file parallel write' 2)
 LFPW_AVG=$(evt_val 'log file parallel write' 4)
@@ -419,7 +453,7 @@ REDO_SYNCH_WRITES=$(stat_val 'redo synch writes')
 REDO_SIZE=$(stat_val    'redo size')
 REDO_SYNCH_US=$(stat_val 'redo synch time (usec)')
 REDO_OVERHEAD_US=$(stat_val 'redo synch time overhead (usec)')
-DBTIME_STARTUP_S=$(stat_val 'DB time (s)')
+DBTIME_STARTUP_MS=$(stat_val 'DB time (ms)')
 
 # ============================================================
 # Collect: histogram convolution E[max(L,R)] (Layer 2)
@@ -488,7 +522,7 @@ PCT_RAW=$(printf '%s\n' "$_out" | trim | grep '^PCT[|]' || true)
 
 info "Collecting per-destination SYNC response histogram..."
 _out=$(run_sql "-- QTAG:RESPHIST
-SELECT 'RESP|'||DEST_ID||'|'||DURATION||'|'||FREQUENCY||'|'||NVL(TIME,'-')
+SELECT 'RESP|'||DEST_ID||'|'||DURATION*1000||'|'||FREQUENCY||'|'||NVL(TIME,'-')
 FROM V\$REDO_DEST_RESP_HISTOGRAM
 WHERE FREQUENCY > 0
 ORDER BY DEST_ID, DURATION;") \
@@ -548,7 +582,7 @@ cm AS (
       AND SNAP_ID BETWEEN ${mins} AND ${maxs})
 ),
 tm AS (
-  SELECT SUM(CASE WHEN DV>=0 THEN DV END)/1000000 DBTIME_S FROM (
+  SELECT SUM(CASE WHEN DV>=0 THEN DV END)/1000 DBTIME_MS FROM (
     SELECT VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DV
     FROM DBA_HIST_SYS_TIME_MODEL
     WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
@@ -569,7 +603,7 @@ SELECT 'XAGG|'||NVL(TO_CHAR(ROUND(w.SECS)),'-')
   ||'|'||NVL(TO_CHAR(ea.SRW_CNT),'-')
   ||'|'||NVL(TO_CHAR(ROUND(ea.SRW_US/NULLIF(ea.SRW_CNT,0)/1000,3)),'-')
   ||'|'||NVL(TO_CHAR(cm.COMMITS),'-')
-  ||'|'||NVL(TO_CHAR(ROUND(tm.DBTIME_S)),'-')
+  ||'|'||NVL(TO_CHAR(ROUND(tm.DBTIME_MS)),'-')
 FROM ea, cm, tm, w;" | trim | grep '^XAGG|' | head -1
 }
 
@@ -676,7 +710,7 @@ p AS (
     MAX(CASE WHEN ev.EVENT_NAME='log file parallel write' AND ev.DW>0  THEN ev.DT/ev.DW/1000 END) LFPW_MS,
     MAX(CASE WHEN ev.EVENT_NAME='SYNC Remote Write'       AND ev.DW>0  THEN ev.DT/ev.DW/1000 END) SRW_MS,
     MAX(cm.DC) COMMITS,
-    MAX(tm.DV)/1000000 DBTIME_S
+    MAX(tm.DV)/1000 DBTIME_MS
   FROM el
   LEFT JOIN ev ON ev.SNAP_ID = el.SNAP_ID
   LEFT JOIN cm ON cm.SNAP_ID = el.SNAP_ID
@@ -691,8 +725,8 @@ SELECT 'TREND|'||SNAP_ID
   ||'|'||NVL(TO_CHAR(ROUND(SRW_MS,3)),'-')
   ||'|'||CASE WHEN COMMITS >= 0 AND SECS > 0
               THEN TO_CHAR(ROUND(COMMITS/SECS,1)) ELSE '-' END
-  ||'|'||CASE WHEN DBTIME_S >= 0
-              THEN TO_CHAR(ROUND(DBTIME_S)) ELSE '-' END
+  ||'|'||CASE WHEN DBTIME_MS >= 0
+              THEN TO_CHAR(ROUND(DBTIME_MS)) ELSE '-' END
   ||'|'||CASE WHEN SRW_MS IS NOT NULL AND LFPW_MS IS NOT NULL AND LFS_CNT > 0
               THEN TO_CHAR(ROUND(GREATEST(0,SRW_MS-LFPW_MS)*LFS_CNT,1)) ELSE '-' END
 FROM p
@@ -941,7 +975,7 @@ AGG_LFPW_AVG=$(field "$AWRAGG_RAW" 5)
 AGG_SRW_CNT=$(field "$AWRAGG_RAW" 6)
 AGG_SRW_AVG=$(field "$AWRAGG_RAW" 7)
 AGG_COMMITS=$(field "$AWRAGG_RAW" 8)
-AGG_DBTIME_S=$(field "$AWRAGG_RAW" 9)
+AGG_DBTIME_MS=$(field "$AWRAGG_RAW" 9)
 
 W_LFS_AVG="$LFS_AVG";   is_num "$AGG_LFS_AVG"  && W_LFS_AVG="$AGG_LFS_AVG"
 W_LFPW_AVG="$LFPW_AVG"; is_num "$AGG_LFPW_AVG" && W_LFPW_AVG="$AGG_LFPW_AVG"
@@ -958,16 +992,16 @@ fi
 
 # Workload rates for scaling: lfs waits/hour and totals
 RATE_LFS_HR=""
-TOTAL_DBTIME_S=""
+TOTAL_DBTIME_MS=""
 TOTAL_LFS_CNT=""
 if is_num "$AGG_LFS_CNT" && is_num "$AGG_ELAPSED" && [[ "${AGG_ELAPSED%.*}" -gt 0 ]] 2>/dev/null; then
     RATE_LFS_HR=$(calc "$AGG_LFS_CNT / $AGG_ELAPSED * 3600")
     TOTAL_LFS_CNT="$AGG_LFS_CNT"
-    TOTAL_DBTIME_S="$AGG_DBTIME_S"
+    TOTAL_DBTIME_MS="$AGG_DBTIME_MS"
 elif is_num "$LFS_CNT" && is_num "$UPTIME_SECONDS" && [[ "${UPTIME_SECONDS%.*}" -gt 0 ]] 2>/dev/null; then
     RATE_LFS_HR=$(calc "$LFS_CNT / $UPTIME_SECONDS * 3600")
     TOTAL_LFS_CNT="$LFS_CNT"
-    TOTAL_DBTIME_S="$DBTIME_STARTUP_S"
+    TOTAL_DBTIME_MS="$DBTIME_STARTUP_MS"
 fi
 
 # Scaled impact: prefer the refined estimate, fall back to the lower bound
@@ -981,15 +1015,15 @@ elif is_num "$BOUND_LOW"; then
     SCALE_BASIS="lower bound max(0, avg R - avg L)"
 fi
 
-ADDED_S_PER_HR=""
+ADDED_MS_PER_HR=""
 PCT_DBTIME=""
 PCT_LFS=""
 if is_num "$SCALE_MS"; then
     if is_num "$RATE_LFS_HR"; then
-        ADDED_S_PER_HR=$(calc "$SCALE_MS * $RATE_LFS_HR / 1000")
+        ADDED_MS_PER_HR=$(calc "$SCALE_MS * $RATE_LFS_HR")
     fi
-    if is_num "$TOTAL_LFS_CNT" && is_num "$TOTAL_DBTIME_S" && [[ "${TOTAL_DBTIME_S%.*}" -gt 0 ]] 2>/dev/null; then
-        PCT_DBTIME=$(calc "$SCALE_MS * $TOTAL_LFS_CNT / 1000 / $TOTAL_DBTIME_S * 100")
+    if is_num "$TOTAL_LFS_CNT" && is_num "$TOTAL_DBTIME_MS" && [[ "${TOTAL_DBTIME_MS%.*}" -gt 0 ]] 2>/dev/null; then
+        PCT_DBTIME=$(calc "$SCALE_MS * $TOTAL_LFS_CNT / $TOTAL_DBTIME_MS * 100")
     fi
     if is_num "$W_LFS_AVG" && awk "BEGIN{exit !($W_LFS_AVG > 0)}"; then
         PCT_LFS=$(calc "$SCALE_MS / $W_LFS_AVG * 100")
@@ -1046,6 +1080,7 @@ emit_report() {
 
     # ---- 1. configuration ----
     printf '## 1. Synchronous transport configuration\n\n'
+    printf '_Source: `V$ARCHIVE_DEST`; LogXptMode from the broker._\n\n'
     if [[ -z "$DESTS_RAW" ]]; then
         printf '_Remote destination data unavailable (V$ARCHIVE_DEST query failed)._\n\n'
     else
@@ -1070,10 +1105,12 @@ emit_report() {
         if [[ -n "$BROKER_XPT" ]]; then
             printf 'Broker LogXptMode: %s\n\n' "$BROKER_XPT"
         fi
+        qblock DESTS
     fi
 
     # ---- 2. headline ----
     printf '## 2. Headline: estimated cost of synchronous transport\n\n'
+    printf '_Source: derived from sections 3 and 4 - no view of its own._\n\n'
     if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
         printf '_Not applicable - no synchronous destination is active._\n\n'
     elif [[ "$SRW_MISSING" == "YES" ]]; then
@@ -1086,7 +1123,7 @@ emit_report() {
         if is_num "$BOUND_LOW"; then
             printf '| Hard bounds from event averages (%s) | %s .. %s ms |\n' "$W_SOURCE" "$BOUND_LOW" "$BOUND_HIGH"
         fi
-        printf '| Estimated added foreground wait | %s |\n' "$(fmt_or_na "$ADDED_S_PER_HR" " s per hour")"
+        printf '| Estimated added foreground wait | %s |\n' "$(fmt_or_na "$ADDED_MS_PER_HR" " ms per hour")"
         printf '| Share of total DB time | %s |\n' "$(fmt_or_na "$PCT_DBTIME" " %")"
         printf '| Share of log file sync time | %s |\n' "$(fmt_or_na "$PCT_LFS" " %")"
         printf '\n'
@@ -1097,10 +1134,11 @@ emit_report() {
 
     # ---- 3. LGWR pipeline ----
     printf '## 3. LGWR pipeline decomposition (since instance startup)\n\n'
+    printf '_Source: `V$SYSTEM_EVENT`, `V$SYSSTAT`, `V$SYS_TIME_MODEL`._\n\n'
     if [[ -z "$EVENTS_RAW" ]]; then
         printf '_Wait event data unavailable._\n\n'
     else
-        printf '| Wait event | Waits | Total (s) | Avg (ms) |\n'
+        printf '| Wait event | Waits | Total (ms) | Avg (ms) |\n'
         printf '|------------|-------|-----------|----------|\n'
         printf '%s\n' "$EVENTS_RAW" | rows EVT | while IFS='|' read -r _ev _w _t _a; do
             printf '| %s | %s | %s | %s |\n' "$_ev" "$_w" "$_t" "$_a"
@@ -1120,10 +1158,12 @@ emit_report() {
         printf '  at Data Guard)\n'
         printf -- '- Uptime: %s s; log file sync waits since startup: %s (avg %s)\n' "$(fmt_or_na "$UPTIME_SECONDS")" "$(fmt_or_na "$LFS_CNT")" "$(fmt_or_na "$LFS_AVG" " ms")"
         printf '\n'
+        qblock EVENTS
     fi
 
     # ---- 4. distributions ----
     printf '## 4. Latency distributions (since instance startup)\n\n'
+    printf '_Source: `V$EVENT_HISTOGRAM_MICRO`, `V$REDO_DEST_RESP_HISTOGRAM`._\n\n'
     if [[ -z "$PCT_RAW" ]]; then
         printf '_Histogram data unavailable._\n\n'
     else
@@ -1136,6 +1176,7 @@ emit_report() {
                 "$_ev" "$(us_to_ms "$_p50")" "$(us_to_ms "$_p90")" "$(us_to_ms "$_p99")" "$(us_to_ms "$_max")" "$_n"
         done
         printf '\n'
+        qblock HISTPCT
     fi
     if [[ "$SYNC_DEST_COUNT" -gt 0 && -n "$EMAX_RAW" ]]; then
         printf 'Overlap model (independence assumed, geometric bucket midpoints):\n\n'
@@ -1144,23 +1185,28 @@ emit_report() {
         printf -- '- E[max(L,R)] = **%s**\n' "$(fmt_or_na "$EMAX_MS" " ms")"
         printf -- '- => estimated overhead per redo write = E[max(L,R)] - E[L] = **%s**\n' "$(fmt_or_na "$OVERHEAD_EST" " ms")"
         printf '\n'
+        qblock EMAX
     fi
     if [[ -n "$RESP_RAW" ]]; then
         printf 'Per-destination SYNC response histogram (`V$REDO_DEST_RESP_HISTOGRAM`).\n'
-        printf 'Durations are rounded UP to whole seconds, so every sub-second response\n'
-        printf 'lands in bucket 1 - on a fast network this view only surfaces outliers and\n'
-        printf 'cannot corroborate a sub-second estimate. `Last at` is the most recent\n'
-        printf 'response that landed in the bucket:\n\n'
-        printf '| Dest | Duration bucket (s) | Responses | Last at |\n'
+        printf 'The view buckets by whole seconds (shown here in ms, so the finest\n'
+        printf 'bucket is 1000 ms and every sub-second response lands in it) - on a fast\n'
+        printf 'network this view only surfaces outliers and cannot corroborate a\n'
+        printf 'sub-second estimate. `Last at` is the most recent response that landed\n'
+        printf 'in the bucket:\n\n'
+        printf '| Dest | Duration bucket (ms) | Responses | Last at |\n'
         printf '|------|---------------------|-----------|---------|\n'
         printf '%s\n' "$RESP_RAW" | rows RESP | while IFS='|' read -r _d _dur _f _tm; do
             printf '| %s | %s | %s | %s |\n' "$_d" "$_dur" "$_f" "${_tm:-n/a}"
         done
         printf '\n'
+        qblock RESPHIST
     fi
 
     # ---- 5. AWR trend ----
     printf '## 5. AWR trend (last %s day(s))\n\n' "$AWR_DAYS"
+    printf '_Source: `DBA_HIST_SNAPSHOT`, `DBA_HIST_SYSTEM_EVENT`, `DBA_HIST_SYSSTAT`,\n'
+    printf '`DBA_HIST_SYS_TIME_MODEL` (Diagnostics Pack)._\n\n'
     if [[ -n "$AWR_NOTE" ]]; then
         printf '_%s_\n\n' "$AWR_NOTE"
     elif [[ -z "$TREND_RAW" ]]; then
@@ -1169,17 +1215,19 @@ emit_report() {
         printf 'Per-snapshot averages; `est ovh (ms)` = max(0, avg R - avg L) x lfs waits, in\n'
         printf 'milliseconds - a lower-bound estimate (AWR carries no histograms fine enough\n'
         printf 'for the E[max] model, but the microsecond event totals keep the averages exact).\n\n'
-        printf '| Snap | End time | lfs waits | lfs avg ms | local wr ms | remote ack ms | commits/s | DB time s | est ovh (ms) |\n'
+        printf '| Snap | End time | lfs waits | lfs avg ms | local wr ms | remote ack ms | commits/s | DB time ms | est ovh (ms) |\n'
         printf '|------|----------|-----------|------------|-------------|---------------|-----------|-----------|-------------|\n'
         printf '%s\n' "$TREND_RAW" | rows TREND | while IFS='|' read -r _s _t _c _l _pw _rw _cs _dbt _ovh; do
             printf '| %s | %s | %s | %s | %s | %s | %s | %s | %s |\n' \
                 "$_s" "$_t" "$_c" "$_l" "$_pw" "$_rw" "$_cs" "$_dbt" "$_ovh"
         done
         printf '\n'
+        qblock TREND
     fi
 
     # ---- 6. top latency spikes ----
     printf '## 6. Top latency spikes\n\n'
+    printf '_Source: the section 4 and section 5 queries, re-ranked worst-first._\n\n'
     if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
         printf '_Not applicable - no synchronous destination is active._\n\n'
     else
@@ -1188,11 +1236,11 @@ emit_report() {
             printf 'failed or empty)._\n\n'
         else
             printf '**Slowest SYNC transport responses** (top 10 non-empty buckets of\n'
-            printf '`V$REDO_DEST_RESP_HISTOGRAM`, worst first; durations rounded up to whole\n'
-            printf 'seconds, so bucket 1 holds everything sub-second - these are the actual\n'
-            printf 'worst remote acks, including e.g. standby restarts and network stalls,\n'
-            printf 'capped at NET_TIMEOUT):\n\n'
-            printf '| Dest | Response time bucket (s) | Responses | Last at |\n'
+            printf '`V$REDO_DEST_RESP_HISTOGRAM`, worst first; the view buckets by whole\n'
+            printf 'seconds, so the 1000 ms bucket holds everything sub-second - these are\n'
+            printf 'the actual worst remote acks, including e.g. standby restarts and\n'
+            printf 'network stalls, capped at NET_TIMEOUT):\n\n'
+            printf '| Dest | Response time bucket (ms) | Responses | Last at |\n'
             printf '|------|--------------------------|-----------|---------|\n'
             printf '%s\n' "$RESP_RAW" | rows RESP | sort -t'|' -k2,2nr | head -10 \
                 | while IFS='|' read -r _d _dur _f _tm; do
@@ -1232,6 +1280,8 @@ emit_report() {
 
     # ---- 7. baseline ----
     printf '## 7. Baseline comparison (before vs after synchronous transport)\n\n'
+    printf '_Source: `DBA_HIST_SYSTEM_EVENT`, `DBA_HIST_SYSSTAT`, `DBA_HIST_SNAPSHOT`\n'
+    printf 'over two windows (Diagnostics Pack)._\n\n'
     if [[ -z "$BASELINE_MODE" && "$AUTO_BASELINE" != "YES" ]]; then
         printf '_No baseline window supplied. Re-run with `--baseline-begin`/`--baseline-end`\n'
         printf 'covering a pre-SYNC period (or with `--auto-baseline` to detect one from AWR\n'
@@ -1324,10 +1374,12 @@ emit_report() {
             printf '  (storage change?) - part of the empirical delta is not transport-related.\n'
         fi
         printf '\n'
+        qblock AWRAGG BASEHIST AUTOBASE
     fi
 
     # ---- 8. ASH ----
     printf '## 8. ASH attribution: who pays (last %s hour(s))\n\n' "$ASH_HOURS"
+    printf '_Source: `V$ACTIVE_SESSION_HISTORY`, foreground samples only (Diagnostics Pack)._\n\n'
     if [[ "$NO_PACK" == "YES" ]]; then
         printf '_Skipped (`--no-pack`)._\n\n'
     elif [[ -z "$ASH_RAW" ]]; then
@@ -1395,10 +1447,12 @@ emit_report() {
             done
             printf '\n'
         fi
+        qblock ASH
     fi
 
     # ---- 9. method notes ----
     printf '## 9. Method notes and caveats\n\n'
+    printf '_Source: no data - assumptions behind the numbers above._\n\n'
     printf -- '- **Overlap model:** since 11g R2 the local redo write (L) and the network send to a\n'
     printf '  SYNC standby run in parallel - LGWR starts the remote write, then issues the\n'
     printf '  local one, then waits for both - so a commit'"'"'s redo-write phase lasts about\n'
@@ -1447,11 +1501,19 @@ emit_report() {
 #
 # Two graphical upgrades happen here (the Markdown itself is unchanged):
 # - the headline "| Measure | Value |" table renders as a row of KPI cards;
-# - other tables get proportional inline bars behind numeric columns
-#   (scaled to the column max). A column qualifies only when every non-"-"
-#   cell is a plain number, at least two are, and its header is not ordinal
-#   (Snap, Hour, bucket, Dest, SQL_ID, NET_TIMEOUT); non-qualifying cells
-#   keep the exact plain <td>/<th> markup.
+# - every other table keeps plain cells and gets a strip of charts below it,
+#   one per plottable column, each on its own scale (columns rarely share
+#   units). A column is plottable when every populated cell is a number
+#   ("<= 1.024" bucket bounds count), at least two are, the max is > 0 and
+#   the header is not an ordinal/identifier (Snap, Hour, bucket, Dest,
+#   SQL_ID, NET_TIMEOUT); Measure|Value and Statistic|Value tables mix units
+#   down the column and are never charted. Categories come from the first
+#   non-plotted column that varies. A snapshot/hour axis with >= 6 points is
+#   drawn as a time series (one column per row, oldest to newest); anything
+#   else as a horizontal ranking capped at 15 rows.
+# Numeric cells get class="n" (right-aligned tabular mono) - alignment only,
+# no marks in the cell. Every table is wrapped in <div class="tw"> so wide
+# tables scroll inside their own frame instead of widening the page.
 
 md_to_html() {
     awk '
@@ -1497,9 +1559,45 @@ md_to_html() {
     function flush_bq() {
         if (bqbuf != "") { print "<blockquote><p>" inline_fmt(bqbuf) "</p></blockquote>"; bqbuf = "" }
     }
+    # ---- numeric cell helpers ----
+    # Oracle prints sub-1 values with a bare leading dot (.5), and the
+    # percentile table prints bucket upper bounds as "<= 1.024" (already
+    # escaped to "&lt;= 1.024" by esc()); both are chartable numbers.
+    function nclean(v) {
+        sub(/^&lt;=[ ]*/, "", v)
+        return v
+    }
+    function isnum(v) {
+        return (nclean(v) ~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/)
+    }
+    function nval(v) {
+        return nclean(v) + 0
+    }
+    function attresc(s) {
+        gsub(/"/, "\\&quot;", s)
+        return s
+    }
+    # 1234567.8 -> 1 234 567.8, so chart captions stay readable
+    function group(x,   s, ip, fp, o, n) {
+        s = sprintf("%.10g", x)
+        ip = s; fp = ""
+        if (index(s, ".") > 0) { ip = substr(s, 1, index(s, ".")-1); fp = substr(s, index(s, ".")) }
+        o = ""
+        while (length(ip) > 3) {
+            o = " " substr(ip, length(ip)-2) o
+            ip = substr(ip, 1, length(ip)-3)
+        }
+        return ip o fp
+    }
+    function ndistinct(j,   r, seen, c) {
+        c = 0
+        for (r = 2; r <= tnr; r++)
+            if (!(tcell[r,j] in seen)) { seen[tcell[r,j]] = 1; c = c + 1 }
+        return c
+    }
     # Emit the buffered table. Buffering (rather than streaming rows out)
-    # is what allows per-column maxima for the inline bars.
-    function emit_table(   r, j, tag, row, hdr1, h, v, ok, numc, pct, maxc) {
+    # is what allows per-column maxima for the charts underneath it.
+    function emit_table(   r, j, tag, row, hdr1, h, v, ok, numc, maxc) {
         if (tnr == 0) return
         if (tsep && tnr >= 2 && tnc[1] == 2 && tcell[1,1] == "Measure" && tcell[1,2] == "Value") {
             print "<div class=\"kpis\">"
@@ -1511,45 +1609,122 @@ md_to_html() {
         }
         maxc = 0
         for (r = 1; r <= tnr; r++) if (tnc[r] > maxc) maxc = tnc[r]
-        for (j = 1; j <= maxc; j++) { barcol[j] = 0; barmax[j] = 0 }
+        for (j = 1; j <= maxc; j++) { numcol[j] = 0; chartcol[j] = 0; cmax[j] = 0 }
         hdr1 = tolower(tcell[1,1])
-        if (tsep && tnr >= 3 && hdr1 !~ /measure|statistic/) {
+        if (tsep) {
+            # numcol: every populated cell is a number and at least two are.
+            # Drives right-aligned tabular cells - alignment only, no marks.
             for (j = 1; j <= maxc; j++) {
-                h = tolower(tcell[1,j])
-                if (h ~ /snap|hour|bucket|dest|sql_id|net_timeout/) continue
                 ok = 1; numc = 0
                 for (r = 2; r <= tnr; r++) {
                     v = tcell[r,j]
                     if (v == "" || v == "-" || v == "n/a") continue
-                    # Oracle prints sub-1 values with a bare leading dot (.5)
-                    if (v !~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) { ok = 0; break }
+                    if (!isnum(v)) { ok = 0; break }
                     numc = numc + 1
-                    if (v + 0 > barmax[j]) barmax[j] = v + 0
+                    if (nval(v) > cmax[j]) cmax[j] = nval(v)
                 }
-                if (ok && numc >= 2 && barmax[j] > 0) barcol[j] = 1
+                if (ok && numc >= 2) numcol[j] = 1
+            }
+            # chartcol: a numeric column worth plotting - needs a real scale
+            # and a header that is a measure, not an ordinal/identifier.
+            if (tnr >= 3 && hdr1 !~ /measure|statistic/) {
+                for (j = 1; j <= maxc; j++) {
+                    h = tolower(tcell[1,j])
+                    if (h ~ /snap|hour|bucket|dest|sql_id|net_timeout/) continue
+                    if (numcol[j] && cmax[j] > 0) chartcol[j] = 1
+                }
             }
         }
-        print "<table>"
+        print "<div class=\"tw\"><table>"
         for (r = 1; r <= tnr; r++) {
             tag = (tsep && r == 1) ? "th" : "td"
             row = "<tr>"
             for (j = 1; j <= tnc[r]; j++) {
                 v = tcell[r,j]
-                if (tag == "td" && barcol[j] && v ~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) {
-                    pct = (v + 0) / barmax[j] * 100
-                    if (pct < 0) pct = 0
-                    if (pct > 0 && pct < 3) pct = 3
-                    row = row "<td class=\"bar\"><span class=\"fill\" style=\"width:" sprintf("%.1f", pct) "%\"></span><span class=\"v\">" v "</span></td>"
-                } else if (tag == "td" && barcol[j]) {
-                    row = row "<td class=\"bar\"><span class=\"v\">" inline_fmt(v) "</span></td>"
-                } else {
+                if (numcol[j])
+                    row = row "<" tag " class=\"n\">" inline_fmt(v) "</" tag ">"
+                else
                     row = row "<" tag ">" inline_fmt(v) "</" tag ">"
-                }
             }
             print row "</tr>"
         }
-        print "</table>"
+        print "</table></div>"
+        emit_charts(maxc)
         tnr = 0; tsep = 0
+    }
+    # One small chart per plottable column, below the table it reads from.
+    # Each chart carries its own scale (columns rarely share units), so the
+    # cells above stay plain and the shape of the data lives here.
+    function emit_charts(maxc,   j, lab, any, series) {
+        any = 0
+        for (j = 1; j <= maxc; j++) if (chartcol[j]) any = 1
+        if (!any) return
+        # label axis: the first non-plotted column that actually varies
+        lab = 0
+        for (j = 1; j <= maxc; j++) {
+            if (chartcol[j]) continue
+            if (ndistinct(j) > 1) { lab = j; break }
+        }
+        if (lab == 0) lab = 1
+        # a snapshot/hour axis with enough points is a trend, not a ranking
+        series = (tolower(tcell[1,lab]) ~ /snap|hour/ && (tnr - 1) >= 6)
+        # on a trend the x axis is time: label its ends with a clock column
+        # when the table has one ("Snap" alone reads like a category)
+        tlab = lab
+        for (j = 1; j <= maxc; j++) {
+            if (chartcol[j]) continue
+            if (tolower(tcell[1,j]) ~ /time|date/ && ndistinct(j) > 1) { tlab = j; break }
+        }
+        print "<div class=\"charts\">"
+        for (j = 1; j <= maxc; j++) {
+            if (!chartcol[j]) continue
+            if (series) emit_series(j, lab, tlab); else emit_bars(j, lab)
+        }
+        print "</div>"
+    }
+    function chart_open(j) {
+        print "<figure class=\"chart\">"
+        print "<figcaption>" inline_fmt(tcell[1,j]) "<span class=\"cmax\">max " group(cmax[j]) "</span></figcaption>"
+    }
+    function emit_bars(j, lab,   r, v, pct, shown) {
+        chart_open(j)
+        print "<div class=\"bars\">"
+        shown = 0
+        for (r = 2; r <= tnr; r++) {
+            if (shown >= 15) break
+            v = tcell[r,j]
+            pct = 0
+            if (isnum(v)) pct = nval(v) / cmax[j] * 100
+            if (pct < 0) pct = 0
+            print "<div class=\"brow\"><span class=\"bl\" title=\"" attresc(tcell[r,lab]) "\">" inline_fmt(tcell[r,lab]) "</span><span class=\"bt\"><span class=\"bf\" style=\"width:" sprintf("%.1f", pct) "%\"></span></span><span class=\"bv\">" inline_fmt(v) "</span></div>"
+            shown = shown + 1
+        }
+        print "</div>"
+        if (tnr - 1 > shown)
+            print "<p class=\"cnote\">first " shown " of " (tnr - 1) " rows</p>"
+        print "</figure>"
+    }
+    # A trend, not a distribution: x is time (one bar per row, oldest left),
+    # y is the value with the column max at the top and zero at the baseline.
+    # The caption spells out what a single bar is, so it cannot be mistaken
+    # for a frequency histogram.
+    function emit_series(j, lab, tlab,   r, v, pct) {
+        print "<figure class=\"chart\">"
+        print "<figcaption>" inline_fmt(tcell[1,j]) "<span class=\"cmax\">1 bar = 1 " tolower(tcell[1,lab]) " (" (tnr - 1) ")</span></figcaption>"
+        print "<div class=\"plot\">"
+        print "<div class=\"yax\"><span>" group(cmax[j]) "</span><span>0</span></div>"
+        print "<div class=\"cols\">"
+        for (r = 2; r <= tnr; r++) {
+            v = tcell[r,j]
+            pct = 0
+            if (isnum(v)) pct = nval(v) / cmax[j] * 100
+            if (pct < 0) pct = 0
+            print "<span class=\"col\" style=\"height:" sprintf("%.1f", pct) "%\" title=\"" attresc(tcell[r,tlab]) ": " attresc(v) "\"></span>"
+        }
+        print "</div>"
+        print "</div>"
+        print "<div class=\"axis\"><span>" inline_fmt(tcell[2,tlab]) "</span><span>" inline_fmt(tcell[tnr,tlab]) "</span></div>"
+        print "</figure>"
     }
     function close_blocks() {
         flush_li(); flush_p(); flush_bq()
@@ -1558,6 +1733,29 @@ md_to_html() {
     }
     {
         line = esc($0)
+
+        # fenced block: the exact query behind the table above, folded away
+        # in a <details> so it never interrupts the reading flow. Checked
+        # first - SQL lines are indented and would otherwise be swallowed by
+        # the bullet-continuation rule below.
+        # Buffered and printed without the surrounding newlines: a <pre> keeps
+        # them, so streaming the lines out would frame the SQL in blank lines.
+        if (infence) {
+            if (line ~ /^```/) {
+                printf "%s", fbuf
+                print "</code></pre></details>"
+                fbuf = ""; infence = 0
+            } else {
+                fbuf = fbuf (fbuf == "" ? "" : "\n") line
+            }
+            next
+        }
+        if (line ~ /^```/) {
+            close_blocks()
+            printf "%s", "<details class=\"q\"><summary>Query</summary><pre><code>"
+            infence = 1
+            next
+        }
 
         # bullet continuation (two-space indent while a bullet is open)
         if (li != "" && line ~ /^  [^ ]/) {
@@ -1610,35 +1808,169 @@ emit_html() {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Sync Data Guard Impact - ${DB_UNIQUE_NAME}</title>
 <style>
-:root{--bg:#fbfcfe;--fg:#1c2733;--muted:#5c6b7a;--accent:#16537e;--line:#dfe6ed;--thbg:#eaf1f7;--stripe:#f3f7fa;--card:#f1f6fa;--bar:#8fc1e3;--code:#eceff3;--warnbg:#fdf6e3;--warnbd:#d98e04}
-@media (prefers-color-scheme: dark){
-:root{--bg:#14161a;--fg:#d8dce2;--muted:#98a3ae;--accent:#6fb1dd;--line:#303a44;--thbg:#1e252c;--stripe:#191e23;--card:#1a2129;--bar:#2f5a7e;--code:#232a31;--warnbg:#2a2412;--warnbd:#b07708}
+:root{
+  color-scheme:light;
+  --ground:#f4f6f5;--surface:#ffffff;--ink:#141a1b;--muted:#5d6b6c;
+  --rule:#dae1df;--rule-strong:#b3c0be;
+  --accent:#0b6a73;--accent-soft:rgba(11,106,115,.11);--accent-line:rgba(11,106,115,.42);
+  --warn:#6d4a08;--warn-bg:#fbf3df;--warn-rule:#d9a441;
+  --code-bg:#e9edec;--track:#e7ebe9;
+  --f-text:"IBM Plex Sans",-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --f-mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,"SF Mono",Menlo,Consolas,"DejaVu Sans Mono",monospace;
 }
-body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;max-width:70em;margin:2em auto;padding:0 1.2em;line-height:1.55;color:var(--fg);background:var(--bg)}
-h1{font-size:1.7em;border-bottom:3px solid var(--accent);padding-bottom:.35em}
-h2{font-size:1.2em;color:var(--accent);border-left:5px solid var(--accent);border-bottom:1px solid var(--line);padding:.15em 0 .25em .55em;margin-top:2.2em}
-table{border-collapse:collapse;margin:1em 0;font-size:.92em;display:block;overflow-x:auto;max-width:100%}
-th,td{border-bottom:1px solid var(--line);padding:.34em .8em;text-align:left;white-space:nowrap}
-th{background:var(--thbg);border-bottom:2px solid var(--accent)}
-tr:nth-child(even) td{background:var(--stripe)}
-td.bar{position:relative;text-align:right;font-variant-numeric:tabular-nums;min-width:6.5em}
-td.bar .fill{position:absolute;left:2px;top:22%;height:56%;background:var(--bar);opacity:.5;border-radius:2px}
-td.bar .v{position:relative}
-.kpis{display:flex;flex-wrap:wrap;gap:.8em;margin:1.1em 0}
-.kpi{flex:1 1 13em;background:var(--card);border:1px solid var(--line);border-left:4px solid var(--accent);border-radius:8px;padding:.65em .9em}
-.kpi-l{display:block;font-size:.78em;color:var(--muted);margin-bottom:.2em}
-.kpi-v{display:block;font-size:1.3em;font-weight:600}
-.kpi-v strong{color:var(--accent)}
-code{background:var(--code);padding:0 .3em;border-radius:3px;font-size:.94em}
-blockquote{border-left:4px solid var(--warnbd);background:var(--warnbg);margin:.9em 0;padding:.6em 1em;border-radius:0 6px 6px 0}
-blockquote p{margin:.2em 0}
-em{color:var(--muted)}
+@media (prefers-color-scheme: dark){
+:root{
+  color-scheme:dark;
+  --ground:#0e1315;--surface:#151c1e;--ink:#dbe4e3;--muted:#8fa0a0;
+  --rule:#26312f;--rule-strong:#3b4846;
+  --accent:#5cb8c0;--accent-soft:rgba(92,184,192,.15);--accent-line:rgba(92,184,192,.5);
+  --warn:#e2bb6b;--warn-bg:#221c0f;--warn-rule:#8a6a1c;
+  --code-bg:#1c2426;--track:#1d2628;
+}
+}
+:root[data-theme="light"]{
+  color-scheme:light;
+  --ground:#f4f6f5;--surface:#ffffff;--ink:#141a1b;--muted:#5d6b6c;
+  --rule:#dae1df;--rule-strong:#b3c0be;
+  --accent:#0b6a73;--accent-soft:rgba(11,106,115,.11);--accent-line:rgba(11,106,115,.42);
+  --warn:#6d4a08;--warn-bg:#fbf3df;--warn-rule:#d9a441;
+  --code-bg:#e9edec;--track:#e7ebe9;
+}
+:root[data-theme="dark"]{
+  color-scheme:dark;
+  --ground:#0e1315;--surface:#151c1e;--ink:#dbe4e3;--muted:#8fa0a0;
+  --rule:#26312f;--rule-strong:#3b4846;
+  --accent:#5cb8c0;--accent-soft:rgba(92,184,192,.15);--accent-line:rgba(92,184,192,.5);
+  --warn:#e2bb6b;--warn-bg:#221c0f;--warn-rule:#8a6a1c;
+  --code-bg:#1c2426;--track:#1d2628;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);
+  font-family:var(--f-text);font-size:15.5px;line-height:1.65;
+  -webkit-font-smoothing:antialiased;-moz-osx-font-smoothing:grayscale;
+  -webkit-text-size-adjust:100%}
+main{max-width:64rem;margin:0 auto;padding:3.5rem 1.5rem 5rem}
+p,ul{max-width:68ch}
+p{margin:1.05rem 0;text-wrap:pretty}
+h1{font-weight:600;font-size:clamp(1.7rem,3.6vw,2.15rem);
+  line-height:1.14;letter-spacing:-.022em;margin:0 0 1.5rem;text-wrap:balance}
+h2{font-weight:600;font-size:1.2rem;line-height:1.3;
+  letter-spacing:-.014em;margin:3.4rem 0 1.15rem;padding-top:1.45rem;
+  border-top:1px solid var(--rule);text-wrap:balance}
+/* the masthead metadata list (database, instance, generated, windows) */
+h1+ul{max-width:none;list-style:none;margin:0;padding:1.05rem 1.25rem;
+  display:flex;flex-direction:column;gap:.45rem;
+  background:var(--surface);border:1px solid var(--rule);border-radius:3px;font-size:.92rem}
+h1+ul li{margin:0}
+h1+ul strong{font-family:var(--f-mono);font-size:.72rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.055em;color:var(--muted)}
+ul{padding-left:1.15rem;margin:1rem 0}
+li{margin:.35rem 0}
+li::marker{color:var(--accent-line)}
+strong{font-weight:600}
+em{color:var(--muted);font-style:italic}
+code{font-family:var(--f-mono);font-size:.86em;background:var(--code-bg);
+  padding:.08em .34em;border-radius:2px}
+.tw{overflow-x:auto;margin:1.3rem 0;background:var(--surface);
+  border:1px solid var(--rule);border-radius:3px;width:fit-content;max-width:100%}
+table{border-collapse:collapse;width:100%;font-size:.86rem}
+th{font-family:var(--f-mono);font-size:.7rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.055em;color:var(--muted);text-align:left;
+  padding:.65rem .9rem;border-bottom:1px solid var(--rule-strong);white-space:nowrap}
+td{padding:.55rem .9rem;border-bottom:1px solid var(--rule);white-space:nowrap;
+  vertical-align:baseline}
+tr:last-child td{border-bottom:0}
+tr:hover td{background:var(--accent-soft)}
+td.n,th.n{text-align:right;font-variant-numeric:tabular-nums}
+td.n{font-family:var(--f-mono)}
+/* charts: one per plottable column, each on its own scale, below the table */
+.charts{display:grid;grid-template-columns:repeat(auto-fit,minmax(17rem,1fr));
+  gap:1.4rem 1.6rem;margin:1.4rem 0 1.8rem}
+.chart{margin:0}
+figcaption{display:flex;justify-content:space-between;align-items:baseline;gap:.75rem;
+  font-family:var(--f-mono);font-size:.68rem;font-weight:600;text-transform:uppercase;
+  letter-spacing:.055em;color:var(--muted);
+  padding-bottom:.5rem;margin-bottom:.6rem;border-bottom:1px solid var(--rule)}
+.cmax{font-weight:400;text-transform:none;letter-spacing:.02em;white-space:nowrap;opacity:.85}
+.cnote{margin:.5rem 0 0;font-family:var(--f-mono);font-size:.66rem;color:var(--muted)}
+/* ranking: horizontal bars, category label at the left */
+.bars{display:flex;flex-direction:column;gap:.3rem}
+.brow{display:grid;grid-template-columns:minmax(0,11em) 1fr auto;gap:.55rem;
+  align-items:center;font-size:.78rem}
+.bl{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--muted)}
+.bt{position:relative;height:.65rem;background:var(--track);
+  background-image:repeating-linear-gradient(to right,var(--rule) 0 1px,transparent 1px 25%)}
+.bf{position:absolute;left:0;top:0;bottom:0;background:var(--accent);opacity:.85}
+.bv{font-family:var(--f-mono);font-size:.74rem;font-variant-numeric:tabular-nums}
+/* trend: one column per snapshot, oldest to newest, on a 0..max y axis */
+.plot{display:grid;grid-template-columns:auto 1fr;gap:.45rem}
+.yax{display:flex;flex-direction:column;justify-content:space-between;text-align:right;
+  font-family:var(--f-mono);font-size:.62rem;line-height:1;color:var(--muted)}
+.cols{display:flex;align-items:flex-end;gap:1px;height:5rem;overflow-x:auto;
+  background:var(--track);
+  background-image:repeating-linear-gradient(to top,var(--rule) 0 1px,transparent 1px 25%);
+  border-left:1px solid var(--rule-strong);border-bottom:1px solid var(--rule-strong)}
+.col{flex:1 1 auto;min-width:2px;min-height:1px;background:var(--accent);opacity:.8}
+.col:hover{opacity:1}
+.axis{display:flex;justify-content:space-between;gap:.75rem;margin-top:.35rem;
+  margin-left:calc(2.5em + .45rem);
+  font-family:var(--f-mono);font-size:.66rem;color:var(--muted)}
+/* headline readouts: hairline-divided panel, gaps show the rule beneath */
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(15rem,1fr));
+  gap:1px;margin:1.5rem 0;background:var(--surface);
+  border:1px solid var(--rule);border-radius:3px;overflow:hidden}
+/* the ring is a shadow, not a border, so it lands in the 1px gap and an
+   incomplete last row leaves plain surface rather than a stray block */
+.kpi{background:var(--surface);box-shadow:0 0 0 1px var(--rule);
+  padding:1.05rem 1.2rem;display:flex;flex-direction:column;gap:.45rem}
+.kpi-l{font-family:var(--f-mono);font-size:.7rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.055em;color:var(--muted);line-height:1.4}
+.kpi-v{font-family:var(--f-mono);font-size:1.4rem;font-weight:500;line-height:1.15;
+  letter-spacing:-.01em;font-variant-numeric:tabular-nums;margin-top:auto}
+.kpi-v strong{color:var(--accent);font-weight:600}
+/* the first readout is the headline estimate the whole report is about */
+.kpi:first-child .kpi-v{font-size:1.72rem}
+/* the exact query behind the table above - folded away by default */
+details.q{margin:1.1rem 0 1.7rem;background:var(--surface);
+  border:1px solid var(--rule);border-radius:3px}
+details.q summary{display:flex;align-items:center;gap:.5rem;cursor:pointer;list-style:none;
+  padding:.55rem .9rem;font-family:var(--f-mono);font-size:.68rem;font-weight:600;
+  text-transform:uppercase;letter-spacing:.055em;color:var(--muted)}
+details.q summary::-webkit-details-marker{display:none}
+details.q summary::before{content:"+";color:var(--accent);font-size:.95rem;line-height:1}
+details.q[open] summary::before{content:"\2212"}
+details.q summary:hover{color:var(--ink)}
+details.q summary:focus-visible{outline:2px solid var(--accent);outline-offset:-2px}
+details.q pre{margin:0;padding:.9rem;border-top:1px solid var(--rule);
+  overflow-x:auto;font-size:.78rem;line-height:1.55}
+details.q code{background:none;padding:0;font-size:1em;white-space:pre}
+blockquote{max-width:70ch;margin:1.4rem 0;padding:.85rem 1.15rem;color:var(--warn);
+  background:var(--warn-bg);border-left:3px solid var(--warn-rule);border-radius:0 3px 3px 0}
+blockquote p{margin:.25rem 0;max-width:none}
+blockquote strong{color:var(--warn)}
+@media (max-width:34rem){
+  main{padding:2.25rem 1rem 3rem}
+  .kpis{grid-template-columns:1fr}
+  .brow{grid-template-columns:minmax(0,7em) 1fr auto}
+}
+@media print{
+  :root{--ground:#fff;--surface:#fff;--ink:#000;--muted:#444;--rule:#bbb;--rule-strong:#666;
+    --accent:#0b6a73;--accent-soft:#eef2f2;--code-bg:#f0f0f0;--warn-bg:#fbf6e8;--warn:#5a3d05;
+    --track:#eef0ef}
+  main{max-width:none;padding:0}
+  h2{page-break-after:avoid}
+  .tw,.kpis,.chart,blockquote{page-break-inside:avoid}
+  .bf,.col,.bt,.cols{-webkit-print-color-adjust:exact;print-color-adjust:exact}
+  tr:hover td{background:transparent}
+}
 </style>
 </head>
 <body>
+<main>
 HTMLHEAD
     emit_report | md_to_html
     cat <<HTMLFOOT
+</main>
 </body>
 </html>
 HTMLFOOT

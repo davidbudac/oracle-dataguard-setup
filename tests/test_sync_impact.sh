@@ -95,16 +95,16 @@ case "$IN" in
     ;;
 *QTAG:EVENTS*)
     fail_if EVENTS
-    echo "EVT|log file sync|3600000|3600.0|1"
-    echo "EVT|log file parallel write|3000000|1500.0|.5"
-    echo "EVT|SYNC Remote Write|3000000|2100.0|.7"
+    echo "EVT|log file sync|3600000|3600000.0|1"
+    echo "EVT|log file parallel write|3000000|1500000.0|.5"
+    echo "EVT|SYNC Remote Write|3000000|2100000.0|.7"
     echo "STAT|user commits|5400000"
     echo "STAT|redo writes|3000000"
     echo "STAT|redo synch writes|3600000"
     echo "STAT|redo size|123456789"
     echo "STAT|redo synch time (usec)|3600000000"
     echo "STAT|redo synch time overhead (usec)|360000000"
-    echo "STAT|DB time (s)|86400"
+    echo "STAT|DB time (ms)|86400000"
     ;;
 *QTAG:EMAX*)
     fail_if EMAX
@@ -118,9 +118,9 @@ case "$IN" in
     ;;
 *QTAG:RESPHIST*)
     fail_if RESPHIST
-    echo "RESP|2|1|2999000|08/09/2026 11:59:02"
-    echo "RESP|2|2|1000|08/09/2026 03:12:45"
-    echo "RESP|2|26|3|08/05/2026 02:11:07"
+    echo "RESP|2|1000|2999000|08/09/2026 11:59:02"
+    echo "RESP|2|2000|1000|08/09/2026 03:12:45"
+    echo "RESP|2|26000|3|08/05/2026 02:11:07"
     ;;
 *QTAG:AWRSNAP*)
     fail_if AWRSNAP
@@ -129,9 +129,9 @@ case "$IN" in
 *QTAG:AWRAGG*)
     fail_if AWRAGG
     if [[ "$IN" == *"BETWEEN 50 AND 90"* || "$IN" == *"BETWEEN 40 AND 49"* ]]; then
-        echo "XAGG|604800|1800000|.6|.48|0|-|2700000|48000"
+        echo "XAGG|604800|1800000|.6|.48|0|-|2700000|48000000"
     else
-        echo "XAGG|604800|2000000|1.05|.5|1900000|.7|3000000|50000"
+        echo "XAGG|604800|2000000|1.05|.5|1900000|.7|3000000|50000000"
     fi
     ;;
 *QTAG:BASEHIST*)
@@ -181,9 +181,18 @@ case "$IN" in
     ;;
 *QTAG:TREND*)
     fail_if TREND
-    echo "TREND|101|2026-08-03 11:00|12000|1.05|.5|.7|3.3|300|2400"
-    echo "TREND|102|2026-08-03 12:00|13000|1.1|.52|.72|3.6|310|2600"
-    echo "TREND|103|2026-08-03 13:00|11000|9.5|.5|9.2|3.1|420|95700"
+    echo "TREND|101|2026-08-03 11:00|12000|1.05|.5|.7|3.3|300000|2400"
+    echo "TREND|102|2026-08-03 12:00|13000|1.1|.52|.72|3.6|310000|2600"
+    echo "TREND|103|2026-08-03 13:00|11000|9.5|.5|9.2|3.1|420000|95700"
+    # STUB_TREND_LONG: enough snapshots for the HTML renderer to treat the
+    # trend as a time series (column chart) instead of a ranking (bars)
+    if [[ "${STUB_TREND_LONG:-}" == "YES" ]]; then
+        i=104
+        while [[ $i -le 112 ]]; do
+            echo "TREND|$i|2026-08-04 0$((i-104)):00|12000|1.05|.5|.7|3.3|300000|2400"
+            i=$((i+1))
+        done
+    fi
     ;;
 *QTAG:ASH*)
     fail_if ASH
@@ -290,9 +299,9 @@ assert_contains "FASTSYNC classification" "$OUT" "NOAFFIRM (FASTSYNC)"
 # Headline: E[max]-E[L] = .85-.52 = 0.330; bounds .7-.5=0.200 .. .7
 assert_contains "refined estimate" "$OUT" "| Added latency per commit (refined estimate) | **0.330 ms** |"
 assert_contains "bounds" "$OUT" "0.200 .. .7 ms"
-# Scaling: 0.330ms x (2000000 lfs / 604800s x 3600) / 1000 = 3.929 s/hr
-assert_contains "added s per hour" "$OUT" "3.929 s per hour"
-# 0.330 x 2000000 / 1000 / 50000 x 100 = 1.320 % of DB time
+# Scaling: 0.330ms x (2000000 lfs / 604800s x 3600) = 3928.571 ms/hr
+assert_contains "added ms per hour" "$OUT" "3928.571 ms per hour"
+# 0.330 x 2000000 / 50000000ms DB time x 100 = 1.320 %
 assert_contains "pct of DB time" "$OUT" "1.320 %"
 # 0.330 / 1.05 x 100 = 31.429 % of lfs
 assert_contains "pct of lfs" "$OUT" "31.429 %"
@@ -300,21 +309,21 @@ assert_contains "reading line uses AWR window avg" "$OUT" "waits ~1.05 ms"
 # Pipeline: group commit 5400000/3000000=1.800; overhead 360000000/3600000/1000=0.100
 assert_contains "group-commit ratio" "$OUT" "**1.800**"
 assert_contains "redo synch overhead avg" "$OUT" "**0.100 ms**"
-assert_contains "event table row" "$OUT" "| SYNC Remote Write | 3000000 | 2100.0 | .7 |"
+assert_contains "event table row in ms" "$OUT" "| SYNC Remote Write | 3000000 | 2100000.0 | .7 |"
 # Distributions: 1024us -> 1.024ms buckets; max = highest non-empty bucket
 assert_contains "lfs percentiles" "$OUT" "| log file sync | <= 1.024 | <= 2.048 | <= 4.096 | <= 8.192 | 3600000 |"
 assert_contains "srw max bucket" "$OUT" "| SYNC Remote Write | <= 0.512 | <= 1.024 | <= 4.096 | <= 16.384 | 3000000 |"
 assert_contains "overlap model result" "$OUT" "E[max(L,R)] - E[L] = **0.330 ms**"
-assert_contains "resp histogram row" "$OUT" "| 2 | 1 | 2999000 | 08/09/2026 11:59:02 |"
+assert_contains "resp histogram row in ms" "$OUT" "| 2 | 1000 | 2999000 | 08/09/2026 11:59:02 |"
 # AWR trend
-assert_contains "trend row" "$OUT" "| 101 | 2026-08-03 11:00 | 12000 | 1.05 | .5 | .7 | 3.3 | 300 | 2400 |"
+assert_contains "trend row" "$OUT" "| 101 | 2026-08-03 11:00 | 12000 | 1.05 | .5 | .7 | 3.3 | 300000 | 2400 |"
 assert_contains "trend ovh header in ms" "$OUT" "| est ovh (ms) |"
 # Top latency spikes: resp buckets sorted worst-first; AWR snaps ranked by
 # max(0, remote ack - local write): snap 103 -> 9.2-.5 = 8.700 on top
-assert_contains "spike resp row" "$OUT" "| 2 | 26 | 3 | 08/05/2026 02:11:07 |"
+assert_contains "spike resp row in ms" "$OUT" "| 2 | 26000 | 3 | 08/05/2026 02:11:07 |"
 SPIKES_SECTION=$(printf '%s\n' "$OUT" | sed -n '/^## 6\./,/^## 7\./p')
 TOP_RESP_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 2 [|] [0-9]+ [|]' | head -1)
-assert_contains "resp spikes sorted desc" "$TOP_RESP_SPIKE" "| 2 | 26 | 3 |"
+assert_contains "resp spikes sorted desc" "$TOP_RESP_SPIKE" "| 2 | 26000 | 3 |"
 assert_contains "awr spike row" "$OUT" "| 103 | 2026-08-03 13:00 | 8.700 | 9.5 | .5 | 9.2 | 11000 | 95700 |"
 assert_contains "awr spike header in ms" "$OUT" "| est added ms |"
 TOP_AWR_SPIKE=$(printf '%s\n' "$SPIKES_SECTION" | grep -E '^[|] 10[0-9] [|]' | head -1)
@@ -324,6 +333,15 @@ assert_contains "baseline hint" "$OUT" "No baseline window supplied"
 # ASH: 1500/10000 = 15.000 %
 assert_contains "ash pct" "$OUT" "15.000 %"
 assert_contains "ash top sql" "$OUT" "abc123def456"
+# Every section names where its data comes from, and each table carries the
+# exact query that produced it (recorded verbatim as run_sql issued it)
+assert_contains "source line section 3" "$OUT" '_Source: `V$SYSTEM_EVENT`, `V$SYSSTAT`, `V$SYS_TIME_MODEL`._'
+assert_contains "source line section 8" "$OUT" '_Source: `V$ACTIVE_SESSION_HISTORY`, foreground samples only (Diagnostics Pack)._'
+assert_contains "query block fence" "$OUT" '```sql'
+assert_contains "query block carries the tag" "$OUT" "-- QTAG:EVENTS"
+assert_contains "query block carries the SQL" "$OUT" "FROM V\$SYSTEM_EVENT"
+assert_contains "resphist query block" "$OUT" "FROM V\$REDO_DEST_RESP_HISTOGRAM"
+assert_contains "ash query block" "$OUT" "FROM V\$ACTIVE_SESSION_HISTORY"
 assert_contains "ash top module" "$OUT" "JDBC Thin Client"
 assert_contains "ash top service" "$OUT" "orders_svc"
 assert_contains "ash hourly row" "$OUT" "| 08-09 12 | 700 | 4000 | 17.500 |"
@@ -402,7 +420,7 @@ assert_not_contains "no trend content" "$OUT" "| 101 | 2026-08-03 11:00"
 # The free-view sections still work
 assert_contains "no-pack still has headline" "$OUT" "**0.330 ms**"
 # Spikes: the free resp-histogram ranking stays, the AWR ranking is skipped
-assert_contains "no-pack spike resp row" "$OUT" "| 2 | 26 | 3 | 08/05/2026 02:11:07 |"
+assert_contains "no-pack spike resp row in ms" "$OUT" "| 2 | 26000 | 3 | 08/05/2026 02:11:07 |"
 assert_contains "no-pack awr spike note" "$OUT" "AWR snapshot spike ranking skipped"
 
 # ==== Test 9: no synchronous destination ====
@@ -471,12 +489,51 @@ assert_contains "closing tag" "$OUT" "</html>"
 assert_contains "italic note" "$OUT" "<p><em>No baseline window supplied."
 assert_not_contains "no leftover underscores" "$OUT" "_No baseline window supplied"
 # Graphical upgrades: the headline Measure|Value table becomes KPI cards,
-# numeric table columns get proportional inline bars, ordinal columns
-# (Snap, Hour, bucket, Dest) and Statistic|Value tables stay plain cells
+# table cells stay plain (numeric ones right-aligned via class="n"), and
+# each plottable column gets its own chart below the table
 assert_contains "kpi card" "$OUT" '<span class="kpi-l">Added latency per commit (refined estimate)</span><span class="kpi-v"><strong>0.330 ms</strong></span>'
-assert_contains "inline bar" "$OUT" '<span class="fill" style="width:'
-assert_contains "snap column not barred" "$OUT" "<td>101</td>"
-assert_contains "statistic table plain" "$OUT" "<td>user commits</td>"
+assert_contains "table wrapped for scroll" "$OUT" '<div class="tw"><table>'
+assert_not_contains "no in-cell bars" "$OUT" '<span class="fill"'
+assert_not_contains "no in-cell bar column" "$OUT" '<td class="bar"'
+assert_contains "numeric cell right-aligned" "$OUT" '<td class="n">3600000</td>'
+assert_contains "label cell plain" "$OUT" "<td>log file sync</td>"
+assert_contains "statistic table plain label" "$OUT" "<td>user commits</td>"
+# charts: caption carries the column header and its scale, bars carry the
+# category label from the table's own label column
+assert_contains "chart strip" "$OUT" '<div class="charts">'
+assert_contains "chart caption with max" "$OUT" '<figcaption>Waits<span class="cmax">max 3 600 000</span></figcaption>'
+assert_contains "chart bar" "$OUT" '<span class="bf" style="width:'
+assert_contains "chart bar label" "$OUT" '<span class="bl" title="log file sync">log file sync</span>'
+# "<= 1.024" percentile buckets are chartable numbers, not opaque text
+assert_contains "percentile chart" "$OUT" '<figcaption>p50 (ms)<span class="cmax">max 1.024</span></figcaption>'
+# ordinal/identifier columns (Snap, Hour, bucket, Dest, SQL_ID) are never
+# plotted, and Measure|Value / Statistic|Value tables get no chart at all
+assert_not_contains "no chart for snap column" "$OUT" '<figcaption>Snap<'
+assert_not_contains "no chart for statistic table" "$OUT" '<figcaption>Value<'
+# a short trend is a ranking (bars); only a long one becomes a column chart
+assert_not_contains "short trend has no column chart" "$OUT" '<div class="cols">'
+
+STUB_TREND_LONG=YES
+export STUB_TREND_LONG
+run_script --html
+unset STUB_TREND_LONG
+assert_eq "html long-trend rc" "0" "$RC"
+assert_contains "long trend column chart" "$OUT" '<div class="cols">'
+assert_contains "trend column" "$OUT" '<span class="col" style="height:'
+# a trend chart carries a 0..max y axis and its x axis is labelled with the
+# window ends taken from the table's own time column, not the snap ids
+assert_contains "trend axis ends are timestamps" "$OUT" '<div class="axis"><span>2026-08-03 11:00</span><span>2026-08-04 08:00</span></div>'
+assert_contains "trend y axis" "$OUT" '<div class="yax"><span>13 000</span><span>0</span></div>'
+assert_contains "trend bar meaning" "$OUT" '<span class="cmax">1 bar = 1 snap (12)</span>'
+
+# fenced queries become collapsed <details>, not raw fences in the page
+run_script --html
+assert_contains "query details block" "$OUT" '<details class="q"><summary>Query</summary><pre><code>'
+assert_contains "query details closed" "$OUT" '</code></pre></details>'
+assert_not_contains "no raw fence in html" "$OUT" '```'
+assert_contains "source line rendered as note" "$OUT" '<p><em>Source: <code>V$SYSTEM_EVENT</code>'
+# SQL inside a fence is escaped and never parsed as a table or a bullet
+assert_contains "sql pipes escaped not tabled" "$OUT" "SELECT 'EVT|'||EVENT"
 
 STUB_NO_SYNC=YES
 export STUB_NO_SYNC
