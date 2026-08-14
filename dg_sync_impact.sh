@@ -1452,6 +1452,14 @@ emit_report() {
 #   cell is a plain number, at least two are, and its header is not ordinal
 #   (Snap, Hour, bucket, Dest, SQL_ID, NET_TIMEOUT); non-qualifying cells
 #   keep the exact plain <td>/<th> markup.
+#
+# AIX 7.2 /usr/bin/awk rules (it aborts the whole run with
+# "0602-558 cannot be used as an array" rather than coping):
+# - every array is seeded in BEGIN, so no name is first subscripted
+#   inside a function body or first touched by a read;
+# - cells are keyed with an explicit "row|col" string instead of a
+#   multi-subscript (SUBSEP) reference;
+# - array elements are compared (== 1), never used as a bare boolean.
 
 md_to_html() {
     awk '
@@ -1501,10 +1509,10 @@ md_to_html() {
     # is what allows per-column maxima for the inline bars.
     function emit_table(   r, j, tag, row, hdr1, h, v, ok, numc, pct, maxc) {
         if (tnr == 0) return
-        if (tsep && tnr >= 2 && tnc[1] == 2 && tcell[1,1] == "Measure" && tcell[1,2] == "Value") {
+        if (tsep && tnr >= 2 && tnc[1] == 2 && tcell["1|1"] == "Measure" && tcell["1|2"] == "Value") {
             print "<div class=\"kpis\">"
             for (r = 2; r <= tnr; r++)
-                print "<div class=\"kpi\"><span class=\"kpi-l\">" inline_fmt(tcell[r,1]) "</span><span class=\"kpi-v\">" inline_fmt(tcell[r,2]) "</span></div>"
+                print "<div class=\"kpi\"><span class=\"kpi-l\">" inline_fmt(tcell[r "|1"]) "</span><span class=\"kpi-v\">" inline_fmt(tcell[r "|2"]) "</span></div>"
             print "</div>"
             tnr = 0; tsep = 0
             return
@@ -1512,14 +1520,14 @@ md_to_html() {
         maxc = 0
         for (r = 1; r <= tnr; r++) if (tnc[r] > maxc) maxc = tnc[r]
         for (j = 1; j <= maxc; j++) { barcol[j] = 0; barmax[j] = 0 }
-        hdr1 = tolower(tcell[1,1])
+        hdr1 = tolower(tcell["1|1"])
         if (tsep && tnr >= 3 && hdr1 !~ /measure|statistic/) {
             for (j = 1; j <= maxc; j++) {
-                h = tolower(tcell[1,j])
+                h = tolower(tcell["1|" j])
                 if (h ~ /snap|hour|bucket|dest|sql_id|net_timeout/) continue
                 ok = 1; numc = 0
                 for (r = 2; r <= tnr; r++) {
-                    v = tcell[r,j]
+                    v = tcell[r "|" j]
                     if (v == "" || v == "-" || v == "n/a") continue
                     # Oracle prints sub-1 values with a bare leading dot (.5)
                     if (v !~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) { ok = 0; break }
@@ -1534,13 +1542,13 @@ md_to_html() {
             tag = (tsep && r == 1) ? "th" : "td"
             row = "<tr>"
             for (j = 1; j <= tnc[r]; j++) {
-                v = tcell[r,j]
-                if (tag == "td" && barcol[j] && v ~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) {
+                v = tcell[r "|" j]
+                if (tag == "td" && barcol[j] == 1 && v ~ /^-?(\.[0-9]+|[0-9]+(\.[0-9]+)?)$/) {
                     pct = (v + 0) / barmax[j] * 100
                     if (pct < 0) pct = 0
                     if (pct > 0 && pct < 3) pct = 3
                     row = row "<td class=\"bar\"><span class=\"fill\" style=\"width:" sprintf("%.1f", pct) "%\"></span><span class=\"v\">" v "</span></td>"
-                } else if (tag == "td" && barcol[j]) {
+                } else if (tag == "td" && barcol[j] == 1) {
                     row = row "<td class=\"bar\"><span class=\"v\">" inline_fmt(v) "</span></td>"
                 } else {
                     row = row "<" tag ">" inline_fmt(v) "</" tag ">"
@@ -1555,6 +1563,15 @@ md_to_html() {
         flush_li(); flush_p(); flush_bq()
         if (inul)   { print "</ul>"; inul = 0 }
         if (tnr > 0) emit_table()
+    }
+    # Seed every array and counter up front: AIX awk refuses a name it
+    # has not already seen subscripted ("cannot be used as an array"),
+    # and index 0 is outside every 1..n loop below, so this is inert.
+    BEGIN {
+        tnr = 0; tsep = 0; inul = 0
+        li = ""; pbuf = ""; bqbuf = ""
+        cells[0] = ""; tnc[0] = 0; tcell["0|0"] = ""
+        barcol[0] = 0; barmax[0] = 0
     }
     {
         line = esc($0)
@@ -1575,7 +1592,7 @@ md_to_html() {
             tnr = tnr + 1; tnc[tnr] = 0
             for (i = 2; i < n; i++) {
                 tnc[tnr] = tnc[tnr] + 1
-                tcell[tnr, tnc[tnr]] = trimcell(cells[i])
+                tcell[tnr "|" tnc[tnr]] = trimcell(cells[i])
             }
             next
         }
@@ -1630,6 +1647,7 @@ td.bar .v{position:relative}
 .kpi-v{display:block;font-size:1.3em;font-weight:600}
 .kpi-v strong{color:var(--accent)}
 code{background:var(--code);padding:0 .3em;border-radius:3px;font-size:.94em}
+pre.fallback{white-space:pre-wrap;font-size:.9em}
 blockquote{border-left:4px solid var(--warnbd);background:var(--warnbg);margin:.9em 0;padding:.6em 1em;border-radius:0 6px 6px 0}
 blockquote p{margin:.2em 0}
 em{color:var(--muted)}
@@ -1637,7 +1655,20 @@ em{color:var(--muted)}
 </head>
 <body>
 HTMLHEAD
-    emit_report | md_to_html
+    # Same contract as the collectors: degrade, never fail. An awk that
+    # cannot run the converter (old vendor awks abort on constructs POSIX
+    # allows) would otherwise leave a truncated page behind, so fall back
+    # to the Markdown verbatim - the report still carries every number.
+    local _md _html
+    _md=$(emit_report)
+    if _html=$(printf '%s\n' "$_md" | md_to_html 2>/dev/null) && [[ -n "$_html" ]]; then
+        printf '%s\n' "$_html"
+    else
+        warn "HTML conversion failed (awk) - embedding the Markdown report verbatim"
+        printf '<pre class="fallback">\n'
+        printf '%s\n' "$_md" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g'
+        printf '</pre>\n'
+    fi
     cat <<HTMLFOOT
 </body>
 </html>

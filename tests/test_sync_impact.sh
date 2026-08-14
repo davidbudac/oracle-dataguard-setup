@@ -490,6 +490,42 @@ assert_eq "html -o rc" "0" "$RC"
 HTML_FILE_CONTENT=$(cat "$TEST_TMP/report.html" 2>/dev/null)
 assert_contains "html file written" "$HTML_FILE_CONTENT" "<!DOCTYPE html>"
 
+# ==== Test 13: the HTML renderer stays AIX-awk safe ====
+# AIX 7.2 /usr/bin/awk aborts the run with "0602-558 cannot be used as an
+# array" instead of coping with a name it has not already seen subscripted
+# or with a multi-subscript (SUBSEP) reference.
+echo "Test 13: HTML renderer is AIX-awk safe and degrades instead of truncating"
+RENDERER=$(sed -n '/^md_to_html() {/,/^}$/p' "$SCRIPT")
+assert_contains "cell table seeded in BEGIN" "$RENDERER" 'tcell["0|0"] = ""'
+assert_contains "bar arrays seeded in BEGIN" "$RENDERER" 'barcol[0] = 0; barmax[0] = 0'
+MULTIDIM=$(printf '%s\n' "$RENDERER" | grep -cE '(tcell|tnc|barcol|barmax|cells)\[[^]]*,')
+assert_eq "no multi-subscript array references" "0" "$MULTIDIM"
+
+# A renderer that dies anyway must still leave a complete, readable page
+BAD_BIN="$TEST_TMP/badbin"
+mkdir -p "$BAD_BIN"
+cat > "$BAD_BIN/awk" <<'BADAWK'
+#!/bin/bash
+# fails only for the HTML renderer program, passes every other awk through
+for a in "$@"; do
+    case "$a" in
+        *kpis*) echo "awk: 0602-558  cannot be used as an array." >&2; exit 2 ;;
+    esac
+done
+exec /usr/bin/awk "$@"
+BADAWK
+chmod +x "$BAD_BIN/awk"
+OUT=$(PATH="$BAD_BIN:$STUB_BIN:$PATH" ORACLE_SID=TESTSID ORACLE_HOME="$TEST_TMP" \
+      bash "$SCRIPT" --html 2>"$ERR_FILE")
+RC=$?
+ERR=$(cat "$ERR_FILE")
+assert_eq "broken renderer still exits 0" "0" "$RC"
+assert_contains "markdown fallback block" "$OUT" '<pre class="fallback">'
+assert_contains "fallback keeps the numbers" "$OUT" "0.330 ms"
+assert_contains "fallback escapes markup" "$OUT" "&lt;= 1.024"
+assert_contains "page still closed" "$OUT" "</html>"
+assert_contains "fallback is announced" "$ERR" "HTML conversion failed"
+
 # ==== Summary ====
 echo ""
 echo "Test Summary: $PASS passed, $FAIL failed"

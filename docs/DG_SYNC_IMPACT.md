@@ -54,6 +54,14 @@ number, at least two are, and its header is not ordinal (`Snap`, `Hour`,
 `bucket`, `Dest`, `SQL_ID`, `NET_TIMEOUT`); everything else keeps plain
 table cells.
 
+The converter sticks to what AIX 7.2's `/usr/bin/awk` accepts - it seeds
+every array in `BEGIN` and keys table cells with a `"row|col"` string
+rather than a multi-subscript `arr[i,j]` reference, both of which that
+awk otherwise rejects outright with `0602-558 cannot be used as an
+array`. Should the conversion still fail on some other vendor awk, the
+page is written with the Markdown report embedded verbatim (and a
+warning on stderr) instead of ending mid-report.
+
 ## Why "log file sync minus the remote wait" is wrong
 
 Since 11g Release 2, LGWR does not serialize the local write and the

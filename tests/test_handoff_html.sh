@@ -197,6 +197,29 @@ fi
 
 echo ""
 echo "============================================================"
+echo "Test 5: renderer stays within AIX awk's array rules"
+echo "============================================================"
+# AIX 7.2 /usr/bin/awk aborts the run with "0602-558 cannot be used as an
+# array" instead of coping with a name it has not already seen subscripted
+# or with a multi-subscript (SUBSEP) reference.
+if grep -q 'tcell\["0|0"\] = ""' "${WORK_DIR}/block_ref.sh"; then
+    echo "  PASS: cell table seeded in BEGIN"
+    PASS=$((PASS+1))
+else
+    echo "  FAIL: no BEGIN block seeding tcell/tnc/cells"
+    FAIL=$((FAIL+1))
+fi
+if grep -qE '(tcell|tnc|cells)\[[^]]*,' "${WORK_DIR}/block_ref.sh"; then
+    echo "  FAIL: multi-subscript array reference (arr[i,j]) in the renderer:"
+    grep -nE '(tcell|tnc|cells)\[[^]]*,' "${WORK_DIR}/block_ref.sh" | head -5
+    FAIL=$((FAIL+1))
+else
+    echo "  PASS: no multi-subscript array references"
+    PASS=$((PASS+1))
+fi
+
+echo ""
+echo "============================================================"
 echo "Test Summary: ${PASS} passed, ${FAIL} failed"
 echo "============================================================"
 

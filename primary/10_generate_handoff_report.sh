@@ -334,7 +334,11 @@ build_visualizer_url() {
 # Markdown subset it produces (h1-h4, pipe tables, bullets with
 # two-space continuations and "- [ ]" checklist items, fenced code
 # blocks, blockquotes, **bold**, `code`, [text](url) links) into HTML.
-# POSIX awk only - no gensub, AIX-safe.
+# POSIX awk only - no gensub, AIX-safe: AIX 7.2 /usr/bin/awk aborts with
+# "0602-558 cannot be used as an array" instead of coping, so every array
+# is seeded in BEGIN (no name is first subscripted inside a function body
+# or first touched by a read) and table cells are keyed with an explicit
+# "row|col" string rather than a multi-subscript (SUBSEP) reference.
 #
 # Presentation upgrades happen here (the Markdown itself is unchanged):
 # the meta list under the H1 becomes a chip strip (CSS h1+ul), the
@@ -415,7 +419,7 @@ handoff_md_to_html() {
             tag = (tsep && r == 1) ? "th" : "td"
             row = "<tr>"
             for (j = 1; j <= tnc[r]; j++)
-                row = row "<" tag ">" inline_fmt(tcell[r,j]) "</" tag ">"
+                row = row "<" tag ">" inline_fmt(tcell[r "|" j]) "</" tag ">"
             print row "</tr>"
         }
         print "</table></div>"
@@ -425,6 +429,14 @@ handoff_md_to_html() {
         flush_li(); flush_p(); flush_bq()
         if (inul)   { print "</ul>"; inul = 0 }
         if (tnr > 0) emit_table()
+    }
+    # Seed every array and counter up front: AIX awk refuses a name it
+    # has not already seen subscripted ("cannot be used as an array"),
+    # and index 0 is outside every 1..n loop below, so this is inert.
+    BEGIN {
+        tnr = 0; tsep = 0; inul = 0; infence = 0
+        li = ""; pbuf = ""; bqbuf = ""
+        cells[0] = ""; tnc[0] = 0; tcell["0|0"] = ""
     }
     {
         line = esc($0)
@@ -455,7 +467,7 @@ handoff_md_to_html() {
             tnr = tnr + 1; tnc[tnr] = 0
             for (i = 2; i < n; i++) {
                 tnc[tnr] = tnc[tnr] + 1
-                tcell[tnr, tnc[tnr]] = trimcell(cells[i])
+                tcell[tnr "|" tnc[tnr]] = trimcell(cells[i])
             }
             next
         }
