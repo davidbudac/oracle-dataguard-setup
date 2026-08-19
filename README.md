@@ -5,9 +5,9 @@ Automated scripts for building, verifying, and operating an Oracle 19c Physical 
 ## What's Included
 
 - **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
-- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11).
-- **Handoff report** (step 12) — Markdown doc with topology, status, and per-service TNS/JDBC strings for application teams.
-- **Operational tools** — SSH dashboard, local triage/diagnostics, wallet setup for password-free peer access, standalone handoff regenerator.
+- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11), NFS artifact cleanup (step 12), Maximum Availability without FSFO (step 13).
+- **Handoff report** (recommended, any time after step 7) — Markdown + styled HTML doc with topology, status, verdict, and per-service TNS/JDBC strings for application teams.
+- **Operational tools** — SSH dashboard, local triage/diagnostics, standby-redo-log audit, SYNC commit-cost report, wallet setup for password-free peer access, standalone handoff regenerator.
 
 ## Prerequisites
 
@@ -34,12 +34,13 @@ dataguard_setup/
 ├── CLAUDE.md                    # Project notes for AI assistants
 │
 ├── nfs/                         # NFS server + client setup (run first)
-├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 8, 9, 10)
+├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 8, 9, 13) + the handoff report (10_...)
 ├── standby/                     # STANDBY-side steps (3, 5, 7)
 ├── fsfo/                        # observer.sh - lifecycle for FSFO observer
 ├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant) + CDB/PDB service creation
 │
 ├── migrate_noncdb_to_pdb/       # Non-CDB → PDB migration subproject (own README/WALKTHROUGH)
+├── observer_sys_to_sysdg/       # Side kit: convert a SYS-authenticated FSFO observer to SYSDG (own README)
 │
 ├── common/                      # Shared functions, wallet setup, status helpers
 ├── templates/                   # Reference templates (init, listener, tnsnames)
@@ -80,7 +81,15 @@ dataguard_setup/
 | 9  | PRIMARY  | `./primary/09_configure_fsfo.sh`         | Optional: enable FSFO |
 | 10 | OBSERVER | `./fsfo/observer.sh setup` then `start`  | Optional: required for FSFO |
 | 11 | PRIMARY  | `./trigger/create_role_trigger.sh`       | Optional: role-aware service start/stop |
-| 12 | PRIMARY  | `./primary/10_generate_handoff_report.sh`| Markdown handoff for app teams |
+| 12 | any host | `./common/cleanup_nfs_artifacts.sh`      | Optional: scrub password files / pfiles / RMAN artifacts off the share |
+| 13 | PRIMARY  | `./primary/13_set_max_availability.sh`   | Optional: zero data loss **without** FSFO — skip if step 9 ran |
+
+Recommended, any time after step 7 — run both **before** step 12's `--all` cleanup:
+
+| Server | Command | Notes |
+|--------|---------|-------|
+| PRIMARY | `./primary/10_generate_handoff_report.sh` | Markdown + HTML handoff for app teams |
+| BOTH    | `bash common/setup_dg_wallet.sh`          | Password-free peer access for the local tools |
 
 `./trigger/create_role_trigger_dedicated_user.sh` is an alternative to step 11 that puts trigger objects under a dedicated user instead of `SYS`. For multitenant databases, `./trigger/create_role_trigger_cdb.sh` manages PDB services, and `./trigger/create_cdb_service.sh` / `./trigger/create_pdb_service.sh` create role-aware services at the `CDB$ROOT` or PDB level.
 
@@ -91,7 +100,9 @@ See [`WALKTHROUGH.md`](WALKTHROUGH.md) for prompts, outputs, and verification pe
 - **Steps 1-4** — idempotent, re-runnable.
 - **Step 5** — once RMAN duplicate starts, you must shut down the standby instance and remove its data files / control files / redo logs before re-running. The script requires you to retype the standby `DB_UNIQUE_NAME` before starting, to reduce accidental execution.
 - **Steps 6-7** — re-runnable; remove the broker config with `REMOVE CONFIGURATION` first if needed.
-- **Step 12** — re-run any time; refreshes the handoff doc.
+- **Step 8** — rotation and lock are separate calls with separate exit codes; a partial run prints an ACTION REQUIRED block and exits `1`. After it runs, SYS is locked and step 5 can no longer clone until SYS is temporarily unlocked.
+- **Step 13** — idempotent; a no-op if step 9 already set MAXAVAILABILITY + FASTSYNC.
+- **Handoff report** — re-run any time; refreshes the doc.
 
 ## Runtime Modes
 
@@ -139,6 +150,11 @@ bash common/setup_dg_wallet.sh
 ./get_dg_config_url.sh           # summary on stderr, URL on stdout
 ./get_dg_config_url.sh -q        # URL only
 
+# Standby redo log audit - prints fix DDL, executes nothing
+./dg_check_srl.sh                # both sides, peer via wallet
+./dg_check_srl.sh -p             # prompt for SYS password for the peer
+./dg_check_srl.sh -L             # local only
+
 # What is synchronous transport costing commits? (run on PRIMARY)
 ./dg_sync_impact.sh                          # ASH last 24h, AWR last 7 days
 ./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' --baseline-end '2026-07-08 00:00'
@@ -148,6 +164,13 @@ bash common/setup_dg_wallet.sh
 ```
 
 References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/DG_CHECK.md), [`docs/DG_SYNC_IMPACT.md`](docs/DG_SYNC_IMPACT.md), [`docs/WALLET_SETUP.md`](docs/WALLET_SETUP.md).
+
+## Side Toolkits
+
+Self-contained subprojects with their own docs, outside the numbered workflow:
+
+- [`observer_sys_to_sysdg/`](observer_sys_to_sysdg/README.md) — convert an existing FSFO observer that authenticates as SYS to a dedicated SYSDG-only user. For configurations built by hand or by other tooling; builds made with steps 9-10 here already use SYSDG.
+- [`migrate_noncdb_to_pdb/`](migrate_noncdb_to_pdb/README.md) — migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby.
 
 ## Common DGMGRL Commands
 

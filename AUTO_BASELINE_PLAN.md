@@ -1,5 +1,10 @@
 # Implementation plan: `--auto-baseline` for dg_sync_impact.sh
 
+> **Status: implemented and merged** (commit `d3915a7`, 2026-08). This document is a
+> historical record of the plan, not open work. The shipped behavior is documented in
+> [docs/DG_SYNC_IMPACT.md](docs/DG_SYNC_IMPACT.md) and covered by
+> `tests/test_sync_impact.sh`.
+
 Self-contained handoff plan. No conversation context needed; everything an
 implementing agent must know is in here plus the referenced files.
 

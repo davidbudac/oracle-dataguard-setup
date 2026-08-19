@@ -11,21 +11,25 @@ This document describes what each automation script does and shows the equivalen
 3. [Restartability](#restartability)
 4. [Common Flags](#common-flags)
 5. [Step 1: Gather Primary Information](#step-1-gather-primary-information)
-7. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
-8. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
-9. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
-10. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
-11. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
-12. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
-13. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
-14. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
-15. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
-16. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
-17. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
-18. [Step 13: Set Maximum Availability Protection (Optional)](#step-13-set-maximum-availability-protection-optional)
-19. [Summary](#summary-what-would-be-done-manually-without-scripts)
-20. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
-21. [Common Monitoring Commands](#common-monitoring-commands)
+6. [Step 2: Generate Standby Configuration](#step-2-generate-standby-configuration)
+7. [Step 3: Setup Standby Environment](#step-3-setup-standby-environment)
+8. [Step 4: Prepare Primary for Data Guard](#step-4-prepare-primary-for-data-guard)
+9. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
+10. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
+11. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
+12. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
+13. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
+14. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
+15. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
+16. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
+17. [Step 13: Set Maximum Availability Protection (Optional)](#step-13-set-maximum-availability-protection-optional)
+18. [Handoff Report (Recommended, Any Time After Step 7)](#handoff-report-recommended-any-time-after-step-7)
+19. [Peer Wallet Setup (Recommended, Any Time After Step 7)](#peer-wallet-setup-recommended-any-time-after-step-7)
+20. [Post-Setup Tooling](#post-setup-tooling)
+21. [Side Toolkits (Outside the Numbered Workflow)](#side-toolkits-outside-the-numbered-workflow)
+22. [Summary](#summary-what-would-be-done-manually-without-scripts)
+23. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
+24. [Common Monitoring Commands](#common-monitoring-commands)
 
 ---
 
@@ -559,11 +563,19 @@ lsnrctl status
 1. Configures TNS names on primary (adds entries for both databases)
 2. Configures listener on primary with static registration
 3. Enables FORCE_LOGGING if not already enabled
-4. Creates standby redo logs (required for switchover)
+4. Creates standby redo logs (required for switchover), one group more than the
+   number of online redo log groups, sized to the largest online redo log, with
+   an explicit `THREAD` clause
 5. Enables Data Guard Broker (DG_BROKER_START=TRUE)
 6. Sets STANDBY_FILE_MANAGEMENT=AUTO
 7. Configures RMAN archivelog deletion policy
 8. Tests network connectivity to standby
+
+> Standby redo logs are also needed on the **standby** side (for the post-switchover
+> primary role). Step 5's RMAN duplicate recreates them there from the primary's
+> definition. To audit both sides at any point - including builds this repo did not
+> create - run `./dg_check_srl.sh`; it prints the exact fix DDL and never executes it.
+> See [Post-Setup Tooling](#post-setup-tooling).
 
 ### Manual Equivalent
 
@@ -586,11 +598,18 @@ ALTER DATABASE FORCE LOGGING;
 SELECT bytes/1024/1024 AS size_mb FROM v$log WHERE rownum = 1;
 SELECT COUNT(*) FROM v$log;
 
--- Add standby redo logs (adjust size and paths as needed)
-ALTER DATABASE ADD STANDBY LOGFILE GROUP 4 ('/u01/app/oracle/oradata/TESTDB/standby_redo04.log') SIZE 200M;
-ALTER DATABASE ADD STANDBY LOGFILE GROUP 5 ('/u01/app/oracle/oradata/TESTDB/standby_redo05.log') SIZE 200M;
-ALTER DATABASE ADD STANDBY LOGFILE GROUP 6 ('/u01/app/oracle/oradata/TESTDB/standby_redo06.log') SIZE 200M;
-ALTER DATABASE ADD STANDBY LOGFILE GROUP 7 ('/u01/app/oracle/oradata/TESTDB/standby_redo07.log') SIZE 200M;
+-- Find the instance's redo thread (single instance: almost always 1)
+SELECT thread# FROM v$instance;
+
+-- Add standby redo logs (adjust size and paths as needed).
+-- Always give an explicit THREAD: an SRL created without one sits at
+-- THREAD#=0 until RFS first uses it, and DGMGRL VALIDATE DATABASE then
+-- reports it as "not configured for thread N" - which blocks the Step 13
+-- MAXAVAILABILITY preflight and confuses per-thread SRL accounting.
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 4 ('/u01/app/oracle/oradata/TESTDB/standby_redo04.log') SIZE 200M;
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 5 ('/u01/app/oracle/oradata/TESTDB/standby_redo05.log') SIZE 200M;
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 6 ('/u01/app/oracle/oradata/TESTDB/standby_redo06.log') SIZE 200M;
+ALTER DATABASE ADD STANDBY LOGFILE THREAD 1 GROUP 7 ('/u01/app/oracle/oradata/TESTDB/standby_redo07.log') SIZE 200M;
 
 -- Verify standby redo logs
 SELECT group#, thread#, bytes/1024/1024 AS size_mb, status FROM v$standby_log;
@@ -1075,9 +1094,9 @@ dgmgrl / "STOP OBSERVER"
 
 1. **Observer location**: The observer can run on the standby server or a dedicated 3rd server. A 3rd server is recommended for production as it remains available regardless of which database fails.
 
-2. **Authentication**: Uses Oracle Wallet with SYSDG user for secure authentication. No passwords are stored in scripts.
+2. **Authentication**: Uses Oracle Wallet with SYSDG user for secure authentication. No passwords are stored in scripts. If you are adopting an *existing* configuration whose observer still authenticates as SYS, convert it with the `observer_sys_to_sysdg/` kit - see [Side Toolkits](#side-toolkits-outside-the-numbered-workflow).
 
-3. **Protection mode impact**: MAXIMUM AVAILABILITY provides zero data loss but may slightly impact primary performance.
+3. **Protection mode impact**: MAXIMUM AVAILABILITY provides zero data loss but adds the remote-write acknowledgement to every commit. Quantify the cost on a live system with `./dg_sync_impact.sh` - see [Post-Setup Tooling](#post-setup-tooling).
 
 4. **Network requirements**: Observer must have network connectivity to both primary and standby databases.
 
@@ -1225,13 +1244,72 @@ To change which services are managed, re-run the script:
 
 The script will discover current services and let you edit the list interactively. Re-running replaces the existing PL/SQL objects.
 
+### Variants
+
+`create_role_trigger.sh` is the baseline: SYS-owned objects, non-CDB database. Three
+variants cover the cases it refuses to handle.
+
+| Script | Use when | Objects created |
+|--------|----------|-----------------|
+| `trigger/create_role_trigger.sh` | Non-CDB, SYS objects allowed | `SYS.DG_SERVICE_MGR` + 2 triggers |
+| `trigger/create_role_trigger_dedicated_user.sh` | Non-CDB, policy forbids adding objects to `SYS` | `DG_ADMIN` user (least privilege) owning the package and triggers, plus a narrow `SYS.DG_ALERT_LOG_MSG` wrapper (the dedicated user cannot call SYS-only `DBMS_SYSTEM.KSDWRT`; only `EXECUTE` on the wrapper is granted, never on `DBMS_SYSTEM`) |
+| `trigger/create_role_trigger_cdb.sh` | Multitenant (`V$DATABASE.CDB = YES`) | `SYS.DG_SERVICE_MGR` storing `(container, service)` pairs; switches container before each `DBMS_SERVICE` call |
+
+**Both non-CDB scripts refuse to run on a CDB** and point at the CDB variant - their
+container-blind `DBMS_SERVICE` calls would silently mismanage PDB services. There is
+currently **no CDB-aware dedicated-user variant**: a shop that runs CDBs *and* forbids
+SYS objects has no supported path here yet.
+
+**CDB variant specifics:**
+
+- Services are discovered as `(container, service)` pairs from `V$ACTIVE_SERVICES`
+  joined to `V$CONTAINERS`, excluding `PDB$SEED`, system services, and each
+  container's default service.
+- The triggers still fire in `CDB$ROOT` (the role transition is CDB-wide);
+  `MANAGE_SERVICES` does `ALTER SESSION SET CONTAINER` per service and returns to
+  `CDB$ROOT`. A per-service failure (e.g. a PDB only MOUNTED on the standby) is
+  written to the alert log and never aborts the others.
+- A PDB service only starts if the PDB is OPEN, so ensure PDBs auto-open
+  (`ALTER PLUGGABLE DATABASE ... SAVE STATE` or an open trigger).
+- **Active Data Guard caveat:** a system trigger cannot switch containers
+  (`ORA-65123`), so the work is deferred to a one-time `DBMS_SCHEDULER.CREATE_JOB`.
+  On a standby opened READ ONLY WITH APPLY, `CREATE_JOB` cannot write to the data
+  dictionary and fails with `ORA-16000`; this is caught and only logged, so services
+  are **not** stopped by the trigger on an ADG-opened standby. Watch the alert log
+  for `DG_SERVICE_MGR SCHEDULE failed` and stop such services manually.
+
+### Creating Role-Aware Services (Multitenant)
+
+The trigger manages services that already exist. To create one in the first place on a
+CDB, use one of these instead of hand-writing `DBMS_SERVICE` calls (both run on the
+PRIMARY, are idempotent, and replicate to the standby via redo):
+
+```bash
+# Service inside a PDB (the PDB must be OPEN READ WRITE)
+./trigger/create_pdb_service.sh --pdb SALESPDB --service sales_rw
+./trigger/create_pdb_service.sh SALESPDB sales_rw            # positional form
+./trigger/create_pdb_service.sh --pdb SALESPDB --service sales_ro --taf --no-start
+
+# Service in CDB$ROOT
+./trigger/create_cdb_service.sh --service admin_svc
+./trigger/create_cdb_service.sh admin_svc --taf
+```
+
+`--taf` adds basic TAF attributes (`FAILOVER_TYPE=SELECT`, `FAILOVER_METHOD=BASIC`);
+`--no-start` creates without starting. Note `-s` is reserved (approval mode) by the
+shared argument parser, so the service flag is the long `--service` only.
+
+Neither script saves PDB state, so role-awareness comes entirely from the trigger:
+**after creating a service, re-run `create_role_trigger_cdb.sh`** so the new service is
+started on PRIMARY and stopped on STANDBY automatically.
+
 ---
 
 ## Step 12: NFS Artifact Cleanup (Optional)
 
 **Script:** `common/cleanup_nfs_artifacts.sh`
 
-Run this once Data Guard has been verified (Step 7), and ideally after the handoff report (Step 15 / `primary/10_generate_handoff_report.sh`) has been reviewed, to scrub sensitive/transient artifacts for a build off the group-readable NFS share.
+Run this once Data Guard has been verified (Step 7), and ideally after the [handoff report](#handoff-report-recommended-any-time-after-step-7) (`primary/10_generate_handoff_report.sh`) has been reviewed, to scrub sensitive/transient artifacts for a build off the group-readable NFS share.
 
 ### What the Script Does
 
@@ -1316,6 +1394,329 @@ EXIT;
 
 ---
 
+## Handoff Report (Recommended, Any Time After Step 7)
+
+**Script:** `primary/10_generate_handoff_report.sh` (run on PRIMARY)
+
+Not part of the numbered 1-13 sequence, but worth generating before Step 12's cleanup -
+`--all` cleanup removes the report from the share. Generate it after Data Guard is
+verified, and ideally after Step 9/10 (FSFO) and Step 11 (service trigger) are in
+place, so the report describes the finished topology.
+
+```bash
+./primary/10_generate_handoff_report.sh
+```
+
+### What the Script Does
+
+1. Discovers the topology (hostnames prefer the broker's `HostName` property;
+   `DGConnectIdentifier` is trusted only when it is a genuine easy-connect string,
+   never a TNS alias)
+2. Collects a status snapshot: roles, open modes, protection mode, standby
+   `LogXptMode`, MRP/apply lag, archive gaps, FSFO state (threshold shown only when
+   FSFO is enabled), broker config, role-trigger deployment status, server-side
+   `SQLNET.EXPIRE_TIME`
+3. Derives the standby's open mode from the broker's `Real Time Query` field (19c
+   DGMGRL prints no "Open Mode" line) plus a best-effort wallet connect
+4. Discovers user-visible services from `V$ACTIVE_SERVICES` (same logic as the role
+   trigger), always including the default `<DB_UNIQUE_NAME>` service - which is
+   flagged as **not** managed by the role trigger
+5. Computes a **Verdict** with each reason named: ERROR on broker-config errors/ORA-
+   diagnostics, failure-state switchover status, or apply lag beyond
+   `DG_SEQ_GAP_CRIT` sequences; WARNING on lesser findings (broker warnings, role
+   trigger not deployed, standby readability unknown); HEALTHY only when nothing fired
+6. Writes the Markdown report, a styled self-contained HTML twin, and copies
+   `docs/DG_APPLICATION_IMPACT.html` to the share when available
+
+### Connection Strings
+
+Per service, in three flavors:
+
+- **Primary-only** TNS + JDBC - writes / admin.
+- **Standby-only** TNS + JDBC - read-only reporting. If the standby is `MOUNTED` the
+  report marks these as not currently usable; if it is `READ ONLY WITH APPLY` it adds
+  the Active Data Guard licensing note, the apply-lag / read-your-writes caveat, and
+  the ORA-16000 no-DML warning.
+- **Role-aware failover** TNS + JDBC + Easy Connect Plus - one descriptor with both
+  hosts in `ADDRESS_LIST`. This is the recommendation for the application tier once
+  Step 11's trigger is deployed: the service runs only on whichever side currently
+  holds the PRIMARY role, so clients follow the active database across a switchover or
+  failover without a config change.
+
+The report is written for application engineers: per-mode RPO semantics (SYNC/FASTSYNC
+ack point, the standby-disconnected loss window, ASYNC loss bounds), an outage-budget
+breakdown (FSFO threshold + failover execution + service startup + reconnect), an ORA-
+error table for role transitions (12514/12541/01033/03113/25402/16000 with
+retryability) plus commit-ambiguity guidance, a descriptor-parameter reference with
+worst-case connect math derived from the actual TNS values, ADG read-staleness controls
+(`STANDBY_MAX_DATA_DELAY`/ORA-03172, `SYNC WITH PRIMARY`), sequence-cache gap and
+NOLOGGING/ORA-26040 specifics, driver mapping examples (ODP.NET, python-oracledb,
+SQLAlchemy), a client/pool settings checklist, and a verification section whose
+end-to-end `SYS_CONTEXT('USERENV', ...)` role check doubles as the switchover-drill
+pass criterion.
+
+### Output
+
+| File | Notes |
+|------|-------|
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` | The report; also printed to stdout |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.html` | Styled, self-contained twin of the same content (ČSOB palette, light/dark, copy buttons on descriptor blocks) |
+| `${NFS_SHARE}/dg_application_impact.html` | Copy of `docs/DG_APPLICATION_IMPACT.html`, linked from "Notes for Client Teams" (supplementary - the Markdown is self-contained) |
+
+The Markdown emitter is the single definition of the report; the HTML is rendered from
+it by a built-in POSIX-awk converter, so the two never diverge in content.
+
+Both handoff scripts also emit an **Interactive diagram** link in the report header: the
+discovered topology (DB unique names, hosts, observer placement, first service, port,
+protection mode, `LogXptMode`, FSFO threshold - **never credentials**) is encoded as
+`#cfg=<base64url(JSON)>` for the interactive configuration explorer at
+`https://davidbudac.cz/dataguard/` (override with `DG_DOC_BASE_URL`). Undiscovered
+fields are omitted so the page falls back to its defaults; the link is skipped entirely
+on a host with neither `base64` nor `openssl`.
+
+Re-run after listener changes, new services, or topology changes.
+
+### Standalone Variant
+
+`./dg_handoff.sh` (repo root) produces the same report against **any** existing Data
+Guard configuration, with no dependency on `standby_config_*.env`,
+`common/dg_functions.sh`, or the NFS share:
+
+```bash
+./dg_handoff.sh
+./dg_handoff.sh -o /tmp/handoff.md
+./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
+```
+
+Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`, with the HTML twin
+written next to it. Use the `--primary-host` / `--standby-host` / `--port` overrides
+when the broker is down or discovery returns the wrong value.
+
+### Manual Equivalent
+
+There is no concise manual equivalent - the report is a document, not a database
+change. Producing it by hand means running the Step 7 verification queries, then
+`DGMGRL SHOW CONFIGURATION` / `SHOW DATABASE ... VERBOSE`, then `V$ACTIVE_SERVICES`,
+then hand-writing a TNS descriptor per service per flavor and keeping all of it in sync
+with the configuration. That is exactly the work the script exists to avoid.
+
+---
+
+## Peer Wallet Setup (Recommended, Any Time After Step 7)
+
+**Script:** `common/setup_dg_wallet.sh` (run on **each** DB host)
+
+Creates an auto-login Oracle Wallet holding SYS credentials for the *peer* database, so
+`dg_triage_sid.sh`, `dg_diag_sid.sh`, and `dg_check_srl.sh` can query the other side
+without prompting for a password.
+
+```bash
+bash common/setup_dg_wallet.sh              # on primary
+bash common/setup_dg_wallet.sh              # on standby
+bash common/setup_dg_wallet.sh -w /path     # custom wallet directory
+bash common/setup_dg_wallet.sh -A           # generate the wallet password automatically
+```
+
+The script auto-detects the local role, discovers the peer TNS alias from the broker,
+creates the wallet, configures `sqlnet.ora`, and tests the connection. It is idempotent
+- re-running adds or updates credentials in an existing wallet.
+
+Re-running with `-A` against a wallet that already holds credentials (or whose
+auto-generated password can no longer be supplied) lists the existing credentials and
+requires typing `RECREATE WALLET` to confirm. The rebuild happens in a staging directory
+and is swapped in only after every step succeeds, with the old wallet kept as a
+timestamped `.bak`.
+
+Full reference: [WALLET_SETUP.md](WALLET_SETUP.md).
+
+### Manual Equivalent
+
+```bash
+# On each DB host, as oracle
+mkstore -wrl /u01/app/oracle/wallet -create
+mkstore -wrl /u01/app/oracle/wallet -createCredential <PEER_TNS_ALIAS> sys <sys_password>
+orapki wallet create -wallet /u01/app/oracle/wallet -auto_login -pwd <wallet_password>
+```
+
+```
+# Add to $ORACLE_HOME/network/admin/sqlnet.ora
+WALLET_LOCATION =
+  (SOURCE = (METHOD = FILE)
+            (METHOD_DATA = (DIRECTORY = /u01/app/oracle/wallet)))
+SQLNET.WALLET_OVERRIDE = TRUE
+```
+
+```bash
+# Verify
+sqlplus /@<PEER_TNS_ALIAS> as sysdba
+```
+
+---
+
+## Post-Setup Tooling
+
+These are standalone operational tools, not workflow steps. None of them changes the
+database; `dg_check_srl.sh` prints DDL but never executes it.
+
+| Tool | Where it runs | What it answers |
+|------|---------------|-----------------|
+| `dg_status.sh` | Jump host (SSH to both DB hosts) | Is the whole configuration healthy right now? |
+| `dg_triage_sid.sh` | On a DB host | Fast local triage - what is wrong with this side? |
+| `dg_diag_sid.sh` | On a DB host | Deep local diagnostics when triage is not enough |
+| `dg_check_srl.sh` | On a DB host | Are standby redo logs right on both sides? What DDL fixes them? |
+| `dg_sync_impact.sh` | On the PRIMARY | What is SYNC/FASTSYNC transport costing commits? |
+| `get_dg_config_url.sh` | On a DB host | Link to the interactive diagram of this configuration |
+
+### Health Dashboard
+
+```bash
+bash dg_status.sh                    # $ORACLE_SID, or auto-detect from ora_pmon_
+bash dg_status.sh -s cdb1            # explicit primary SID
+bash dg_status.sh -c myconfig.env    # custom SSH config
+bash dg_status.sh --no-color         # or set NO_COLOR
+```
+
+Checks both databases: role, open mode, protection mode, switchover status, force
+logging, flashback, broker status, running services, redo/SRL counts, archive
+destination errors, archive gaps, FRA usage, MRP apply status, transport/apply lag,
+archived-log sequence gaps, UNNAMED datafiles, broker config including FSFO and
+per-member ORA errors, and recent DG-related alert log entries.
+
+Exit codes: `0` healthy, `1` warnings, `2` errors, `3` usage/config error - use these in
+cron rather than scraping the colored output. An unreachable host is reported as
+`UNREACHABLE`, and an unreachable standby renders replication state as `UNKNOWN`, never
+`IN SYNC`. Thresholds are env-overridable: `DG_FRA_WARN_PCT` (80), `DG_FRA_CRIT_PCT`
+(90), `DG_SEQ_GAP_WARN` (1), `DG_SEQ_GAP_CRIT` (5), `DG_LAG_WARN_SECONDS` (60).
+
+Full reference: [DG_STATUS.md](DG_STATUS.md).
+
+### Local Triage and Diagnostics
+
+No SSH needed - run directly on the DB host.
+
+```bash
+bash dg_triage_sid.sh        # fast triage, wallet-only auth by default
+bash dg_diag_sid.sh          # deep diagnostics, prompts if wallet auth fails
+bash dg_triage_sid.sh -L     # local + broker only, skip remote SQL
+bash dg_diag_sid.sh -P       # force SYS password prompt for the remote side
+```
+
+`dg_check_sid.sh` is a deprecated wrapper that forwards to `dg_triage_sid.sh` and always
+exits `0`. Full reference: [DG_CHECK.md](DG_CHECK.md).
+
+### Standby Redo Log Audit
+
+```bash
+./dg_check_srl.sh                     # both sides, peer via wallet
+./dg_check_srl.sh -p                  # prompt for SYS password for the peer
+./dg_check_srl.sh -L                  # local only (run separately on each host)
+./dg_check_srl.sh -d /u02/oradata/srl # override the directory in generated DDL
+```
+
+Verifies at least (online redo groups + 1) SRL groups per thread, each sized to the
+largest online redo log, on **both** sides, and prints the exact fix DDL for whatever is
+missing or undersized. It executes nothing.
+
+SRLs created without a `THREAD` clause sit at `THREAD#=0` until first use (this repo's
+Step 4 created them that way before 2026-08; it now assigns `THREAD` explicitly). The
+checker counts `THREAD#=0` SRLs as a shared pool toward each thread's requirement rather
+than demanding duplicates, so old and new builds both check out correctly. On a
+multi-thread database that pooling is flagged, because Oracle hands each group to
+whichever thread claims it first.
+
+Exit codes: `0` compliant, `1` DDL needed (or a peer exists but was not checked), `2`
+argument / pre-flight / data-collection error.
+
+### Synchronous Transport Impact
+
+```bash
+./dg_sync_impact.sh                                   # ASH 24h, AWR 7 days
+./dg_sync_impact.sh --auto-baseline                   # detect the pre-SYNC baseline from AWR
+./dg_sync_impact.sh --baseline-begin 12000 --baseline-end 12168
+./dg_sync_impact.sh --no-pack                         # no Diagnostics Pack license
+./dg_sync_impact.sh --html -o impact.html             # self-contained HTML page
+```
+
+Answers "what is SYNC costing us" with a model rather than a guess. Since 11g R2 the
+local redo write (`log file parallel write`, L) and the remote send/ack (`SYNC Remote
+Write`, R) run **in parallel**, so a commit's redo-write phase is `max(L,R)` and the
+per-write overhead is `E[max(L,R)] - E[L]` - a number averages alone cannot produce. The
+script cross-joins the two `V$EVENT_HISTOGRAM_MICRO` distributions, brackets the result
+with the assumption-free bounds `max(0, avgR-avgL) <= overhead <= avgR`, and scales it to
+added ms/commit, s/hour, and % of DB time.
+
+Run it on the PRIMARY. Not being a primary is fatal (exit 1); having no SYNC destination
+is not - it reports current `log file sync` and L as an ASYNC-side baseline. Every
+section names its source views and prints the exact query that produced each table.
+
+Full methodology, flags, and the `--auto-baseline` detection heuristic:
+[DG_SYNC_IMPACT.md](DG_SYNC_IMPACT.md).
+
+### Interactive Diagram Link
+
+```bash
+./get_dg_config_url.sh                                # summary on stderr, URL on stdout
+./get_dg_config_url.sh -q                             # URL only: URL=$(./get_dg_config_url.sh -q)
+./get_dg_config_url.sh --standby-host stb --port 1521 # fill in what discovery missed
+```
+
+Produces the same visualizer link the handoff report embeds, without generating a
+report. Standalone (no `standby_config_*.env`, no `common/dg_functions.sh`, no NFS
+share) and runnable from either side - on a standby it swaps the roles and reports the
+local host as the standby. Overrides: `--primary-host`, `--standby-host`,
+`--observer-host`, `--port`, `--service`, `--base-url`. Every query is best-effort; only
+a failed `sqlplus / as sysdba` connection, or a host with neither `base64` nor
+`openssl`, is fatal.
+
+---
+
+## Side Toolkits (Outside the Numbered Workflow)
+
+Two self-contained subprojects live in this repo but are not part of the 1-13 sequence.
+
+### Convert an FSFO Observer from SYS to SYSDG
+
+**Directory:** `observer_sys_to_sysdg/` (see its own `README.md`)
+
+For **existing** configurations - built by hand or by other tooling - where the observer
+still authenticates as SYS. Moves it to a dedicated user holding only `SYSDG` +
+`CREATE SESSION`. New builds through Step 9 + `fsfo/observer.sh` already have this
+shape; this kit retrofits it.
+
+| Script | Runs on | Does |
+|--------|---------|------|
+| `01_create_sysdg_user.sh` | PRIMARY | Creates/verifies the dedicated user with exactly `CREATE SESSION` + `SYSDG`. CDB-aware (auto-prefixes `C##`). Idempotent |
+| `02_switch_observer_credentials.sh` | OBSERVER host | Replaces SYS credentials in the existing wallet (or creates one if the observer used `sys/password@alias` directly), tests both databases, then optionally restarts the observer under the new identity |
+| `03_verify_conversion.sh` | anywhere | `SHOW CONFIGURATION` / `SHOW FAST_START FAILOVER` / `SHOW OBSERVER` + `V$DATABASE` observer columns + `V$PWFILE_USERS`. Exit `0` = observer present |
+
+Why it matters: an observer running as SYS breaks on every SYS password rotation, holds
+full SYSDBA power in a long-lived unattended process, and muddies the audit trail. No
+dependency on `common/`, the NFS share, or `standby_config_*.env` - copy the one
+directory to the hosts involved. All passwords are prompted at runtime, never accepted
+via argv, env, or files.
+
+Before starting, identify how the observer authenticates today:
+
+```bash
+# On the observer host
+ps -eo args | grep -i dgmgrl | grep -iv grep
+```
+
+`dgmgrl /@alias START OBSERVER` means a wallet (which most likely holds SYS
+credentials); anything else means credentials passed directly.
+
+### Migrate a Non-CDB into a CDB, Keeping Both Standbys
+
+**Directory:** `migrate_noncdb_to_pdb/` (own `README.md`, `WALKTHROUGH.md`,
+`MINIMAL_STEPS.md`, and tests)
+
+Migrates a non-CDB that has its own standby into an existing CDB that has its own
+standby, **without recreating either standby**. Six numbered scripts
+(`01_preflight.sh` through `06_decommission_noncdb.sh`), a `config.env.template`, and a
+`run_minimal.sh` driver. Read that subproject's own docs before running any of it.
+
+---
+
 ## Summary: What Would Be Done Manually Without Scripts
 
 | Step | Script | Manual Effort |
@@ -1335,6 +1736,8 @@ EXIT;
 | 11 | Service Trigger | Write PL/SQL package and triggers, deploy to database (optional) |
 | 12 | NFS Cleanup | Track down and remove password file copies, pfiles, RMAN artifacts (optional) |
 | 13 | Max Availability | Validate readiness, set FASTSYNC + MAXAVAILABILITY, verify (optional) |
+| - | Handoff Report | Re-run every verification query, then hand-write a TNS/JDBC descriptor per service per flavor and keep it in sync (recommended) |
+| - | Peer Wallet | `mkstore`/`orapki` per host, edit `sqlnet.ora`, test (recommended) |
 
 **Total Manual Steps:** ~100+ individual commands, queries, and file edits
 
@@ -1447,7 +1850,11 @@ Then confirm apply catches up (`v$dataguard_stats`, `v$recover_file` now empty, 
 
 ## Common Monitoring Commands
 
-After setup, use these commands for ongoing monitoring:
+For day-to-day monitoring, prefer the packaged tools in
+[Post-Setup Tooling](#post-setup-tooling) - `dg_status.sh` from a jump host,
+`dg_triage_sid.sh` / `dg_diag_sid.sh` on a DB host. The raw commands below are the
+building blocks, useful when those tools are not available or when you need one
+specific answer:
 
 ```sql
 -- Check apply lag
