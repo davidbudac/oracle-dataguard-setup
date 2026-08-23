@@ -1420,13 +1420,27 @@ place, so the report describes the finished topology.
    DGMGRL prints no "Open Mode" line) plus a best-effort wallet connect
 4. Discovers user-visible services from `V$ACTIVE_SERVICES` (same logic as the role
    trigger), always including the default `<DB_UNIQUE_NAME>` service - which is
-   flagged as **not** managed by the role trigger
-5. Computes a **Verdict** with each reason named: ERROR on broker-config errors/ORA-
-   diagnostics, failure-state switchover status, or apply lag beyond
-   `DG_SEQ_GAP_CRIT` sequences; WARNING on lesser findings (broker warnings, role
-   trigger not deployed, standby readability unknown); HEALTHY only when nothing fired
+   flagged as **not** managed by the role trigger - and reads each service's HA
+   attributes from the dictionary (`sql/queries/get_service_ha_attributes.sql`:
+   TAF type/method/retries/delay, Transaction Guard `COMMIT_OUTCOME`,
+   `DRAIN_TIMEOUT`, `FAILOVER_RESTORE`), so the report states what each service
+   actually has instead of hedging
+5. Computes a **Verdict** with each reason named *and an action attached to every
+   finding*: ERROR on broker-config errors/ORA- diagnostics, failure-state
+   switchover status, or apply lag beyond `DG_SEQ_GAP_CRIT` sequences; WARNING on
+   lesser findings (broker warnings, role trigger not deployed, standby readability
+   unknown); HEALTHY only when nothing fired
 6. Writes the Markdown report, a styled self-contained HTML twin, and copies
    `docs/DG_APPLICATION_IMPACT.html` to the share when available
+
+The report opens with an **At a Glance** section (verdict pill + finding/action
+list, one-line RPO, failover mode, standby readability, which connect string to
+hand out, go-live pointers); the application-facing sections follow (1 Connection
+Strings, 2 Application Impact, 3 Client and Pool Settings, 4 Verification), and all
+DBA-only material (topology, status snapshot, broker output, the datafile/PDB
+convert-pair note, discovery warnings) moves to a closing **Appendix: DBA
+Snapshot**. Set `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT` in the environment to add
+an environment label (PROD/UAT/...) and a DBA contact chip to the header.
 
 ### Connection Strings
 
@@ -1448,7 +1462,9 @@ ack point, the standby-disconnected loss window, ASYNC loss bounds), an outage-b
 breakdown (FSFO threshold + failover execution + service startup + reconnect), an ORA-
 error table for role transitions (12514/12541/01033/03113/25402/16000 with
 retryability) plus commit-ambiguity guidance, a descriptor-parameter reference with
-worst-case connect math derived from the actual TNS values, ADG read-staleness controls
+worst-case connect math derived from the actual TNS values (the Easy Connect Plus
+strings carry the same connect/retry values as the TNS descriptor, so every driver
+gets the documented behavior), ADG read-staleness controls
 (`STANDBY_MAX_DATA_DELAY`/ORA-03172, `SYNC WITH PRIMARY`), sequence-cache gap and
 NOLOGGING/ORA-26040 specifics, driver mapping examples (ODP.NET, python-oracledb,
 SQLAlchemy), a client/pool settings checklist, and a verification section whose
@@ -1486,11 +1502,26 @@ Guard configuration, with no dependency on `standby_config_*.env`,
 ./dg_handoff.sh
 ./dg_handoff.sh -o /tmp/handoff.md
 ./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
+./dg_handoff.sh --env PROD --contact "DBA team <dba@example.com>"
 ```
 
 Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`, with the HTML twin
 written next to it. Use the `--primary-host` / `--standby-host` / `--port` overrides
-when the broker is down or discovery returns the wrong value.
+when the broker is down or discovery returns the wrong value; `--env` / `--contact`
+fill the header chips (also settable via `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT`).
+
+Beyond the step-10 report, the standalone variant is container-aware: services are
+discovered as (container, service) pairs from `V$ACTIVE_SERVICES` joined to
+`V$CONTAINERS`, each service section names the container it lands in (with a
+warning for `CDB$ROOT`), and every **default** service (a container's own
+`DB_NAME[.DB_DOMAIN]` / PDB-name service) is flagged as NOT role-aware - those are
+registered wherever the container is up, including the standby, so they must never
+be handed to applications as failover descriptors. User-created services sort
+first, and a run with no user-created service at all is a WARNING of its own.
+
+Exit codes: `0` HEALTHY, `1` WARNING, `2` ERROR, `3` usage/connection failure -
+cron-friendly, same convention as `dg_status.sh`. (The step-10 variant keeps the
+setup-step convention: nonzero only on ERROR.)
 
 ### Manual Equivalent
 

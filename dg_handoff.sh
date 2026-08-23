@@ -29,6 +29,12 @@ OUTPUT_FILE=""
 PRIMARY_HOST_OVERRIDE=""
 STANDBY_HOST_OVERRIDE=""
 PORT_OVERRIDE=""
+# Optional header metadata (also settable via env for the step-10 variant,
+# which takes no arguments): environment label (PROD/UAT/...) and a DBA
+# contact line. Both end up as chips in the report header - a shared HTML
+# report without an environment label is a mixup waiting to happen.
+ENV_LABEL="${DG_HANDOFF_ENV:-}"
+CONTACT_INFO="${DG_HANDOFF_CONTACT:-}"
 
 usage() {
     cat <<EOF
@@ -42,12 +48,19 @@ Options:
       --primary-host HOST   Override primary hostname in connect strings
       --standby-host HOST   Override standby hostname in connect strings
       --port PORT           Override listener port (default: discover or 1521)
+      --env LABEL           Environment label shown in the header (PROD, UAT, ...)
+                            (env: DG_HANDOFF_ENV)
+      --contact TEXT        DBA contact line shown in the header
+                            (env: DG_HANDOFF_CONTACT)
   -h, --help                Show this help
 
 Topology (DB_UNIQUE_NAMEs, peer hostnames, listener ports) is discovered from
 V\$DATABASE, V\$DATAGUARD_CONFIG, V\$LISTENER_NETWORK and DGMGRL SHOW DATABASE.
 Use the --*-host / --port flags when broker is not started or discovery
 returns the wrong value.
+
+Exit codes: 0 report generated and HEALTHY, 1 report generated with WARNING
+verdict, 2 report generated with ERROR verdict, 3 usage or connection error.
 EOF
 }
 
@@ -57,8 +70,10 @@ while [[ $# -gt 0 ]]; do
         --primary-host)     PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
         --standby-host)     STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
         --port)             PORT_OVERRIDE="$2"; shift 2 ;;
+        --env)              ENV_LABEL="$2"; shift 2 ;;
+        --contact)          CONTACT_INFO="$2"; shift 2 ;;
         -h|--help)          usage; exit 0 ;;
-        *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
+        *) echo "Unknown option: $1" >&2; usage >&2; exit 3 ;;
     esac
 done
 
@@ -66,7 +81,9 @@ done
 # Pre-flight
 # ============================================================
 
-die() { echo "ERROR: $*" >&2; exit 1; }
+# Exit 3: preflight/usage failures, so monitoring can tell "could not run"
+# (3) apart from "ran and found problems" (1 warning / 2 error).
+die() { echo "ERROR: $*" >&2; exit 3; }
 warn() { echo "WARN:  $*" >&2; }
 info() { echo "INFO:  $*" >&2; }
 
@@ -399,6 +416,25 @@ fi
 DISCOVERED_PORT=$(echo "$LOCAL_LISTENER_RAW" | sed -n 's/.*PORT *= *\([0-9][0-9]*\).*/\1/p' | head -1)
 PORT="${PORT_OVERRIDE:-${DISCOVERED_PORT:-1521}}"
 
+# CDB flag, server version, character set, db_domain: all client-facing facts
+# (driver choice, NLS handling, alias qualification) - each best-effort.
+if ! IS_CDB=$(run_sql "SELECT CDB FROM V\$DATABASE;" | clean | head -1); then
+    IS_CDB=""
+    note_discovery_failure "CDB flag (V\$DATABASE.CDB)"
+fi
+# VERSION_FULL carries the RU (19.23 vs 19.0); older dictionaries only have
+# VERSION, so fall back rather than fail.
+if ! DB_VERSION=$(run_sql "SELECT VERSION_FULL FROM V\$INSTANCE;" | clean | head -1); then
+    DB_VERSION=$(run_sql "SELECT VERSION FROM V\$INSTANCE;" | clean | head -1) || DB_VERSION=""
+    [[ -z "$DB_VERSION" ]] && note_discovery_failure "database version (V\$INSTANCE)"
+fi
+if ! DB_CHARSET=$(run_sql "SELECT VALUE FROM NLS_DATABASE_PARAMETERS WHERE PARAMETER='NLS_CHARACTERSET';" | clean | head -1); then
+    DB_CHARSET=""
+    note_discovery_failure "database character set (NLS_DATABASE_PARAMETERS)"
+fi
+# Empty db_domain is a legitimate outcome, not a discovery failure.
+DB_DOMAIN=$(run_sql "SELECT VALUE FROM V\$PARAMETER WHERE NAME='db_domain';" | clean | head -1) || DB_DOMAIN=""
+
 # ============================================================
 # Discover hostnames via DGMGRL (best-effort)
 # ============================================================
@@ -523,40 +559,146 @@ fi
 # Discover services
 # ============================================================
 
-# An empty result here is a legitimate outcome (no user-facing services
-# active yet), not necessarily a query failure - only a real run_sql failure
-# (non-zero exit, e.g. an ORA- error under WHENEVER SQLERROR EXIT 1) is
-# counted as a discovery failure below.
+# Services are discovered as (container, name, class) triples so the report
+# can (a) tell the reader which container - CDB root or which PDB - a service
+# lands in, and (b) separate USER services (creatable/stoppable, i.e. what the
+# role trigger manages) from DEFAULT services. A container's default service
+# (DB_NAME[.DB_DOMAIN], DB_UNIQUE_NAME, instance name for root; the PDB name
+# for a PDB) is always registered wherever the container is up - the role
+# trigger deliberately excludes it, so it can NEVER be role-aware and must not
+# be handed to applications as a failover descriptor.
+#
+# V$CONTAINERS works on non-CDB too (single CON_ID=0 row), so one query
+# covers both architectures. An empty result is a legitimate outcome; only a
+# real run_sql failure (ORA- under WHENEVER SQLERROR EXIT 1) is a discovery
+# failure.
 if ! SERVICE_OUTPUT=$(run_sql "
-SELECT NAME FROM V\$ACTIVE_SERVICES
-WHERE UPPER(NAME) NOT IN (
-    SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE
-    UNION ALL SELECT UPPER(NAME) FROM V\$DATABASE
-    UNION ALL SELECT UPPER(INSTANCE_NAME) FROM V\$INSTANCE
-)
-AND NAME NOT LIKE 'SYS\$%'
-AND UPPER(NAME) NOT LIKE '%XDB%'
-AND UPPER(NAME) NOT LIKE '%\_CFG' ESCAPE '\'
-AND UPPER(NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
-ORDER BY NAME;
+SELECT c.NAME || '|' || s.NAME || '|' ||
+       CASE WHEN UPPER(s.NAME) IN (
+           UPPER(c.NAME),
+           UPPER(c.NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain'),
+           (SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE),
+           (SELECT UPPER(NAME) FROM V\$DATABASE),
+           (SELECT UPPER(NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain') FROM V\$DATABASE),
+           (SELECT UPPER(DB_UNIQUE_NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain') FROM V\$DATABASE),
+           (SELECT UPPER(INSTANCE_NAME) FROM V\$INSTANCE)
+       ) THEN 'DEFAULT' ELSE 'USER' END
+FROM V\$ACTIVE_SERVICES s
+JOIN V\$CONTAINERS c ON s.CON_ID = c.CON_ID
+WHERE s.NAME NOT LIKE 'SYS\$%'
+  AND UPPER(s.NAME) NOT LIKE '%XDB%'
+  AND UPPER(s.NAME) NOT LIKE '%\_CFG' ESCAPE '\'
+  AND UPPER(s.NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
+  AND c.NAME <> 'PDB\$SEED'
+ORDER BY s.CON_ID, s.NAME;
 " | clean); then
     SERVICE_OUTPUT=""
     note_discovery_failure "active services list (report will show no per-service connection strings)"
 fi
 
+# Parallel indexed arrays (no bash-4 associative arrays - AIX portability),
+# ordered USER services first: they are the ones applications should get.
 SERVICE_LIST=()
+SERVICE_CON=()
+SERVICE_CLASS=()
+_def_list=()
+_def_con=()
 while IFS= read -r line; do
-    [[ -n "$line" ]] && SERVICE_LIST+=("$line")
+    [[ -z "$line" ]] && continue
+    _con=$(field "$line" 1)
+    _svc=$(field "$line" 2)
+    _cls=$(field "$line" 3)
+    [[ -z "$_svc" ]] && continue
+    if [[ "$_cls" == "USER" ]]; then
+        SERVICE_LIST+=("$_svc")
+        SERVICE_CON+=("$_con")
+        SERVICE_CLASS+=("USER")
+    else
+        _def_list+=("$_svc")
+        _def_con+=("$_con")
+    fi
 done <<< "$SERVICE_OUTPUT"
+_i=0
+while [[ $_i -lt ${#_def_list[@]} ]]; do
+    SERVICE_LIST+=("${_def_list[$_i]}")
+    SERVICE_CON+=("${_def_con[$_i]}")
+    SERVICE_CLASS+=("DEFAULT")
+    _i=$((_i + 1))
+done
 
-info "Services in report: ${SERVICE_LIST[*]}"
+# Guarantee at least one entry so the report always carries a connect string,
+# even before any service is created: the default db_unique_name service.
+if [[ ${#SERVICE_LIST[@]} -eq 0 && -n "$LOCAL_DB_UNIQUE_NAME" ]]; then
+    _svc="$LOCAL_DB_UNIQUE_NAME"
+    [[ -n "$DB_DOMAIN" ]] && _svc="${_svc}.${DB_DOMAIN}"
+    SERVICE_LIST=("$_svc")
+    SERVICE_CON=("")
+    SERVICE_CLASS=("DEFAULT")
+fi
+
+# First USER (role-manageable) service, if any - drives the driver examples
+# and the verification connect string.
+RECOMMENDED_SVC=""
+_i=0
+while [[ $_i -lt ${#SERVICE_LIST[@]} ]]; do
+    if [[ "${SERVICE_CLASS[$_i]}" == "USER" ]]; then
+        RECOMMENDED_SVC="${SERVICE_LIST[$_i]}"
+        break
+    fi
+    _i=$((_i + 1))
+done
+USER_SERVICE_COUNT=0
+_i=0
+while [[ $_i -lt ${#SERVICE_LIST[@]} ]]; do
+    [[ "${SERVICE_CLASS[$_i]}" == "USER" ]] && USER_SERVICE_COUNT=$((USER_SERVICE_COUNT + 1))
+    _i=$((_i + 1))
+done
+
+info "Services in report: ${SERVICE_LIST[*]} (${USER_SERVICE_COUNT} user service(s))"
+
+# Per-service HA attributes from CDB_SERVICES (= DBA_SERVICES plus CON_ID;
+# works on non-CDB too). These decide what the report can promise about TAF,
+# Transaction Guard and Application Continuity - stated as discovered facts
+# instead of \"where the DBA configured it\" hedging. Best-effort: a failure
+# degrades to an 'unknown' row per service.
+if ! SERVICE_ATTR_OUTPUT=$(run_sql "
+SELECT c.NAME || '|' || s.NAME || '|' ||
+       NVL(s.FAILOVER_TYPE, 'NONE') || '|' ||
+       NVL(s.FAILOVER_METHOD, '-') || '|' ||
+       NVL(TO_CHAR(s.FAILOVER_RETRIES), '-') || '|' ||
+       NVL(TO_CHAR(s.FAILOVER_DELAY), '-') || '|' ||
+       NVL(s.COMMIT_OUTCOME, 'false') || '|' ||
+       NVL(TO_CHAR(s.DRAIN_TIMEOUT), '-') || '|' ||
+       NVL(s.FAILOVER_RESTORE, 'NONE')
+FROM CDB_SERVICES s
+JOIN V\$CONTAINERS c ON s.CON_ID = c.CON_ID
+WHERE s.NAME NOT LIKE 'SYS\$%';
+" | clean); then
+    SERVICE_ATTR_OUTPUT=""
+    note_discovery_failure "service HA attributes (CDB_SERVICES: TAF/COMMIT_OUTCOME/DRAIN_TIMEOUT)"
+fi
+
+# Print the pipe-joined attribute record for (container, service); empty when
+# unknown. Exact-match on both fields (service names may contain dots), but
+# case-insensitive: the dictionary stores a PDB default service as 'PDB1'
+# while V$ACTIVE_SERVICES registers it as 'pdb1'.
+service_attrs() {
+    printf '%s\n' "$SERVICE_ATTR_OUTPUT" | awk -F'|' -v c="$1" -v s="$2" '
+        BEGIN { c = toupper(c); s = toupper(s) }
+        toupper($1) == c && toupper($2) == s { print; exit }
+        c == "" && toupper($2) == s { print; exit }
+    '
+}
 
 SQLNET_EXPIRE_TIME=$(get_sqlnet_expire_time)
 
 RPO_STATEMENT="RPO unknown: protection mode or standby transport mode could not be discovered. Treat every failover as potentially lossy until the DBA team confirms the transport mode."
 case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%s' "$STANDBY_LOGXPTMODE" | tr '[:lower:]' '[:upper:]')" in
-    *MAXIMUM*AVAILABILITY*'|'SYNC|*MAXIMUM*AVAILABILITY*'|'FASTSYNC)
-        RPO_STATEMENT="RPO = 0 while synchronized: protection is ${PROTECTION_MODE}, standby transport ${STANDBY_LOGXPTMODE}. A commit is not acknowledged to the client until the standby confirms redo receipt (FASTSYNC acknowledges on receipt into standby memory, before the standby disk write), so a failover loses no committed transactions. If the standby becomes unreachable the primary continues alone; a failover during that window loses the redo generated since the disconnect. Cost: every commit carries one primary-to-standby network round trip."
+    *MAXIMUM*AVAILABILITY*'|'SYNC)
+        RPO_STATEMENT="RPO = 0 while synchronized: protection is ${PROTECTION_MODE}, standby transport SYNC. A commit is not acknowledged to the client until the standby has written the redo to its standby redo log on disk, so a failover loses no committed transactions. If the standby becomes unreachable the primary continues alone; a failover during that window loses the redo generated since the disconnect. Cost: every commit carries one primary-to-standby network round trip plus the standby redo disk write."
+        ;;
+    *MAXIMUM*AVAILABILITY*'|'FASTSYNC)
+        RPO_STATEMENT="RPO = 0 while synchronized: protection is ${PROTECTION_MODE}, standby transport FASTSYNC. A commit is not acknowledged to the client until the standby confirms redo receipt into memory (before its disk write - a simultaneous failure of BOTH hosts can lose that in-flight redo, single-host failures cannot), so a failover loses no committed transactions. If the standby becomes unreachable the primary continues alone; a failover during that window loses the redo generated since the disconnect. Cost: every commit carries one primary-to-standby network round trip."
         ;;
     *MAXIMUM*PERFORMANCE*'|'ASYNC)
         RPO_STATEMENT="RPO > 0: protection is ${PROTECTION_MODE}, standby transport ${STANDBY_LOGXPTMODE}. Redo ships asynchronously, so a failover loses whatever had not reached the standby at failure time - normally a few seconds, unbounded if transport falls behind. Committed, client-acknowledged transactions can disappear in a failover: exactly-once workflows need idempotency keys or post-failover reconciliation."
@@ -582,12 +724,32 @@ fi
 # Renderers (same shape as the setup-time script)
 # ============================================================
 
+# Single source of truth for the descriptor's retry knobs. The parameter
+# table, the worst-case connect-time math and the pool-timeout advice are all
+# DERIVED from these four values, so editing them here keeps the prose true.
+# The Easy Connect Plus form uses the SAME values (it used to differ, which
+# silently gave ODP.NET/python/SQLAlchemy clients different behavior than the
+# documented TNS descriptor).
+TNS_CT=10    # CONNECT_TIMEOUT seconds (per address: TCP + handshake + session)
+TNS_TCT=3    # TRANSPORT_CONNECT_TIMEOUT seconds (per address: TCP connect)
+TNS_RC=3     # RETRY_COUNT (extra passes over the whole ADDRESS_LIST)
+TNS_RD=3     # RETRY_DELAY seconds between passes
+# Worst-case time until the driver errors out:
+#  - both hosts unreachable: TCP timeout on both addresses, every pass
+WORST_BOTH_S=$(( 2 * TNS_TCT * (TNS_RC + 1) + TNS_RC * TNS_RD ))
+#  - primary host down, standby listener up but service stopped there:
+#    TCP timeout on the primary + immediate ORA-12514 on the standby, per pass
+WORST_PRI_S=$(( TNS_TCT * (TNS_RC + 1) + TNS_RC * TNS_RD ))
+# One pass over the list with hosts up but hung handshakes is bounded by
+# CONNECT_TIMEOUT per address:
+ONE_PASS_MAX_S=$(( 2 * TNS_CT ))
+
 render_tns_ha() {
     local alias="$1" phost="$2" shost="$3" port="$4" service="$5"
     cat <<EOF
 ${alias} =
   (DESCRIPTION =
-    (CONNECT_TIMEOUT = 10)(TRANSPORT_CONNECT_TIMEOUT = 3)(RETRY_COUNT = 3)(RETRY_DELAY = 3)
+    (CONNECT_TIMEOUT = ${TNS_CT})(TRANSPORT_CONNECT_TIMEOUT = ${TNS_TCT})(RETRY_COUNT = ${TNS_RC})(RETRY_DELAY = ${TNS_RD})
     (ADDRESS_LIST =
       (LOAD_BALANCE = OFF)
       (ADDRESS = (PROTOCOL = TCP)(HOST = ${phost})(PORT = ${port}))
@@ -603,25 +765,27 @@ EOF
 
 render_jdbc_ha() {
     local phost="$1" shost="$2" port="$3" service="$4"
-    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=10)(TRANSPORT_CONNECT_TIMEOUT=3)(RETRY_COUNT=3)(RETRY_DELAY=3)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)))\n' \
-        "$phost" "$port" "$shost" "$port" "$service"
+    printf 'jdbc:oracle:thin:@(DESCRIPTION=(CONNECT_TIMEOUT=%s)(TRANSPORT_CONNECT_TIMEOUT=%s)(RETRY_COUNT=%s)(RETRY_DELAY=%s)(ADDRESS_LIST=(LOAD_BALANCE=OFF)(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s))(ADDRESS=(PROTOCOL=TCP)(HOST=%s)(PORT=%s)))(CONNECT_DATA=(SERVICE_NAME=%s)))\n' \
+        "$TNS_CT" "$TNS_TCT" "$TNS_RC" "$TNS_RD" "$phost" "$port" "$shost" "$port" "$service"
 }
 
+# retry_delay is deliberately omitted: not every 19c client parses it in the
+# Easy Connect form, and an unknown parameter aborts the connect. Retries are
+# therefore back-to-back here - slightly faster to error than the TNS form.
 render_easy_connect_ha() {
     local phost="$1" shost="$2" port="$3" service="$4"
-    printf '%s:%s,%s:%s/%s?connect_timeout=5&transport_connect_timeout=3&retry_count=2\n' \
-        "$phost" "$port" "$shost" "$port" "$service"
+    printf '%s:%s,%s:%s/%s?connect_timeout=%s&transport_connect_timeout=%s&retry_count=%s\n' \
+        "$phost" "$port" "$shost" "$port" "$service" "$TNS_CT" "$TNS_TCT" "$TNS_RC"
 }
 
-render_driver_table() {
+# Driver-specific forms as stacked labeled code blocks (each gets its own
+# copy button in the HTML twin; the old table clipped/nowrapped the strings).
+render_driver_examples() {
     local ez="$1"
-    printf '| Client | Form |\n'
-    printf '|--------|------|\n'
-    printf '| ODP.NET | `User Id=app_user;Password=<pwd>;Data Source=%s` |\n' "$ez"
-    printf '| python-oracledb | `oracledb.connect(user="app_user", password="<pwd>", dsn="%s")` |\n' "$ez"
-    printf '| SQLAlchemy | `oracle+oracledb://app_user:<pwd>@%s` |\n' "$ez"
-    printf '| SQL*Plus | `sqlplus app_user/<pwd>@%s` |\n' "$ez"
-    printf '\n'
+    printf '**ODP.NET**\n\n```\nUser Id=app_user;Password=<pwd>;Data Source=%s\n```\n\n' "$ez"
+    printf '**python-oracledb**\n\n```\noracledb.connect(user="app_user", password="<pwd>", dsn="%s")\n```\n\n' "$ez"
+    printf '**SQLAlchemy**\n\n```\noracle+oracledb://app_user:<pwd>@%s\n```\n\n' "$ez"
+    printf '**SQL*Plus**\n\n```\nsqlplus app_user/<pwd>@'\''%s'\''\n```\n\n' "$ez"
 }
 
 # ---- begin dataguard-doc visualizer helpers ----
@@ -989,10 +1153,10 @@ pre code{background:none;color:inherit;padding:0;border-radius:0;font-size:1em}
 .prewrap .copy{
   position:absolute;top:.55em;right:.6em;
   font:inherit;font-size:.8em;letter-spacing:.04em;
-  color:var(--prefg);background:transparent;border:1px solid var(--preline);
-  border-radius:5px;padding:.15em .7em;cursor:pointer;opacity:.75;
+  color:var(--prefg);background:var(--pre);border:1px solid var(--preline);
+  border-radius:5px;padding:.15em .7em;cursor:pointer;
 }
-.prewrap .copy:hover,.prewrap .copy:focus-visible{opacity:1;border-color:var(--prefg);outline:none}
+.prewrap .copy:hover,.prewrap .copy:focus-visible{border-color:var(--prefg);outline:none}
 .twrap{overflow-x:auto;margin:.8em 0 1.2em}
 table{border-collapse:collapse;font-size:.9em;min-width:34em}
 th,td{
@@ -1019,7 +1183,7 @@ p.warn,blockquote{
 }
 blockquote p{margin:.2em 0}
 @media (prefers-reduced-motion: no-preference){
-  .prewrap .copy{transition:opacity .15s ease,border-color .15s ease}
+  .prewrap .copy{transition:border-color .15s ease}
 }
 </style>
 </head>
@@ -1093,25 +1257,25 @@ case "$LAG_CRIT_SEQ" in ''|*[!0-9]*) LAG_CRIT_SEQ=5 ;; esac
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY")
+    VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY — re-run this script on the primary host so service discovery and connect strings are complete")
 fi
 if [[ "${GAP_COUNT}" -gt 0 ]]; then
     escalate_verdict "ERROR"
-    VERDICT_NOTES+=("${GAP_COUNT} archive gap(s) detected")
+    VERDICT_NOTES+=("${GAP_COUNT} archive gap(s) detected — redo transport is broken; run dg_status.sh / check archive destinations before trusting the standby")
 fi
 if [[ "$DG_BROKER_START" != "TRUE" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Data Guard Broker is not started")
+    VERDICT_NOTES+=("Data Guard Broker is not started — set dg_broker_start=TRUE; broker-derived fields in this report are incomplete")
 fi
 
 # Redo apply progress: a standby that is many sequences behind is not a
 # usable failover target, no matter what the broker says.
 if [[ "$APPLY_LAG_SEQ" -gt "$LAG_CRIT_SEQ" ]]; then
     escalate_verdict "ERROR"
-    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences (threshold ${LAG_CRIT_SEQ})")
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences (threshold ${LAG_CRIT_SEQ}) — the standby is not a usable failover target until apply catches up; investigate MRP and transport")
 elif [[ "$APPLY_LAG_SEQ" -gt "$LAG_WARN_SEQ" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences")
+    VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_SEQ} sequences — watch it; a failover now loses roughly this much redo history of reporting freshness")
 fi
 
 # Switchover readiness. On a healthy primary this is TO STANDBY / SESSIONS
@@ -1119,11 +1283,11 @@ fi
 case "$(printf '%s' "$SWITCHOVER_STATUS" | tr '[:lower:]' '[:upper:]')" in
     *"FAILED DESTINATION"*|*"UNRESOLVABLE GAP"*|*"LOG SWITCH GAP"*)
         escalate_verdict "ERROR"
-        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS} — redo transport to the standby is broken; fix before any role change (dg_status.sh shows the failing destination)")
         ;;
     *"RESOLVABLE GAP"*|*"RECOVERY NEEDED"*|*"PREPARING"*)
         escalate_verdict "WARNING"
-        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS}")
+        VERDICT_NOTES+=("Switchover status is ${SWITCHOVER_STATUS} — transient states usually clear on their own; re-check before any planned switchover")
         ;;
 esac
 
@@ -1134,28 +1298,35 @@ if [[ -n "$BROKER_OUTPUT" ]]; then
     case "$BROKER_CONFIG_STATUS" in
         ERROR)
             escalate_verdict "ERROR"
-            VERDICT_NOTES+=("Broker Configuration Status is ERROR")
+            VERDICT_NOTES+=("Broker Configuration Status is ERROR — see the Broker Configuration appendix; run DGMGRL SHOW CONFIGURATION for live detail")
             ;;
         WARNING)
             escalate_verdict "WARNING"
-            VERDICT_NOTES+=("Broker Configuration Status is WARNING")
+            VERDICT_NOTES+=("Broker Configuration Status is WARNING — see the Broker Configuration appendix; run DGMGRL SHOW CONFIGURATION for live detail")
             ;;
     esac
     if broker_output_has_error "$BROKER_OUTPUT"; then
         escalate_verdict "ERROR"
-        VERDICT_NOTES+=("Broker reported ORA-/DGM- errors (see Broker Configuration section)")
+        VERDICT_NOTES+=("Broker reported ORA-/DGM- errors — see the Broker Configuration appendix for the exact messages")
     fi
 fi
 
 # Role-aware descriptors are only safe once the trigger is deployed.
 if [[ "$ROLE_TRIGGER_READY" != "YES" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Role-aware service trigger is not deployed/enabled")
+    VERDICT_NOTES+=("Role-aware service trigger is not deployed/enabled — run trigger/create_role_trigger.sh (CDB: create_role_trigger_cdb.sh) on the primary before handing role-aware descriptors to applications")
+fi
+
+# Default services can never be role-aware; with no user-created service there
+# is nothing safe to hand to the application tier.
+if [[ "$USER_SERVICE_COUNT" -eq 0 && "$DB_ROLE" == "PRIMARY" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("No user-created service found — only default services exist, and those cannot follow the primary role; create one with trigger/create_pdb_service.sh or trigger/create_cdb_service.sh")
 fi
 
 if [[ -n "$STANDBY_DB_UNIQUE_NAME" && "$STANDBY_OPEN_MODE" == "unknown" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Standby readability could not be determined from the broker")
+    VERDICT_NOTES+=("Standby readability could not be determined from the broker — verify the standby OPEN_MODE before promising read-only access")
 fi
 
 if [[ ${#VERDICT_NOTES[@]} -eq 0 ]]; then
@@ -1170,7 +1341,7 @@ if [[ -z "$OUTPUT_FILE" ]]; then
     OUTPUT_FILE="./dg_handoff_${PRIMARY_DB_UNIQUE_NAME:-${LOCAL_DB_UNIQUE_NAME}}.md"
 fi
 
-GEN_DATE=$(date)
+GEN_DATE=$(date '+%Y-%m-%d %H:%M:%S %Z')
 GEN_HOST=$(hostname 2>/dev/null)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 IMPACT_LOCAL="${SCRIPT_DIR}/DG_APPLICATION_IMPACT.html"
@@ -1185,34 +1356,132 @@ fi
 # Best-effort: no base64/openssl on the host just drops the link
 VIZ_URL=$(build_visualizer_url) || VIZ_URL=""
 
+# Service used by the driver examples and the end-to-end verification: the
+# first user-created (role-manageable) service, falling back to whatever
+# heads the list, falling back to a placeholder.
+EXAMPLE_SVC="${RECOMMENDED_SVC:-${SERVICE_LIST[0]:-service_name}}"
+
 # Easy Connect Plus string used by the end-to-end verification example;
 # degrades to a primary-only address when the standby host is unknown.
 if [[ -n "$STANDBY_HOSTNAME" ]]; then
-    VERIFY_EZ=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "${SERVICE_LIST[0]:-service_name}")
+    VERIFY_EZ=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$EXAMPLE_SVC")
 else
-    VERIFY_EZ="${PRIMARY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+    VERIFY_EZ="${PRIMARY_HOSTNAME}:${PORT}/${EXAMPLE_SVC}"
 fi
+
+# One-line derived facts for the At a Glance section
+case "$(printf '%s' "$PROTECTION_MODE" | tr '[:lower:]' '[:upper:]')|$(printf '%s' "$STANDBY_LOGXPTMODE" | tr '[:lower:]' '[:upper:]')" in
+    *MAXIMUM*AVAILABILITY*'|'SYNC|*MAXIMUM*AVAILABILITY*'|'FASTSYNC)
+        RPO_SHORT="RPO = 0 while synchronized (${PROTECTION_MODE}, transport ${STANDBY_LOGXPTMODE})" ;;
+    *MAXIMUM*PERFORMANCE*'|'ASYNC)
+        RPO_SHORT="RPO > 0 (async transport: a failover can lose the last seconds of commits)" ;;
+    *)  RPO_SHORT="RPO to be confirmed (protection ${PROTECTION_MODE:-unknown}, transport ${STANDBY_LOGXPTMODE:-unknown})" ;;
+esac
+if [[ "$FSFO_ENABLED" == "YES" ]]; then
+    FAILOVER_SHORT="automatic (FSFO, threshold ${FSFO_THRESHOLD:-unknown} s) — budget 1-3 minutes of connection errors on primary loss"
+else
+    FAILOVER_SHORT="manual — a DBA must execute the failover; outage lasts until then"
+fi
+STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
+case "$STANDBY_OPEN_UPPER" in
+    *MOUNTED*)          READABILITY_SHORT="not readable (MOUNTED) — no reporting offload today" ;;
+    *READ*ONLY*APPLY*)  READABILITY_SHORT="readable (READ ONLY WITH APPLY — Active Data Guard, separately licensed)" ;;
+    *)                  READABILITY_SHORT="unknown — verify before promising read-only access" ;;
+esac
+
+# Per-service HA attribute bullets, from the discovered CDB_SERVICES facts.
+emit_service_attr_lines() {
+    local con="$1" svc="$2" attrs ftype fmethod fretries fdelay commit drain restore taf_max
+    attrs=$(service_attrs "$con" "$svc")
+    if [[ -z "$attrs" ]]; then
+        echo "- HA attributes could not be discovered for this service (treat as: no TAF, no Transaction Guard)."
+        return 0
+    fi
+    ftype=$(field "$attrs" 3 | tr '[:lower:]' '[:upper:]')
+    fmethod=$(field "$attrs" 4)
+    fretries=$(field "$attrs" 5)
+    fdelay=$(field "$attrs" 6)
+    commit=$(field "$attrs" 7 | tr '[:lower:]' '[:upper:]')
+    drain=$(field "$attrs" 8)
+    restore=$(field "$attrs" 9)
+    case "$ftype" in
+        NONE|-|'')
+            echo "- TAF: none — after a session drop, reconnecting is the pool's or the application's job." ;;
+        TRANSACTION|AUTO)
+            echo "- Application Continuity: FAILOVER_TYPE=${ftype} — 12.2+ drivers can replay in-flight work after a failover (driver support and request boundaries still required)." ;;
+        *)
+            taf_max=""
+            case "${fretries}${fdelay}" in *[!0-9]*) ;; *) taf_max=" (max $((fretries * fdelay)) s)"; esac
+            echo "- TAF: ${ftype}/${fmethod} — on session loss the client retries every ${fdelay} s, up to ${fretries} attempts${taf_max}. Open SELECT cursors resume; in-flight transactions roll back (ORA-25402)." ;;
+    esac
+    if [[ "$commit" == "TRUE" || "$commit" == "YES" ]]; then
+        echo "- Transaction Guard: enabled (COMMIT_OUTCOME=TRUE) — 12c+ drivers can resolve an in-doubt commit programmatically after a dropped connection."
+    else
+        echo "- Transaction Guard: not enabled (COMMIT_OUTCOME=FALSE) — an in-doubt commit stays ambiguous; handle with idempotency keys (section 2)."
+    fi
+    case "$drain" in
+        ''|-|0) ;;
+        *[!0-9]*) ;;
+        *) echo "- DRAIN_TIMEOUT: ${drain} s — planned maintenance waits up to this long for sessions to finish before disconnecting them." ;;
+    esac
+    case "$(printf '%s' "$restore" | tr '[:lower:]' '[:upper:]')" in
+        NONE|-|'') ;;
+        *) echo "- FAILOVER_RESTORE: ${restore} — selected session state is restored on failover." ;;
+    esac
+}
 
 {
     echo "# Data Guard Handoff Report"
     echo ""
     echo "- **Generated:** ${GEN_DATE}"
     echo "- **Generated on:** ${GEN_HOST}"
+    if [[ -n "$ENV_LABEL" ]]; then
+        echo "- **Environment:** ${ENV_LABEL}"
+    fi
     if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
         echo "- **Configuration:** ${PRIMARY_DB_UNIQUE_NAME} → ${STANDBY_DB_UNIQUE_NAME}"
     else
         echo "- **Configuration:** ${PRIMARY_DB_UNIQUE_NAME} (no peer detected)"
     fi
+    if [[ -n "$DB_VERSION" ]]; then
+        _arch="non-CDB"
+        [[ "$IS_CDB" == "YES" ]] && _arch="CDB"
+        echo "- **Database:** Oracle ${DB_VERSION} (${_arch}${DB_CHARSET:+, ${DB_CHARSET}})"
+    fi
+    if [[ -n "$CONTACT_INFO" ]]; then
+        echo "- **Contact:** ${CONTACT_INFO}"
+    fi
     if [[ -n "$VIZ_URL" ]]; then
         echo "- **Interactive diagram:** [open in the Data Guard visualizer](${VIZ_URL}) - topology only, no credentials"
     fi
+    echo ""
+    if [[ "$DB_ROLE" != "PRIMARY" ]]; then
+        echo "**WARNING:** This report was generated on the ${DB_ROLE:-non-primary} side. Application services only run on the primary, so the service list and connection strings below are incomplete or empty. Re-run this script on the primary host${PRIMARY_HOSTNAME:+ (\`${PRIMARY_HOSTNAME}\`)} before handing the report to anyone."
+        echo ""
+    fi
+    echo "## At a Glance"
+    echo ""
+    echo "**Verdict:** ${VERDICT}"
+    if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
+        for n in "${VERDICT_NOTES[@]}"; do echo "- ${n}"; done
+    fi
+    echo ""
+    echo "- **Data protection:** ${RPO_SHORT}. Full semantics in section 2."
+    echo "- **Failover:** ${FAILOVER_SHORT}."
+    echo "- **Standby readability:** ${READABILITY_SHORT}."
+    if [[ -n "$RECOMMENDED_SVC" ]]; then
+        echo "- **Application connect string:** use the role-aware descriptor for service \`${RECOMMENDED_SVC}\` (section 1)."
+    else
+        echo "- **Application connect string:** no user-created service exists yet — do not hand out the default-service descriptors in section 1; create a dedicated service first."
+    fi
+    echo "- **Before go-live:** work through the client/pool checklist (section 3) and the verification steps (section 4)."
     echo ""
     echo "## 1. Connection Strings"
     echo ""
     echo "**Role-aware (failover)** descriptors: both hosts in one ADDRESS_LIST. The service runs only on the current primary (stopped on the standby by the role trigger), so clients follow the primary across switchover/failover with no config change. Use this for the application tier."
     echo ""
     if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
-        echo "**Role-aware trigger status:** deployed and enabled. The role-aware descriptor is safe to hand to applications."
+        echo "**Role-aware trigger status:** deployed and enabled. Role-aware descriptors are safe to hand to applications **for the services the trigger manages** - each service section below states whether it is one of them."
     else
         echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
     fi
@@ -1222,24 +1491,50 @@ fi
     echo "| Parameter | Value | Effect |"
     echo "|-----------|-------|--------|"
     echo "| LOAD_BALANCE | OFF | Addresses tried in listed order: primary host first, then standby |"
-    echo "| TRANSPORT_CONNECT_TIMEOUT | 3 s | TCP connect budget per address |"
-    echo "| CONNECT_TIMEOUT | 10 s | Total budget per address (TCP + listener handshake + session creation) |"
-    echo "| RETRY_COUNT / RETRY_DELAY | 3 / 3 s | After the whole ADDRESS_LIST fails, it is retried 3 more times, 3 s apart |"
+    echo "| TRANSPORT_CONNECT_TIMEOUT | ${TNS_TCT} s | TCP connect budget per address |"
+    echo "| CONNECT_TIMEOUT | ${TNS_CT} s | Total budget per address (TCP + listener handshake + session creation) |"
+    echo "| RETRY_COUNT / RETRY_DELAY | ${TNS_RC} / ${TNS_RD} s | After the whole ADDRESS_LIST fails, it is retried ${TNS_RC} more times, ${TNS_RD} s apart |"
     echo ""
-    echo "This descriptor configures no TAF (\`FAILOVER_MODE\`): after a session drop, reconnecting is the pool's or application's job unless the DBA has set TAF attributes on the service itself."
+    echo "The Easy Connect Plus form below carries the same values (retry_delay is omitted there - not every 19c client parses it - so its retries are back-to-back). The descriptor itself configures no TAF (\`FAILOVER_MODE\`); whether the **service** has TAF or Transaction Guard is stated per service below."
     echo ""
     echo "Worst-case connect times these values produce:"
     echo ""
-    echo "- Both hosts unreachable (TCP timeout): 2 addresses x 3 s per pass, 4 passes, 3 x 3 s delays = **about 33 s** until the driver returns an error."
-    echo "- Primary host down, standby listener up (service stopped there): about 3 s TCP timeout + immediate ORA-12514 per pass = **about 21 s** until error."
+    echo "- Both hosts unreachable (TCP timeout): 2 addresses x ${TNS_TCT} s per pass, $((TNS_RC + 1)) passes, ${TNS_RC} x ${TNS_RD} s delays = **about ${WORST_BOTH_S} s** until the driver returns an error."
+    echo "- Primary host down, standby listener up (service stopped there): about ${TNS_TCT} s TCP timeout + immediate ORA-12514 per pass = **about ${WORST_PRI_S} s** until error."
+    echo "- Hosts up but hung handshakes: one pass is bounded by ${TNS_CT} s per address = up to ${ONE_PASS_MAX_S} s per pass."
     echo "- Failover in progress: attempts cycle (each bounded as above) until the service registers on the new primary, then the next attempt succeeds."
     echo ""
 
-    for svc in "${SERVICE_LIST[@]}"; do
+    svc_idx=0
+    while [[ $svc_idx -lt ${#SERVICE_LIST[@]} ]]; do
+        svc="${SERVICE_LIST[$svc_idx]}"
+        svc_con="${SERVICE_CON[$svc_idx]}"
+        svc_class="${SERVICE_CLASS[$svc_idx]}"
+        svc_idx=$((svc_idx + 1))
         local_safe=$(echo "$svc" | tr '.' '_' | tr '[:lower:]' '[:upper:]')
         ALIAS_HA="${local_safe}_HA"
 
         echo "### Service: \`${svc}\`"
+        echo ""
+        if [[ "$IS_CDB" == "YES" && -n "$svc_con" ]]; then
+            if [[ "$svc_con" == 'CDB$ROOT' ]]; then
+                echo "Lands in container \`${svc_con}\` — the CDB root. Application schemas normally live in a PDB; check that root-level access is intended."
+            else
+                echo "Lands in container \`${svc_con}\` (PDB)."
+            fi
+            echo ""
+        fi
+        if [[ "$svc_class" == "DEFAULT" ]]; then
+            echo "> **Default service — NOT role-aware.** \`${svc}\` is the container's own default service: it is registered wherever the container is up (including an open standby), and \`trigger/create_role_trigger.sh\` deliberately excludes it, so it does **not** follow the primary after a switchover or failover. Keep it for admin/DBA access; give applications a dedicated service (\`trigger/create_pdb_service.sh\` / \`trigger/create_cdb_service.sh\`) instead."
+            echo ""
+        elif [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
+            echo "Managed by the role trigger - safe to hand to applications."
+            echo ""
+        else
+            echo "**Not yet role-aware:** deploy \`trigger/create_role_trigger.sh\` before handing this descriptor to applications."
+            echo ""
+        fi
+        emit_service_attr_lines "$svc_con" "$svc"
         echo ""
 
         if [[ -n "$STANDBY_HOSTNAME" ]]; then
@@ -1247,75 +1542,50 @@ fi
             render_tns_ha "$ALIAS_HA" "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
             echo '```'
             echo ""
-            echo '```'
-            echo "JDBC: $(render_jdbc_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")"
-            echo '```'
-            echo ""
-            EASY_HA=$(render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc")
-            echo "Easy Connect Plus (19c+ clients):"
+            echo "JDBC (thin driver):"
             echo ""
             echo '```'
-            echo "$EASY_HA"
+            render_jdbc_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
             echo '```'
             echo ""
-            render_driver_table "$EASY_HA"
-            STANDBY_OPEN_UPPER=$(printf '%s' "$STANDBY_OPEN_MODE" | tr '[:lower:]' '[:upper:]')
-            if [[ "$STANDBY_OPEN_UPPER" == *MOUNTED* ]]; then
-                echo "Standby-only note: the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
-                echo ""
-            elif [[ "$STANDBY_OPEN_UPPER" == *READ*ONLY*APPLY* ]]; then
-                echo "Standby-only note: the standby is READ ONLY WITH APPLY (Active Data Guard - separately licensed). Reads see committed data as of the apply point (staleness = apply lag; read-your-writes across the two databases is not guaranteed). Bound staleness per session with \`ALTER SESSION SET STANDBY_MAX_DATA_DELAY = <seconds>\` (queries then raise ORA-03172 instead of returning stale data); \`ALTER SESSION SYNC WITH PRIMARY\` blocks until caught up (requires SYNC transport and real-time apply). DML and DDL fail with ORA-16000 (exception: DML on global temporary tables)."
-                echo ""
-            elif [[ "$STANDBY_OPEN_MODE" == "unknown" ]]; then
-                echo "Standby-only note: standby readability could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
-                echo ""
-            fi
+            echo "Easy Connect Plus (19c+ client libraries${DB_VERSION:+; server is ${DB_VERSION}}):"
+            echo ""
+            echo '```'
+            render_easy_connect_ha "$PRIMARY_HOSTNAME" "$STANDBY_HOSTNAME" "$PORT" "$svc"
+            echo '```'
+            echo ""
+        else
+            echo "Standby hostname unknown - only a primary-only string can be offered:"
+            echo ""
+            echo '```'
+            echo "${PRIMARY_HOSTNAME}:${PORT}/${svc}"
+            echo '```'
+            echo ""
         fi
     done
-    echo ""
-    echo "## 2. Topology"
-    echo ""
-    echo "| Role    | DB_UNIQUE_NAME              | Hostname              | Listener |"
-    echo "|---------|-----------------------------|-----------------------|----------|"
-    echo "| Primary | ${PRIMARY_DB_UNIQUE_NAME}   | ${PRIMARY_HOSTNAME}   | ${PORT}  |"
-    if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
-        echo "| Standby | ${STANDBY_DB_UNIQUE_NAME}   | ${STANDBY_HOSTNAME:-UNKNOWN} | ${PORT}  |"
-    fi
-    echo ""
-    echo "## 3. Status Snapshot"
-    echo ""
-    echo "| Item                  | Value |"
-    echo "|-----------------------|-------|"
-    echo "| Local role            | ${DB_ROLE:-N/A} |"
-    echo "| Open mode             | ${OPEN_MODE:-N/A} |"
-    echo "| Protection mode       | ${PROTECTION_MODE:-N/A} |"
-    echo "| Standby LogXptMode    | ${STANDBY_LOGXPTMODE:-unknown} |"
-    echo "| Standby open mode     | ${STANDBY_OPEN_MODE:-unknown} |"
-    echo "| Switchover status     | ${SWITCHOVER_STATUS:-N/A} |"
-    echo "| Force logging         | ${FORCE_LOGGING:-N/A} |"
-    echo "| Broker started        | ${DG_BROKER_START:-N/A} |"
-    echo "| Last received seq#    | ${LAST_RECEIVED:-N/A} |"
-    echo "| Last applied seq#     | ${LAST_APPLIED:-N/A} |"
-    echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
-    echo "| Archive gaps          | ${GAP_COUNT} |"
-    echo "| FSFO status           | ${FSFO_STATUS:-N/A} |"
-    echo "| FSFO observer present | ${FSFO_OBSERVER:-N/A} |"
-    if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
-        echo "| FSFO observer host    | ${FSFO_OBSERVER_HOST} |"
-    fi
-    if [[ "$FSFO_ENABLED" == "YES" ]]; then
-        echo "| FSFO threshold        | ${FSFO_THRESHOLD:-unknown} |"
-    fi
-    echo "| Role trigger ready    | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
-    echo "| SQLNET.EXPIRE_TIME    | ${SQLNET_EXPIRE_TIME} |"
-    echo ""
-    echo "**Verdict:** ${VERDICT}"
-    if [[ ${#VERDICT_NOTES[@]} -gt 0 ]]; then
-        for n in "${VERDICT_NOTES[@]}"; do echo "- ${n}"; done
+
+    if [[ -n "$STANDBY_HOSTNAME" ]]; then
+        echo "### Driver Examples"
+        echo ""
+        echo "Same Easy Connect Plus string, per driver (shown for \`${EXAMPLE_SVC}\`; substitute another service name as needed):"
+        echo ""
+        render_driver_examples "$VERIFY_EZ"
     fi
 
+    case "$STANDBY_OPEN_UPPER" in
+        *MOUNTED*)
+            echo "**Standby readability:** the broker reports Real Time Query OFF - the standby is MOUNTED (or open read-only without apply), so direct standby connections will fail until it is opened READ ONLY WITH APPLY."
+            ;;
+        *READ*ONLY*APPLY*)
+            echo "**Standby readability:** the standby is READ ONLY WITH APPLY (Active Data Guard - separately licensed). Reads see committed data as of the apply point (staleness = apply lag; read-your-writes across the two databases is not guaranteed). Bound staleness per session with \`ALTER SESSION SET STANDBY_MAX_DATA_DELAY = <seconds>\` (queries then raise ORA-03172 instead of returning stale data); \`ALTER SESSION SYNC WITH PRIMARY\` blocks until caught up (requires SYNC transport and real-time apply). DML and DDL fail with ORA-16000 (exception: DML on global temporary tables)."
+            ;;
+        *)
+            echo "**Standby readability:** could not be discovered; verify OPEN_MODE before giving direct standby strings to applications."
+            ;;
+    esac
     echo ""
-    echo "### Application Impact Summary"
+
+    echo "## 2. Application Impact"
     echo ""
     echo "- ${RPO_STATEMENT}"
     echo "- ${OUTAGE_STATEMENT}"
@@ -1332,60 +1602,42 @@ fi
     echo "| ORA-12541, ORA-12170, ORA-12535 | No listener / TCP connect timeout - host or listener down | Retryable: next address |"
     echo "| ORA-01033 | Instance starting or mounting (mid-role-change) | Retryable with backoff |"
     echo "| ORA-03113, ORA-03114, ORA-01089 | Existing session killed by failover/shutdown | Reconnect; the role-aware descriptor re-routes to the surviving side |"
-    echo "| ORA-25402 | TAF (where the DBA configured it on the service) failed the session over mid-transaction | ROLLBACK, then re-run the transaction |"
+    echo "| ORA-25402 | TAF (where enabled on the service - see section 1) failed the session over mid-transaction | ROLLBACK, then re-run the transaction |"
     echo "| ORA-16000 | DML sent to a read-only standby | Not retryable: routing bug - service running on the standby without the role trigger, or a standby-only string handed to a writer |"
     echo ""
-    echo "**Commit ambiguity:** a dropped connection (e.g. ORA-03113) while a COMMIT is in flight leaves the outcome unknown - the transaction may or may not be committed on the surviving database. Blind re-execution double-applies it. Use idempotency keys / unique business keys and verify state after reconnect. Oracle Transaction Guard resolves the outcome programmatically but requires a service with COMMIT_OUTCOME=TRUE and a 12c+ driver - not configured by this setup; request it from the DBA team if you need it."
+    echo "**Commit ambiguity:** a dropped connection (e.g. ORA-03113) while a COMMIT is in flight leaves the outcome unknown - the transaction may or may not be committed on the surviving database. Blind re-execution double-applies it. Use idempotency keys / unique business keys and verify state after reconnect. Oracle Transaction Guard resolves the outcome programmatically but requires a service with COMMIT_OUTCOME=TRUE and a 12c+ driver - section 1 states per service whether that is enabled here."
     echo ""
 
-    echo "### Adding Datafiles or PDBs After Setup (DBA Note)"
-    echo ""
-    echo "- New datafiles and PDBs replicate to the standby automatically only when their primary-side paths fall under a directory prefix covered by the standby's \`DB_FILE_NAME_CONVERT\` pairs. OMF-mode standbys (\`db_create_file_dest\` set) are immune."
-    echo "- A file added in an uncovered directory is created as \`UNNAMEDnnnnn\` in \`\$ORACLE_HOME/dbs\` on the standby; MRP stops with ORA-01274 and redo apply halts until manually repaired."
-    echo "- Before creating a PDB or adding a datafile in a new directory, keep paths under a covered prefix, or use \`CREATE PLUGGABLE DATABASE ... FILE_NAME_CONVERT\` / PDB-level OMF."
-    echo "- After any addition, verify the standby: \`dg_status.sh\` flags UNNAMED datafiles; also check \`V\$RECOVER_FILE\` and the standby alert log."
-    echo "- Repair sequence (\`STANDBY_FILE_MANAGEMENT=MANUAL\`, \`ALTER DATABASE CREATE DATAFILE ... AS ...\`, back to \`AUTO\`, restart apply): see \"Life After Setup: Adding Datafiles and PDBs\" in the repository's \`docs/DATA_GUARD_WALKTHROUGH.md\`."
-    echo ""
-
-    if [[ -n "$BROKER_OUTPUT" ]]; then
-        echo ""
-        echo "### Broker Configuration"
-        echo ""
-        echo '```'
-        echo "$BROKER_OUTPUT"
-        echo '```'
-    fi
-
-    echo ""
-
-    echo "## 4. Notes for Client Teams"
+    echo "### Notes for Client Teams"
     echo ""
     if [[ -n "$IMPACT_REFERENCE" ]]; then
         echo "- Full application behavior briefing: \`${IMPACT_REFERENCE}\`."
     fi
     echo "- The role-aware descriptor works only because \`trigger/create_role_trigger.sh\` stops the service on the standby. With the trigger disabled, both hosts accept connections and writers landing on the standby get ORA-16000."
     echo "- Sequences: NOORDER/CACHE sequences (default CACHE 20) discard cached values at role change - expect gaps of up to the CACHE size per sequence, and no ordering guarantee across a failover. Never use sequence values as gapless or strictly-ordered business keys."
-    echo "- TAF (where configured on the service) replays SELECTs only. In-flight transactions roll back (ORA-25402); commits and non-idempotent calls need application retry with the commit-ambiguity handling in section 3."
-    echo "- Application Continuity (12.2+ drivers) can replay in-flight transactions, but requires \`FAILOVER_TYPE=TRANSACTION\` and \`COMMIT_OUTCOME=TRUE\` on the service - not configured by this setup; coordinate with the DBA team."
+    echo "- TAF, Transaction Guard and Application Continuity are per-service settings; section 1 states what each service actually has (discovered from the database, not assumed). Ask the DBA team to change a service's settings if your failure-handling design needs more."
+    if [[ -n "$DB_DOMAIN" ]]; then
+        echo "- This database sets DB_DOMAIN=\`${DB_DOMAIN}\`. Clients whose \`sqlnet.ora\` sets \`NAMES.DEFAULT_DOMAIN\` append that domain to every unqualified TNS alias - define aliases fully qualified (as printed here) so resolution works with or without a default domain."
+    fi
     echo "- After a switchover nothing changes for clients on the role-aware descriptor. Host-specific strings silently point at the wrong database until this report is regenerated."
     echo ""
-    echo "## 5. Client and Pool Settings"
+    echo "## 3. Client and Pool Settings"
     echo ""
-    echo "- [ ] Pool connection-wait/checkout timeout of at least 15 s: one full descriptor pass takes up to 12 s, worst case 33 s (section 1). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
+    echo "- [ ] Pool connection-wait/checkout timeout of at least $((WORST_PRI_S + 5)) s: one pass over the ADDRESS_LIST can take up to ${ONE_PASS_MAX_S} s, and the descriptor's worst case is ${WORST_BOTH_S} s (section 1). A shorter pool timeout aborts borrowers before the descriptor's retry logic can succeed."
     echo "- [ ] Read/call timeout on every request path (JDBC \`oracle.jdbc.ReadTimeout\`, python-oracledb \`call_timeout\`, ODP.NET \`CommandTimeout\`): without one, a failover can leave in-flight calls hanging until TCP gives up (minutes)."
     echo "- [ ] Dead connection detection: server-side \`SQLNET.EXPIRE_TIME\` is ${SQLNET_EXPIRE_TIME}. Add \`(ENABLE=BROKEN)\` inside DESCRIPTION to enable OS TCP keepalive on the session socket, and tune client keepalive below any firewall idle timeout."
     echo "- [ ] Validate on borrow (JDBC \`isValid()\`, python-oracledb pool \`ping_interval\`, ODP.NET \`Validate Connection=true\`): after a failover every idle pooled connection is dead and must be detected before first use."
     echo "- [ ] Cap pool max size and reconnect concurrency: after a failover all clients reconnect at once, and an uncapped logon storm slows the new primary during the cold-cache window."
     echo "- [ ] Set max connection lifetime/recycle below any firewall or load-balancer idle timeout between the app tier and the database hosts."
     echo ""
-    echo "## 6. Verification"
+    echo "## 4. Verification"
     echo ""
     echo "Reachability - both hosts, from every application host (the standby address is only exercised when it is already an emergency):"
     echo ""
     echo '```bash'
-    echo "tnsping ${PRIMARY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+    echo "tnsping ${PRIMARY_HOSTNAME}:${PORT}/${EXAMPLE_SVC}"
     if [[ -n "$STANDBY_HOSTNAME" ]]; then
-        echo "tnsping ${STANDBY_HOSTNAME}:${PORT}/${SERVICE_LIST[0]:-service_name}"
+        echo "tnsping ${STANDBY_HOSTNAME}:${PORT}/${EXAMPLE_SVC}"
     fi
     echo "nc -z ${PRIMARY_HOSTNAME} ${PORT}"
     if [[ -n "$STANDBY_HOSTNAME" ]]; then
@@ -1405,10 +1657,75 @@ fi
     echo '```'
     echo ""
     echo "Expected now: \`${PRIMARY_DB_UNIQUE_NAME}\` / \`PRIMARY\` / \`${PRIMARY_HOSTNAME}\`."
+    echo ""
+
+    echo "## Appendix: DBA Snapshot"
+    echo ""
+    echo "Point-in-time details for the DBA team - application teams can stop reading here. Regenerate this report after listener changes, new services, or any topology change."
+    echo ""
+    echo "### Topology"
+    echo ""
+    echo "| Role | DB_UNIQUE_NAME | Hostname | Listener |"
+    echo "|------|----------------|----------|----------|"
+    echo "| Primary | ${PRIMARY_DB_UNIQUE_NAME} | ${PRIMARY_HOSTNAME} | ${PORT} |"
+    if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
+        echo "| Standby | ${STANDBY_DB_UNIQUE_NAME} | ${STANDBY_HOSTNAME:-UNKNOWN} | ${PORT} |"
+    fi
+    if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
+        echo "| Observer | - | ${FSFO_OBSERVER_HOST} | - |"
+    fi
+    echo ""
+    echo "### Status Snapshot"
+    echo ""
+    echo "| Item | Value |"
+    echo "|------|-------|"
+    echo "| Local role | ${DB_ROLE:-N/A} |"
+    echo "| Open mode | ${OPEN_MODE:-N/A} |"
+    echo "| Database version | ${DB_VERSION:-N/A} |"
+    echo "| CDB | ${IS_CDB:-N/A} |"
+    echo "| Character set | ${DB_CHARSET:-N/A} |"
+    echo "| Protection mode | ${PROTECTION_MODE:-N/A} |"
+    echo "| Standby LogXptMode | ${STANDBY_LOGXPTMODE:-unknown} |"
+    echo "| Standby open mode | ${STANDBY_OPEN_MODE:-unknown} |"
+    echo "| Switchover status | ${SWITCHOVER_STATUS:-N/A} |"
+    echo "| Force logging | ${FORCE_LOGGING:-N/A} |"
+    echo "| Broker started | ${DG_BROKER_START:-N/A} |"
+    echo "| Last received seq# | ${LAST_RECEIVED:-N/A} |"
+    echo "| Last applied seq# | ${LAST_APPLIED:-N/A} |"
+    echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
+    echo "| Archive gaps | ${GAP_COUNT} |"
+    echo "| FSFO status | ${FSFO_STATUS:-N/A} |"
+    echo "| FSFO observer present | ${FSFO_OBSERVER:-N/A} |"
+    if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
+        echo "| FSFO observer host | ${FSFO_OBSERVER_HOST} |"
+    fi
+    if [[ "$FSFO_ENABLED" == "YES" ]]; then
+        echo "| FSFO threshold | ${FSFO_THRESHOLD:-unknown} |"
+    fi
+    echo "| Role trigger ready | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
+    echo "| SQLNET.EXPIRE_TIME | ${SQLNET_EXPIRE_TIME} |"
+    echo ""
+
+    if [[ -n "$BROKER_OUTPUT" ]]; then
+        echo "### Broker Configuration"
+        echo ""
+        echo '```'
+        echo "$BROKER_OUTPUT"
+        echo '```'
+        echo ""
+    fi
+
+    echo "### Adding Datafiles or PDBs After Setup"
+    echo ""
+    echo "- New datafiles and PDBs replicate to the standby automatically only when their primary-side paths fall under a directory prefix covered by the standby's \`DB_FILE_NAME_CONVERT\` pairs. OMF-mode standbys (\`db_create_file_dest\` set) are immune."
+    echo "- A file added in an uncovered directory is created as \`UNNAMEDnnnnn\` in \`\$ORACLE_HOME/dbs\` on the standby; MRP stops with ORA-01274 and redo apply halts until manually repaired."
+    echo "- Before creating a PDB or adding a datafile in a new directory, keep paths under a covered prefix, or use \`CREATE PLUGGABLE DATABASE ... FILE_NAME_CONVERT\` / PDB-level OMF."
+    echo "- After any addition, verify the standby: \`dg_status.sh\` flags UNNAMED datafiles; also check \`V\$RECOVER_FILE\` and the standby alert log."
+    echo "- Repair sequence (\`STANDBY_FILE_MANAGEMENT=MANUAL\`, \`ALTER DATABASE CREATE DATAFILE ... AS ...\`, back to \`AUTO\`, restart apply): see \"Life After Setup: Adding Datafiles and PDBs\" in the repository's \`docs/DATA_GUARD_WALKTHROUGH.md\`."
 
     if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
         echo ""
-        echo "## Discovery Warnings"
+        echo "### Discovery Warnings"
         echo ""
         echo "The following items could not be discovered (shown as N/A above) - this is"
         echo "usually a transient ORA- error; re-run the report if the field is needed:"
@@ -1443,7 +1760,11 @@ if [[ "$VERDICT" != "HEALTHY" ]]; then
     done
 fi
 
+# 0 healthy, 1 warnings, 2 errors (3 = usage/connect failure, via die/arg
+# parsing) - same convention as dg_status.sh, so monitoring wrappers can
+# tell the severities apart without scraping the text.
 case "$VERDICT" in
-    ERROR)   exit 1 ;;
+    ERROR)   exit 2 ;;
+    WARNING) exit 1 ;;
     *)       exit 0 ;;
 esac
