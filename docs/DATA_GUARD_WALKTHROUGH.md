@@ -1107,6 +1107,8 @@ dgmgrl / "STOP OBSERVER"
    FSFO_THRESHOLD=60 ./primary/09_configure_fsfo.sh
    ```
 
+7. **Retrofitting an observer onto an existing configuration**: this step resolves its inputs from the build's `standby_config_*.env` on the NFS share. For a configuration that already exists and already works - especially one this repo did not build, or one where the observer must live on a **third host** - use the standalone `add_observer/` kit instead. It discovers the topology from the broker and never changes the protection mode. See [Side Toolkits](#side-toolkits-outside-the-numbered-workflow).
+
 ---
 
 ## Step 11: Role-Aware Service Trigger (Optional)
@@ -1703,7 +1705,88 @@ a failed `sqlplus / as sysdba` connection, or a host with neither `base64` nor
 
 ## Side Toolkits (Outside the Numbered Workflow)
 
-Two self-contained subprojects live in this repo but are not part of the 1-13 sequence.
+Three self-contained subprojects live in this repo but are not part of the 1-13 sequence.
+
+### Add an FSFO Observer on a Third Host
+
+**Directory:** `add_observer/` (see its own `README.md`)
+
+For a Data Guard configuration that **already exists and already works** - built by this
+repo or not - that needs an FSFO observer placed on a **third host** rather than on
+either database host. Steps 9 and 10 cannot do this: both resolve their inputs from this
+build's `standby_config_*.env` on the NFS share, and Step 9 additionally forces
+`MAXIMUM AVAILABILITY` + `LogXptMode=FASTSYNC`, which is an unwanted change to a running
+configuration. This kit resolves everything from the broker instead and leaves the
+protection mode alone.
+
+| Script | Runs on | Does |
+|--------|---------|------|
+| `01_prepare_primary.sh` | PRIMARY | Discovers the topology, reports FSFO readiness, creates/verifies the dedicated `SYSDG` observer user (CDB-aware), optionally enables FSFO (`--enable-fsfo`), writes the bundle for the third host |
+| `02_setup_observer_host.sh` | THIRD HOST | TNS entries + auto-login wallet, then proves the observer user can log in `AS SYSDG` to **both** databases |
+| `03_observer_ctl.sh` | THIRD HOST | `start` / `stop` / `restart` / `status` / `log` / `boot` |
+| `04_verify_observer.sh` | THIRD HOST (or anywhere) | End-state verification + placement check. Exit `0` = observer present and FSFO ready |
+
+```bash
+# 1. on the PRIMARY
+./add_observer/01_prepare_primary.sh --observer-host obs1
+#    ... reports readiness, creates the observer user, writes the bundle
+
+# 2. copy the bundle to the third host
+scp -r ./observer_bundle_<PRIMARY_DB_UNIQUE_NAME> obs1:~/
+
+# 3. on the THIRD host
+cd ~/observer_bundle_<PRIMARY_DB_UNIQUE_NAME>
+./02_setup_observer_host.sh      # TNS + wallet + connectivity proof
+./03_observer_ctl.sh start
+./04_verify_observer.sh
+./03_observer_ctl.sh boot        # systemd unit + cron @reboot + watchdog
+```
+
+The generated bundle carries `RUN_ON_OBSERVER_HOST.md` - the same runbook with the
+discovered values already substituted in - so the person working on the third host does
+not need this document or a copy of the repository.
+
+Add `--enable-fsfo` to script 01 to have it enable Fast-Start Failover as well; without
+the flag it only prints the DGMGRL commands it would have run, so an existing FSFO
+setup (or a change window) is never disturbed.
+
+**Why a third host.** An observer on the standby host cannot distinguish "the primary is
+down" from "the network between the sites is down", and an observer on the primary host
+dies with the very failure it is supposed to react to. A third host - ideally in a third
+location, or at least on separate power and network - is what makes the observer a
+tie-breaker rather than a participant.
+
+**Prerequisites on the third host:** an Oracle **Administrator**-type client or a full
+database home. The Instant Client is not sufficient - it ships neither `dgmgrl` nor
+`mkstore`, and script 02 refuses to continue on one. TCP to both databases' listener
+ports must be open.
+
+Design notes:
+
+- **Discovery over assumption.** Each member's host, port, and service name come from
+  running `tnsping` on the broker's `DGConnectIdentifier` for that member - that is what
+  the databases themselves use to reach each other - with the broker `HostName` property
+  and `V$LISTENER_NETWORK` as fallbacks. `--primary-host`, `--standby-host`, `--port`
+  override anything discovery gets wrong.
+- **The protection mode is never changed.** The FSFO flavour adapts to whatever is
+  configured instead: `MAXIMUM AVAILABILITY` / `MAXIMUM PROTECTION` use
+  `FastStartFailoverThreshold` (zero data loss); `MAXIMUM PERFORMANCE` uses
+  `FastStartFailoverLagLimit`, which is asynchronous FSFO and **can lose transactions** -
+  the script says so rather than silently upgrading the mode.
+- **Both connections are proven before anything starts.** Script 02 aborts if the
+  observer user cannot log in `AS SYSDG` to the *standby*, which is usually `ORA-01017`
+  from a password file that was never propagated. An observer the standby rejects can
+  watch a failure but cannot complete the failover.
+- **Named observers** (12.2+) are used when available, falling back to the unnamed form
+  if `START OBSERVER <name>` fails, rather than leaving no observer running at all.
+- **Reboot survival is explicit.** A background observer is a detached `dgmgrl` process
+  that nothing restarts. `03_observer_ctl.sh boot` prints a systemd unit
+  (`Type=oneshot` + `RemainAfterExit=yes`, because the real observer is a detached
+  child), a cron `@reboot` line, and a watchdog driven by `status` - which exits `0`
+  only when the primary reports `FS_FAILOVER_OBSERVER_PRESENT=YES`.
+
+**Rollback** is `03_observer_ctl.sh stop` (plus `DISABLE FAST_START FAILOVER` in DGMGRL
+if script 01 enabled it). The databases keep running; only automatic failover goes away.
 
 ### Convert an FSFO Observer from SYS to SYSDG
 

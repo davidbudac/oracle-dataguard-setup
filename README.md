@@ -7,6 +7,7 @@ Automated scripts for building, verifying, and operating an Oracle 19c Physical 
 - **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
 - **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11), NFS artifact cleanup (step 12), Maximum Availability without FSFO (step 13).
 - **Handoff report** (recommended, any time after step 7) — Markdown + styled HTML doc with topology, status, verdict, and per-service TNS/JDBC strings for application teams.
+- **Side toolkits** — add an FSFO observer on a third host to an existing configuration, convert a SYS-authenticated observer to SYSDG, migrate a non-CDB into a CDB keeping both standbys.
 - **Operational tools** — SSH dashboard, local triage/diagnostics, standby-redo-log audit, SYNC commit-cost report, wallet setup for password-free peer access, standalone handoff regenerator.
 
 ## Prerequisites
@@ -41,6 +42,7 @@ dataguard_setup/
 │
 ├── migrate_noncdb_to_pdb/       # Non-CDB → PDB migration subproject (own README/WALKTHROUGH)
 ├── observer_sys_to_sysdg/       # Side kit: convert a SYS-authenticated FSFO observer to SYSDG (own README)
+├── add_observer/                # Side kit: add an FSFO observer on a 3rd host to an existing config (own README)
 │
 ├── common/                      # Shared functions, wallet setup, status helpers
 ├── templates/                   # Reference templates (init, listener, tnsnames)
@@ -169,6 +171,7 @@ References: [`docs/DG_STATUS.md`](docs/DG_STATUS.md), [`docs/DG_CHECK.md`](docs/
 
 Self-contained subprojects with their own docs, outside the numbered workflow:
 
+- [`add_observer/`](add_observer/README.md) — add an FSFO observer on a **third host** to a Data Guard configuration that already exists and already works, whether or not this repo built it. Discovers the topology from the broker, creates the SYSDG observer user, and generates a self-contained bundle to copy to the third host. Never changes protection mode, `LogXptMode`, or transport.
 - [`observer_sys_to_sysdg/`](observer_sys_to_sysdg/README.md) — convert an existing FSFO observer that authenticates as SYS to a dedicated SYSDG-only user. For configurations built by hand or by other tooling; builds made with steps 9-10 here already use SYSDG.
 - [`migrate_noncdb_to_pdb/`](migrate_noncdb_to_pdb/README.md) — migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby.
 

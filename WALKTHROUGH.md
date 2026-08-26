@@ -360,6 +360,11 @@ before planned database maintenance.
 must be a `dgmgrl` process) before trusting it, and cleans up stale or mismatched
 pidfiles automatically.
 
+**Adding an observer later, on a third host?** Steps 9-10 need this build's
+`standby_config_*.env` on the NFS share. To retrofit an observer onto a configuration
+that already exists and already works - including one this repo did not build - use the
+standalone `add_observer/` kit instead (see [Side Toolkits](#side-toolkits)).
+
 ---
 
 ## Step 11: Role-Aware Service Trigger (Optional)
@@ -596,6 +601,11 @@ Same link the handoff report embeds, without generating a report. Runs from eith
 
 Self-contained subprojects with their own docs, outside the numbered workflow:
 
+- **`add_observer/`** — add an FSFO observer on a **third host** to an already-working
+  configuration (`01_prepare_primary.sh` on the primary builds a bundle;
+  `02_setup_observer_host.sh` / `03_observer_ctl.sh` / `04_verify_observer.sh` run on the
+  third host). Works against configurations this repo did not build. Never changes
+  protection mode, `LogXptMode`, or transport.
 - **`observer_sys_to_sysdg/`** — convert an existing FSFO observer that authenticates as
   SYS to a dedicated SYSDG-only user (create the user on the primary, swap the wallet
   credentials and restart the observer, verify). For configurations built by hand or by

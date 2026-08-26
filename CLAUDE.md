@@ -15,6 +15,7 @@ dg_sync_impact.sh - Standalone SYNC/FASTSYNC commit-latency impact report (run o
 dg_check_srl.sh  - Standby redo log checker: verifies SRL count/size on both sides and prints fix DDL (flags -p/--prompt-password, -L/--local-only, -d/--srl-path; exit codes 0 compliant / 1 DDL needed / 2 argument, pre-flight, or data-collection error). SRLs created without a THREAD clause sit at THREAD#=0 until first use (step 4 created them that way before 2026-08; it now assigns THREAD explicitly); the checker counts THREAD#=0 SRLs as a shared pool toward each thread's requirement instead of demanding duplicates, so both old and new builds check out correctly
 migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB with its own standby into an existing CDB with its own standby, without recreating either standby (has its own README/WALKTHROUGH)
 observer_sys_to_sysdg/ - Standalone side toolkit (NOT part of the numbered workflow): convert an existing FSFO observer that authenticates as SYS to a dedicated SYSDG-only user - create the user on the primary (01), swap/create the observer wallet credentials and restart the observer (02), verify (03); self-contained (no common/ or NFS dependencies), see its README.md
+add_observer/    - Standalone side toolkit (NOT part of the numbered workflow): add an FSFO observer on a THIRD host to an existing, already-working Data Guard configuration (built by this repo or not). `01_prepare_primary.sh` runs on the PRIMARY - discovers the topology (peer DB_UNIQUE_NAME, hostnames, and host/port/service by running `tnsping` on each member's broker `DGConnectIdentifier`), reports FSFO readiness (SHOW CONFIGURATION, VALIDATE DATABASE, Flashback Database on both members, protection mode, SRLs), creates/verifies the dedicated SYSDG observer user (CDB-aware), optionally enables FSFO (`--enable-fsfo`), and writes a self-contained bundle for the third host. `02_setup_observer_host.sh` / `03_observer_ctl.sh` / `04_verify_observer.sh` run there: TNS entries + auto-login wallet + both-database connectivity proof; start/stop/restart/status/log/boot lifecycle; end-state verification. Never changes protection mode, LogXptMode or transport. Self-contained (no common/ or NFS dependencies), see its README.md
 nfs/             - NFS setup scripts (run before Data Guard setup)
 primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10, 13)
 standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
@@ -225,6 +226,44 @@ This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mo
 The observer must be running for automatic failover to occur.
 
 `observer.sh` validates a pidfile's PID against the process's actual command line (must be a `dgmgrl` process) before trusting it as the running observer; stale or mismatched pidfiles are automatically cleaned up.
+
+## Adding an Observer to an Existing Configuration (Third Host)
+
+`add_observer/` retrofits an FSFO observer onto a Data Guard configuration that
+already exists and already works, placing it on a **third host** rather than on
+either database host. It is standalone - no `standby_config_*.env`, no NFS share,
+no `common/dg_functions.sh` - so the generated bundle can be copied to a host that
+has never seen this repository.
+
+```bash
+# on the PRIMARY
+./add_observer/01_prepare_primary.sh --observer-host obs1 [--enable-fsfo]
+scp -r ./observer_bundle_<PRIMARY_DB_UNIQUE_NAME> obs1:~/
+
+# on the THIRD host (Oracle client, Administrator type, or a DB home)
+./02_setup_observer_host.sh && ./03_observer_ctl.sh start && ./04_verify_observer.sh
+./03_observer_ctl.sh boot     # systemd unit + cron @reboot + watchdog
+```
+
+Design notes:
+- **Discovery over assumption.** Host/port/service come from `tnsping` on each
+  member's broker `DGConnectIdentifier` (what the members actually use to reach
+  each other), with the broker `HostName` property and `V$LISTENER_NETWORK` as
+  fallbacks and `--primary-host`/`--standby-host`/`--port` as overrides.
+- **The protection mode is never changed.** The FSFO flavour adapts to it instead:
+  `MAXIMUM AVAILABILITY`/`PROTECTION` -> `FastStartFailoverThreshold`;
+  `MAXIMUM PERFORMANCE` -> `FastStartFailoverLagLimit` (asynchronous FSFO, not
+  zero-data-loss - stated as such in the output).
+- **Both connections are proven before anything starts.** Script 02 aborts if the
+  observer user cannot log in `AS SYSDG` to the *standby* (usually ORA-01017 from a
+  password file that never propagated) - an observer the standby rejects cannot
+  complete a failover.
+- **Named observers** (12.2+) are used when available; `START OBSERVER <name>`
+  failing falls back to the unnamed form rather than leaving no observer at all.
+- **Reboot survival is explicit.** `03_observer_ctl.sh boot` prints a systemd unit
+  (`Type=oneshot` + `RemainAfterExit`, because the real observer is a detached
+  child), a cron `@reboot` line, and a watchdog driven by `status`, which exits 0
+  only when the primary reports `FS_FAILOVER_OBSERVER_PRESENT=YES`.
 
 ## Maximum Availability Without FSFO (Optional)
 
