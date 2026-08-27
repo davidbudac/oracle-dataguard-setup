@@ -903,8 +903,9 @@ progress_step "Generating TNS Configuration"
 SQLNET_DEFAULT_DOMAIN=""
 _sqlnet_file="${TNS_ADMIN:-${ORACLE_HOME}/network/admin}/sqlnet.ora"
 if [[ -f "$_sqlnet_file" ]]; then
+    # grep exits 1 when the parameter is absent - must not trip set -e
     SQLNET_DEFAULT_DOMAIN=$(grep -i '^[[:space:]]*NAMES\.DEFAULT_DOMAIN[[:space:]]*=' "$_sqlnet_file" \
-        | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]#].*//')
+        | head -1 | sed -e 's/.*=[[:space:]]*//' -e 's/[[:space:]#].*//') || true
 fi
 
 _ALIAS_DOMAIN="${SQLNET_DEFAULT_DOMAIN:-$DB_DOMAIN}"
