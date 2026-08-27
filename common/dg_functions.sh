@@ -863,9 +863,15 @@ verify_sys_password() {
     # runs - this replaces the old "</dev/null so a bad password hits EOF at
     # the re-prompt" trick, which only applied to a bad *command-line* logon
     # and is unreachable now that the logon happens as an in-script CONNECT.
+    # SET DEFINE OFF comes first: as *script* input (unlike the old
+    # command-line logon) the CONNECT line is scanned for substitution
+    # variables, so an "&" anywhere in the password would be silently
+    # replaced and a correct password rejected with ORA-01017.
     # 2>&1 is kept deliberately: the connection test inspects the error text
-    # in $result.
+    # in $result, and callers read it back from VERIFY_SYS_ERROR_TEXT (which
+    # holds sqlplus output only - never the password).
     result=$(sqlplus -s /nolog <<SQL 2>&1
+SET DEFINE OFF
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 CONNECT sys/"${password}"@${tns_alias} AS SYSDBA
 @${SQL_DIR}/queries/check_connection.sql
@@ -873,6 +879,8 @@ SQL
 )
     local rc=$?
     resume_verbose_trace
+
+    VERIFY_SYS_ERROR_TEXT="$result"
 
     if [[ $rc -ne 0 ]]; then
         return 1
@@ -883,6 +891,37 @@ SQL
     else
         return 1
     fi
+}
+
+# ------------------------------------------------------------
+# Endpoints the local listener actually listens on, one
+# "HOST PORT" line per TCP endpoint in lsnrctl order.
+#
+# The listener binds exactly the address listener.ora names, so
+# on the usual (HOST=<server>) configuration nothing answers on
+# 127.0.0.1 - "localhost" is not a valid stand-in for "local".
+# ------------------------------------------------------------
+_discover_listener_tcp_endpoints() {
+    [[ -x "${ORACLE_HOME}/bin/lsnrctl" ]] || return 0
+    # (protocol=tcp) with the closing paren so TCPS endpoints (which would
+    # need a wallet) are not offered as probe candidates.
+    "${ORACLE_HOME}/bin/lsnrctl" status 2>/dev/null \
+        | tr 'ABCDEFGHIJKLMNOPQRSTUVWXYZ' 'abcdefghijklmnopqrstuvwxyz' \
+        | sed -n 's/.*(protocol=tcp)(host=\([^)]*\))(port=\([0-9][0-9]*\)).*/\1 \2/p'
+}
+
+# True when the sqlplus output is a transport/listener failure - the
+# database never saw the credentials, so it says nothing about the
+# password and the next candidate endpoint should be tried.
+_sys_probe_transport_error() {
+    printf '%s\n' "$1" | grep -E 'TNS-|ORA-12154|ORA-12162|ORA-12170|ORA-12224|ORA-12500|ORA-12505|ORA-12514|ORA-12518|ORA-12520|ORA-12521|ORA-12528|ORA-12537|ORA-12541|ORA-12545|ORA-12547|ORA-12560|ORA-12564|ORA-12570|ORA-03113|ORA-03135' >/dev/null 2>&1
+}
+
+# First diagnostic line of a sqlplus run, for operator-facing messages.
+_first_ora_line() {
+    local line
+    line=$(printf '%s\n' "$1" | grep -E 'ORA-|TNS-|SP2-' | head -1 | sed 's/^[[:space:]]*//')
+    printf '%s\n' "${line:-no diagnostic returned by sqlplus}"
 }
 
 # ============================================================
@@ -898,43 +937,98 @@ prompt_and_verify_local_sys_password() {
     local prompt_text="${1:-Enter SYS password for the local primary database}"
     local max_attempts="${2:-3}"
 
-    # Discover the running listener port. Auto-derived from lsnrctl,
-    # falling back to 1521 if that fails. This is local only.
-    local probe_port=""
-    if [[ -x "${ORACLE_HOME}/bin/lsnrctl" ]]; then
-        probe_port=$("${ORACLE_HOME}/bin/lsnrctl" status 2>/dev/null \
-            | sed -n 's/.*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
-            | head -1)
+    # Probe candidates, best first: the addresses the listener reports for
+    # itself, then this host's own name, then localhost as a last resort.
+    # Hardcoding localhost (as this did before) rejects every password on
+    # the standard listener.ora that binds the host address only.
+    # DG_SYS_PROBE_HOST / DG_SYS_PROBE_PORT override discovery entirely.
+    local endpoints first_port candidates this_host
+    endpoints=$(_discover_listener_tcp_endpoints)
+    first_port=$(printf '%s\n' "$endpoints" | sed -n '1s/.*[[:space:]]//p')
+    first_port="${first_port:-1521}"
+
+    if [[ -n "${DG_SYS_PROBE_HOST:-}" ]]; then
+        candidates="${DG_SYS_PROBE_HOST} ${DG_SYS_PROBE_PORT:-$first_port}"
+    else
+        candidates="$endpoints"
+        this_host=$(hostname 2>/dev/null)
+        [[ -n "$this_host" ]] && candidates="${candidates}
+${this_host} ${first_port}"
+        candidates="${candidates}
+localhost ${first_port}"
     fi
-    probe_port="${probe_port:-1521}"
+    # Drop blank lines (no endpoints discovered) and duplicates, keeping order.
+    candidates=$(printf '%s\n' "$candidates" | sed '/^[[:space:]]*$/d' | awk '!seen[$0]++')
 
-    # Build a SID-based descriptor so we don't depend on knowing the
-    # registered service name (PMON registers <SID> via the static
-    # entry on most setups).
-    local probe_target
-    probe_target="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=localhost)(PORT=${probe_port}))(CONNECT_DATA=(SID=${ORACLE_SID})))"
+    log_info "Verifying SYS password against the local instance (SID ${ORACLE_SID}) via:"
+    log_info "  $(printf '%s\n' "$candidates" | sed 's/ /:/' | tr '\n' ',' | sed 's/,$//; s/,/, /g')"
 
-    log_info "Verifying SYS password against local instance (port ${probe_port}, SID ${ORACLE_SID})..."
-
+    # The live endpoint is settled on the first attempt: whichever candidate
+    # returns an *authentication* verdict (right or wrong password) is the
+    # one the instance answers on. Candidates that fail in transport are
+    # skipped, and if every one of them does we report that rather than
+    # blaming the password.
+    local pinned=""
     local attempt=1
-    local pw=""
+    local pw="" cand_host cand_port target answered transport_error
+
     while [[ $attempt -le $max_attempts ]]; do
         pw=$(prompt_password "$prompt_text")
         if [[ -z "$pw" ]]; then
             log_warn "SYS password cannot be empty (attempt ${attempt}/${max_attempts})"
-        elif [[ "$pw" == *'"'* ]]; then
+            attempt=$((attempt + 1))
+            continue
+        fi
+        if [[ "$pw" == *'"'* ]]; then
             # verify_sys_password() (and RMAN's CONNECT string) embed the
             # password inside double quotes (sys/"<pw>"@...) - an embedded
             # quote breaks that syntax and would otherwise be misreported as
             # a plain "Invalid SYS password" a few lines below (L16).
             log_warn "SYS password must not contain a double-quote (\") character - it breaks the sys/\"<pw>\"@ connect syntax (attempt ${attempt}/${max_attempts})"
-        elif verify_sys_password "$pw" "$probe_target"; then
-            log_success "SYS password verified against the local primary database"
-            export SYS_PASSWORD="$pw"
-            return 0
-        else
-            log_error "SYS password verification failed (attempt ${attempt}/${max_attempts})"
+            attempt=$((attempt + 1))
+            continue
         fi
+
+        answered=0
+        transport_error=""
+        while IFS=' ' read -r cand_host cand_port; do
+            [[ -z "$cand_host" ]] && continue
+            target="(DESCRIPTION=(ADDRESS=(PROTOCOL=TCP)(HOST=${cand_host})(PORT=${cand_port}))(CONNECT_DATA=(SID=${ORACLE_SID})))"
+
+            if verify_sys_password "$pw" "$target"; then
+                log_success "SYS password verified against the local primary database (${cand_host}:${cand_port}, SID ${ORACLE_SID})"
+                export SYS_PASSWORD="$pw"
+                return 0
+            fi
+
+            if _sys_probe_transport_error "$VERIFY_SYS_ERROR_TEXT"; then
+                transport_error="$VERIFY_SYS_ERROR_TEXT"
+                log_info "  ${cand_host}:${cand_port} unreachable - $(_first_ora_line "$VERIFY_SYS_ERROR_TEXT")"
+                continue
+            fi
+
+            # The instance answered: a real authentication verdict, so stop
+            # walking candidates and keep using this one from now on.
+            answered=1
+            pinned="${cand_host} ${cand_port}"
+            log_error "SYS logon rejected by ${cand_host}:${cand_port} (attempt ${attempt}/${max_attempts})"
+            log_error "  $(_first_ora_line "$VERIFY_SYS_ERROR_TEXT")"
+            break
+        done <<CANDIDATES
+${pinned:-$candidates}
+CANDIDATES
+
+        if [[ $answered -eq 0 ]]; then
+            # Not a password problem - no candidate endpoint even reached the
+            # instance. Re-prompting would just misattribute this to the user.
+            log_error "Could not reach the local instance on any listener endpoint - the password was never tested"
+            log_error "  Last error: $(_first_ora_line "$transport_error")"
+            log_error "  Tried: $(printf '%s\n' "$candidates" | sed 's/ /:/' | tr '\n' ',' | sed 's/,$//; s/,/, /g') (SID ${ORACLE_SID})"
+            log_error "  Check 'lsnrctl status' (endpoints and a registered instance for SID ${ORACLE_SID}),"
+            log_error "  or set DG_SYS_PROBE_HOST/DG_SYS_PROBE_PORT to the address the listener answers on."
+            return 1
+        fi
+
         attempt=$((attempt + 1))
     done
 

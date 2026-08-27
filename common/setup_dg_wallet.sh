@@ -207,6 +207,7 @@ info "Testing connection to ${PEER_LABEL} (${PEER_TNS})..."
 # CONNECT is fed via stdin (sqlplus -s /nolog) instead of on the sqlplus
 # command line, so SYS_PASSWORD never appears in `ps -ef` output.
 PEER_TEST=$(sqlplus -s /nolog <<EOF 2>&1
+SET DEFINE OFF
 CONNECT sys/"${SYS_PASSWORD}"@${PEER_TNS} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF
 SELECT 'PEER_OK' FROM DUAL;
@@ -229,6 +230,7 @@ if [[ -n "${LOC_TNS:-}" ]]; then
     # CONNECT is fed via stdin (sqlplus -s /nolog) instead of on the sqlplus
     # command line, so SYS_PASSWORD never appears in `ps -ef` output.
     LOC_TEST=$(sqlplus -s /nolog <<EOF 2>&1
+SET DEFINE OFF
 CONNECT sys/"${SYS_PASSWORD}"@${LOC_TNS} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF
 SELECT 'LOC_OK' FROM DUAL;

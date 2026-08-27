@@ -232,6 +232,7 @@ if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
     # check_connection.sql.
     pause_verbose_trace
     VERIFY_ERROR_TEXT=$(sqlplus -s /nolog <<SQL 2>&1
+SET DEFINE OFF
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
 @${SQL_DIR}/queries/check_connection.sql
