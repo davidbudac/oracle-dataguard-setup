@@ -67,7 +67,7 @@ TARGET_PDB_DATAFILE_DIR="${TARGET_PDB_DATAFILE_DIR:-${ORACLE_BASE}/oradata/${TAR
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 BLUE='\033[0;34m'; CYAN='\033[0;36m'; NC='\033[0m'
 PASS=0; FAIL=0; SKIP=0; ISSUE=0
-log()   { local m="[$(date '+%H:%M:%S')] $*"; echo -e "$m"; echo -e "$m" >> "$FULL_LOG"; }
+log()   { local m="[$(date '+%H:%M:%S')] $*"; printf '%b\n' "$m"; printf '%b\n' "$m" >> "$FULL_LOG"; }
 log_phase() { log ""; log "${BLUE}============================================================${NC}";
               log "${BLUE}  $*${NC}"; log "${BLUE}============================================================${NC}"; }
 log_pass()  { log "${GREEN}  [PASS]${NC} $*"; echo "[PASS] $*" >> "$RESULTS_FILE"; PASS=$((PASS+1)); }
@@ -167,7 +167,7 @@ SELECT 'NONC|'||name||'|'||open_mode||'|'||database_role||'|'||cdb FROM v\\\$dat
 EXIT;
 SQL
     ")
-    if echo "$out" | grep -qE "^NONC[|]${SOURCE_DB_NAME^^}[|]READ WRITE[|]PRIMARY[|]NO"; then
+    if echo "$out" | grep -qE "^NONC[|]$(printf %s "$SOURCE_DB_NAME" | tr "[:lower:]" "[:upper:]")[|]READ WRITE[|]PRIMARY[|]NO"; then
         log_pass "Source non-CDB ${SOURCE_DB_NAME} is PRIMARY READ WRITE"
     else
         log_fail "Source non-CDB ${SOURCE_DB_NAME} not in expected state"
@@ -183,7 +183,7 @@ SELECT 'CDB|'||name||'|'||open_mode||'|'||database_role||'|'||cdb FROM v\\\$data
 EXIT;
 SQL
     ")
-    if echo "$out" | grep -qE "^CDB[|]${TARGET_CDB_NAME^^}[|]READ WRITE[|]PRIMARY[|]YES"; then
+    if echo "$out" | grep -qE "^CDB[|]$(printf %s "$TARGET_CDB_NAME" | tr "[:lower:]" "[:upper:]")[|]READ WRITE[|]PRIMARY[|]YES"; then
         log_pass "Target CDB ${TARGET_CDB_NAME} is PRIMARY READ WRITE"
     else
         log_fail "Target CDB ${TARGET_CDB_NAME} not in expected state"

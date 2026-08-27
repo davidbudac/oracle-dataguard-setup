@@ -53,6 +53,31 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# ============================================================
+# Platform guard
+# ============================================================
+# Everything below is Linux-specific: yum/dnf/apt, systemd units, the
+# Linux /etc/exports option syntax and `exportfs -ra`. AIX has none of
+# them, and NFSv4 on AIX additionally needs an NFS domain (chnfsdom) and
+# an nfsroot (chnfs -r) - site decisions a script should not make as root
+# on someone's box. Stop with the AIX-native sequence instead of running
+# Linux commands that half-fail.
+if [ "$(uname -s)" = "AIX" ]; then
+    log_error "This NFS *server* script supports Linux only (see docs/DATA_GUARD_WALKTHROUGH.md, Step 0a)."
+    log_error ""
+    log_error "On AIX 7.2, export ${NFS_SHARE_PATH} manually as root:"
+    log_error "  mkdir -p ${NFS_SHARE_PATH} && chown oracle:oinstall ${NFS_SHARE_PATH} && chmod 750 ${NFS_SHARE_PATH}"
+    log_error "  mknfs -B                                  # configure + start the NFS daemons"
+    log_error "  chnfsdom <your.nfs.domain>                # NFSv4 domain, must match the clients"
+    log_error "  chnfs -r / -B                             # NFSv4 pseudo-root"
+    log_error "  mknfsexp -d ${NFS_SHARE_PATH} -v 4 -t rw -c <primary>,<standby> -B"
+    log_error "  exportfs -v                               # verify"
+    log_error ""
+    log_error "The rest of the workflow (steps 1-13) is AIX-clean and needs only the"
+    log_error "share mounted at ${NFS_SHARE_PATH} on both DB hosts."
+    exit 1
+fi
+
 echo "============================================================"
 echo "     NFS Server Setup for Oracle Data Guard"
 echo "============================================================"

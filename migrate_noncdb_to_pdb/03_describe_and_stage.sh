@@ -147,8 +147,9 @@ while IFS= read -r f; do
     stage_one "$f"
 done < "$DF_FILE"
 
-STAGED_BYTES=$(du -sb "$MIGRATE_DATAFILE_STAGE" 2>/dev/null | awk '{print $1}')
-[[ -z "$STAGED_BYTES" ]] && STAGED_BYTES=$(du -sk "$MIGRATE_DATAFILE_STAGE" | awk '{print $1*1024}')
+# du -sk (POSIX), not du -sb: -b is a GNU extension AIX 7.2 does not have.
+# KB granularity is plenty for a staging-size log line.
+STAGED_BYTES=$(du -sk "$MIGRATE_DATAFILE_STAGE" 2>/dev/null | awk '{print $1*1024}')
 log_success "Staged ${DF_COUNT} datafile(s), ~${STAGED_BYTES} bytes total"
 
 # ---- 4. Record SOURCE_FILE_NAME_CONVERT and FILE_NAME_CONVERT --------------

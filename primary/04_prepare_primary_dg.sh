@@ -531,6 +531,23 @@ if command -v nc >/dev/null 2>&1; then
         log_error "  3. Hostname '${STANDBY_HOSTNAME}' resolves correctly"
         PORT_CHECK_RESULT=1
     fi
+elif [[ -x "${ORACLE_HOME}/bin/tnsping" ]]; then
+    # AIX 7.2 ships neither nc nor timeout(1). tnsping is always present in
+    # ORACLE_HOME and a raw descriptor makes it a pure listener-handshake
+    # test (it never looks at the service), with the wait bounded by the
+    # descriptor's own timeout parameters rather than an external tool.
+    if "${ORACLE_HOME}/bin/tnsping" \
+        "(DESCRIPTION=(CONNECT_TIMEOUT=5)(TRANSPORT_CONNECT_TIMEOUT=5)(RETRY_COUNT=0)(ADDRESS=(PROTOCOL=TCP)(HOST=${STANDBY_HOSTNAME})(PORT=${STANDBY_PORT})))" \
+        2>/dev/null | grep -q '^OK'; then
+        log_info "PASS: Port ${STANDBY_PORT} is reachable on ${STANDBY_HOSTNAME}"
+    else
+        log_error "FAILED: Cannot reach port ${STANDBY_PORT} on ${STANDBY_HOSTNAME}"
+        log_error "Please check:"
+        log_error "  1. Network connectivity between servers"
+        log_error "  2. Firewall rules allow port ${STANDBY_PORT}"
+        log_error "  3. Hostname '${STANDBY_HOSTNAME}' resolves correctly"
+        PORT_CHECK_RESULT=1
+    fi
 elif command -v timeout >/dev/null 2>&1; then
     # Use bash /dev/tcp with timeout
     if timeout 5 bash -c "echo > /dev/tcp/${STANDBY_HOSTNAME}/${STANDBY_PORT}" 2>/dev/null; then
@@ -544,7 +561,7 @@ elif command -v timeout >/dev/null 2>&1; then
         PORT_CHECK_RESULT=1
     fi
 else
-    log_warn "Neither 'nc' nor 'timeout' available - skipping basic port check"
+    log_warn "None of nc, tnsping or timeout available - skipping basic port check"
 fi
 
 if [[ "$PORT_CHECK_RESULT" -ne 0 ]]; then

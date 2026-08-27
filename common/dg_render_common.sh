@@ -205,7 +205,10 @@ fit_text() {
 
 wrap_text() {
     local text="$1" width="$2"
-    text=$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]]\+/ /g; s/^ //; s/ $//')
+    # [[:space:]][[:space:]]* not [[:space:]]\+ : \+ is a GNU BRE extension,
+    # AIX 7.2 /usr/bin/sed matches a literal '+' instead (runs of blanks then
+    # survive into the rendered table and break the column alignment).
+    text=$(printf '%s' "$text" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//')
     [[ -z "$text" ]] && text="-"
     printf '%s\n' "$text" | fold -s -w "$width"
 }

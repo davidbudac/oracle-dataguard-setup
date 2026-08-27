@@ -98,6 +98,29 @@ if [ "$EUID" -ne 0 ]; then
     exit 1
 fi
 
+# ============================================================
+# Platform guard
+# ============================================================
+# Below is Linux-specific: yum/dnf/apt, `mount -t nfs4`, /etc/fstab.
+# AIX mounts NFS through /etc/filesystems (mknfsmnt), so running the
+# Linux path there leaves a mounted-but-not-persistent share at best.
+if [ "$(uname -s)" = "AIX" ]; then
+    log_error "This NFS *client* script supports Linux only (see docs/DATA_GUARD_WALKTHROUGH.md, Step 0b)."
+    log_error ""
+    log_error "On AIX 7.2, mount the share manually as root:"
+    log_error "  mkdir -p ${NFS_MOUNT_PATH}"
+    log_error "  chnfsdom <your.nfs.domain>                # must match the NFS server's domain"
+    log_error "  mknfsmnt -f ${NFS_MOUNT_PATH} -d <server-export-path> -h <nfs-server> \\"
+    log_error "           -A -t rw -w bg -X -Y -V 4        # -A = mount now + persist in /etc/filesystems"
+    log_error "  mount ${NFS_MOUNT_PATH} && df -k ${NFS_MOUNT_PATH}"
+    log_error ""
+    log_error "Then confirm the oracle user can write to it:"
+    log_error "  su - oracle -c 'touch ${NFS_MOUNT_PATH}/.w && rm -f ${NFS_MOUNT_PATH}/.w && echo OK'"
+    log_error ""
+    log_error "The rest of the workflow (steps 1-13) is AIX-clean once the share is mounted."
+    exit 1
+fi
+
 echo "============================================================"
 echo "     NFS Client Mount for Oracle Data Guard"
 echo "============================================================"

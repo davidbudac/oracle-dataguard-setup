@@ -81,7 +81,8 @@ Recommended, run any time after Step 7 (not part of the walkthrough's numbered s
 - **Passwords prompted at runtime**, never stored
 - **Filesystem storage** (not ASM), single instance (not RAC)
 - **Storage mode choice**: Step 2 offers Traditional (path substitution via `DB_FILE_NAME_CONVERT`) or OMF mode (`db_create_file_dest` + `db_recovery_file_dest`). OMF mode supports mixed-storage scenarios where primary uses regular file paths and standby uses FRA. OMF mode also protects against the post-setup new-PDB/new-datafile convert-pair gap: in Traditional mode a file created in a directory not covered by any `DB_FILE_NAME_CONVERT` pair becomes an `UNNAMED` placeholder on the standby and halts apply with ORA-01274 (see "Life After Setup" in docs/DATA_GUARD_WALKTHROUGH.md)
-- **AIX 7.2 compatible**: Uses printf instead of echo -e, sed instead of grep -P
+- **AIX 7.2 compatible**: Uses printf instead of echo -e, sed instead of grep -P, POSIX BRE only (no `\+`/`\?`), `df -Pk`, `du -sk`, and no bash 4 syntax. Linux-only binaries (`timeout`, `nc`, `systemctl`, `mktemp`, `base64`, `tput`) are always behind a `command -v` guard with a working fallback - e.g. step 4's port check falls back to `tnsping` against a raw descriptor, since AIX ships neither `nc` nor `timeout`. Enforced by `tests/test_aix_portability.sh`.
+  The two `nfs/` scripts are the deliberate exception: they are Linux-only (yum/dnf/apt, systemd, `exportfs`, `mount -t nfs4`, `/etc/fstab`) and now stop on AIX with the AIX-native sequence (`mknfs`/`chnfsdom`/`mknfsexp`, `mknfsmnt`) printed instead of half-running Linux commands as root
 
 ## Common Functions
 
@@ -169,6 +170,7 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 - `tests/test_counter_increment.sh` - Demonstrates why `((VAR++))` is banned under `set -e` and sweeps the repo for the construct (codebase uses `x=$((x+1))`)
 - `tests/test_df_parsing.sh` - Tests `parse_df_available_kb` / `get_available_space_kb`; guards the `df -Pk` (POSIX format) requirement for AIX compatibility
 - `tests/test_grep_portability.sh` - Tests broker-output detection patterns and sweeps the repo for GNU-grep-only usage (`grep -P`, `\s`, BRE `\|` alternation)
+- `tests/test_aix_portability.sh` - Repo-wide AIX 7.2 sweep of the shipped (non-test) scripts: GNU-only sed/coreutils flags and GNU BRE extensions, bash 4+ syntax (`mapfile`, `declare -A`, `${v^^}`), Linux-only binaries (`timeout`, `nc`, `systemctl`, `base64`, `mktemp`, `tput`) used without a `command -v` guard - heredocs and `echo`/`printf` lines are excluded so printed command *examples* don't trip it - and the AIX platform guard in both `nfs/` scripts. `nfs/01`/`nfs/02` and `tests/**` are out of scope by design (see the header)
 - `tests/test_sid_detection.sh` - Tests the SID-detection/validation pipeline used by `dg_status.sh` (`_detect_pmon_sid` / `_validate_sid`)
 - `tests/test_visualizer_url.sh` - Tests the dataguard-doc visualizer link helpers embedded in both handoff scripts and `get_dg_config_url.sh` (block-drift diff across all three copies, base64url payload, field mapping/omission, JSON escaping)
 - `tests/test_handoff_html.sh` - Tests the handoff HTML renderer embedded in both handoff scripts (block-drift diff between the two copies, full Markdown-subset conversion fixture: headings, tables, fences, checklist items, verdict pill classes, callouts, escaping, tag balance, AIX-awk array rules)

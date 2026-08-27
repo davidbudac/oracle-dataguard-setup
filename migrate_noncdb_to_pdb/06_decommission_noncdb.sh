@@ -92,7 +92,8 @@ fi
 
 # ---- 4. Tidy up staging on NFS ---------------------------------------------
 if [[ -d "$MIGRATE_DATAFILE_STAGE" ]]; then
-    BYTES=$(du -sb "$MIGRATE_DATAFILE_STAGE" 2>/dev/null | awk '{print $1}')
+    # du -sk (POSIX), not du -sb: -b is a GNU extension AIX 7.2 lacks.
+    BYTES=$(du -sk "$MIGRATE_DATAFILE_STAGE" 2>/dev/null | awk '{print $1*1024}')
     log_info "Staging dir size: ${BYTES:-?} bytes"
     log_info "Removing staged datafiles ${MIGRATE_DATAFILE_STAGE} ..."
     rm -rf "$MIGRATE_DATAFILE_STAGE"
