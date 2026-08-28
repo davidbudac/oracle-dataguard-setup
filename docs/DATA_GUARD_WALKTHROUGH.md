@@ -370,11 +370,9 @@ cp $ORACLE_HOME/dbs/orapw$ORACLE_SID /OINSTALL/_dataguard_setup/
 3. Prompts for standby storage mode:
    - **Traditional** (default): derives standby paths from primary via path substitution (`DB_FILE_NAME_CONVERT`)
    - **OMF**: prompts for `db_create_file_dest` and `db_recovery_file_dest` — no FILE_NAME_CONVERT needed. Use this when the standby has a different storage layout (e.g., FRA) than the primary.
-4. **Q1b — standby file locations** (Traditional mode, interactive terminals only): choose between the two typical scenarios up front —
-   - **Same paths as primary** (default): the mounts are named identically on both hosts; only DB-name directory components are renamed to the standby `DB_UNIQUE_NAME`
-   - **Same layout on renamed filesystems**: you supply one suffix (e.g. `_s`) that is appended to the **first path component** of every derived location — datafiles, redo, SRLs, archive destination, FRA: `/ora_1/oradata → /ora_1_s/oradata`, `/ora_redo → /ora_redo_s`. The standby `ORACLE_BASE` default gets the suffix on its **last** component instead (`/u01/app/oracle → /u01/app/oracle_s`) since the software mount is typically not renamed. The suffix composes with the DB-name rename (`/ora_1/oradata/PROD → /ora_1_s/oradata/PRODSTBY`)
-5. Derives each standby directory from its primary counterpart by swapping the DB-name path component (plus the Q1b suffix, if chosen), then (Traditional mode) walks you through the result — see [Reviewing the derived path mappings](#reviewing-the-derived-path-mappings) below
-6. Prompts for the standby `ORACLE_BASE` / `ORACLE_HOME` (defaults: the primary's values, suffixed per Q1b)
+4. **Q1b — standby filesystems** (Traditional mode, interactive terminals only): the script lists the distinct filesystems (the **first path component**, labeled with what lives on each — datafiles, redo logs, archive logs, FRA) found across the primary's paths, and asks whether any are named differently on the standby host. Answer **N** (default) if the mounts are named identically on both hosts. Answer **y** and you are prompted once per filesystem for its standby name — accept the default to keep a name unchanged, or type the standby's (`/ora_1 → /ora_1_s`; a multi-component target like `/mnt/oracle/ora_1` also works). The remap applies to every derived location on that filesystem and composes with the DB-name rename (`/ora_1/oradata/PROD → /ora_1_s/oradata/PRODSTBY`)
+5. Derives each standby directory from its primary counterpart by applying the Q1b filesystem remap (if any) and swapping the DB-name path component, then (Traditional mode) walks you through the result — see [Reviewing the derived path mappings](#reviewing-the-derived-path-mappings) below
+6. Prompts for the standby `ORACLE_BASE` / `ORACLE_HOME` (defaults: the primary's values — the Q1b remap deliberately does not touch the software mount; override here if the standby's differs)
 7. Generates path conversion parameters (Traditional mode) or OMF configuration
 8. Creates standby parameter file (init.ora)
 9. Creates TNS entries for both databases
@@ -384,12 +382,10 @@ cp $ORACLE_HOME/dbs/orapw$ORACLE_SID /OINSTALL/_dataguard_setup/
 
 ### Reviewing the Derived Path Mappings
 
-Standby directories are derived by replacing the DB-name component of each primary path (`/u01/oradata/PROD` → `/u01/oradata/PRODSTBY`), plus the Q1b filesystem suffix when you chose the renamed-filesystems scenario (`/ora_1/oradata/PROD` → `/ora_1_s/oradata/PRODSTBY`). That is correct when both hosts share a mount layout (or differ only by the suffix rule), but a standby with a **different layout** needs corrections. Traditional mode surfaces two opportunities to make them:
+Standby directories are derived by applying the Q1b filesystem remap (if you declared one) and replacing the DB-name component of each primary path (`/u01/oradata/PROD` → `/u01/oradata/PRODSTBY`; with a remap, `/ora_1/oradata/PROD` → `/ora_1_s/oradata/PRODSTBY`). That is correct when both hosts share a layout up to those two rules, but a standby with a genuinely **different layout** needs corrections. Traditional mode surfaces them through:
 
-1. **Unmapped-path confirmation.** A path with no DB-name component in it (in any case) — typically redo or temp on its own mount — cannot be auto-derived and is left pointing at the *primary's* directory. Each one is flagged individually so you can accept the identical path or type the correct standby directory. Leaving a wrong path here makes the Step 5 RMAN duplicate fail with `ORA-17502` / `ORA-19504`, because the directory is never created on the standby.
-2. **Mapping review table.** A numbered table of every derived `primary -> standby` directory mapping. Press Enter to accept all, or enter a number to override that entry. This is where you redirect an *asymmetric* standby — one where the token substitution succeeded but the base mount differs entirely (`/u01/oradata/PROD` → `/oracle/data/PRODSTBY`) — or fix an individual mount the Q1b suffix rule should not have applied to.
-
-With a Q1b suffix in effect, the unmapped-path confirmation naturally never fires (every derived path already differs from the primary's), so the review table is your remaining checkpoint — worth an actual look before accepting.
+1. **Unmapped-path confirmation** (only when Q1b was *not* asked — piped/non-interactive runs). A path with no DB-name component in it (in any case) — typically redo or temp on its own mount — cannot be auto-derived and is left pointing at the *primary's* directory, with a warning. When Q1b ran, this per-path confirmation is skipped entirely: you already declared, filesystem by filesystem, whether the standby's names differ, so an identical derived path is a stated choice rather than an ambiguity. Leaving a wrong path in place makes the Step 5 RMAN duplicate fail with `ORA-17502` / `ORA-19504`, because the directory is never created on the standby.
+2. **Mapping review table.** A numbered table of every derived `primary -> standby` directory mapping. Press Enter to accept all, or enter a number to override that entry. This is where you redirect an *asymmetric* standby — one where the derivation succeeded but a directory's target differs in a way neither rule can express (`/u01/oradata/PROD` → `/oracle/data/PRODSTBY`) — and your final checkpoint after a Q1b remap, so it is worth an actual look before accepting.
 
 Both run **before** the convert pairs and the `.env` are written, so corrections propagate into every generated file.
 
@@ -401,7 +397,7 @@ The reason is structural: a convert pair remaps a primary *filename*, and when O
 
 To genuinely split redo on the standby, give the **primary** a distinct redo directory as well, then re-run Step 2. This is the same root cause as the SRL-contradiction warning (`PRIMARY_SRL_PATH` equal to `PRIMARY_REDO_PATH` with a differing standby SRL path).
 
-> **Non-interactive runs (piped stdin):** Q1b and both review prompts are TTY-gated. Q1b is skipped entirely (same-paths scenario, no suffix), the mapping table is still printed for the log, but the derived defaults are accepted silently and unmapped paths keep the identical primary path with a warning. To change a path afterwards, edit `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` and re-run with `--regenerate` (see below).
+> **Non-interactive runs (piped stdin):** Q1b and both review prompts are TTY-gated. Q1b is skipped entirely (identical filesystems, empty remap), the mapping table is still printed for the log, but the derived defaults are accepted silently and unmapped paths keep the identical primary path with a warning. To change a path afterwards, edit `standby_config_<STANDBY_DB_UNIQUE_NAME>.env` and re-run with `--regenerate` (see below).
 
 ### Regenerating After Editing the Config
 

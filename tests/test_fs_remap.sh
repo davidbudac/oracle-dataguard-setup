@@ -1,16 +1,17 @@
 #!/bin/bash
 # ============================================================
-# Unit test for the Q1b filesystem-suffix derivation logic in
+# Unit test for the Q1b per-filesystem remap logic in
 # primary/02_generate_standby_config.sh
 # ============================================================
-# Step 2's Q1b lets the operator declare that the standby uses the same
-# layout on RENAMED filesystems: one suffix is appended to the FIRST
-# path component of every derived standby location (/ora_1/oradata ->
-# /ora_1_s/oradata), while the ORACLE_BASE default gets the suffix on
-# its LAST component instead (/u01/app/oracle -> /u01/app/oracle_s).
+# Step 2's Q1b asks whether the standby's filesystems (the FIRST path
+# component of each location) are named differently than the primary's;
+# if so, each distinct primary filesystem is listed and the operator
+# supplies its standby counterpart. Only changed entries land in the
+# parallel arrays STANDBY_FS_MAP_FROM / STANDBY_FS_MAP_TO (stored
+# without the leading slash) that apply_fs_map() consults.
 #
-# apply_fs_suffix / derive_standby_path (and the token-remap helpers
-# they build on) are kept byte-identical to the copies in
+# apply_fs_map / derive_standby_path (and the token-remap helpers they
+# build on) are kept byte-identical to the copies in
 # primary/02_generate_standby_config.sh; the drift guard at the end
 # diffs the two new functions against the script so a change in either
 # copy fails this test. The token-remap helpers themselves are drift-
@@ -65,9 +66,9 @@ remap_path_token() {
     fi
 }
 
-apply_fs_suffix() {
-    local _p="$1" _first _rest
-    if [[ -z "${STANDBY_FS_SUFFIX:-}" ]]; then printf '%s' "$_p"; return 0; fi
+apply_fs_map() {
+    local _p="$1" _first _rest _i=0
+    if [[ ${#STANDBY_FS_MAP_FROM[@]} -eq 0 ]]; then printf '%s' "$_p"; return 0; fi
     case "$_p" in
         ""|/) printf '%s' "$_p"; return 0 ;;
         /*) ;;
@@ -76,13 +77,20 @@ apply_fs_suffix() {
     _rest="${_p#/}"
     _first="${_rest%%/*}"
     _rest="${_rest#"$_first"}"
-    printf '/%s%s%s' "$_first" "$STANDBY_FS_SUFFIX" "$_rest"
+    while [[ $_i -lt ${#STANDBY_FS_MAP_FROM[@]} ]]; do
+        if [[ "${STANDBY_FS_MAP_FROM[$_i]}" == "$_first" ]]; then
+            printf '/%s%s' "${STANDBY_FS_MAP_TO[$_i]}" "$_rest"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    printf '%s' "$_p"
 }
 
 derive_standby_path() {
     local _p
-    _p=$(remap_path_token "$1")
-    apply_fs_suffix "$_p"
+    _p=$(apply_fs_map "$1")
+    remap_path_token "$_p"
 }
 
 # Set the case-variant globals exactly as the script does.
@@ -95,89 +103,94 @@ setup_names() {
     STANDBY_DIR_NAME_LOWER=$(echo "$STANDBY_DB_UNIQUE_NAME" | tr '[:upper:]' '[:lower:]')
 }
 
-echo "Test group A: apply_fs_suffix with suffix '_s'"
+echo "Test group A: apply_fs_map with a two-entry map"
 setup_names "PROD" "STBY"
-STANDBY_FS_SUFFIX="_s"
+STANDBY_FS_MAP_FROM=("ora_1" "ora_redo")
+STANDBY_FS_MAP_TO=("ora_1_s" "ora_redo_s")
 
-assert_eq "suffix lands on the first path component only" \
-    "/ora_1_s/oradata/x" "$(apply_fs_suffix "/ora_1/oradata/x")"
+assert_eq "mapped filesystem is swapped, rest of path kept" \
+    "/ora_1_s/oradata/x" "$(apply_fs_map "/ora_1/oradata/x")"
 
-assert_eq "single-component mount gets the suffix" \
-    "/ora_redo_s" "$(apply_fs_suffix "/ora_redo")"
+assert_eq "second map entry works too" \
+    "/ora_redo_s/PROD" "$(apply_fs_map "/ora_redo/PROD")"
+
+assert_eq "single-component mount is swapped" \
+    "/ora_redo_s" "$(apply_fs_map "/ora_redo")"
+
+assert_eq "unmapped filesystem passes through unchanged" \
+    "/ora_arch/logs" "$(apply_fs_map "/ora_arch/logs")"
 
 assert_eq "trailing slash is preserved" \
-    "/ora_1_s/oradata/" "$(apply_fs_suffix "/ora_1/oradata/")"
+    "/ora_1_s/oradata/" "$(apply_fs_map "/ora_1/oradata/")"
 
 assert_eq "bare root is left unchanged" \
-    "/" "$(apply_fs_suffix "/")"
+    "/" "$(apply_fs_map "/")"
 
 assert_eq "empty path is left unchanged" \
-    "" "$(apply_fs_suffix "")"
+    "" "$(apply_fs_map "")"
 
 assert_eq "relative path is left unchanged" \
-    "ora_1/oradata" "$(apply_fs_suffix "ora_1/oradata")"
+    "ora_1/oradata" "$(apply_fs_map "ora_1/oradata")"
 
-echo "Test group B: derive_standby_path (token remap FIRST, then suffix)"
+assert_eq "only a WHOLE-component match swaps (ora_1 != ora_10)" \
+    "/ora_10/oradata" "$(apply_fs_map "/ora_10/oradata")"
 
-assert_eq "DB-name component swap and suffix compose" \
+echo "Test group B: derive_standby_path (filesystem map FIRST, then token remap)"
+
+assert_eq "filesystem swap and DB-name component swap compose" \
     "/ora_1_s/oradata/STBY" "$(derive_standby_path "/ora_1/oradata/PROD")"
 
-assert_eq "first component that IS the DB name gets both transformations" \
-    "/STBY_s/data" "$(derive_standby_path "/PROD/data")"
-
-assert_eq "lowercase token variant still remaps under the suffix" \
+assert_eq "lowercase token variant still remaps under a mapped filesystem" \
     "/ora_1_s/stby/x" "$(derive_standby_path "/ora_1/prod/x")"
 
-assert_eq "token-less path still gets the filesystem rename" \
-    "/ora_arch_s/logs" "$(derive_standby_path "/ora_arch/logs")"
+assert_eq "unmapped filesystem still gets the token remap" \
+    "/ora_arch/STBY/logs" "$(derive_standby_path "/ora_arch/PROD/logs")"
 
-echo "Test group C: empty suffix is a byte-exact no-op (scenario 1)"
-STANDBY_FS_SUFFIX=""
+# The map's keys are the PRIMARY filesystem names as the operator was
+# shown them - a first component that IS the DB name is offered and
+# mapped under its primary name, and the explicit answer wins (no
+# token remap is applied on top of it).
+STANDBY_FS_MAP_FROM=("PROD")
+STANDBY_FS_MAP_TO=("PROD_s")
+assert_eq "first component that IS the DB name maps under its primary name" \
+    "/PROD_s/data" "$(derive_standby_path "/PROD/data")"
 
-assert_eq "derive_standby_path == remap_path_token when suffix is empty" \
+echo "Test group C: empty map is a byte-exact no-op (same-filesystems scenario)"
+STANDBY_FS_MAP_FROM=()
+STANDBY_FS_MAP_TO=()
+
+assert_eq "derive_standby_path == remap_path_token when the map is empty" \
     "$(remap_path_token "/ora_1/oradata/PROD")" \
     "$(derive_standby_path "/ora_1/oradata/PROD")"
 
-assert_eq "token-less path passes through unchanged when suffix is empty" \
+assert_eq "token-less path passes through unchanged when the map is empty" \
     "/ora_arch/logs" "$(derive_standby_path "/ora_arch/logs")"
 
-unset STANDBY_FS_SUFFIX
-assert_eq "unset suffix behaves like empty (no-op)" \
-    "/ora_1/oradata/x" "$(apply_fs_suffix "/ora_1/oradata/x")"
+echo "Test group D: multi-component map targets"
+STANDBY_FS_MAP_FROM=("ora_1")
+STANDBY_FS_MAP_TO=("mnt/oracle/ora_1")
 
-echo "Test group D: other suffix charsets"
-STANDBY_FS_SUFFIX="-dr2"
+assert_eq "a target with interior slashes relocates the filesystem" \
+    "/mnt/oracle/ora_1/oradata/PROD" "$(apply_fs_map "/ora_1/oradata/PROD")"
 
-assert_eq "suffix with '-' and digits works" \
-    "/ora_1-dr2/oradata" "$(apply_fs_suffix "/ora_1/oradata")"
-
-echo "Test group E: ORACLE_BASE last-component rule (inline expression)"
-# The script appends the suffix to the END of ORACLE_BASE (the software
-# mount is not renamed): STANDBY_ORACLE_BASE="${PRIMARY_ORACLE_BASE%/}${STANDBY_FS_SUFFIX}"
-STANDBY_FS_SUFFIX="_s"
-PRIMARY_ORACLE_BASE="/u01/app/oracle"
-assert_eq "ORACLE_BASE default gets the suffix on its last component" \
-    "/u01/app/oracle_s" "${PRIMARY_ORACLE_BASE%/}${STANDBY_FS_SUFFIX}"
-
-PRIMARY_ORACLE_BASE="/u01/app/oracle/"
-assert_eq "ORACLE_BASE trailing slash is stripped before appending" \
-    "/u01/app/oracle_s" "${PRIMARY_ORACLE_BASE%/}${STANDBY_FS_SUFFIX}"
+assert_eq "token remap still applies after a multi-component relocation" \
+    "/mnt/oracle/ora_1/oradata/STBY" "$(derive_standby_path "/ora_1/oradata/PROD")"
 
 # ------------------------------------------------------------
-# Drift guard: the apply_fs_suffix / derive_standby_path copies above
+# Drift guard: the apply_fs_map / derive_standby_path copies above
 # must stay byte-identical to primary/02_generate_standby_config.sh,
 # or these tests validate code that no longer ships.
 # ------------------------------------------------------------
-echo "Test group F: copies have not drifted from the script"
+echo "Test group E: copies have not drifted from the script"
 _SCRIPT="$(dirname "$0")/../primary/02_generate_standby_config.sh"
 if [[ ! -f "$_SCRIPT" ]]; then
     echo "  FAIL: cannot find $_SCRIPT"
     FAIL=$((FAIL + 1))
 else
-    for _fn in apply_fs_suffix derive_standby_path; do
+    for _fn in apply_fs_map derive_standby_path; do
         # Range: the function header through its first column-0 '}'.
-        _TMP_A="${TMPDIR:-/tmp}/fss_script.$$"
-        _TMP_B="${TMPDIR:-/tmp}/fss_test.$$"
+        _TMP_A="${TMPDIR:-/tmp}/fsm_script.$$"
+        _TMP_B="${TMPDIR:-/tmp}/fsm_test.$$"
         awk "/^${_fn}\\(\\) \\{/,/^\\}\$/" "$_SCRIPT" > "$_TMP_A"
         awk "/^${_fn}\\(\\) \\{/,/^\\}\$/" "$0"       > "$_TMP_B"
         if [[ ! -s "$_TMP_A" ]]; then

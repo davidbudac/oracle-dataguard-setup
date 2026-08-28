@@ -502,16 +502,19 @@ remap_path_token() {
     fi
 }
 
-# Echo path $1 with STANDBY_FS_SUFFIX appended to its FIRST path
-# component (the filesystem/mount): /ora_1/oradata/X -> /ora_1_s/oradata/X,
-# /ora_redo -> /ora_redo_s. Empty suffix, bare "/", empty, and
-# non-absolute paths pass through unchanged. Pure parameter expansion -
-# portable to AIX / bash 3.2. Copied verbatim into
-# tests/test_fs_suffix_remap.sh, whose drift guard diffs the copies -
-# keep the function name and closing brace at column 0.
-apply_fs_suffix() {
-    local _p="$1" _first _rest
-    if [[ -z "${STANDBY_FS_SUFFIX:-}" ]]; then printf '%s' "$_p"; return 0; fi
+# Echo path $1 with its FIRST path component (the filesystem/mount)
+# swapped per the Q1b per-filesystem map held in the parallel arrays
+# STANDBY_FS_MAP_FROM / STANDBY_FS_MAP_TO (entries stored WITHOUT the
+# leading slash; a TO entry may contain interior slashes, so /ora_1 can
+# map to /mnt/ora_1). A path whose first component is not in the map -
+# and bare "/", empty, and non-absolute paths - pass through unchanged.
+# Pure parameter expansion plus an array walk - portable to AIX /
+# bash 3.2 (no associative arrays). Copied verbatim into
+# tests/test_fs_remap.sh, whose drift guard diffs the copies - keep the
+# function name and closing brace at column 0.
+apply_fs_map() {
+    local _p="$1" _first _rest _i=0
+    if [[ ${#STANDBY_FS_MAP_FROM[@]} -eq 0 ]]; then printf '%s' "$_p"; return 0; fi
     case "$_p" in
         ""|/) printf '%s' "$_p"; return 0 ;;
         /*) ;;
@@ -520,17 +523,25 @@ apply_fs_suffix() {
     _rest="${_p#/}"
     _first="${_rest%%/*}"
     _rest="${_rest#"$_first"}"
-    printf '/%s%s%s' "$_first" "$STANDBY_FS_SUFFIX" "$_rest"
+    while [[ $_i -lt ${#STANDBY_FS_MAP_FROM[@]} ]]; do
+        if [[ "${STANDBY_FS_MAP_FROM[$_i]}" == "$_first" ]]; then
+            printf '/%s%s' "${STANDBY_FS_MAP_TO[$_i]}" "$_rest"
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    printf '%s' "$_p"
 }
 
-# One derivation path for every standby DB-file default: DB-name token
-# remap FIRST, then the filesystem suffix - so a first component that IS
-# the DB name gets renamed to the standby name and then suffixed. Also
-# copied verbatim into tests/test_fs_suffix_remap.sh (drift-guarded).
+# One derivation path for every standby DB-file default: the Q1b
+# filesystem map FIRST (its keys are the PRIMARY filesystem names, as
+# the operator was shown them), then the DB-name token remap on the
+# rest of the path. Also copied verbatim into tests/test_fs_remap.sh
+# (drift-guarded).
 derive_standby_path() {
     local _p
-    _p=$(remap_path_token "$1")
-    apply_fs_suffix "$_p"
+    _p=$(apply_fs_map "$1")
+    remap_path_token "$_p"
 }
 
 # ============================================================
@@ -569,44 +580,115 @@ STANDBY_DB_RECOVERY_FILE_DEST_SIZE=""
 STANDBY_FRA=""
 STANDBY_ARCHIVE_DEST=""
 USE_FRA_FOR_STANDBY=""
-STANDBY_FS_SUFFIX=""
+STANDBY_FS_MAP_FROM=()
+STANDBY_FS_MAP_TO=()
+_q1b_asked="NO"
+
+# Fallback: if step 1 did not write the *_PATHS arrays (older config
+# files), populate from the singular *_PATH so both Q1b's filesystem
+# collection and the derivation loops below still work end-to-end.
+if [[ -z "${PRIMARY_DATA_PATHS+x}" || ${#PRIMARY_DATA_PATHS[@]} -eq 0 ]]; then
+    PRIMARY_DATA_PATHS=("$PRIMARY_DATA_PATH")
+fi
+if [[ -z "${PRIMARY_REDO_PATHS+x}" || ${#PRIMARY_REDO_PATHS[@]} -eq 0 ]]; then
+    PRIMARY_REDO_PATHS=("$PRIMARY_REDO_PATH")
+fi
 
 # ============================================================
-# Q1b - Standby file locations (Traditional only; OMF operators type
+# Q1b - Standby filesystems (Traditional only; OMF operators type
 # their dests explicitly). TTY-gated: the E2E suites drive this script
 # with a fixed piped-stdin line sequence, so NO input may be consumed
-# here - non-interactive runs get scenario 1 (identical paths, empty
-# suffix = exactly the pre-Q1b behavior). The suffix prompt must stay
-# inside the same guard as the mode question.
+# here - non-interactive runs get identical filesystems (empty map =
+# exactly the pre-Q1b behavior). Every prompt in this feature must
+# stay inside the same guard as the opening question.
+#
+# If the operator says the standby's filesystems ARE named
+# differently, each distinct filesystem (the FIRST path component)
+# found across the primary's datafile, redo, archive, and FRA paths
+# is listed and the operator supplies its standby counterpart -
+# accepting the default keeps that filesystem's name unchanged. Only
+# changed entries go into the STANDBY_FS_MAP_FROM/_TO map that
+# apply_fs_map() consults.
 # ============================================================
-if [[ "$STANDBY_STORAGE_MODE" == "TRADITIONAL" && -t 0 ]]; then
-    echo ""
-    echo "Q1b) Standby file locations (datafiles, redo, SRLs, archive/FRA"
-    echo "     defaults, and the standby ORACLE_BASE default):"
-    echo "  1) Same paths as primary (DB-name directory components are"
-    echo "     still renamed to ${STANDBY_DB_UNIQUE_NAME})"
-    echo "  2) Same layout on renamed filesystems - one suffix appended to"
-    echo "     the FIRST path component of every location, e.g. suffix '_s':"
-    echo "       /ora_1/oradata -> /ora_1_s/oradata, /ora_redo -> /ora_redo_s"
-    echo "     (the ORACLE_BASE default gets the suffix on its LAST"
-    echo "     component instead: /u01/app/oracle -> /u01/app/oracle_s)"
-    echo ""
-    prompt_with_default "File location mode" "1" _layout_choice
-    if [[ "$_layout_choice" == "2" ]]; then
-        while :; do
-            prompt_with_default "Filesystem suffix (e.g. _s)" "" STANDBY_FS_SUFFIX
-            if [[ -z "$STANDBY_FS_SUFFIX" ]]; then
-                echo "Suffix cannot be empty (choose mode 1 for identical paths)"
-                continue
-            fi
-            case "$STANDBY_FS_SUFFIX" in
-                *[!A-Za-z0-9_-]*)
-                    echo "Suffix may only contain letters, digits, '_' and '-'"
-                    ;;
-                *) break ;;
+
+# Collect the unique first path components (with a what-lives-there
+# label) into the parallel arrays _q1b_fs / _q1b_lbl.
+_q1b_fs=()
+_q1b_lbl=()
+_q1b_add_fs() {
+    # $1 = absolute path, $2 = label
+    local _p="$1" _lbl="$2" _fs _i=0
+    case "$_p" in
+        /?*) ;;
+        *) return 0 ;;
+    esac
+    _fs="${_p#/}"
+    _fs="/${_fs%%/*}"
+    while [[ $_i -lt ${#_q1b_fs[@]} ]]; do
+        if [[ "${_q1b_fs[$_i]}" == "$_fs" ]]; then
+            case ", ${_q1b_lbl[$_i]}," in
+                *", ${_lbl},"*) ;;
+                *) _q1b_lbl[$_i]="${_q1b_lbl[$_i]}, ${_lbl}" ;;
             esac
+            return 0
+        fi
+        _i=$((_i + 1))
+    done
+    _q1b_fs+=("$_fs")
+    _q1b_lbl+=("$_lbl")
+}
+
+if [[ "$STANDBY_STORAGE_MODE" == "TRADITIONAL" && -t 0 ]]; then
+    _q1b_asked="YES"
+    for _p in "${PRIMARY_DATA_PATHS[@]}"; do _q1b_add_fs "$_p" "datafiles"; done
+    for _p in "${PRIMARY_REDO_PATHS[@]}"; do _q1b_add_fs "$_p" "redo logs"; done
+    [[ -n "${PRIMARY_ARCHIVE_DEST:-}" ]] && _q1b_add_fs "$PRIMARY_ARCHIVE_DEST" "archive logs"
+    [[ -n "${DB_RECOVERY_FILE_DEST:-}" ]] && _q1b_add_fs "$DB_RECOVERY_FILE_DEST" "FRA"
+
+    echo ""
+    echo "Q1b) The standby's directory layout is derived from the primary's"
+    echo "     (DB-name directory components are renamed to ${STANDBY_DB_UNIQUE_NAME})."
+    echo "     The primary keeps its files on these filesystems:"
+    _i=0
+    while [[ $_i -lt ${#_q1b_fs[@]} ]]; do
+        printf '       %-20s (%s)\n' "${_q1b_fs[$_i]}" "${_q1b_lbl[$_i]}"
+        _i=$((_i + 1))
+    done
+    echo ""
+    printf "Are any of these filesystems named DIFFERENTLY on the standby host? [y/N]: "
+    read _q1b_remap
+    _q1b_remap=$(echo "$_q1b_remap" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')
+    if [[ "$_q1b_remap" == "y" || "$_q1b_remap" == "yes" ]]; then
+        echo ""
+        echo "For each primary filesystem, enter its name on the standby"
+        echo "(accept the default to keep the same name):"
+        _i=0
+        while [[ $_i -lt ${#_q1b_fs[@]} ]]; do
+            _q1b_from="${_q1b_fs[$_i]}"
+            while :; do
+                prompt_with_default "Standby filesystem for ${_q1b_from} (${_q1b_lbl[$_i]})" "$_q1b_from" _q1b_to
+                [[ "$_q1b_to" != "/" ]] && _q1b_to="${_q1b_to%/}"
+                case "$_q1b_to" in
+                    /?*) ;;
+                    *) echo "Enter an absolute path (starting with /)"; continue ;;
+                esac
+                case "$_q1b_to" in
+                    *[!A-Za-z0-9_./-]*)
+                        echo "Path may only contain letters, digits, '/', '_', '.' and '-'"
+                        continue ;;
+                esac
+                break
+            done
+            if [[ "$_q1b_to" != "$_q1b_from" ]]; then
+                STANDBY_FS_MAP_FROM+=("${_q1b_from#/}")
+                STANDBY_FS_MAP_TO+=("${_q1b_to#/}")
+                log_info "Filesystem remap: ${_q1b_from} -> ${_q1b_to}"
+            fi
+            _i=$((_i + 1))
         done
-        log_info "Standby filesystems will be renamed with suffix '${STANDBY_FS_SUFFIX}' (e.g. /ora_1 -> /ora_1${STANDBY_FS_SUFFIX})"
+        if [[ ${#STANDBY_FS_MAP_FROM[@]} -eq 0 ]]; then
+            log_info "All filesystems kept their primary names (no remap)"
+        fi
     fi
 fi
 
@@ -678,8 +760,8 @@ case "$_archive_choice" in
             if [[ "$_fra_default" == "$DB_RECOVERY_FILE_DEST" ]]; then
                 _fra_default="$DB_RECOVERY_FILE_DEST"
             fi
-            # Q1b filesystem rename (no-op when the suffix is empty)
-            _fra_default=$(apply_fs_suffix "$_fra_default")
+            # Q1b filesystem remap (no-op when the map is empty)
+            _fra_default=$(apply_fs_map "$_fra_default")
         fi
         prompt_with_default "Standby FRA path (db_recovery_file_dest)" "$_fra_default" STANDBY_FRA
         if [[ -z "$STANDBY_FRA" ]]; then
@@ -731,15 +813,9 @@ progress_step "Generating Path Conversions"
 # DB_FILE_NAME_CONVERT - without that, datafiles outside the first
 # directory get the wrong path and step 5 fails.
 
-# Fallback: if step 1 did not write the *_PATHS arrays (older config
-# files), populate from the singular *_PATH so the new code still
-# works end-to-end.
-if [[ -z "${PRIMARY_DATA_PATHS+x}" || ${#PRIMARY_DATA_PATHS[@]} -eq 0 ]]; then
-    PRIMARY_DATA_PATHS=("$PRIMARY_DATA_PATH")
-fi
-if [[ -z "${PRIMARY_REDO_PATHS+x}" || ${#PRIMARY_REDO_PATHS[@]} -eq 0 ]]; then
-    PRIMARY_REDO_PATHS=("$PRIMARY_REDO_PATH")
-fi
+# (The *_PATHS array fallback for older step-1 config files now runs
+# earlier, just before Q1b, which needs the arrays for its filesystem
+# collection.)
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     # OMF mode: paths are managed by Oracle, no FILE_NAME_CONVERT needed
@@ -764,8 +840,8 @@ else
 # derive_standby_path and its helpers are defined above (right after
 # the STANDBY_DB_UNIQUE_NAME prompt) because the archive-destination
 # default also uses them. Each path below is remapped INDEPENDENTLY:
-# DB-name token swap first, then the Q1b filesystem suffix (no-op when
-# the suffix is empty).
+# the Q1b filesystem remap first (no-op when the map is empty), then
+# the DB-name token swap.
 
 # Derive matching standby paths for each primary directory.
 STANDBY_DATA_PATHS=()
@@ -795,10 +871,11 @@ STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
 # Surface each unmapped path and let the operator confirm (accept the
 # identical default) or override it with the correct standby directory.
 # Uses eval-based array indirection for bash 3.2 / AIX compatibility.
-# NOTE: with a Q1b filesystem suffix in effect every derived path
-# differs from the primary's, so this check can only fire in the
-# empty-suffix (identical filesystems) scenario - which is exactly when
-# an unchanged path is ambiguous and worth confirming.
+# NOTE: only reached when Q1b was NOT asked (piped stdin / OMF start).
+# When Q1b ran, the operator already declared per filesystem whether
+# the standby's name differs, so an identical derived path is a stated
+# choice - re-asking here for every such path would just interrupt the
+# flow (the mapping review table below remains the safety net).
 _confirm_unmapped_paths() {
     # $1 = human label, $2 = primary array name, $3 = standby array name
     local _label="$1" _pri_arr="$2" _stby_arr="$3"
@@ -827,8 +904,10 @@ _confirm_unmapped_paths() {
         _i=$(( _i + 1 ))
     done
 }
-_confirm_unmapped_paths "datafile" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS
-_confirm_unmapped_paths "redo log" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
+if [[ "$_q1b_asked" != "YES" ]]; then
+    _confirm_unmapped_paths "datafile" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS
+    _confirm_unmapped_paths "redo log" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS
+fi
 
 # ============================================================
 # Interactive mapping review (interactive terminals only)
@@ -1019,15 +1098,10 @@ progress_step "Generating Admin Directories"
 # STANDBY_ORACLE_BASE, and the listener snippet uses
 # STANDBY_ORACLE_HOME). With piped stdin (E2E suite's fixed input
 # sequence) the primary's values are kept silently - no input is read.
-# A Q1b filesystem suffix goes on ORACLE_BASE's LAST component
-# (/u01/app/oracle -> /u01/app/oracle_s) - the software mount itself
-# is not renamed, unlike the DB-file filesystems. Default only; the
-# prompt below still lets the operator override it.
-if [[ -n "$STANDBY_FS_SUFFIX" ]]; then
-    STANDBY_ORACLE_BASE="${PRIMARY_ORACLE_BASE%/}${STANDBY_FS_SUFFIX}"
-else
-    STANDBY_ORACLE_BASE="$PRIMARY_ORACLE_BASE"
-fi
+# The Q1b filesystem remap deliberately does NOT touch ORACLE_BASE -
+# the software mount is typically not renamed even when the DB-file
+# filesystems are; override at the prompt below if yours is.
+STANDBY_ORACLE_BASE="$PRIMARY_ORACLE_BASE"
 STANDBY_ORACLE_HOME="$PRIMARY_ORACLE_HOME"
 if [[ -t 0 ]]; then
     prompt_with_default "Standby ORACLE_BASE" "$STANDBY_ORACLE_BASE" STANDBY_ORACLE_BASE
@@ -1056,6 +1130,15 @@ log_info "Recommended standby redo groups: $RECOMMENDED_STBY_GROUPS"
 # ============================================================
 
 progress_step "Writing Standby Configuration Files"
+
+# Record of the Q1b per-filesystem remap, rendered as space-separated
+# "/from=/to" entries for the .env below (record only - see there).
+_fs_map_record=""
+_i=0
+while [[ $_i -lt ${#STANDBY_FS_MAP_FROM[@]} ]]; do
+    _fs_map_record="${_fs_map_record}${_fs_map_record:+ }/${STANDBY_FS_MAP_FROM[$_i]}=/${STANDBY_FS_MAP_TO[$_i]}"
+    _i=$((_i + 1))
+done
 
 # Use STANDBY_DB_UNIQUE_NAME in filename to support concurrent builds
 STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config_${STANDBY_DB_UNIQUE_NAME}.env"
@@ -1100,11 +1183,11 @@ COMPATIBLE="$COMPATIBLE"
 STANDBY_STORAGE_MODE="$STANDBY_STORAGE_MODE"
 # OMF only: base directory for data, redo, and control files (empty in Traditional mode)
 STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
-# Filesystem suffix applied to the first path component of derived
-# standby paths at generation time (Q1b; record only - the path ARRAYS
-# below are the truth; --regenerate re-derives convert pairs from them
-# and never re-applies this suffix)
-STANDBY_FS_SUFFIX="$STANDBY_FS_SUFFIX"
+# Per-filesystem remap ("/primary_fs=/standby_fs" entries) applied to
+# the first path component of derived standby paths at generation time
+# (Q1b; record only - the path ARRAYS below are the truth; --regenerate
+# re-derives convert pairs from them and never re-applies this map)
+STANDBY_FS_MAP="$_fs_map_record"
 
 # --- Path Conversions (Traditional mode only) ---
 # *_DATA_PATH  = primary/standby's FIRST datafile directory (backward compat)
