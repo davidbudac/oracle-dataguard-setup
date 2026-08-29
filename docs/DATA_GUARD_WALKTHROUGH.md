@@ -569,8 +569,14 @@ lsnrctl status
    an explicit `THREAD` clause
 5. Enables Data Guard Broker (DG_BROKER_START=TRUE)
 6. Sets STANDBY_FILE_MANAGEMENT=AUTO
-7. Configures RMAN archivelog deletion policy
-8. Tests network connectivity to standby
+7. Tests network connectivity to standby
+
+> The RMAN archivelog deletion policy (`SHIPPED TO ALL STANDBY`) is **not** set
+> here. With no standby yet receiving redo, that policy would make every
+> archived log non-deletable to RMAN/FRA maintenance — on a busy primary with a
+> tight FRA this can fill the FRA and hang the database (ORA-00257) before the
+> clone finishes. Step 6 sets it after the broker configuration is healthy and
+> transport is confirmed shipping.
 
 > Standby redo logs are also needed on the **standby** side (for the post-switchover
 > primary role). Step 5's RMAN duplicate recreates them there from the primary's
@@ -625,11 +631,6 @@ EXIT;
 ```
 
 ```bash
-# Configure RMAN archivelog deletion policy
-rman target /
-CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
-EXIT;
-
 # Test connectivity to standby
 tnsping TESTDB_STBY
 ```
@@ -738,6 +739,11 @@ EXIT;
 6. Enables the configuration
 7. Verifies configuration status
 8. Tests log shipping with forced log switch
+9. Sets the primary's RMAN archivelog deletion policy to `SHIPPED TO ALL
+   STANDBY` — done here (not in Step 4) because the policy blocks archivelog
+   deletion until a standby has received the logs; setting it before transport
+   works risks filling the FRA (ORA-00257). Skipped (with the manual command
+   printed) if the broker configuration did not reach SUCCESS/WARNING
 
 ### Manual Equivalent
 
@@ -791,6 +797,14 @@ EXIT;
 -- Verify log shipping in DGMGRL
 dgmgrl /
 SHOW DATABASE 'TESTDB_STBY' 'LogXptStatus';
+EXIT;
+```
+
+```bash
+# Only once SHOW CONFIGURATION is SUCCESS and log shipping works:
+# configure the RMAN archivelog deletion policy on the primary
+rman target /
+CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;
 EXIT;
 ```
 

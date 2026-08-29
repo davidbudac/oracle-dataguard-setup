@@ -58,7 +58,8 @@ progress_step "Reviewing Planned Changes"
 print_list_block "This Step Will Change" \
     "Create or recreate the Data Guard Broker configuration ${DG_BROKER_CONFIG_NAME:-${PRIMARY_DB_NAME}_DG}." \
     "Add ${STANDBY_DB_UNIQUE_NAME} as a physical standby in Broker." \
-    "Enable the Broker configuration and force a logfile switch test."
+    "Enable the Broker configuration and force a logfile switch test." \
+    "Set the primary RMAN archivelog deletion policy to SHIPPED TO ALL STANDBY (only once the configuration is healthy)."
 
 print_list_block "This Step Will Not Change" \
     "It will not run RMAN DUPLICATE." \
@@ -431,6 +432,35 @@ log_info "Checking log shipping status..."
 run_dgmgrl "show_log_status.dgmgrl" "$STANDBY_DB_UNIQUE_NAME"
 
 # ============================================================
+# Configure RMAN Archivelog Deletion Policy (Primary)
+# ============================================================
+# Deliberately done HERE and not in step 4: SHIPPED TO ALL STANDBY makes
+# archived logs non-deletable to RMAN/FRA maintenance until a standby has
+# received them. Set before transport works, it can fill the FRA and hang
+# the primary (ORA-00257). By this point the broker configuration is
+# SUCCESS/WARNING and a test log switch has shipped, so the policy is safe.
+# Non-fatal: a failure here must not mask the broker result in the summary.
+
+log_section "Configuring RMAN Archivelog Deletion Policy"
+
+if [[ "$BROKER_STATUS" == "SUCCESS" || "$BROKER_STATUS" == "WARNING" ]]; then
+    log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
+    log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
+    if run_rman "configure_archivelog_deletion.rman"; then
+        log_success "RMAN archivelog deletion policy configured"
+    else
+        log_warn "Failed to set the RMAN archivelog deletion policy"
+        log_warn "Set it manually once transport is confirmed:"
+        log_warn "  rman target / <<< \"CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;\""
+    fi
+else
+    log_warn "Broker status is ${BROKER_STATUS} - skipping the deletion policy change"
+    log_warn "Without working transport the policy would block all archivelog deletion (FRA fill / ORA-00257 risk)"
+    log_warn "After the configuration is healthy, set it manually:"
+    log_warn "  rman target / <<< \"CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY;\""
+fi
+
+# ============================================================
 # Summary
 # ============================================================
 
@@ -451,7 +481,8 @@ print_list_block "Completed Actions" \
     "Created the broker configuration." \
     "Added the primary and standby databases." \
     "Enabled the configuration." \
-    "Forced a log switch to test redo transport."
+    "Forced a log switch to test redo transport." \
+    "Set the primary RMAN archivelog deletion policy (when the configuration was healthy)."
 
 print_list_block "Broker Management Commands" \
     "dgmgrl / \"show configuration\"" \

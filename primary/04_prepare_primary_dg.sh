@@ -488,18 +488,13 @@ log_success "Data Guard Broker enabled successfully"
 log_info "Note: LOG_ARCHIVE_DEST_2, FAL_SERVER, etc. will be configured by DGMGRL"
 record_artifact "tnsnames:${TNSNAMES_ORA}"
 
-# ============================================================
-# Configure RMAN Archivelog Deletion Policy
-# ============================================================
-
-log_section "Configuring RMAN Archivelog Deletion Policy"
-
-log_info "Setting archivelog deletion policy to SHIPPED TO ALL STANDBY..."
-log_cmd "rman target /" "CONFIGURE ARCHIVELOG DELETION POLICY TO SHIPPED TO ALL STANDBY"
-
-run_rman "configure_archivelog_deletion.rman"
-
-log_success "RMAN archivelog deletion policy configured"
+# NOTE: the RMAN archivelog deletion policy (SHIPPED TO ALL STANDBY) is
+# deliberately NOT set here. At this point no standby exists, so the policy
+# would immediately make every archived log non-deletable to RMAN/FRA
+# maintenance; on a busy primary with a tight FRA that can fill the FRA and
+# hang the database (ORA-00257) before steps 5-6 complete. Step 6 sets it
+# after the broker configuration reaches SUCCESS/WARNING, i.e. once redo
+# transport is actually shipping.
 
 # ============================================================
 # Verify Network Connectivity to Standby
