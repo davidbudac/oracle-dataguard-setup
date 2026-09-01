@@ -11,11 +11,16 @@
 # - Sets LogXptMode to FASTSYNC
 # - Enables Fast-Start Failover
 # - Copies password file to NFS for observer server
-# - Outputs wallet setup instructions for observer
+# - Checks whether an observer is already connected and, if not, asks
+#   where the observer will run: walks through fsfo/observer.sh for a
+#   repo/NFS host, or generates the add_observer third-host bundle on
+#   the spot (its step 1 runs on the primary anyway)
 #
-# After running this script, set up the observer:
-#   1. On the observer server, run: ./fsfo/observer.sh setup
-#   2. Then start the observer: ./fsfo/observer.sh start
+# After running this script, set up the observer (unless one is
+# already connected):
+#   - repo/NFS host: ./fsfo/observer.sh setup && ./fsfo/observer.sh start
+#   - third host:    copy observer_bundle_<PRIMARY_DB_UNIQUE_NAME>/ there
+#                    and follow its RUN_ON_OBSERVER_HOST.md
 # ============================================================
 
 set -e
@@ -36,7 +41,7 @@ FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
 # ============================================================
 
 print_banner "Step 9: Configure Fast-Start Failover"
-init_progress 14
+init_progress 15
 
 # Initialize logging
 init_log "09_configure_fsfo"
@@ -189,7 +194,8 @@ print_list_block "This Step Will Change" \
     "Create or update an observer user with SYSDG privilege." \
     "Set LogXptMode to FASTSYNC on ${PRIMARY_DB_UNIQUE_NAME} and ${STANDBY_DB_UNIQUE_NAME}." \
     "Set protection mode to MAXIMUM AVAILABILITY when needed." \
-    "Enable Fast-Start Failover and persist observer metadata into ${STANDBY_CONFIG_FILE}."
+    "Enable Fast-Start Failover and persist observer metadata into ${STANDBY_CONFIG_FILE}." \
+    "Ask where the observer will run and, for a third host, optionally generate the add_observer bundle."
 
 print_list_block "This Step Will Not Change" \
     "It will not start the observer process." \
@@ -607,8 +613,103 @@ run_dgmgrl "show_fsfo_status.dgmgrl"
 echo ""
 
 # ============================================================
+# Observer Placement
+# ============================================================
+
+progress_step "Observer Placement"
+
+# FSFO is now enabled, but automatic failover stays dormant until an
+# observer watches the configuration. Find out whether one is already
+# connected and, when running interactively, ask where the observer is
+# going to live: walk the operator through fsfo/observer.sh for a host
+# that has this repo + the NFS share, or generate the add_observer
+# third-host bundle right here (its step 1 runs on the primary anyway).
+#
+# Every prompt below is TTY-gated: piped runs (the E2E suite) must keep
+# their exact stdin sequence, so they skip straight to the printed
+# guidance - the pre-integration behavior.
+
+OBSERVER_PRESENT=""
+OBSERVER_HOST_SEEN=""
+FSFO_OBS_STATE=$(run_sql_query "get_fsfo_status.sql" 2>/dev/null | grep '|' | head -1) || FSFO_OBS_STATE=""
+if [[ -n "$FSFO_OBS_STATE" ]]; then
+    OBSERVER_PRESENT=$(echo "$FSFO_OBS_STATE" | awk -F'|' '{print $2}' | tr -d ' \t\r')
+    OBSERVER_HOST_SEEN=$(echo "$FSFO_OBS_STATE" | awk -F'|' '{print $3}' | tr -d ' \t\r')
+fi
+
+# What the summary should tell the operator to do next:
+#   present           - observer already connected, nothing to set up
+#   running-elsewhere - operator says one exists, broker cannot see it
+#   third-host        - add_observer bundle generated in this run
+#   repo-host/manual  - fsfo/observer.sh walkthrough
+OBSERVER_NEXT="manual"
+
+if [[ "$OBSERVER_PRESENT" == "YES" ]]; then
+    log_info "An observer is already connected (host: ${OBSERVER_HOST_SEEN:-unknown})"
+    log_info "Nothing to set up - automatic failover is fully armed."
+    OBSERVER_NEXT="present"
+elif [[ -t 0 ]]; then
+    echo ""
+    echo "FSFO is enabled, but the broker does not see an observer yet"
+    echo "(FS_FAILOVER_OBSERVER_PRESENT=${OBSERVER_PRESENT:-unknown})."
+    echo "Automatic failover will NOT happen until an observer is running."
+    echo ""
+
+    prompt_with_default "Is an observer already set up on another host? (y/n)" "n" OBS_ALREADY_SETUP
+    case "$OBS_ALREADY_SETUP" in
+        [yY]*)
+            OBSERVER_NEXT="running-elsewhere"
+            log_warn "The broker does not report that observer as connected."
+            log_warn "Start (or restart) it on its host, then verify the broker sees it."
+            ;;
+        *)
+            echo ""
+            echo "Where will the observer run?"
+            echo ""
+            echo "  1) The STANDBY host, or any host that has this repository and"
+            echo "     the NFS share mounted  ->  fsfo/observer.sh (walkthrough printed)"
+            echo "  2) A dedicated THIRD host without this repository  ->  generate a"
+            echo "     self-contained add_observer bundle now, from this primary"
+            echo "  3) Decide later"
+            echo ""
+            prompt_with_default "Select option" "1" OBS_PLACEMENT
+
+            case "$OBS_PLACEMENT" in
+                2)
+                    echo ""
+                    log_info "Running add_observer/01_prepare_primary.sh (reusing observer user ${OBSERVER_USER})..."
+                    log_info "It rechecks FSFO readiness, prompts for the third host's name, and writes the bundle."
+                    echo ""
+                    if bash "${SCRIPT_DIR}/../add_observer/01_prepare_primary.sh" -u "$OBSERVER_USER"; then
+                        OBSERVER_NEXT="third-host"
+                        record_next_step "scp -r ./observer_bundle_${PRIMARY_DB_UNIQUE_NAME} <observer-host>:~/"
+                    else
+                        log_warn "Bundle preparation did not finish. Re-run it any time with:"
+                        log_warn "  ./add_observer/01_prepare_primary.sh -u ${OBSERVER_USER}"
+                    fi
+                    ;;
+                3)
+                    : # decide later - keep the generic walkthrough
+                    ;;
+                *)
+                    OBSERVER_NEXT="repo-host"
+                    ;;
+            esac
+            ;;
+    esac
+else
+    log_info "Non-interactive run - observer setup instructions are printed below."
+fi
+
+# ============================================================
 # Summary
 # ============================================================
+
+if [[ "$OBSERVER_NEXT" == "present" ]]; then
+    OBSERVER_SUMMARY_STATE="CONNECTED (${OBSERVER_HOST_SEEN:-unknown})"
+else
+    OBSERVER_SUMMARY_STATE="NOT RUNNING YET"
+fi
 
 print_summary "SUCCESS" "Fast-Start Failover configured"
 print_status_block "FSFO Configuration" \
@@ -616,17 +717,41 @@ print_status_block "FSFO Configuration" \
     "LogXptMode" "FASTSYNC" \
     "FSFO Threshold" "${FSFO_THRESHOLD} seconds" \
     "FSFO Target" "$STANDBY_DB_UNIQUE_NAME" \
-    "Observer User" "$OBSERVER_USER"
+    "Observer User" "$OBSERVER_USER" \
+    "Observer" "$OBSERVER_SUMMARY_STATE"
 
-print_list_block "Observer Setup" \
-    "Ensure Oracle client is installed on the observer host." \
-    "Configure tnsnames.ora with ${PRIMARY_TNS_ALIAS} and ${STANDBY_TNS_ALIAS}." \
-    "Run ./fsfo/observer.sh setup." \
-    "Run ./fsfo/observer.sh start." \
-    "Verify with ./fsfo/observer.sh status."
+case "$OBSERVER_NEXT" in
+    present)
+        print_list_block "Observer" \
+            "Observer already connected from ${OBSERVER_HOST_SEEN:-unknown} - no further setup needed." \
+            "Monitor it with ./fsfo/observer.sh status (repo host) or dg_status.sh."
+        ;;
+    running-elsewhere)
+        print_list_block "Observer Setup" \
+            "Start the existing observer on its host: ./fsfo/observer.sh start (repo host) or ./03_observer_ctl.sh start (add_observer third host)." \
+            "Verify: dgmgrl / 'show fast_start failover' must report Observer Present." \
+            "dg_status.sh treats a missing observer as an ERROR while FSFO is enabled."
+        ;;
+    third-host)
+        print_list_block "Observer Setup (third host)" \
+            "Copy the generated observer_bundle_${PRIMARY_DB_UNIQUE_NAME}/ directory to the third host (scp command printed above)." \
+            "On the third host, run ./02_setup_observer_host.sh (TNS entries + wallet + both-database connectivity proof)." \
+            "Then ./03_observer_ctl.sh start and ./04_verify_observer.sh." \
+            "Optional: ./03_observer_ctl.sh boot to survive reboots (systemd unit / cron @reboot + watchdog)."
+        ;;
+    *)
+        print_list_block "Observer Setup" \
+            "Ensure Oracle client is installed on the observer host." \
+            "Configure tnsnames.ora with ${PRIMARY_TNS_ALIAS} and ${STANDBY_TNS_ALIAS} (step 3 already created both on the standby)." \
+            "Run ./fsfo/observer.sh setup." \
+            "Run ./fsfo/observer.sh start." \
+            "Verify with ./fsfo/observer.sh status." \
+            "For a dedicated third host without this repository, use ./add_observer/01_prepare_primary.sh instead."
 
-print_list_block "Wallet Notes" \
-    "The wallet avoids storing passwords in scripts or process arguments." \
-    "observer.sh setup will prompt for the password of ${OBSERVER_USER}." \
-    "The observer connects using dgmgrl /@${PRIMARY_TNS_ALIAS}." \
-    "Automatic failover only works while the observer is running."
+        print_list_block "Wallet Notes" \
+            "The wallet avoids storing passwords in scripts or process arguments." \
+            "observer.sh setup will prompt for the password of ${OBSERVER_USER}." \
+            "The observer connects using dgmgrl /@${PRIMARY_TNS_ALIAS}." \
+            "Automatic failover only works while the observer is running."
+        ;;
+esac

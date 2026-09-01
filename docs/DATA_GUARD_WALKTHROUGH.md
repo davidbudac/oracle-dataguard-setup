@@ -913,7 +913,18 @@ EXIT;
 6. Configures FSFO properties (threshold, target)
 7. Enables Fast-Start Failover
 8. Copies password file to NFS for observer server
-9. Outputs wallet setup instructions
+9. Checks whether an observer is already connected
+   (`FS_FAILOVER_OBSERVER_PRESENT`) and, interactively, asks where the
+   observer will run:
+   - **already set up elsewhere** - reminds you to start it and verify the
+     broker sees it
+   - **standby host (or any host with this repo + NFS share)** - prints the
+     `fsfo/observer.sh setup` / `start` walkthrough (Step 10)
+   - **dedicated third host** - runs `add_observer/01_prepare_primary.sh`
+     for you on the spot (it runs on the primary anyway), generating the
+     self-contained bundle to copy to that host
+   - piped/non-interactive runs skip the questions and get the printed
+     walkthrough, exactly as before
 
 ### Manual Equivalent
 
@@ -963,6 +974,11 @@ EXIT;
 ### What the Script Does
 
 The observer can run on the **standby server** or a **dedicated 3rd server**.
+Step 9 asks which one it will be at the end of its run: for a host with this
+repository and the NFS share it prints this step's walkthrough; for a third
+host without the repository it offers to generate the `add_observer/` bundle
+immediately (in that case follow the bundle's `RUN_ON_OBSERVER_HOST.md`
+instead of this step).
 
 **Setup command (`./observer.sh setup`):**
 1. Creates Oracle Wallet directory

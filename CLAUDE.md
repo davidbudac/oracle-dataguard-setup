@@ -205,9 +205,9 @@ After Data Guard setup is complete, you can optionally configure Fast-Start Fail
 ```bash
 ./primary/09_configure_fsfo.sh
 ```
-This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mode, enables FSFO. On a multitenant primary (`V$DATABASE.CDB = YES`) the observer user must be a common user: the script detects this, accepts `#` in usernames, and auto-prefixes `C##` (TTY-confirmed; logged and applied automatically in non-interactive runs). SYSDG possession is checked via `V$PWFILE_USERS` (administrative privileges never appear in `DBA_ROLE_PRIVS`).
+This creates an observer user with SYSDG privilege, sets MAXIMUM AVAILABILITY mode, enables FSFO. It ends with an **observer placement** section: it checks `FS_FAILOVER_OBSERVER_PRESENT` (already connected = nothing to do) and otherwise asks (TTY-gated - piped/E2E runs just get the printed walkthrough) whether an observer is already set up elsewhere, and if not, where it will run - a repo/NFS host gets the `fsfo/observer.sh` walkthrough, a dedicated third host gets `add_observer/01_prepare_primary.sh` run on the spot (reusing the observer user via `-u`) to generate the bundle. On a multitenant primary (`V$DATABASE.CDB = YES`) the observer user must be a common user: the script detects this, accepts `#` in usernames, and auto-prefixes `C##` (TTY-confirmed; logged and applied automatically in non-interactive runs). SYSDG possession is checked via `V$PWFILE_USERS` (administrative privileges never appear in `DBA_ROLE_PRIVS`).
 
-**Step 10: Observer Setup (on OBSERVER server - can be standby or 3rd server)**
+**Step 10: Observer Setup (on OBSERVER server - can be standby or 3rd server; step 9's closing prompt routes you here or to `add_observer/`)**
 ```bash
 ./fsfo/observer.sh setup   # Create Oracle Wallet with SYSDG credentials
 ./fsfo/observer.sh start   # Start observer in background
