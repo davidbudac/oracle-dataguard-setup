@@ -1913,11 +1913,19 @@ json_str_line() {
 
 # '  "key": true|false,' from a YES/NO/true/false-ish value.
 json_bool_line() {
+    printf '  "%s": %s,\n' "$1" "$(json_bool_token "$2")"
+}
+
+# Normalize a YES/NO/TRUE/FALSE/ENABLED-ish value to the JSON token true or
+# false. Used by the writer AND by the diff, so a value stored as "false" is
+# never compared against a raw "NO" (19c's CDB_SERVICES.COMMIT_OUTCOME is
+# YES/NO; the E2E stub used true/false - both must diff clean).
+json_bool_token() {
     local v
-    v=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    v=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
     case "$v" in
-        yes|true|enabled|y|1) printf '  "%s": true,\n' "$1" ;;
-        *)                    printf '  "%s": false,\n' "$1" ;;
+        yes|true|enabled|y|1) printf 'true' ;;
+        *)                    printf 'false' ;;
     esac
 }
 
@@ -2549,9 +2557,9 @@ if [[ $NO_JSON -eq 0 && -f "$PREV_JSON_FILE" ]]; then
     diff_scalar "Protection mode"            protection_mode           "$PROTECTION_MODE"
     diff_scalar "Standby LogXptMode"         standby_logxptmode        "$STANDBY_LOGXPTMODE"
     diff_scalar "Standby open mode"          standby_open_mode         "$STANDBY_OPEN_MODE"
-    diff_scalar "FSFO enabled"               fsfo_enabled              "$(printf '%s' "$FSFO_ENABLED" | tr '[:upper:]' '[:lower:]' | sed -e 's/^yes$/true/' -e 's/^no$/false/')"
+    diff_scalar "FSFO enabled"               fsfo_enabled              "$(json_bool_token "$FSFO_ENABLED")"
     diff_scalar "FSFO threshold"             fsfo_threshold            "$FSFO_THRESHOLD"
-    diff_scalar "Role trigger ready"         role_trigger_ready        "$(printf '%s' "$ROLE_TRIGGER_READY" | tr '[:upper:]' '[:lower:]' | sed -e 's/^yes$/true/' -e 's/^no$/false/')"
+    diff_scalar "Role trigger ready"         role_trigger_ready        "$(json_bool_token "$ROLE_TRIGGER_READY")"
     diff_scalar "Database version"           db_version                "$DB_VERSION"
     diff_scalar "CONNECT_TIMEOUT"            connect_timeout           "$TNS_CT"
     diff_scalar "TRANSPORT_CONNECT_TIMEOUT"  transport_connect_timeout "$TNS_TCT"
@@ -2605,7 +2613,7 @@ if [[ $NO_JSON -eq 0 && -f "$PREV_JSON_FILE" ]]; then
                 _cmp "$(field "$_pline" 4)" "${SVC_REC_ROLE_AWARE[$_i]}"                 "role-aware"
                 _cmp "$(field "$_pline" 5)" "$(json_escape "${SVC_REC_FTYPE[$_i]}")"     "TAF type"
                 _cmp "$(field "$_pline" 6)" "$(json_escape "${SVC_REC_FMETHOD[$_i]}")"   "TAF method"
-                _cmp "$(field "$_pline" 7)" "$(printf '%s' "${SVC_REC_COMMIT[$_i]}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^yes$/true/')" "COMMIT_OUTCOME"
+                _cmp "$(field "$_pline" 7)" "$(json_bool_token "${SVC_REC_COMMIT[$_i]}")" "COMMIT_OUTCOME"
                 _cmp "$(field "$_pline" 8)" "$(json_escape "${SVC_REC_DRAIN[$_i]}")"     "DRAIN_TIMEOUT"
                 [[ -n "$_deltas" ]] && CHANGE_SVC_CHANGED+=("\`${_svc}\` — ${_deltas}")
             fi
@@ -3211,7 +3219,7 @@ if [[ $NO_JSON -eq 0 ]]; then
                     "$(json_escape "${SVC_REC_FMETHOD[$_i]}")" \
                     "$(json_escape "${SVC_REC_FRETRIES[$_i]}")" \
                     "$(json_escape "${SVC_REC_FDELAY[$_i]}")" \
-                    "$(printf '%s' "${SVC_REC_COMMIT[$_i]}" | tr '[:upper:]' '[:lower:]' | sed -e 's/^yes$/true/' -e 's/^true$/true/' -e '/^true$/!s/.*/false/')" \
+                    "$(json_bool_token "${SVC_REC_COMMIT[$_i]}")" \
                     "$(json_escape "${SVC_REC_DRAIN[$_i]}")" \
                     "$(json_escape "${SVC_REC_RESTORE[$_i]}")" \
                     "$(json_escape "${SVC_REC_ALIAS[$_i]}")" \

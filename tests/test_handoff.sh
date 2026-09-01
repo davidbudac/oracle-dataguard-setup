@@ -161,10 +161,10 @@ active_services)
     echo "PDB1|pdb1|DEFAULT"
     ;;
 service_ha_attributes)
-    echo "PDB1|app_svc|SELECT|BASIC|30|5|true|60|NONE"
-    [ -n "${DGSTUB_EXTRA_SVC:-}" ] && echo "PDB1|${DGSTUB_EXTRA_SVC}|NONE|-|-|-|false|-|NONE"
-    echo "CDB\$ROOT|cdb1.example.com|NONE|-|-|-|false|-|NONE"
-    echo "PDB1|PDB1|NONE|-|-|-|false|-|NONE"
+    echo "PDB1|app_svc|SELECT|BASIC|30|5|YES|60|NONE"
+    [ -n "${DGSTUB_EXTRA_SVC:-}" ] && echo "PDB1|${DGSTUB_EXTRA_SVC}|NONE|-|-|-|NO|-|NONE"
+    echo "CDB\$ROOT|cdb1.example.com|NONE|-|-|-|NO|-|NONE"
+    echo "PDB1|PDB1|NONE|-|-|-|NO|-|NONE"
     ;;
 standby_direct)
     if [ "${DGSTUB_DIRECT:-0}" = "1" ]; then
