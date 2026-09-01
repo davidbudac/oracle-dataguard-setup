@@ -39,7 +39,9 @@ Options:
                       one from ${NFS_SHARE}/standby_config_*.env
       --all           Remove EVERYTHING staged for this build on the NFS
                       share, including the config .env files, the handoff
-                      report, and the application-impact briefing.
+                      report (.md/.html/.json plus the _tnsnames.ora,
+                      _jdbc.properties and _verify.sh deliverable pack),
+                      and the application-impact briefing.
                       Without --all, only password file copies, the
                       generated standby pfile, and RMAN duplicate
                       cmdfiles/logs are removed.
@@ -151,7 +153,9 @@ log_info "Build: ${PRIMARY_DB_UNIQUE_NAME} (primary) -> ${STANDBY_DB_UNIQUE_NAME
 #   - primary/02_generate_standby_config.sh: ${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora
 #   - primary/02_generate_standby_config.sh: ${NFS_SHARE}/listener_${STANDBY_DB_UNIQUE_NAME}.ora
 #   - primary/02_generate_standby_config.sh: ${NFS_SHARE}/configure_broker_${STANDBY_DB_UNIQUE_NAME}.dgmgrl
-#   - primary/10_generate_handoff_report.sh: ${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.md (+ .html twin)
+#   - primary/10_generate_handoff_report.sh: ${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.md
+#     plus the .html twin, the .json sidecar and the deliverable pack
+#     (_tnsnames.ora, _jdbc.properties, _verify.sh) written by dg_handoff.sh
 # ============================================================
 
 progress_step "Scanning NFS Share for Build Artifacts"
@@ -197,6 +201,10 @@ KEEP_BY_DEFAULT_PATTERNS=(
     "${NFS_SHARE}/primary_info_${PRIMARY_DB_UNIQUE_NAME}.env"
     "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.md"
     "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.html"
+    "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.json"
+    "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}_tnsnames.ora"
+    "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}_jdbc.properties"
+    "${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}_verify.sh"
     "${NFS_SHARE}/dg_application_impact.html"
     "${NFS_SHARE}/dg_application_impact_${PRIMARY_DB_UNIQUE_NAME}.html"
 )

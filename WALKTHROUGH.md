@@ -387,7 +387,7 @@ for the full variant comparison.
 ```bash
 ./common/cleanup_nfs_artifacts.sh                 # password files, pfile, RMAN cmdfiles/logs
 ./common/cleanup_nfs_artifacts.sh -c /path/to/standby_config_<NAME>.env
-./common/cleanup_nfs_artifacts.sh --all           # also the config .env, handoff report + HTML, app-impact HTML
+./common/cleanup_nfs_artifacts.sh --all           # also the config .env, the whole handoff set (.md/.html/.json/pack), app-impact HTML
 ./common/cleanup_nfs_artifacts.sh -y              # skip the confirmation prompt
 ```
 
@@ -442,19 +442,26 @@ it says so and exits successfully.
 
 Generates a handoff document for application teams that consume the database. Run it once Data Guard is verified, and ideally after the optional FSFO (Steps 9-10) and role-aware service trigger (Step 11) steps, so it describes the finished topology.
 
+This step is a thin wrapper around `dg_handoff.sh` (repo root), which is the single implementation; the wrapper supplies the build's `standby_config_*.env` values, the NFS output location, the application-impact briefing copy, and the setup-step chrome, and passes `--all-flavors`.
+
 **Contents:**
-- Connection strings per user-visible service in three flavors:
+- Connection strings per user-visible service in three flavors (step 10 passes `--all-flavors`; run standalone, only the role-aware strings are emitted):
   - **Primary-only** TNS + JDBC (writes / admin)
   - **Standby-only** TNS + JDBC (read-only reporting; marked unusable when the standby is MOUNTED, with ADG licensing/staleness/ORA-16000 caveats when it is READ ONLY WITH APPLY)
   - **Role-aware failover** TNS + JDBC + Easy Connect Plus — one descriptor with both hosts in `ADDRESS_LIST`. Recommended for the app tier once the Step 11 trigger is deployed: the service only runs on whichever side is currently primary, so clients follow the active database across a switchover or failover
 - Topology table (primary/standby host, SID, listener port) and an **Interactive diagram** link encoding the discovered topology — never credentials — for `https://davidbudac.cz/dataguard/` (override with `DG_DOC_BASE_URL`)
 - Status snapshot (roles, open modes, protection mode, standby `LogXptMode`, MRP, apply lag, archive gaps, FSFO state, broker config, role-trigger deployment, `SQLNET.EXPIRE_TIME`)
 - A computed **Verdict** (HEALTHY / WARNING / ERROR) with every reason named
-- Application-engineering detail: per-mode RPO semantics, outage-budget breakdown, an ORA- error table for role transitions with retryability, descriptor-parameter reference with worst-case connect math, ADG read-staleness controls, driver mapping examples, a client/pool checklist, and verification snippets (`tnsping`, `nc -z`, and a `SYS_CONTEXT` role check that doubles as the switchover-drill pass criterion)
+- A **Changes Since Last Report** diff against the previous run's JSON sidecar (topology, protection settings, FSFO, role trigger, descriptor timeouts, services added/removed/changed)
+- **Recommended Service Changes (DBA)** in the appendix: a ready `DBMS_SERVICE.MODIFY_SERVICE` block for every user service missing TAF, Transaction Guard or a drain timeout
+- Application-engineering detail: per-mode RPO semantics, outage-budget breakdown, an ORA- error table for role transitions with retryability, descriptor-parameter reference with worst-case connect math (from `--connect-timeout` / `--transport-timeout` / `--retry-count` / `--retry-delay`; the descriptors themselves carry no `FAILOVER_MODE` — TAF is reported per service as a dictionary fact), ADG read-staleness controls, driver mapping examples, a client/pool checklist, and verification snippets (`tnsping`, `nc -z`, and a `SYS_CONTEXT` role check that doubles as the switchover-drill pass criterion)
 
 **Output files (on NFS):**
 - `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` — share this with client teams
-- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.html` — styled, self-contained twin of the same content (rendered from the Markdown, so the two never diverge)
+- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.html` — styled, self-contained twin of the same content (rendered from the Markdown, so the two never diverge; table of contents, print stylesheet, staleness banner)
+- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.json` — machine-readable sidecar, and the baseline for the next run's change diff
+- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>_tnsnames.ora` / `_jdbc.properties` — ready-to-install aliases and JDBC URLs per service
+- `dg_handoff_<PRIMARY_DB_UNIQUE_NAME>_verify.sh` — runnable reachability + `SYS_CONTEXT` role check for application hosts (`-u user/pass` or `APP_USER`/`APP_PASSWORD`; `--expect-db-unique-name` after a switchover)
 - `dg_application_impact.html` — copy of `docs/DG_APPLICATION_IMPACT.html` when available; supplementary, the Markdown stands on its own
 
 Re-run the script after listener changes, new services, or topology changes to refresh the report.
@@ -473,7 +480,7 @@ Re-run the script after listener changes, new services, or topology changes to r
                 --port 1521
 ```
 
-`dg_handoff.sh` produces the same handoff document as `primary/10_generate_handoff_report.sh`, but works against any existing Data Guard configuration without depending on the setup-time `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`.
+`dg_handoff.sh` is the generator `primary/10_generate_handoff_report.sh` wraps; run directly it works against any existing Data Guard configuration without depending on the setup-time `standby_config_*.env`, `common/dg_functions.sh`, or the NFS share. Topology (peer `DB_UNIQUE_NAME`, hostnames, listener port) is discovered from `V$DATABASE`, `V$DATAGUARD_CONFIG`, `V$LISTENER_NETWORK`, and `DGMGRL SHOW DATABASE VERBOSE`.
 
 **Requirements:**
 - Run on the PRIMARY with `ORACLE_SID` and `ORACLE_HOME` set
@@ -484,8 +491,13 @@ Re-run the script after listener changes, new services, or topology changes to r
 - `--primary-host HOST` / `--standby-host HOST` — override hostnames in connect strings
 - `--port PORT` — override listener port (default: discover or 1521)
 - `-o FILE` — output path (default `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`)
+- `--standby-tns-alias A` — query the standby directly (auto-login wallet) for its open mode and lag
+- `--all-flavors` — also emit primary-only and standby-only strings (step-10 behavior)
+- `--service NAME` / `--exclude-service NAME` — repeatable service filter (`CONTAINER:NAME` accepted)
+- `--connect-timeout` / `--transport-timeout` / `--retry-count` / `--retry-delay N` — descriptor knobs; the tables, worst-case math and pool advice all follow them
+- `--previous FILE` — JSON sidecar to diff against; `--no-json` / `--no-pack` skip the sidecar / the TNS-JDBC-verify pack
 
-**Output:** the Markdown file above, plus the HTML twin written next to it.
+**Output:** the Markdown file above, plus the HTML twin, the JSON sidecar and the `_tnsnames.ora` / `_jdbc.properties` / `_verify.sh` pack written next to it.
 
 Use this when you need to refresh handoff documentation on a system that wasn't built with these scripts, or after the NFS share has been retired.
 
