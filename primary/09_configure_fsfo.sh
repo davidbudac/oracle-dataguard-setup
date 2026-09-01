@@ -484,15 +484,20 @@ fi
 
 progress_step "Setting FSFO Properties"
 
+# FastStartFailoverThreshold is a configuration property, but
+# FastStartFailoverTarget is a *database* property - EDIT CONFIGURATION SET
+# PROPERTY FastStartFailoverTarget fails with ORA-16568. Set it on both
+# members so a target exists in either direction after a role change.
 log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=${FSFO_THRESHOLD}"
-log_cmd "dgmgrl / :" "EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='${STANDBY_DB_UNIQUE_NAME}'"
-if ! run_dgmgrl_checked "set_fsfo_properties.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" "$FSFO_THRESHOLD"; then
+log_cmd "dgmgrl / :" "EDIT DATABASE '${PRIMARY_DB_UNIQUE_NAME}' SET PROPERTY FastStartFailoverTarget='${STANDBY_DB_UNIQUE_NAME}'"
+log_cmd "dgmgrl / :" "EDIT DATABASE '${STANDBY_DB_UNIQUE_NAME}' SET PROPERTY FastStartFailoverTarget='${PRIMARY_DB_UNIQUE_NAME}'"
+if ! run_dgmgrl_checked "set_fsfo_properties.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" "$FSFO_THRESHOLD"; then
     log_error "Failed to set FSFO properties (threshold/target)"
     exit 1
 fi
 
 log_info "FSFO threshold set to ${FSFO_THRESHOLD} seconds"
-log_info "FSFO target set to ${STANDBY_DB_UNIQUE_NAME}"
+log_info "FSFO target of ${PRIMARY_DB_UNIQUE_NAME} set to ${STANDBY_DB_UNIQUE_NAME} (and the reverse)"
 
 # ============================================================
 # Enable Fast-Start Failover

@@ -432,14 +432,20 @@ printf '%s\n' "$FSFO_OUT"
 FSFO_ENABLED=false
 printf '%s\n' "$FSFO_OUT" | grep -qiE 'Fast-Start Failover:[[:space:]]*(Enabled|ENABLED)' && FSFO_ENABLED=true
 
+# FastStartFailoverThreshold/LagLimit are configuration properties, but
+# FastStartFailoverTarget is a *database* property - setting it with
+# EDIT CONFIGURATION fails with ORA-16568. It goes on both members so a
+# target exists in either direction after a role change.
 if [[ "$FSFO_FLAVOUR" == "lag" ]]; then
     FSFO_CMDS="EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=${FSFO_THRESHOLD};
-EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='${STANDBY_DBUN}';
+EDIT DATABASE '${PRIMARY_DBUN}' SET PROPERTY FastStartFailoverTarget='${STANDBY_DBUN}';
+EDIT DATABASE '${STANDBY_DBUN}' SET PROPERTY FastStartFailoverTarget='${PRIMARY_DBUN}';
 EDIT CONFIGURATION SET PROPERTY FastStartFailoverLagLimit=${FSFO_LAG_LIMIT};
 ENABLE FAST_START FAILOVER;"
 else
     FSFO_CMDS="EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=${FSFO_THRESHOLD};
-EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='${STANDBY_DBUN}';
+EDIT DATABASE '${PRIMARY_DBUN}' SET PROPERTY FastStartFailoverTarget='${STANDBY_DBUN}';
+EDIT DATABASE '${STANDBY_DBUN}' SET PROPERTY FastStartFailoverTarget='${PRIMARY_DBUN}';
 ENABLE FAST_START FAILOVER;"
 fi
 

@@ -1,7 +1,15 @@
 -- ============================================================
 -- Set Fast-Start Failover properties
--- Usage: Pass standby_db_unique_name as &1, threshold (seconds) as &2
+-- Usage: Pass primary_db_unique_name as &1, standby_db_unique_name as &2,
+--        threshold (seconds) as &3
+--
+-- FastStartFailoverThreshold is a CONFIGURATION property, but
+-- FastStartFailoverTarget is a DATABASE property - setting it with
+-- EDIT CONFIGURATION fails with ORA-16568 (cannot set property).
+-- It is set on each member so FSFO has a target in both directions
+-- (after a failover/switchover the old standby becomes the primary).
 -- ============================================================
-EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=&2;
-EDIT CONFIGURATION SET PROPERTY FastStartFailoverTarget='&1';
+EDIT CONFIGURATION SET PROPERTY FastStartFailoverThreshold=&3;
+EDIT DATABASE '&1' SET PROPERTY FastStartFailoverTarget='&2';
+EDIT DATABASE '&2' SET PROPERTY FastStartFailoverTarget='&1';
 EXIT;
