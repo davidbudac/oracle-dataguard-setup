@@ -74,7 +74,7 @@ check_oracle_env() {
 # ------------------------------------------------------------
 # Text helpers
 # ------------------------------------------------------------
-clean() { tr -d ' \r' | sed '/^$/d'; }                       # strip ALL spaces
+clean() { tr -d ' \t\r' | sed '/^$/d'; }                    # strip ALL spaces/tabs
 trim()  { tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'; }
 field() { awk -F'|' -v i="$2" '{print $i}' <<< "$1"; }
 
@@ -88,7 +88,7 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # names (v\$database) when building the SQL in double quotes.
 run_sql() {
     "$ORACLE_HOME/bin/sqlplus" -s -L / as sysdba <<EOF
-set pagesize 0 feedback off verify off heading off echo off trimspool on linesize 32767
+set pagesize 0 feedback off verify off heading off echo off trimspool on tab off linesize 32767
 whenever sqlerror exit 1
 $1
 exit
@@ -102,7 +102,7 @@ run_sql_as() {
     local __conn="$1" __sql="$2"
     # shellcheck disable=SC2086
     "$ORACLE_HOME/bin/sqlplus" -s -L $__conn <<EOF
-set pagesize 0 feedback off verify off heading off echo off trimspool on linesize 32767
+set pagesize 0 feedback off verify off heading off echo off trimspool on tab off linesize 32767
 whenever sqlerror exit 1
 ${__sql}
 exit
