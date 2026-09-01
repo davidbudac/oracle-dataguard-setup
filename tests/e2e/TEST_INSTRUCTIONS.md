@@ -112,7 +112,6 @@ bash ./tests/e2e/run_e2e_test.sh --only cleanup
 | step6 | primary | Runs 06_configure_broker.sh, validates DGMGRL config |
 | step7 | standby | Runs 07_verify_dataguard.sh, checks health report |
 | step13 | primary | Runs 13_set_max_availability.sh, validates MAXAVAILABILITY + FASTSYNC + idempotent re-run (optional; runs here, not in walkthrough order, so the mutation path is exercised before step 9 would make it a no-op) |
-| step8 | primary | Runs 08_security_hardening.sh, validates SYS locked (optional) |
 | step9 | primary | Runs 09_configure_fsfo.sh, validates FSFO enabled (optional) |
 | step10 | standby | Runs observer.sh setup+start, validates observer running (optional) |
 | step11 | primary | Runs create_role_trigger.sh, validates PL/SQL objects (optional) |
@@ -230,12 +229,8 @@ for the five bugs this run surfaced and fixed.
 - **Fix:** input is now `${OBSERVER_USER}\ny\n${PW}\n${PW}`. Also, `assert_sql` strips
   whitespace, so the protection-mode expected value is `MAXIMUMAVAILABILITY` (joined).
 
-### Issue: step 8 needs a format-12.2 password file
-- DBCA creates a legacy (format 12) password file; locking SYS needs format 12.2
-  (else `ORA-40365`). `create_db` now migrates the password file to 12.2 after DBCA.
-
 ### Issue: refreshing the standby password file needs a standby restart
-- After step 8 (SYS pw change) and step 9 (adds observer SYSDG user), redo transport
+- After step 9 (adds observer SYSDG user), redo transport
   fails with `ORA-16191` on reconnect until the **standby instance is restarted** to
   re-read its (replaced) password file — a plain `cp` while it runs is not enough.
 

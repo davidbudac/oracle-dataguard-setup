@@ -715,23 +715,6 @@ phase_create_db() {
 
     log_pass "DBCA database created"
 
-    # DBCA creates a legacy (format=12) password file; step 8 (security
-    # hardening) needs format=12.2 to lock SYS (else ORA-40365). Migrate it
-    # now so the optional step-8 phase can run against a fresh test DB.
-    ssh_cmd "PRIMARY" "
-        cd '${ORACLE_HOME}/dbs' 2>/dev/null || exit 0
-        [[ -f orapw${TEST_DB_NAME} ]] || exit 0
-        fmt=\$(orapwd describe file=orapw${TEST_DB_NAME} 2>/dev/null | sed -n 's/.*format=\([0-9.]*\).*/\1/p')
-        if [[ -n \"\$fmt\" && \"\$fmt\" != '12.2' ]]; then
-            orapwd file=orapw${TEST_DB_NAME}.new input_file=orapw${TEST_DB_NAME} format=12.2 >/dev/null 2>&1 \
-              && mv orapw${TEST_DB_NAME} orapw${TEST_DB_NAME}.fmt12.bak \
-              && mv orapw${TEST_DB_NAME}.new orapw${TEST_DB_NAME} \
-              && echo 'PWFILE_MIGRATED_12_2'
-        else
-            echo 'PWFILE_ALREADY_12_2'
-        fi
-    " | grep -qE 'PWFILE_(MIGRATED|ALREADY)_12_2' && log_pass "Password file is format 12.2 (SYS-lockable)" || log_info "Password file format migration skipped"
-
     # Post-creation: disable OMF and FRA, enable archivelog with explicit dest
     result=$(ssh_cmd "PRIMARY" "
         sqlplus -s / as sysdba << 'SQLEOF'
@@ -1331,49 +1314,6 @@ phase_step13() {
 }
 
 # =============================================================================
-# Phase: Step 8 - Security Hardening (Optional)
-# =============================================================================
-
-phase_step8() {
-    if [[ "${SKIP_SECURITY}" == "true" ]]; then
-        log_skip "Step 8: Security Hardening (SKIP_SECURITY=true)"
-        return 0
-    fi
-
-    log_phase "STEP 8: Security Hardening"
-
-    local result
-    # Prompts: typed confirmation (config auto-selected)
-    result=$(ssh_piped "PRIMARY" \
-        "./primary/08_security_hardening.sh" \
-        "SECURE ${TEST_DB_NAME}")
-
-    local exit_code=$?
-    log_info "Step 8 output (last 10 lines):"
-    echo "$result" | tail -10 | while read -r line; do log_info "  $line"; done
-
-    if [[ $exit_code -ne 0 ]]; then
-        log_fail "Step 8 script exited with code ${exit_code}"
-        record_issue "step8" "08_security_hardening.sh failed" "$(echo "$result" | tail -20)"
-        return 1
-    fi
-
-    # Validate: SYS account is locked
-    assert_sql "PRIMARY" \
-        "SELECT account_status FROM dba_users WHERE username = 'SYS';" \
-        "LOCKED" \
-        "SYS account locked" || return 1
-
-    # Validate: OS authentication still works
-    assert_sql "PRIMARY" \
-        "SELECT 'OSAUTH=OK' FROM dual;" \
-        "OSAUTH=OK" \
-        "OS authentication works after lockout" || return 1
-
-    log_pass "Step 8 completed and validated"
-}
-
-# =============================================================================
 # Phase: Step 9 - Configure FSFO (Optional)
 # =============================================================================
 
@@ -1601,7 +1541,6 @@ ALL_PHASES=(
     step6
     step7
     step13
-    step8
     step9
     step10
     step11
@@ -1626,7 +1565,6 @@ run_phase() {
         step6)           phase_step6 ;;
         step7)           phase_step7 ;;
         step13)          phase_step13 ;;
-        step8)           phase_step8 ;;
         step9)           phase_step9 ;;
         step10)          phase_step10 ;;
         step11)          phase_step11 ;;
@@ -1664,7 +1602,6 @@ Phases (in execution order):
   step5             Clone standby (RMAN duplicate)
   step6             Configure DG broker
   step7             Verify Data Guard
-  step8             Security hardening (optional)
   step9             Configure FSFO (optional)
   step10            Observer setup (optional)
   step11            Service trigger (optional)

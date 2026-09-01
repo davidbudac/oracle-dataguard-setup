@@ -142,8 +142,9 @@ ps -eo args | grep -i dgmgrl | grep -iv grep     # must show /@alias, not sys/
 
 With no observer depending on SYS anymore, you can rotate the SYS password
 without coordination — the observer no longer cares. If you also want to lock
-SYS against remote logins entirely, this repo's `primary/08_security_hardening.sh`
-shows the pattern (rotation + `ACCOUNT LOCK` + password-file propagation).
+SYS against remote logins entirely, the pattern is: rotate the password,
+`ALTER USER SYS ACCOUNT LOCK`, and propagate the refreshed password file to the
+standby (transport fails with ORA-16191 until the copies match).
 
 ## Zero-gap variant (no observer downtime)
 

@@ -5,7 +5,7 @@ Automated scripts for building, verifying, and operating an Oracle 19c Physical 
 ## What's Included
 
 - **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
-- **Optional hardening** — security hardening (step 8), Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11), NFS artifact cleanup (step 12), Maximum Availability without FSFO (step 13).
+- **Optional add-ons** — Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11), NFS artifact cleanup (step 12), Maximum Availability without FSFO (step 13).
 - **Handoff report** (recommended, any time after step 7) — Markdown + styled HTML doc with topology, status, verdict, and per-service TNS/JDBC strings for application teams.
 - **Side toolkits** — add an FSFO observer on a third host to an existing configuration, convert a SYS-authenticated observer to SYSDG, migrate a non-CDB into a CDB keeping both standbys.
 - **Operational tools** — SSH dashboard, local triage/diagnostics, standby-redo-log audit, SYNC commit-cost report, wallet setup for password-free peer access, standalone handoff regenerator.
@@ -35,7 +35,7 @@ dataguard_setup/
 ├── CLAUDE.md                    # Project notes for AI assistants
 │
 ├── nfs/                         # NFS server + client setup (run first)
-├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 8, 9, 13) + the handoff report (10_...)
+├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 9, 13) + the handoff report (10_...)
 ├── standby/                     # STANDBY-side steps (3, 5, 7)
 ├── fsfo/                        # observer.sh - lifecycle for FSFO observer
 ├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant) + CDB/PDB service creation
@@ -79,7 +79,6 @@ dataguard_setup/
 | 5  | STANDBY  | `./standby/05_clone_standby.sh`          | RMAN duplicate; **not directly restartable** |
 | 6  | PRIMARY  | `./primary/06_configure_broker.sh`       | |
 | 7  | STANDBY  | `./standby/07_verify_dataguard.sh`       | Health check |
-| 8  | PRIMARY  | `./primary/08_security_hardening.sh`     | Optional: lock SYS |
 | 9  | PRIMARY  | `./primary/09_configure_fsfo.sh`         | Optional: enable FSFO |
 | 10 | OBSERVER | `./fsfo/observer.sh setup` then `start`  | Optional: required for FSFO |
 | 11 | PRIMARY  | `./trigger/create_role_trigger.sh`       | Optional: role-aware service start/stop |
@@ -102,7 +101,6 @@ See [`WALKTHROUGH.md`](WALKTHROUGH.md) for prompts, outputs, and verification pe
 - **Steps 1-4** — idempotent, re-runnable.
 - **Step 5** — once RMAN duplicate starts, you must shut down the standby instance and remove its data files / control files / redo logs before re-running. The script requires you to retype the standby `DB_UNIQUE_NAME` before starting, to reduce accidental execution.
 - **Steps 6-7** — re-runnable; remove the broker config with `REMOVE CONFIGURATION` first if needed.
-- **Step 8** — rotation and lock are separate calls with separate exit codes; a partial run prints an ACTION REQUIRED block and exits `1`. After it runs, SYS is locked and step 5 can no longer clone until SYS is temporarily unlocked.
 - **Step 13** — idempotent; a no-op if step 9 already set MAXAVAILABILITY + FASTSYNC.
 - **Handoff report** — re-run any time; refreshes the doc.
 

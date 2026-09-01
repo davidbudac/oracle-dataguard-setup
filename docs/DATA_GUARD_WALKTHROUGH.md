@@ -17,19 +17,22 @@ This document describes what each automation script does and shows the equivalen
 9. [Step 5: Clone Standby Database](#step-5-clone-standby-database)
 10. [Step 6: Configure Data Guard Broker](#step-6-configure-data-guard-broker)
 11. [Step 7: Verify Data Guard](#step-7-verify-data-guard)
-12. [Step 8: Security Hardening (Optional)](#step-8-security-hardening-optional)
-13. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
-14. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
-15. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
-16. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
-17. [Step 13: Set Maximum Availability Protection (Optional)](#step-13-set-maximum-availability-protection-optional)
-18. [Handoff Report (Recommended, Any Time After Step 7)](#handoff-report-recommended-any-time-after-step-7)
-19. [Peer Wallet Setup (Recommended, Any Time After Step 7)](#peer-wallet-setup-recommended-any-time-after-step-7)
-20. [Post-Setup Tooling](#post-setup-tooling)
-21. [Side Toolkits (Outside the Numbered Workflow)](#side-toolkits-outside-the-numbered-workflow)
-22. [Summary](#summary-what-would-be-done-manually-without-scripts)
-23. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
-24. [Common Monitoring Commands](#common-monitoring-commands)
+12. [Step 9: Configure Fast-Start Failover (Optional)](#step-9-configure-fast-start-failover-optional)
+13. [Step 10: Observer Setup (Optional)](#step-10-observer-setup-optional)
+14. [Step 11: Role-Aware Service Trigger (Optional)](#step-11-role-aware-service-trigger-optional)
+15. [Step 12: NFS Artifact Cleanup (Optional)](#step-12-nfs-artifact-cleanup-optional)
+16. [Step 13: Set Maximum Availability Protection (Optional)](#step-13-set-maximum-availability-protection-optional)
+17. [Handoff Report (Recommended, Any Time After Step 7)](#handoff-report-recommended-any-time-after-step-7)
+18. [Peer Wallet Setup (Recommended, Any Time After Step 7)](#peer-wallet-setup-recommended-any-time-after-step-7)
+19. [Post-Setup Tooling](#post-setup-tooling)
+20. [Side Toolkits (Outside the Numbered Workflow)](#side-toolkits-outside-the-numbered-workflow)
+21. [Summary](#summary-what-would-be-done-manually-without-scripts)
+22. [Life After Setup: Adding Datafiles and PDBs](#life-after-setup-adding-datafiles-and-pdbs)
+23. [Common Monitoring Commands](#common-monitoring-commands)
+
+> Step numbering follows the script filenames. There is no step 8 — the former
+> security-hardening step was removed from the project — so the sequence jumps
+> from 7 to 9.
 
 ---
 
@@ -156,7 +159,7 @@ sudo chmod 750 /OINSTALL/_dataguard_setup
 | 0a-0b | **Yes** | NFS scripts detect existing setup and skip if already done. |
 | 1-4 | **Yes** | Fully idempotent. Can restart from step 1 at any point. |
 | 5 | **No** | Once RMAN duplicate begins, cleanup required before restart. |
-| 6-8 | **Yes** | Broker config can be removed and recreated. Steps 7-8 are safe to re-run. |
+| 6-7 | **Yes** | Broker config can be removed and recreated. Step 7 is safe to re-run. |
 | 9-10 | **Yes** | FSFO can be disabled/re-enabled. Observer can be stopped/restarted. |
 | 11 | **Yes** | Re-running replaces existing PL/SQL objects with updated service list. |
 
@@ -166,7 +169,7 @@ sudo chmod 750 /OINSTALL/_dataguard_setup
 3. Remove standby control files and redo logs
 4. Re-run step 5
 
-**Re-cloning after Step 8 hardening:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this during its password check (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run Step 8 afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
+**Re-cloning with a locked SYS account:** if SYS on the primary has been locked (e.g. by a site hardening policy), `standby/05_clone_standby.sh` detects this during its password check (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-apply the lockdown and make sure the standby's password file matches the primary's.
 
 **To restart from Step 6 after a failure:**
 1. Connect to DGMGRL: `dgmgrl /`
@@ -896,70 +899,6 @@ EXIT;
 
 ---
 
-## Step 8: Security Hardening (Optional)
-
-**Script:** `primary/08_security_hardening.sh`
-
-### What the Script Does
-
-1. Verifies this is the primary database
-2. Checks that Data Guard Broker configuration is healthy
-3. Prompts for confirmation before proceeding
-4. Generates a random 32-character password for SYS
-5. Changes SYS password to the random value (not stored anywhere)
-6. Locks the SYS account
-7. Verifies OS authentication still works
-8. Clears the password from memory
-
-### Why Lock the SYS Account?
-
-After Data Guard is configured:
-- The password file is used for redo transport authentication
-- DBAs should use OS authentication (`/ as sysdba`) for local connections
-- Locking SYS prevents password-based attacks while maintaining functionality
-
-### Manual Equivalent
-
-```sql
--- As oracle user on PRIMARY server
-sqlplus / as sysdba
-
--- Generate a random password (use your preferred method)
--- Then change SYS password and lock the account
-ALTER USER SYS IDENTIFIED BY '<random_32_char_password>';
-ALTER USER SYS ACCOUNT LOCK;
-
--- Verify the change
-SELECT username, account_status FROM dba_users WHERE username = 'SYS';
-
-EXIT;
-```
-
-### Important Notes
-
-- **After running this script:**
-  - Use `sqlplus / as sysdba` for all DBA connections
-  - Password-based SYS connections will not work
-  - Data Guard redo transport continues to work (uses password file)
-
-- **To unlock SYS if needed:**
-  ```sql
-  sqlplus / as sysdba
-  ALTER USER SYS ACCOUNT UNLOCK;
-  ALTER USER SYS IDENTIFIED BY '<new_password>';
-  ```
-
-- **Consider also locking:**
-  ```sql
-  ALTER USER SYSTEM ACCOUNT LOCK;
-  ```
-
-- **Standby impact:** the SYS password change regenerates the primary's local password file. The script stages a refreshed copy (`orapw<STANDBY_SID>_hardened`) on the NFS share and prints the exact `cp`/`chmod` commands to install it on the standby; until that copy is installed, Data Guard redo transport fails with `ORA-16191`.
-
-- **Re-cloning after hardening:** if you later need to re-run `standby/05_clone_standby.sh` (see [Restartability](#restartability)), SYS on the primary is now locked. The clone script detects this (`ORA-28000`) and prints the temporary unlock/reset procedure, ending with re-running this step to re-harden SYS and re-propagate the password file.
-
----
-
 ## Step 9: Configure Fast-Start Failover (Optional)
 
 **Script:** `primary/09_configure_fsfo.sh`
@@ -1331,7 +1270,7 @@ Run this once Data Guard has been verified (Step 7), and ideally after the [hand
 ### What the Script Does
 
 1. Selects (or accepts via `-c`/`--config`) the `standby_config_*.env` file for the build and derives its primary/standby `DB_UNIQUE_NAME`s
-2. Scans the NFS share for that build's password file copies (`orapw*`, including the `_hardened` variant staged by Step 8), the generated standby pfile, and RMAN duplicate cmdfiles/logs
+2. Scans the NFS share for that build's password file copies (`orapw*`), the generated standby pfile, and RMAN duplicate cmdfiles/logs
 3. Prints the exact list of files that will be removed, and the files that will be left in place
 4. Prompts for confirmation (unless `-y`/`--yes` is given) before deleting anything
 5. By default, keeps the config `.env` files, the handoff report, and the application-impact briefing; `--all` removes those too (with a stronger, typed confirmation)
@@ -1342,7 +1281,6 @@ Run this once Data Guard has been verified (Step 7), and ideally after the [hand
 # As oracle user, on any host with the NFS share mounted
 rm -f /OINSTALL/_dataguard_setup/orapw<PRIMARY_SID>
 rm -f /OINSTALL/_dataguard_setup/orapw<PRIMARY_DB_NAME>
-rm -f /OINSTALL/_dataguard_setup/orapw<STANDBY_SID>_hardened
 rm -f /OINSTALL/_dataguard_setup/init<STANDBY_SID>_<STANDBY_DB_UNIQUE_NAME>.ora
 rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.rcv
 rm -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
@@ -1859,7 +1797,6 @@ standby, **without recreating either standby**. Six numbered scripts
 | 5 | Clone Standby | Start NOMOUNT, run RMAN duplicate, create SPFILE, start MRP |
 | 6 | Configure Broker | Run DGMGRL commands to create config, add database, enable |
 | 7 | Verify | Run multiple SQL queries and DGMGRL commands to check health |
-| 8 | Security Hardening | Change SYS password to random value, lock account (optional) |
 | 9 | Configure FSFO | Create observer user, set FASTSYNC, enable FSFO (optional) |
 | 10 | Observer Setup | Create wallet, add credentials, start observer process (optional) |
 | 11 | Service Trigger | Write PL/SQL package and triggers, deploy to database (optional) |

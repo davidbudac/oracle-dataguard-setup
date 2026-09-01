@@ -144,7 +144,6 @@ log_info "Build: ${PRIMARY_DB_UNIQUE_NAME} (primary) -> ${STANDBY_DB_UNIQUE_NAME
 # write them (not guessed):
 #   - primary/01_gather_primary_info.sh   : ${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}
 #   - primary/09_configure_fsfo.sh        : ${NFS_SHARE}/orapw${PRIMARY_DB_NAME}
-#   - primary/08_security_hardening.sh    : ${NFS_SHARE}/orapw${STANDBY_ORACLE_SID}_hardened
 #   - primary/02_generate_standby_config.sh: ${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora
 #   - standby/05_clone_standby.sh         : ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.rcv|.log
 #   - primary/01_gather_primary_info.sh   : ${NFS_SHARE}/primary_info_${PRIMARY_DB_UNIQUE_NAME}.env
@@ -187,7 +186,6 @@ add_matches() {
 # the generated pfile, and RMAN duplicate cmdfiles/logs).
 add_matches "${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
 add_matches "${NFS_SHARE}/orapw${PRIMARY_DB_NAME}"
-add_matches "${NFS_SHARE}/orapw${STANDBY_ORACLE_SID}_hardened"
 add_matches "${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora"
 add_matches "${NFS_SHARE}/logs/rman_duplicate_*.rcv"
 add_matches "${NFS_SHARE}/logs/rman_duplicate_*.log"

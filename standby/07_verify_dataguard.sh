@@ -87,14 +87,14 @@ print_list_block "This Step Will Check" \
 print_list_block "This Step Will Not Change" \
     "It does not modify Broker or database parameters." \
     "It does not restart services or the database." \
-    "It does not enable FSFO or security hardening."
+    "It does not enable FSFO."
 
 print_list_block "Credentials and Outputs" \
     "SYS password is only used for optional DGMGRL network validation." \
     "Verification output is written to ${LOG_FILE}." \
     "The script exits non-zero only when hard errors are found."
 
-record_next_step "./primary/08_security_hardening.sh"
+record_next_step "./primary/09_configure_fsfo.sh"
 
 if [[ "$CHECK_ONLY" == "1" ]]; then
     finish_check_mode "Verification preflight complete. No validation queries were executed."
@@ -453,7 +453,7 @@ print_list_block "Useful Monitoring Commands" \
 
 if [[ "$ERRORS" -eq 0 ]]; then
     print_list_block "Next Step" \
-        "Run ./primary/08_security_hardening.sh on PRIMARY to lock down the SYS account."
+        "Optionally run ./primary/09_configure_fsfo.sh on PRIMARY to configure Fast-Start Failover."
 fi
 
 # Return appropriate exit code

@@ -17,7 +17,7 @@ migrate_noncdb_to_pdb/ - Non-CDB to PDB migration subproject: migrate a non-CDB 
 observer_sys_to_sysdg/ - Standalone side toolkit (NOT part of the numbered workflow): convert an existing FSFO observer that authenticates as SYS to a dedicated SYSDG-only user - create the user on the primary (01), swap/create the observer wallet credentials and restart the observer (02), verify (03); self-contained (no common/ or NFS dependencies), see its README.md
 add_observer/    - Standalone side toolkit (NOT part of the numbered workflow): add an FSFO observer on a THIRD host to an existing, already-working Data Guard configuration (built by this repo or not). `01_prepare_primary.sh` runs on the PRIMARY - discovers the topology (peer DB_UNIQUE_NAME, hostnames, and host/port/service by running `tnsping` on each member's broker `DGConnectIdentifier`), reports FSFO readiness (SHOW CONFIGURATION, VALIDATE DATABASE, Flashback Database on both members, protection mode, SRLs), creates/verifies the dedicated SYSDG observer user (CDB-aware), optionally enables FSFO (`--enable-fsfo`), and writes a self-contained bundle for the third host. `02_setup_observer_host.sh` / `03_observer_ctl.sh` / `04_verify_observer.sh` run there: TNS entries + auto-login wallet + both-database connectivity proof; start/stop/restart/status/log/boot lifecycle; end-state verification. Never changes protection mode, LogXptMode or transport. Self-contained (no common/ or NFS dependencies), see its README.md
 nfs/             - NFS setup scripts (run before Data Guard setup)
-primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 8, 9, 10, 13)
+primary/         - Scripts to run on PRIMARY server (Steps 1, 2, 4, 6, 9, 10, 13)
 standby/         - Scripts to run on STANDBY server (Steps 3, 5, 7)
 fsfo/            - Observer scripts (run on observer server - standby or 3rd server)
 trigger/         - Role-aware service trigger (run on PRIMARY); two variants: SYS-owned and dedicated-user
@@ -41,8 +41,9 @@ Numbering matches `docs/DATA_GUARD_WALKTHROUGH.md` (the authoritative step refer
 5. `standby/05_clone_standby.sh` - RMAN duplicate (prompts for SYS password)
 6. `primary/06_configure_broker.sh` - Configure DGMGRL
 7. `standby/07_verify_dataguard.sh` - Verify setup
-8. `primary/08_security_hardening.sh` - Lock SYS account (optional)
 9. `primary/09_configure_fsfo.sh` - Configure Fast-Start Failover (optional)
+
+There is no step 8: the former security-hardening step was removed from the project, and the remaining scripts keep their filename numbering (the sequence jumps from 7 to 9).
 10. `fsfo/observer.sh setup` then `fsfo/observer.sh start` - Set up and start the observer (on observer server, optional)
 11. `trigger/create_role_trigger.sh` - Deploy role-aware service trigger (on PRIMARY, optional)
 12. `common/cleanup_nfs_artifacts.sh` - Remove sensitive/transient setup artifacts (password file copies, generated pfiles, RMAN files) from the NFS share once the build is verified (optional, run from any host with the share mounted)
@@ -59,9 +60,7 @@ Recommended, run any time after Step 7 (not part of the walkthrough's numbered s
 2. Remove all standby data files, control files, and redo logs
 3. Re-run step 5
 
-**Step 8 hardening runs in two phases** - the SYS password rotation and the ACCOUNT LOCK are separate sqlplus calls with separate exit codes. If rotation succeeds but the lock fails, the script keeps going (the primary is already rotated, so the standby's password file copy is stale either way): it stages the refreshed password file, prints an ACTION REQUIRED block with the exact state SYS is in, and exits 1. It also refreshes the step-1 staged copy `orapw<PRIMARY_ORACLE_SID>` on the NFS share (not just the `_hardened` name), so a re-run of step 3 after hardening installs the *rotated* password file. The absence of ORA-16191 immediately after rotation is expected (existing transport connections stay authenticated until they reconnect) and is reported as such, not as proof transport survived.
-
-**Post-hardening re-clone limitation:** if `primary/08_security_hardening.sh` has already run, SYS on the primary is locked. `standby/05_clone_standby.sh` detects this at the password-verification step (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-run `primary/08_security_hardening.sh` afterward to re-harden SYS (fresh random password, re-lock) and re-propagate the refreshed password file to the standby.
+**Locked-SYS re-clone limitation:** if SYS on the primary has been locked (e.g. by a site hardening policy), `standby/05_clone_standby.sh` detects this at the password-verification step (`ORA-28000`) and prints the fix: temporarily `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp password>` on the primary, re-run step 5, then re-apply the lockdown and keep the standby's password file in sync with the primary's.
 
 **Steps 6-7 are restartable** - the broker configuration can be removed with `REMOVE CONFIGURATION` in DGMGRL and recreated. Step 7 is read-only verification.
 
@@ -394,7 +393,7 @@ Design notes:
 
 ## NFS Artifact Cleanup
 
-`primary/01_gather_primary_info.sh` and `primary/09_configure_fsfo.sh` stage `orapw*` password file copies (SYS password hash) on the group-readable NFS share, and `primary/08_security_hardening.sh` stages a refreshed `orapw*_hardened` copy; `primary/02_generate_standby_config.sh` and `standby/05_clone_standby.sh` leave a generated pfile and RMAN duplicate cmdfiles/logs behind. None of this is ever cleaned up automatically.
+`primary/01_gather_primary_info.sh` and `primary/09_configure_fsfo.sh` stage `orapw*` password file copies (SYS password hash) on the group-readable NFS share; `primary/02_generate_standby_config.sh` and `standby/05_clone_standby.sh` leave a generated pfile and RMAN duplicate cmdfiles/logs behind. None of this is ever cleaned up automatically.
 
 **Step 12: Clean Up NFS Artifacts (on any host with the share mounted, optional)**
 ```bash

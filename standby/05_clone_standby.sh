@@ -222,8 +222,7 @@ log_info "Verifying SYS password against primary..."
 if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
     # verify_sys_password() only reports pass/fail. Make a direct connection
     # attempt here so we can inspect the actual error text and distinguish a
-    # locked SYS account (ORA-28000, typically left behind by
-    # primary/08_security_hardening.sh) from a plain bad password or
+    # locked SYS account (ORA-28000) from a plain bad password or
     # connectivity failure, and point the operator at the right fix.
     # CONNECT is fed on stdin (sqlplus -s /nolog), not the sqlplus command
     # line, so SYS_PASSWORD never appears in `ps -ef`. WHENEVER SQLERROR EXIT
@@ -242,15 +241,13 @@ SQL
     if echo "$VERIFY_ERROR_TEXT" | grep -q "ORA-28000"; then
         log_error "SYS account on the primary is LOCKED (ORA-28000)"
         log_error ""
-        log_error "This is expected if primary/08_security_hardening.sh has already run on the primary."
         log_error "To proceed with this clone, temporarily unlock and reset SYS on the PRIMARY:"
         log_error "  sqlplus / as sysdba"
         log_error "  ALTER USER SYS ACCOUNT UNLOCK;"
         log_error "  ALTER USER SYS IDENTIFIED BY <temporary_password>;"
         log_error ""
-        log_error "After this clone completes, re-run primary/08_security_hardening.sh to re-harden SYS"
-        log_error "(it generates a fresh random password, locks the account again, and re-propagates"
-        log_error "the refreshed password file to this standby)."
+        log_error "After this clone completes, re-apply your site's SYS lockdown policy and make sure"
+        log_error "the standby's password file matches the primary's."
     else
         log_error "Invalid SYS password or cannot connect to primary"
     fi

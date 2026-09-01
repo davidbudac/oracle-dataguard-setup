@@ -100,7 +100,6 @@ SHOW PARAMETER REMOTE_LOGIN_PASSWORDFILE;
 | 5 | STANDBY | `./standby/05_clone_standby.sh` | |
 | 6 | PRIMARY | `./primary/06_configure_broker.sh` | |
 | 7 | STANDBY | `./standby/07_verify_dataguard.sh` | |
-| 8 | PRIMARY | `./primary/08_security_hardening.sh` | optional |
 | 9 | PRIMARY | `./primary/09_configure_fsfo.sh` | optional |
 | 10 | OBSERVER | `./fsfo/observer.sh setup` then `start` | optional, required for FSFO |
 | 11 | PRIMARY | `./trigger/create_role_trigger.sh` | optional |
@@ -286,34 +285,6 @@ tail -f /OINSTALL/_dataguard_setup/logs/rman_duplicate_*.log
 - Archive gaps: 0
 - Broker status: SUCCESS
 - Clear health summary with errors, warnings, and key sequence numbers
-
----
-
-## Step 8: Security Hardening (Optional)
-
-**Server:** PRIMARY
-
-```bash
-./primary/08_security_hardening.sh
-```
-
-Rotates the SYS password to a random value and locks the SYS account. Rotation and lock
-are two separate sqlplus calls: if rotation succeeds but the lock fails, the script
-keeps going (the primary is rotated either way), stages the refreshed password file,
-prints an ACTION REQUIRED block, and exits `1`.
-
-It also refreshes the Step 1 staged copy `orapw<PRIMARY_ORACLE_SID>` on the NFS share -
-not just the `_hardened` name - so a re-run of Step 3 after hardening installs the
-**rotated** password file.
-
-> The absence of `ORA-16191` right after rotation is expected (existing transport
-> connections stay authenticated until they reconnect) and is reported as such, not as
-> proof transport survived.
-
-> **After this runs, Step 5 can no longer clone.** `05_clone_standby.sh` detects the
-> locked SYS (`ORA-28000`) and prints the fix: temporarily
-> `ALTER USER SYS ACCOUNT UNLOCK` + `IDENTIFIED BY <temp>` on the primary, re-run Step 5,
-> then re-run Step 8 to re-harden and re-propagate the password file.
 
 ---
 
@@ -679,7 +650,6 @@ ALTER SYSTEM SWITCH LOGFILE;
 │                                                                         │
 │  OPTIONAL (in order):                                                   │
 │  ════════════════════                                                   │
-│  PRIMARY:  ./primary/08_security_hardening.sh      ← LOCKS SYS          │
 │  PRIMARY:  ./primary/09_configure_fsfo.sh          ← MAXAVAIL+FASTSYNC  │
 │  OBSERVER: ./fsfo/observer.sh setup && ... start                        │
 │  PRIMARY:  ./trigger/create_role_trigger.sh                             │

@@ -1152,49 +1152,6 @@ SQLEOF
 }
 
 # =============================================================================
-# Phase: Step 8 - Security Hardening (Optional)
-# =============================================================================
-
-phase_step8() {
-    if [[ "${SKIP_SECURITY}" == "true" ]]; then
-        log_skip "Step 8: Security Hardening (SKIP_SECURITY=true)"
-        return 0
-    fi
-
-    log_phase "STEP 8: Security Hardening"
-
-    local result
-    # Prompts: typed confirmation (config auto-selected)
-    result=$(ssh_piped "PRIMARY" \
-        "./primary/08_security_hardening.sh" \
-        "SECURE ${TEST_DB_NAME}")
-
-    local exit_code=$?
-    log_info "Step 8 output (last 10 lines):"
-    echo "$result" | tail -10 | while read -r line; do log_info "  $line"; done
-
-    if [[ $exit_code -ne 0 ]]; then
-        log_fail "Step 8 script exited with code ${exit_code}"
-        record_issue "step8" "08_security_hardening.sh failed" "$(echo "$result" | tail -20)"
-        return 1
-    fi
-
-    # Validate: SYS account is locked
-    assert_sql "PRIMARY" \
-        "SELECT account_status FROM dba_users WHERE username = 'SYS';" \
-        "LOCKED" \
-        "SYS account locked" || return 1
-
-    # Validate: OS authentication still works
-    assert_sql "PRIMARY" \
-        "SELECT 'OSAUTH=OK' FROM dual;" \
-        "OSAUTH=OK" \
-        "OS authentication works after lockout" || return 1
-
-    log_pass "Step 8 completed and validated"
-}
-
-# =============================================================================
 # Phase: Step 9 - Configure FSFO (Optional)
 # =============================================================================
 
@@ -1421,7 +1378,6 @@ ALL_PHASES=(
     step5
     step6
     step7
-    step8
     step9
     step10
     step11
@@ -1445,7 +1401,6 @@ run_phase() {
         step5)           phase_step5 ;;
         step6)           phase_step6 ;;
         step7)           phase_step7 ;;
-        step8)           phase_step8 ;;
         step9)           phase_step9 ;;
         step10)          phase_step10 ;;
         step11)          phase_step11 ;;
@@ -1483,7 +1438,6 @@ Phases (in execution order):
   step5             Clone standby (RMAN duplicate)
   step6             Configure DG broker
   step7             Verify Data Guard
-  step8             Security hardening (optional)
   step9             Configure FSFO (optional)
   step10            Observer setup (optional)
   step11            Service trigger (optional)

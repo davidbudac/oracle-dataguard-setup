@@ -295,7 +295,7 @@ if [[ "$USER_EXISTS" == "1" ]]; then
     # privilege - it never shows up in DBA_ROLE_PRIVS (that only lists
     # regular roles). V$PWFILE_USERS is where it actually appears, so the
     # old query was always false here and could never detect a SYSDG grant
-    # lost when step 8 replaced the password file.
+    # lost when the password file was replaced.
     HAS_SYSDG=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
 SELECT COUNT(*) FROM V\$PWFILE_USERS WHERE USERNAME = '${OBSERVER_USER}' AND SYSDG = 'TRUE';

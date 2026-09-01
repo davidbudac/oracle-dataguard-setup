@@ -584,7 +584,7 @@ printf "   ${DIM}sqlplus /@%s as sysdba${NC}\n" "$PEER_TNS"
 [[ -n "${LOC_TNS:-}" ]] && [[ "$LOC_TNS" != "$PEER_TNS" ]] && \
     printf "   ${DIM}sqlplus /@%s as sysdba${NC}\n" "$LOC_TNS"
 printf "\n"
-warn "If SYS is ever rotated (e.g. primary/08_security_hardening.sh), the credential stored"
+warn "If the SYS password is ever rotated, the credential stored"
 warn "in this wallet goes stale - re-run this script afterward. Until then, SQLNET.WALLET_OVERRIDE=TRUE"
 warn "means the stale wallet credential silently wins over a freshly typed password (ORA-01017)."
 printf "\n"
