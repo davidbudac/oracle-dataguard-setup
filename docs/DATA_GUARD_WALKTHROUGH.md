@@ -1292,7 +1292,7 @@ Run this once Data Guard has been verified (Step 7), and ideally after the [hand
 2. Scans the NFS share for that build's password file copies (`orapw*`), the generated standby pfile, and RMAN duplicate cmdfiles/logs
 3. Prints the exact list of files that will be removed, and the files that will be left in place
 4. Prompts for confirmation (unless `-y`/`--yes` is given) before deleting anything
-5. By default, keeps the config `.env` files, the handoff report, and the application-impact briefing; `--all` removes those too (with a stronger, typed confirmation)
+5. By default, keeps the config `.env` files, the handoff report and its companion files (HTML, JSON sidecar, `_tnsnames.ora`, `_jdbc.properties`, `_verify.sh`), and the application-impact briefing; `--all` removes those too (with a stronger, typed confirmation)
 
 ### Manual Equivalent
 
@@ -1381,6 +1381,14 @@ place, so the report describes the finished topology.
 ./primary/10_generate_handoff_report.sh
 ```
 
+Step 10 is a **thin wrapper** around `dg_handoff.sh` in the repository root, which is
+the single implementation of the report. The wrapper adds only what the setup workflow
+knows and the standalone script cannot discover: the build's `standby_config_<NAME>.env`
+(hostnames, listener port, standby TNS alias), the NFS share as the output location, the
+`docs/DG_APPLICATION_IMPACT.html` copy next to the report, and the setup-step
+banner/`-n` check mode/summary chrome. It passes `--all-flavors`, so the step-10 output
+keeps the primary-only / standby-only / role-aware connect strings.
+
 ### What the Script Does
 
 1. Discovers the topology (hostnames prefer the broker's `HostName` property;
@@ -1391,34 +1399,48 @@ place, so the report describes the finished topology.
    FSFO is enabled), broker config, role-trigger deployment status, server-side
    `SQLNET.EXPIRE_TIME`
 3. Derives the standby's open mode from the broker's `Real Time Query` field (19c
-   DGMGRL prints no "Open Mode" line) plus a best-effort wallet connect
+   DGMGRL prints no "Open Mode" line) plus, when a standby TNS alias is known, a
+   best-effort auto-login-wallet connect to the standby, which also yields apply and
+   transport **lag in seconds** from `V$DATAGUARD_STATS` (otherwise the lag is parsed
+   from the broker's `Apply Lag:` line)
 4. Discovers user-visible services from `V$ACTIVE_SERVICES` (same logic as the role
    trigger), always including the default `<DB_UNIQUE_NAME>` service - which is
    flagged as **not** managed by the role trigger - and reads each service's HA
-   attributes from the dictionary (`sql/queries/get_service_ha_attributes.sql`:
-   TAF type/method/retries/delay, Transaction Guard `COMMIT_OUTCOME`,
-   `DRAIN_TIMEOUT`, `FAILOVER_RESTORE`), so the report states what each service
-   actually has instead of hedging
+   attributes from the dictionary (TAF type/method/retries/delay, Transaction Guard
+   `COMMIT_OUTCOME`, `DRAIN_TIMEOUT`, `FAILOVER_RESTORE`), so the report states what
+   each service actually has instead of hedging
 5. Computes a **Verdict** with each reason named *and an action attached to every
    finding*: ERROR on broker-config errors/ORA- diagnostics, failure-state
    switchover status, or apply lag beyond `DG_SEQ_GAP_CRIT` sequences; WARNING on
    lesser findings (broker warnings, role trigger not deployed, standby readability
-   unknown); HEALTHY only when nothing fired
-6. Writes the Markdown report, a styled self-contained HTML twin, and copies
+   unknown, no user-created service, apply lag in time beyond `DG_LAG_WARN_SECONDS`,
+   default 60); HEALTHY only when nothing fired
+6. Writes the Markdown report, a styled self-contained HTML twin, a JSON sidecar and a
+   TNS/JDBC/verify pack (see **Output** below), and copies
    `docs/DG_APPLICATION_IMPACT.html` to the share when available
 
 The report opens with an **At a Glance** section (verdict pill + finding/action
-list, one-line RPO, failover mode, standby readability, which connect string to
-hand out, go-live pointers); the application-facing sections follow (1 Connection
+list, one-line RPO, failover mode, standby readability, standby data freshness,
+which connect string to hand out, go-live pointers), followed by **Changes Since
+Last Report** - a diff against the previous run's JSON sidecar (verdict, DB unique
+names, hosts, port, protection mode, `LogXptMode`, standby open mode, FSFO, role
+trigger, DB version, descriptor timeouts, and services added/removed/changed), which
+degrades to a one-liner on the first run or when nothing changed; the
+application-facing sections follow (1 Connection
 Strings, 2 Application Impact, 3 Client and Pool Settings, 4 Verification), and all
 DBA-only material (topology, status snapshot, broker output, the datafile/PDB
 convert-pair note, discovery warnings) moves to a closing **Appendix: DBA
-Snapshot**. Set `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT` in the environment to add
+Snapshot**, which also carries **Recommended Service Changes (DBA)**: for every
+user-created service missing TAF, Transaction Guard or a drain timeout, a ready
+`DBMS_SERVICE.MODIFY_SERVICE` block (prefixed with `ALTER SESSION SET CONTAINER` for a
+PDB service) with suggested starting values and a reminder that the service must be
+restarted for new TAF attributes to apply. Set `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT` in the environment to add
 an environment label (PROD/UAT/...) and a DBA contact chip to the header.
 
 ### Connection Strings
 
-Per service, in three flavors:
+Role-aware strings are always emitted; step 10 passes `--all-flavors`, so its report
+carries three flavors per service:
 
 - **Primary-only** TNS + JDBC - writes / admin.
 - **Standby-only** TNS + JDBC - read-only reporting. If the standby is `MOUNTED` the
@@ -1436,9 +1458,14 @@ ack point, the standby-disconnected loss window, ASYNC loss bounds), an outage-b
 breakdown (FSFO threshold + failover execution + service startup + reconnect), an ORA-
 error table for role transitions (12514/12541/01033/03113/25402/16000 with
 retryability) plus commit-ambiguity guidance, a descriptor-parameter reference with
-worst-case connect math derived from the actual TNS values (the Easy Connect Plus
-strings carry the same connect/retry values as the TNS descriptor, so every driver
-gets the documented behavior), ADG read-staleness controls
+worst-case connect math derived from the actual TNS values - `CONNECT_TIMEOUT`,
+`TRANSPORT_CONNECT_TIMEOUT`, `RETRY_COUNT` and `RETRY_DELAY`, tunable per run with
+`--connect-timeout` / `--transport-timeout` / `--retry-count` / `--retry-delay`, and
+the prose follows the values you set (the Easy Connect Plus strings carry the same
+connect/retry values as the TNS descriptor, so every driver gets the documented
+behavior). The descriptors configure **no** `FAILOVER_MODE`: TAF is reported per
+service as a dictionary fact, not baked into the connect string. The report also
+covers ADG read-staleness controls
 (`STANDBY_MAX_DATA_DELAY`/ORA-03172, `SYNC WITH PRIMARY`), sequence-cache gap and
 NOLOGGING/ORA-26040 specifics, driver mapping examples (ODP.NET, python-oracledb,
 SQLAlchemy), a client/pool settings checklist, and a verification section whose
@@ -1450,13 +1477,20 @@ pass criterion.
 | File | Notes |
 |------|-------|
 | `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md` | The report; also printed to stdout |
-| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.html` | Styled, self-contained twin of the same content (ČSOB palette, light/dark, copy buttons on descriptor blocks) |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.html` | Styled, self-contained twin of the same content (ČSOB palette, light/dark, table of contents, print stylesheet, staleness banner, copy buttons on descriptor blocks) |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.json` | Machine-readable sidecar (`schema_version` 1) with every discovered fact, the verdict and its notes, the descriptor timeouts and the per-service HA attributes - also the baseline the next run diffs for "Changes Since Last Report" |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>_tnsnames.ora` | Ready-to-append TNS aliases (`<SERVICE>_HA`, plus `_PRI` / `_STB` under `--all-flavors`) |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>_jdbc.properties` | One `<SERVICE>_HA.url` (full descriptor) and `<SERVICE>_HA.easyconnect` per service |
+| `${NFS_SHARE}/dg_handoff_<PRIMARY_DB_UNIQUE_NAME>_verify.sh` | Runnable check for application hosts: name resolution and TCP reachability for both hosts, plus an end-to-end `SYS_CONTEXT` role assertion through the role-aware Easy Connect string. Needs no repository and no Oracle server install - a missing tool SKIPs its check. Credentials via `-u user/pass` or `APP_USER`/`APP_PASSWORD`; `--expect-db-unique-name <new primary>` turns it into the switchover-drill pass criterion |
 | `${NFS_SHARE}/dg_application_impact.html` | Copy of `docs/DG_APPLICATION_IMPACT.html`, linked from "Notes for Client Teams" (supplementary - the Markdown is self-contained) |
 
-The Markdown emitter is the single definition of the report; the HTML is rendered from
-it by a built-in POSIX-awk converter, so the two never diverge in content.
+The report header lists these files in a **Files** chip. The Markdown emitter is the
+single definition of the report; the HTML is rendered from it by a built-in POSIX-awk
+converter, so the two never diverge in content. The HTML branding (eyebrow name, logo,
+accent/ink/tint colors) can be overridden with the `DG_HANDOFF_BRAND_*` environment
+variables, and its staleness banner threshold with `DG_HANDOFF_STALE_DAYS` (default 30).
 
-Both handoff scripts also emit an **Interactive diagram** link in the report header: the
+The report header also carries an **Interactive diagram** link in the report header: the
 discovered topology (DB unique names, hosts, observer placement, first service, port,
 protection mode, `LogXptMode`, FSFO threshold - **never credentials**) is encoded as
 `#cfg=<base64url(JSON)>` for the interactive configuration explorer at
@@ -1466,10 +1500,10 @@ on a host with neither `base64` nor `openssl`.
 
 Re-run after listener changes, new services, or topology changes.
 
-### Standalone Variant
+### Running It Standalone
 
-`./dg_handoff.sh` (repo root) produces the same report against **any** existing Data
-Guard configuration, with no dependency on `standby_config_*.env`,
+`./dg_handoff.sh` (repo root) is the same generator, run directly against **any**
+existing Data Guard configuration, with no dependency on `standby_config_*.env`,
 `common/dg_functions.sh`, or the NFS share:
 
 ```bash
@@ -1477,14 +1511,28 @@ Guard configuration, with no dependency on `standby_config_*.env`,
 ./dg_handoff.sh -o /tmp/handoff.md
 ./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
 ./dg_handoff.sh --env PROD --contact "DBA team <dba@example.com>"
+./dg_handoff.sh --standby-tns-alias STB_ALIAS --all-flavors
+./dg_handoff.sh --service APP_SVC --exclude-service PDB1:OLD_SVC
+./dg_handoff.sh --connect-timeout 5 --retry-count 2
+./dg_handoff.sh --previous /tmp/last.json --no-pack
 ```
 
-Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`, with the HTML twin
-written next to it. Use the `--primary-host` / `--standby-host` / `--port` overrides
-when the broker is down or discovery returns the wrong value; `--env` / `--contact`
-fill the header chips (also settable via `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT`).
+Output defaults to `./dg_handoff_<PRIMARY_DB_UNIQUE_NAME>.md`, with the HTML twin, the
+JSON sidecar and the TNS/JDBC/verify pack written next to it. Useful flags:
 
-Beyond the step-10 report, the standalone variant is container-aware: services are
+| Flag | Effect |
+|------|--------|
+| `--primary-host` / `--standby-host` / `--port` | Override discovery when the broker is down or returns the wrong value |
+| `--standby-tns-alias A` | Query the standby directly (auto-login wallet only, never prompts) for its `OPEN_MODE` and `V$DATAGUARD_STATS` lag (env: `DG_HANDOFF_STANDBY_TNS_ALIAS`) |
+| `--all-flavors` | Also emit primary-only and standby-only strings (what step 10 does) |
+| `--impact-reference PATH` | What the "Full application behavior briefing" bullet points at |
+| `--env` / `--contact` | Header chips (env: `DG_HANDOFF_ENV` / `DG_HANDOFF_CONTACT`) |
+| `--service NAME` / `--exclude-service NAME` | Repeatable, case-insensitive, `CONTAINER:NAME` accepted. An active filter is stated in the header; a `--service` that matches nothing is a WARNING |
+| `--connect-timeout` / `--transport-timeout` / `--retry-count` / `--retry-delay N` | Descriptor knobs the tables, worst-case math, pool checklist and Easy Connect strings all derive from (env: `DG_HANDOFF_CONNECT_TIMEOUT` and friends) |
+| `--previous FILE` | Diff against this JSON sidecar instead of the one at the default path |
+| `--no-json` / `--no-pack` | Skip the sidecar (and therefore the change tracking) / skip the TNS/JDBC/verify pack |
+
+Service discovery is container-aware: services are
 discovered as (container, service) pairs from `V$ACTIVE_SERVICES` joined to
 `V$CONTAINERS`, each service section names the container it lands in (with a
 warning for `CDB$ROOT`), and every **default** service (a container's own
@@ -1494,7 +1542,7 @@ be handed to applications as failover descriptors. User-created services sort
 first, and a run with no user-created service at all is a WARNING of its own.
 
 Exit codes: `0` HEALTHY, `1` WARNING, `2` ERROR, `3` usage/connection failure -
-cron-friendly, same convention as `dg_status.sh`. (The step-10 variant keeps the
+cron-friendly, same convention as `dg_status.sh`. (The step-10 wrapper keeps the
 setup-step convention: nonzero only on ERROR.)
 
 ### Manual Equivalent
@@ -1502,7 +1550,8 @@ setup-step convention: nonzero only on ERROR.)
 There is no concise manual equivalent - the report is a document, not a database
 change. Producing it by hand means running the Step 7 verification queries, then
 `DGMGRL SHOW CONFIGURATION` / `SHOW DATABASE ... VERBOSE`, then `V$ACTIVE_SERVICES`,
-then hand-writing a TNS descriptor per service per flavor and keeping all of it in sync
+then hand-writing a TNS descriptor per service per flavor, a JDBC URL per service and a
+per-host connectivity check, and keeping all of it in sync
 with the configuration. That is exactly the work the script exists to avoid.
 
 ---

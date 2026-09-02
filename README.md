@@ -6,9 +6,9 @@ Automated scripts for building, verifying, and operating an Oracle 19c Physical 
 
 - **Setup workflow** (steps 1-7) — gather primary info, generate config, prepare both sides, RMAN duplicate, broker setup, verification.
 - **Optional add-ons** — Fast-Start Failover + observer (steps 9-10), role-aware service trigger (step 11), NFS artifact cleanup (step 12), Maximum Availability without FSFO (step 13).
-- **Handoff report** (recommended, any time after step 7) — Markdown + styled HTML doc with topology, status, verdict, and per-service TNS/JDBC strings for application teams.
+- **Handoff report** (recommended, any time after step 7) — Markdown + styled HTML doc with topology, status, verdict, and per-service TNS/JDBC strings for application teams, plus a JSON sidecar and a ready-to-install pack (`_tnsnames.ora`, `_jdbc.properties`, runnable `_verify.sh`).
 - **Side toolkits** — add an FSFO observer on a third host to an existing configuration, convert a SYS-authenticated observer to SYSDG, migrate a non-CDB into a CDB keeping both standbys.
-- **Operational tools** — SSH dashboard, local triage/diagnostics, standby-redo-log audit, SYNC commit-cost report, wallet setup for password-free peer access, standalone handoff regenerator.
+- **Operational tools** — SSH dashboard, local triage/diagnostics, standby-redo-log audit, SYNC commit-cost report, wallet setup for password-free peer access, standalone handoff regenerator (`dg_handoff.sh`, which step 10 wraps).
 
 ## Prerequisites
 
@@ -35,7 +35,7 @@ dataguard_setup/
 ├── CLAUDE.md                    # Project notes for AI assistants
 │
 ├── nfs/                         # NFS server + client setup (run first)
-├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 9, 13) + the handoff report (10_...)
+├── primary/                     # PRIMARY-side steps (1, 2, 4, 6, 9, 13) + the handoff report wrapper (10_...)
 ├── standby/                     # STANDBY-side steps (3, 5, 7)
 ├── fsfo/                        # observer.sh - lifecycle for FSFO observer
 ├── trigger/                     # Role-aware service triggers (SYS or dedicated user variant) + CDB/PDB service creation
@@ -52,7 +52,7 @@ dataguard_setup/
 ├── dg_triage_sid.sh             # Fast local triage (run on DB host)
 ├── dg_diag_sid.sh               # Deep local diagnostics (run on DB host)
 ├── dg_check_sid.sh              # Deprecated wrapper - prefer triage/diag
-├── dg_handoff.sh                # Standalone handoff report (no setup-time deps)
+├── dg_handoff.sh                # THE handoff report generator (step 10 is a thin wrapper around it)
 ├── get_dg_config_url.sh         # Standalone interactive-diagram link for an existing configuration
 ├── dg_check_srl.sh              # Standby redo log checker - prints fix DDL for missing/undersized SRLs
 ├── dg_sync_impact.sh            # Standalone SYNC/FASTSYNC commit-latency impact report (ASH/AWR + histogram model)
@@ -89,7 +89,7 @@ Recommended, any time after step 7 — run both **before** step 12's `--all` cle
 
 | Server | Command | Notes |
 |--------|---------|-------|
-| PRIMARY | `./primary/10_generate_handoff_report.sh` | Markdown + HTML handoff for app teams |
+| PRIMARY | `./primary/10_generate_handoff_report.sh` | Markdown + HTML handoff for app teams, plus JSON sidecar and TNS/JDBC/verify pack |
 | BOTH    | `bash common/setup_dg_wallet.sh`          | Password-free peer access for the local tools |
 
 `./trigger/create_role_trigger_dedicated_user.sh` is an alternative to step 11 that puts trigger objects under a dedicated user instead of `SYS`. For multitenant databases, `./trigger/create_role_trigger_cdb.sh` manages PDB services, and `./trigger/create_cdb_service.sh` / `./trigger/create_pdb_service.sh` create role-aware services at the `CDB$ROOT` or PDB level.
@@ -143,8 +143,13 @@ bash dg_diag_sid.sh -P           # Force SYS password prompt for remote
 bash common/setup_dg_wallet.sh
 
 # Handoff report regeneration (no NFS / no setup config required)
+# Writes <out>.md/.html/.json plus <out>_tnsnames.ora, <out>_jdbc.properties, <out>_verify.sh
 ./dg_handoff.sh
 ./dg_handoff.sh --primary-host pri --standby-host stb --port 1521
+./dg_handoff.sh --all-flavors --standby-tns-alias STB_ALIAS   # + primary-only/standby-only strings
+./dg_handoff.sh --service APP_SVC --exclude-service OLD_SVC   # limit the report to given services
+./dg_handoff.sh --connect-timeout 5 --retry-count 2           # descriptor knobs (prose follows them)
+./dg_handoff.sh --no-json --no-pack                           # Markdown + HTML only
 
 # Interactive diagram link for an existing configuration (run on a DB host)
 ./get_dg_config_url.sh           # summary on stderr, URL on stdout

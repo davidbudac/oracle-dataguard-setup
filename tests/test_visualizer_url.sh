@@ -1,8 +1,7 @@
 #!/bin/bash
 # ============================================================
 # Test script for the dataguard-doc visualizer link helpers
-# embedded in dg_handoff.sh, primary/10_generate_handoff_report.sh
-# and get_dg_config_url.sh
+# embedded in dg_handoff.sh and get_dg_config_url.sh
 # ============================================================
 # Usage: bash tests/test_visualizer_url.sh [-b|--base-url <url>]
 #
@@ -13,8 +12,8 @@
 # The helpers build the "#cfg=<base64url(JSON)>" share URL consumed by
 # the interactive Data Guard configuration explorer
 # (https://github.com/davidbudac/dataguard-doc, published at
-# https://davidbudac.cz/dataguard/). The block is duplicated in both
-# handoff scripts and in the standalone link generator; this test:
+# https://davidbudac.cz/dataguard/). The block is duplicated in the
+# handoff report generator and the standalone link generator; this test:
 #   1. diffs all copies (they must stay byte-identical)
 #   2. sources the extracted block and checks the generated URL:
 #      base64url alphabet, decodable payload, correct JSON members,
@@ -124,7 +123,7 @@ if [[ -z "$BLOCK_A" ]]; then
     FAIL=$((FAIL + 1))
 fi
 
-for OTHER in "primary/10_generate_handoff_report.sh" "get_dg_config_url.sh"; do
+for OTHER in "get_dg_config_url.sh"; do
     BLOCK_B=$(extract_block "${REPO_DIR}/${OTHER}")
     TMP_B="${TMPDIR:-/tmp}/viz_block_b.$$"
     printf '%s\n' "$BLOCK_B" > "$TMP_B"

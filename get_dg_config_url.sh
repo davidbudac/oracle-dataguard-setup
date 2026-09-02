@@ -341,9 +341,9 @@ if [[ -z "$STANDBY_HOSTNAME" && -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
 fi
 
 # ---- begin dataguard-doc visualizer helpers ----
-# Kept byte-identical in dg_handoff.sh and
-# primary/10_generate_handoff_report.sh (tests/test_visualizer_url.sh
-# diffs the two copies). The handoff report links the discovered
+# Kept byte-identical in dg_handoff.sh and get_dg_config_url.sh
+# (tests/test_visualizer_url.sh diffs the copies against the
+# dg_handoff.sh reference). The handoff report links the discovered
 # topology into the interactive Data Guard configuration explorer
 # (source: https://github.com/davidbudac/dataguard-doc, published at
 # https://davidbudac.cz/dataguard/). The page restores its state from

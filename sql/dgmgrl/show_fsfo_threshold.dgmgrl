@@ -1,3 +1,0 @@
--- Show Fast-Start Failover properties
-SHOW FAST_START FAILOVER;
-EXIT;
