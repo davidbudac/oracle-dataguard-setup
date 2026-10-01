@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 4: Prepare Primary for DG
 # ============================================================
@@ -55,8 +55,8 @@ init_log "04_prepare_primary_dg_${STANDBY_DB_UNIQUE_NAME}"
 progress_step "Reviewing Planned Changes"
 
 print_list_block "This Step Will Change" \
-    "Update ${ORACLE_HOME}/network/admin/tnsnames.ora with the standby aliases if missing." \
-    "Update ${ORACLE_HOME}/network/admin/listener.ora with static registration for primary and broker access." \
+    "Update $(dg_net_admin_dir)/tnsnames.ora with the standby aliases if missing." \
+    "Update $(dg_net_admin_dir)/listener.ora with static registration for primary and broker access." \
     "Enable FORCE LOGGING if required." \
     "Create missing standby redo log groups on the primary." \
     "Enable DG_BROKER_START and set STANDBY_FILE_MANAGEMENT=AUTO."
@@ -68,8 +68,8 @@ print_list_block "This Step Will Not Change" \
 
 print_list_block "Files and Objects" \
     "Standby config: ${STANDBY_CONFIG_FILE}" \
-    "Listener file: ${ORACLE_HOME}/network/admin/listener.ora" \
-    "TNS file: ${ORACLE_HOME}/network/admin/tnsnames.ora" \
+    "Listener file: $(dg_net_admin_dir)/listener.ora" \
+    "TNS file: $(dg_net_admin_dir)/tnsnames.ora" \
     "Database changes: FORCE LOGGING, standby redo logs, DG_BROKER_START, STANDBY_FILE_MANAGEMENT"
 
 print_list_block "Recovery If This Step Fails" \
@@ -89,7 +89,7 @@ fi
 
 progress_step "Configuring TNS Names on Primary"
 
-TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
+TNSNAMES_ORA="$(dg_net_admin_dir)/tnsnames.ora"
 TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
@@ -160,7 +160,7 @@ fi
 
 progress_step "Configuring Listener on Primary"
 
-LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
+LISTENER_ORA="$(dg_net_admin_dir)/listener.ora"
 
 # Private temp dir + EXIT-trap cleanup: create_temp_dir prefers `mktemp -d`,
 # falling back to a mode-700 directory on AIX images without mktemp - safer
@@ -317,6 +317,32 @@ fi
 log_info "Current standby redo groups: $CURRENT_STBY_GROUPS"
 log_info "Required standby redo groups: $REQUIRED_STBY_GROUPS"
 
+check_existing_srl_sizes() {
+    # M6: count alone doesn't catch UNDERSIZED pre-existing SRLs. Oracle
+    # rejects a standby redo log smaller than the largest online redo
+    # log for real-time apply, so an SRL set created before an ORL
+    # resize (or the H1 arbitrary-log-size bug this review also fixes)
+    # can pass this count check while defeating step 1's own advice to
+    # resize the ORLs before the standby exists. Compare, warn, and give
+    # the fix DDL - do not auto-drop existing standby redo log groups.
+    STBY_MIN_SIZE_MB=$(run_sql_query "get_standby_redo_min_size.sql")
+    STBY_MIN_SIZE_MB=$(echo "$STBY_MIN_SIZE_MB" | tr -d '[:space:]')
+    if is_numeric "$STBY_MIN_SIZE_MB" && is_numeric "${REDO_LOG_SIZE_MB:-}"; then
+        if [[ "$STBY_MIN_SIZE_MB" -lt "$REDO_LOG_SIZE_MB" ]]; then
+            log_warn "Existing standby redo logs are UNDERSIZED: smallest is ${STBY_MIN_SIZE_MB}MB, online redo logs are ${REDO_LOG_SIZE_MB}MB"
+            log_warn "  Oracle rejects standby redo logs smaller than the largest online redo log for"
+            log_warn "  real-time apply - transport silently falls back to archiver mode instead."
+            log_warn "  Fix (run manually - not applied automatically), for each undersized group:"
+            log_warn "    ALTER DATABASE DROP STANDBY LOGFILE GROUP <n>;"
+            log_warn "    ALTER DATABASE ADD STANDBY LOGFILE GROUP <n> ('<path>') SIZE ${REDO_LOG_SIZE_MB}M;"
+        else
+            log_info "Existing standby redo logs are sized adequately (>= ${REDO_LOG_SIZE_MB}MB)"
+        fi
+    else
+        log_warn "Could not verify existing standby redo log sizes (non-numeric query result) - check manually"
+    fi
+}
+
 if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     log_info "Creating standby redo logs..."
 
@@ -341,6 +367,15 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
         REDO_PATH=$(run_sql_query "get_redo_member_path.sql")
         REDO_PATH=$(echo "$REDO_PATH" | tr -d '[:space:]')
         log_info "PRIMARY_SRL_PATH not set in config, using queried ORL path: $REDO_PATH"
+    fi
+
+    # An empty path would become "/" below and aim ADD STANDBY LOGFILE at
+    # the filesystem root (the query is empty for a member with no
+    # directory component, or when no ONLINE member row came back).
+    if [[ -z "$REDO_PATH" ]]; then
+        log_error "Could not determine a directory for the standby redo logs (no ONLINE redo log member path found)"
+        log_error "Set PRIMARY_SRL_PATH in the standby config and re-run."
+        exit 1
     fi
 
     # Ensure trailing slash since we concatenate the filename directly
@@ -418,32 +453,16 @@ if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
     echo ""
     log_info "Standby redo log configuration:"
     run_sql_display "get_standby_redo_info.sql"
+
+    # A partial set (some SRLs already existed) was never size-checked:
+    # the groups just added match the ORL size, but the old ones may not.
+    if [[ "$CURRENT_STBY_GROUPS" -gt 0 ]]; then
+        check_existing_srl_sizes
+    fi
 else
     log_info "Sufficient standby redo logs already exist"
 
-    # M6: count alone doesn't catch UNDERSIZED pre-existing SRLs. Oracle
-    # rejects a standby redo log smaller than the largest online redo
-    # log for real-time apply, so an SRL set created before an ORL
-    # resize (or the H1 arbitrary-log-size bug this review also fixes)
-    # can pass this count check while defeating step 1's own advice to
-    # resize the ORLs before the standby exists. Compare, warn, and give
-    # the fix DDL - do not auto-drop existing standby redo log groups.
-    STBY_MIN_SIZE_MB=$(run_sql_query "get_standby_redo_min_size.sql")
-    STBY_MIN_SIZE_MB=$(echo "$STBY_MIN_SIZE_MB" | tr -d '[:space:]')
-    if is_numeric "$STBY_MIN_SIZE_MB" && is_numeric "${REDO_LOG_SIZE_MB:-}"; then
-        if [[ "$STBY_MIN_SIZE_MB" -lt "$REDO_LOG_SIZE_MB" ]]; then
-            log_warn "Existing standby redo logs are UNDERSIZED: smallest is ${STBY_MIN_SIZE_MB}MB, online redo logs are ${REDO_LOG_SIZE_MB}MB"
-            log_warn "  Oracle rejects standby redo logs smaller than the largest online redo log for"
-            log_warn "  real-time apply - transport silently falls back to archiver mode instead."
-            log_warn "  Fix (run manually - not applied automatically), for each undersized group:"
-            log_warn "    ALTER DATABASE DROP STANDBY LOGFILE GROUP <n>;"
-            log_warn "    ALTER DATABASE ADD STANDBY LOGFILE GROUP <n> ('<path>') SIZE ${REDO_LOG_SIZE_MB}M;"
-        else
-            log_info "Existing standby redo logs are sized adequately (>= ${REDO_LOG_SIZE_MB}MB)"
-        fi
-    else
-        log_warn "Could not verify existing standby redo log sizes (non-numeric query result) - check manually"
-    fi
+    check_existing_srl_sizes
 fi
 
 # ============================================================

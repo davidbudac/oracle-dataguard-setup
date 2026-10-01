@@ -25,6 +25,7 @@ NFS share) - copy the one file to the primary host and run it.
    ./dg_sync_impact.sh                          # defaults: ASH last 24h, AWR last 7 days
    ./dg_sync_impact.sh --ash-hours 6 --days 14
    ./dg_sync_impact.sh --baseline-begin '2026-07-01 00:00' --baseline-end '2026-07-08 00:00'
+   ./dg_sync_impact.sh --baseline-begin 2026-07-01 --baseline-end 2026-07-08  # whole days
    ./dg_sync_impact.sh --baseline-begin 12000 --baseline-end 12168     # snap-ID form
    ./dg_sync_impact.sh --auto-baseline          # detect the pre-SYNC baseline from AWR
    ./dg_sync_impact.sh --no-pack                # no Diagnostics Pack license
@@ -39,16 +40,29 @@ takes a few seconds; it is read-only against the database (SELECTs,
 `dgmgrl SHOW`, and one session-local NLS setting - no DDL, no DML, no
 configuration changes), so it is safe on production. Exit codes: `0`
 report produced (read the report - warnings live there), `1` fatal
-(environment/connection problem, or not a PRIMARY), `2` bad arguments.
+(environment/connection problem, or not a PRIMARY), `2` bad arguments
+(including an option given without its value, and an `-o` file that cannot
+be written - that is checked before anything is collected). Numeric values
+are decimal, so `--days 08` means 8. Ctrl-C (or SIGTERM) ends the run at
+once (exit `130` / `143`) and removes the temporary query directory.
+
+**Baseline dates:** `--baseline-begin` / `--baseline-end` take either
+`'YYYY-MM-DD HH24:MI'` or a bare `YYYY-MM-DD`. A bare begin date means
+`00:00` of that day and a bare end date runs to the end of that day
+(`23:59:59`), so `--baseline-begin 2026-07-01 --baseline-end 2026-07-08`
+covers eight whole days. Both values must use the same form (dates or
+snapshot IDs), and a begin after the end is refused.
 
 **Units:** every duration in the report is in **milliseconds**. That
 includes the ones Oracle exposes in other units - `V$SYSTEM_EVENT`
 totals and `DB time` are divided down from microseconds, and the
 `V$REDO_DEST_RESP_HISTOGRAM` buckets (the view counts in whole seconds)
 are multiplied up, so its finest bucket appears as `1000` ms and holds
-every sub-second response. The two exceptions are rates (`commits/s`)
-and instance uptime, which stay in seconds because they are not
-latencies. Statistic names are printed as Oracle names them, so
+every sub-second response. The exceptions are rates (`commits/s`),
+instance uptime, and the `NET_TIMEOUT` configuration setting in
+section 1 (shown as Oracle defines it, in seconds, under the header
+`NET_TIMEOUT (s)`), which are not latencies measured by this report.
+Statistic names are printed as Oracle names them, so
 `redo synch time (usec)` keeps its own unit.
 
 **Provenance:** each section opens with a one-line `Source:` naming the
@@ -57,8 +71,12 @@ produced it - recorded verbatim as it was sent to `sqlplus`, so it can
 be copied and re-run by hand. In Markdown these are fenced `sql` blocks;
 in HTML they are collapsed `<details>` panels that stay out of the way
 until you open them. The queries are captured in a temporary directory
-that is removed when the script exits; if it cannot be created, the
-report simply omits the blocks.
+that is removed when the script exits (created with `mktemp -d`, or with
+`mkdir -m 700` under `$TMPDIR` where `mktemp` is missing, as on a stock
+AIX); if neither works the script warns and the report simply omits the
+blocks. The current AWR window and the baseline window are recorded under
+separate names (`AWRAGG`/`AWRHIST` and `BASEAGG`/`BASEHIST`), so each
+table shows the query that produced it.
 
 `--html` renders the same report as a standalone HTML page (inline CSS,
 light/dark aware, no external assets - text is set in IBM Plex Sans and
@@ -154,6 +172,11 @@ view can only surface outliers, never corroborate a sub-second estimate.
   division by the group-commit ratio.
 - *Total added foreground wait* = overhead x `log file sync` wait count,
   expressed per hour, as % of DB time, and as % of log file sync time.
+- *Restarts*: every AWR delta is computed within one instance incarnation
+  (`LAG()` partitioned by the snapshot's `STARTUP_TIME`), so a counter reset
+  never produces a bogus delta, and the elapsed time behind the per-hour
+  rates counts only the intervals that contributed - restart downtime does
+  not dilute the rates.
 - *AWR trend* (`DBA_HIST_SYSTEM_EVENT` / `DBA_HIST_SYSSTAT` /
   `DBA_HIST_SYS_TIME_MODEL` deltas per snapshot) shows when the tax bites.
   The per-snapshot overhead column uses the **lower bound** estimator -
@@ -196,7 +219,12 @@ predates it): `SYNC` at ratio >= 0.5, `NOSYNC` at ratio <= 0.05, `IDLE` for
 near-idle snapshots (fewer than 50 redo writes) or restart artifacts
 (negative deltas), `MIXED` in between. The thresholds are env-overridable:
 `DG_SI_SYNC_RATIO` (0.5), `DG_SI_NOSYNC_RATIO` (0.05), `DG_SI_MIN_WRITES`
-(50). It then takes the **most recent run of at least 2 consecutive
+(50); a value that is not a plain number (or `DG_SI_MIN_WRITES` below 1, or
+a no-sync ratio not below the sync ratio) is reported on stderr and replaced
+by its default. The `SYNC Remote Write` delta is taken over every snapshot,
+counting a snapshot without a row for the event as zero waits (AWR stores an
+event only once it has occurred), so the first snapshot in which the event
+appears reads as SYNC rather than as the last snapshot of the baseline. It then takes the **most recent run of at least 2 consecutive
 `NOSYNC` snapshots** before the last `SYNC` snapshot as the baseline
 (`IDLE`/`MIXED` snapshots break a run - gaps are never silently bridged)
 and feeds it into the same comparison machinery as the manual flags. The
@@ -219,7 +247,7 @@ be combined with `--no-pack`).
 
 | Section | What to look at |
 |---------|-----------------|
-| 1 Configuration | Which destinations are synchronous; AFFIRM vs NOAFFIRM decides what R contains |
+| 1 Configuration | Which destinations are synchronous; AFFIRM vs NOAFFIRM decides what R contains. Only `STATUS = VALID` SYNC/FASTSYNC destinations count as active transport; a SYNC destination that is deferred or in error is called out separately and not counted |
 | 2 Headline | The refined per-commit estimate with its bounds; s/hour; % of DB time |
 | 3 LGWR pipeline | `redo synch time overhead` - the part of log file sync that is scheduling/CPU, **not** transport. If this dominates, fix CPU starvation, not Data Guard |
 | 4 Distributions | p50/p90/p99 **and max** for lfs, L and R; the E[max] model inputs; per-destination SYNC response histogram (with each bucket's last-occurrence time) |

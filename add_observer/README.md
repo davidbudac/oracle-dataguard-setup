@@ -38,7 +38,7 @@ it must reach **both** listeners.
 |---|---|---|
 | `01_prepare_primary.sh` | **PRIMARY** | Discovers the topology, reports FSFO readiness, creates the dedicated `SYSDG` observer user, optionally enables FSFO, and writes the bundle for the third host. |
 | `02_setup_observer_host.sh` | **THIRD host** | Installs the TNS entries, builds the auto-login wallet, configures `sqlnet.ora`, and proves connectivity to **both** databases. |
-| `03_observer_ctl.sh` | **THIRD host** | `start` / `stop` / `restart` / `status` / `log` / `boot` (prints a systemd unit, a cron `@reboot` line, and a watchdog). |
+| `03_observer_ctl.sh` | **THIRD host** | `start` / `stop` / `restart` / `status` / `log` / `boot` (prints a systemd unit and a cron `@reboot` line for Linux, an `inittab`/`rc2.d` entry for AIX, and a watchdog cron line). |
 | `04_verify_observer.sh` | anywhere | End-state verification, including a check that the observer is *not* on a database host. Exit 0 = verified. |
 | `_lib.sh` | — | Shared helpers sourced by the numbered scripts. |
 
@@ -203,9 +203,15 @@ This is the step people skip. A background observer is an ordinary detached
 `dgmgrl` process; **nothing in Oracle restarts it**. After a reboot of the third
 host the configuration runs on with no observer and no automatic failover, and
 usually nobody notices until the day it was needed. `boot` prints a ready-made
-systemd unit, a cron `@reboot` line, and a five-minute watchdog that restarts a
-dead observer (`03_observer_ctl.sh status` exits 0 only when the primary reports
-the observer present, so it is safe to drive a restart from).
+systemd unit and a cron `@reboot` line (Linux), an `mkitab` entry and an
+`/etc/rc.d/rc2.d` script (AIX, whose cron has neither `@reboot` nor `*/N` steps),
+and a five-minute watchdog that restarts a dead observer. The watchdog spells
+the minutes out (`0,5,10,...,55`) so it is valid on AIX too, and the generated
+lines export `ORACLE_HOME`, `TNS_ADMIN`, `LIBPATH` and `LD_LIBRARY_PATH` because
+cron and init skip `.profile`. `03_observer_ctl.sh status` exits 0 only when the
+broker lists *this* observer (by name, else by host), so it is safe to drive a
+restart from; it falls back to the standby alias when the primary does not
+answer, so the watchdog keeps working after a failover.
 
 Alert on it as well:
 
@@ -288,7 +294,10 @@ target standby at the same time.
 **Can I run more than one observer?**
 Yes, on 12.2+: up to three can be registered per configuration, one of them the
 master (`SET MASTEROBSERVER TO <name>`). Run script 02 on each additional host
-and give each a distinct `--observer-name`. The observer *user* and wallet
+and give each a distinct `--observer-name`. `03_observer_ctl.sh start` checks
+for *this* observer (by name, else by host) in `SHOW OBSERVER`, so an observer
+already running elsewhere does not stop another host from adding its own;
+`restart` waits for the broker to drop this observer before starting again. The observer *user* and wallet
 approach are identical.
 
 **Can one host observe several configurations?**

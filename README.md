@@ -111,9 +111,11 @@ All workflow scripts that source `common/dg_functions.sh` accept:
 | Flag | Env var | Effect |
 |------|---------|--------|
 | `--check`, `--plan`     | —              | Preflight only; print plan and exit before changes |
-| `--verbose`             | `VERBOSE=1`    | Trace shell commands (suppressed around password prompts) |
+| `--verbose`             | `VERBOSE=1`    | Trace shell commands (tracing is paused while a password is read, held or verified, so it never appears in the trace) |
 | `--approval-mode`       | `APPROVAL_MODE=1` | Pause before mutating actions with action/impact/log preview |
 | `--suspicious`          | `SUSPICIOUS=1` | Backward-compatible alias for `--approval-mode` |
+
+`--help` prints the script's usage. An unrecognised flag or an unexpected positional argument is rejected with exit code 2 instead of silently running the step (so a typo such as `--chek` can never run the real step).
 
 ```bash
 ./standby/03_setup_standby_env.sh --check

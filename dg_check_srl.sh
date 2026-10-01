@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Data Guard Standby Redo Log Checker - Standalone
 # ============================================================
@@ -6,7 +6,8 @@
 # redo logs (SRLs) are correctly configured on BOTH sides:
 #
 #   - At least (online_redo_groups + 1) SRL groups per thread
-#   - SRL size equal to the largest online redo log
+#   - SRL size at least that of the largest online redo log (larger is
+#     fine; only a smaller SRL is a finding)
 #
 # Thread accounting: an SRL added without a THREAD clause (which is what
 # this repo's step 4 / sql/commands/add_standby_logfile.sql did before
@@ -23,8 +24,8 @@
 # DDL itself.
 #
 # Connects locally via 'sqlplus / as sysdba' against $ORACLE_SID.
-# Uses the broker-managed peer TNS alias plus Oracle Wallet to
-# reach the peer database. Pass -p to prompt for SYS password
+# Uses the broker-managed peer TNS alias (the peer's DGConnectIdentifier)
+# plus Oracle Wallet to reach every peer database. Pass -p to prompt for SYS password
 # instead, or -L to skip the peer entirely (e.g. when running
 # the script separately on each host).
 #
@@ -106,7 +107,11 @@ run_sql() {
     # never appears in `ps -ef` output. -L avoids reconnect prompts.
     # Do not discard stderr: WHENEVER SQLERROR EXIT 1 keeps it silent when
     # healthy, so any connection/ORA- error is surfaced rather than swallowed.
+    # SET DEFINE OFF comes first: an '&' in the password would otherwise be
+    # taken as a substitution variable and the CONNECT line (or the next
+    # heredoc line) consumed by an "Enter value for" prompt.
     sqlplus -s -L /nolog <<EOF
+SET DEFINE OFF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
 WHENEVER SQLERROR EXIT 1
 CONNECT ${cs}
@@ -157,7 +162,8 @@ fi
 #   5  MAX_GROUP                 (max(group#) across V$LOG and V$STANDBY_LOG)
 #   6  SRL_PATH                  (existing SRL dir, or ORL dir as fallback)
 #   7  OMF                       ("YES" if db_create_file_dest is set)
-#   8  PEER_DB_UNIQUE_NAME       (from V$DATAGUARD_CONFIG; may be empty)
+#   8  PEER_DB_UNIQUE_NAMES      (every other member of V$DATAGUARD_CONFIG,
+#                                 comma-separated; may be empty)
 #   9  UNASSIGNED_SRL_CNT        (H11: SRL groups still at THREAD#=0)
 #  10  UNASSIGNED_SRL_MIN_MB     (smallest of those, 0 when none)
 # ============================================================
@@ -216,7 +222,7 @@ WHERE TYPE='ONLINE' AND ROWNUM=1;
 " | trim | head -1)
     fi
 
-    peer=$(run_sql "$cs" "SELECT DB_UNIQUE_NAME FROM V\$DATAGUARD_CONFIG WHERE DB_UNIQUE_NAME <> '${du}' AND ROWNUM=1;" | trim | head -1)
+    peer=$(run_sql "$cs" "SELECT LISTAGG(DB_UNIQUE_NAME, ',') WITHIN GROUP (ORDER BY DB_UNIQUE_NAME) FROM V\$DATAGUARD_CONFIG WHERE DB_UNIQUE_NAME <> '${du}';" | clean | head -1)
 
     printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s\n' \
         "$du" "$role" "${max_orl:-0}" "$threads" "${max_grp:-0}" "$path" "$omf" "$peer" \
@@ -225,7 +231,7 @@ WHERE TYPE='ONLINE' AND ROWNUM=1;
 
 # ============================================================
 # emit_side: print summary + DDL for one side.
-# Returns 0 = compliant, 1 = DDL emitted (missing or wrong size),
+# Returns 0 = compliant, 1 = DDL emitted (missing or undersized),
 #         2 = the side could not be evaluated at all (M22).
 #
 # Args: du role max_orl threads max_grp path omf unassigned_cnt unassigned_min_mb
@@ -261,6 +267,17 @@ emit_side() {
 
     local max_orl_int="${max_orl%.*}"
     case "$max_orl_int" in ''|*[!0-9]*) max_orl_int=0 ;; esac
+
+    # An unreadable (or zero) ORL size would turn into "SIZE 0M" DDL and a
+    # bogus "not 0 MB" size finding - refuse to grade the side instead.
+    if [[ "$max_orl_int" -le 0 ]]; then
+        echo ""
+        echo "  Result: ERROR - could not read the online redo log size."
+        echo "  V\$LOG returned no usable size for ${du} (raw value: '${max_orl}'), so no"
+        echo "  DDL is printed and nothing was verified. Check that the connection has"
+        echo "  SYSDBA and that the instance is at least MOUNTED, then re-run."
+        return 2
+    fi
 
     # -- Pass 1: validate the thread list (M22) ---------------------------
     # An empty or unparsable V$THREAD result used to produce a table with
@@ -323,7 +340,8 @@ emit_side() {
         printf "  %-8s %-11s %-11s %-11s %-13s %-11s\n" \
             "$tid" "$orl_cnt" "$srl_cnt" "$unassigned_cnt" "$required" "$effective_min"
 
-        if [[ "$effective_srl" -gt 0 ]] && [[ "$effective_min" -ne "$max_orl_int" ]]; then
+        # Larger than the biggest ORL is fine; only a smaller SRL is skipped.
+        if [[ "$effective_srl" -gt 0 ]] && [[ "$effective_min" -lt "$max_orl_int" ]]; then
             any_size_mismatch="yes"
             needs_fix="yes"
         fi
@@ -361,7 +379,7 @@ emit_side() {
 
     echo ""
     if [[ "$needs_fix" == "no" ]]; then
-        echo "  Result: OK - all ${thread_count} thread(s) have at least N+1 SRLs at ${max_orl_int} MB."
+        echo "  Result: OK - all ${thread_count} thread(s) have at least N+1 SRLs of at least ${max_orl_int} MB."
         return 0
     fi
 
@@ -369,11 +387,11 @@ emit_side() {
 
     if [[ "$any_size_mismatch" == "yes" ]]; then
         echo ""
-        echo "  WARNING: At least one existing SRL group is not ${max_orl_int} MB."
+        echo "  WARNING: At least one existing SRL group is smaller than ${max_orl_int} MB."
         echo "  Undersized SRLs are skipped by transport. List them with:"
         echo ""
         echo "    SELECT GROUP#, THREAD#, BYTES/1024/1024 MB, STATUS"
-        echo "      FROM V\$STANDBY_LOG WHERE BYTES/1024/1024 <> ${max_orl_int};"
+        echo "      FROM V\$STANDBY_LOG WHERE BYTES/1024/1024 < ${max_orl_int};"
         echo ""
         echo "  Then drop and recreate each at the correct size (the group must"
         echo "  not be CURRENT or ACTIVE; on a standby, stop apply first):"
@@ -426,56 +444,106 @@ LOCAL_UNASSIGNED_MB="${LOCAL_UNASSIGNED_MB:-0}"
 [[ -n "$LOCAL_DU" ]] || die "Could not read local DB_UNIQUE_NAME."
 
 # ============================================================
-# Try peer
+# Try peers
 # ============================================================
+# Every other member of V$DATAGUARD_CONFIG is checked. The wallet is keyed on
+# the broker's DGConnectIdentifier, which need not equal the peer's
+# DB_UNIQUE_NAME, so that is the alias tried first (the DB_UNIQUE_NAME second).
 
-PEER_REACHED="no"
-PEER_DU=""
-PEER_ROLE=""
-PEER_FIX_RC=0
+# resolve_peer_alias NAME -> the peer's DGConnectIdentifier, or NAME itself
+resolve_peer_alias() {
+    local peer="$1" dgm="" raw id=""
+    if [[ -x "${ORACLE_HOME}/bin/dgmgrl" ]]; then
+        dgm="${ORACLE_HOME}/bin/dgmgrl"
+    elif command -v dgmgrl >/dev/null 2>&1; then
+        dgm="dgmgrl"
+    fi
+    if [[ -n "$dgm" ]]; then
+        raw=$("$dgm" -silent / "SHOW DATABASE '${peer}' 'DGConnectIdentifier'" 2>&1) || true
+        id=$(printf '%s\n' "$raw" | grep 'DGConnectIdentifier' | sed "s/.*= *'//" | sed "s/'.*//" | head -1)
+        # Error text or a multi-word value is not usable as an alias.
+        case "$id" in ''|*[[:space:]]*|*\"*|*\'*) id="" ;; esac
+    fi
+    printf '%s' "${id:-$peer}"
+}
+
+# read_peer_password NAME -> PEER_PWD. Echo is restored on every exit path,
+# Ctrl-C included, so an interrupt cannot leave the terminal silent.
+read_peer_password() {
+    printf "Enter SYS password for %s: " "$1" >&2
+    stty -echo 2>/dev/null || true
+    trap 'stty echo 2>/dev/null || true; printf "\n" >&2; exit 130' INT
+    trap 'stty echo 2>/dev/null || true; printf "\n" >&2; exit 143' TERM
+    read -r PEER_PWD
+    stty echo 2>/dev/null || true
+    trap - INT TERM
+    printf "\n" >&2
+}
+
+P_N=0
+P_NAME=(); P_ALIAS=(); P_REACHED=(); P_REC=(); P_DU=(); P_ROLE=(); P_RC=()
 
 if [[ "$PEER_MODE" != "skip" && -n "$LOCAL_PEER" ]]; then
-    peer_alias="$LOCAL_PEER"
-    case "$PEER_MODE" in
-        wallet)
-            PEER_CS="/@${peer_alias} as sysdba"
-            ;;
-        prompt)
-            stty -echo 2>/dev/null || true
-            printf "Enter SYS password for %s: " "$peer_alias" >&2
-            read -r PEER_PWD
-            stty echo 2>/dev/null || true
-            printf "\n" >&2
-            # Double-quoted password: this string is fed to an in-script
-            # CONNECT (never sqlplus argv), and the quotes keep special
-            # characters in an operator-typed password intact.
-            PEER_CS="sys/\"${PEER_PWD}\"@${peer_alias} as sysdba"
-            ;;
-    esac
+    for peer_name in $(printf '%s' "$LOCAL_PEER" | tr ',' ' '); do
+        idx=$P_N
+        P_N=$((P_N + 1))
+        P_NAME[$idx]="$peer_name"
+        P_ALIAS[$idx]="$peer_name"
+        P_REACHED[$idx]="no"
+        P_REC[$idx]=""
+        P_DU[$idx]=""
+        P_ROLE[$idx]=""
+        P_RC[$idx]=0
 
-    if run_sql "$PEER_CS" "SELECT 'OK' FROM DUAL;" | clean | grep -q '^OK$'; then
-        PEER_REACHED="yes"
-        info "Connected to peer ${peer_alias}."
-        PEER_DU=""; PEER_ROLE=""; PEER_MAX_ORL=0; PEER_THREADS=""; PEER_MAX_GRP=0
-        PEER_PATH=""; PEER_OMF="NO"; PEER_PEER=""; PEER_UNASSIGNED=0; PEER_UNASSIGNED_MB=0
-        PEER_REC=$(gather_side "$PEER_CS")
-        IFS='|' read -r PEER_DU PEER_ROLE PEER_MAX_ORL PEER_THREADS PEER_MAX_GRP \
-            PEER_PATH PEER_OMF PEER_PEER PEER_UNASSIGNED PEER_UNASSIGNED_MB <<<"$PEER_REC"
-        PEER_MAX_ORL="${PEER_MAX_ORL:-0}"
-        PEER_MAX_GRP="${PEER_MAX_GRP:-0}"
-        PEER_OMF="${PEER_OMF:-NO}"
-        PEER_UNASSIGNED="${PEER_UNASSIGNED:-0}"
-        PEER_UNASSIGNED_MB="${PEER_UNASSIGNED_MB:-0}"
-        if [[ -z "$PEER_DU" ]]; then
-            warn "Connected to peer '${peer_alias}' but could not read its DB_UNIQUE_NAME; treating the peer as unchecked."
-            PEER_REACHED="no"
+        peer_resolved=$(resolve_peer_alias "$peer_name")
+        peer_candidates="$peer_resolved"
+        if [[ "$peer_resolved" != "$peer_name" ]]; then
+            peer_candidates="$peer_resolved $peer_name"
         fi
-    else
-        case "$PEER_MODE" in
-            wallet) warn "Could not reach peer '${peer_alias}' via wallet. Use -p for password prompt or -L to skip; or run this script on the peer host." ;;
-            prompt) warn "Could not reach peer '${peer_alias}' with the provided password." ;;
-        esac
-    fi
+
+        if [[ "$PEER_MODE" == "prompt" ]]; then
+            read_peer_password "$peer_name"
+            # The password goes into an in-script CONNECT inside double
+            # quotes, which a double quote inside it would close early.
+            case "$PEER_PWD" in
+                *\"*) die "The SYS password contains a double quote (\"), which cannot be passed through the CONNECT string. Use the wallet (default) or a password without one." ;;
+            esac
+        fi
+
+        peer_connected="no"
+        for peer_alias in $peer_candidates; do
+            if [[ "$PEER_MODE" == "prompt" ]]; then
+                # Double-quoted password: this string is fed to an in-script
+                # CONNECT (never sqlplus argv), and the quotes keep special
+                # characters in an operator-typed password intact.
+                PEER_CS="sys/\"${PEER_PWD}\"@${peer_alias} as sysdba"
+            else
+                PEER_CS="/@${peer_alias} as sysdba"
+            fi
+            run_sql "$PEER_CS" "SELECT 'OK' FROM DUAL;" | clean | grep -q '^OK$' || continue
+
+            peer_connected="yes"
+            info "Connected to peer ${peer_alias}."
+            PEER_REC=$(gather_side "$PEER_CS")
+            PEER_DU=""
+            IFS='|' read -r PEER_DU _ <<<"$PEER_REC"
+            if [[ -z "$PEER_DU" ]]; then
+                warn "Connected to peer '${peer_alias}' but could not read its DB_UNIQUE_NAME; treating the peer as unchecked."
+            else
+                P_REACHED[$idx]="yes"
+                P_ALIAS[$idx]="$peer_alias"
+                P_REC[$idx]="$PEER_REC"
+            fi
+            break
+        done
+
+        if [[ "$peer_connected" == "no" ]]; then
+            case "$PEER_MODE" in
+                wallet) warn "Could not reach peer '${peer_name}' via wallet (tried: ${peer_candidates}). Use -p for password prompt or -L to skip; or run this script on the peer host." ;;
+                prompt) warn "Could not reach peer '${peer_name}' with the provided password (tried: ${peer_candidates})." ;;
+            esac
+        fi
+    done
 elif [[ -z "$LOCAL_PEER" ]]; then
     warn "No peer found in V\$DATAGUARD_CONFIG. Reporting on local only."
 fi
@@ -488,11 +556,28 @@ LOCAL_FIX_RC=0
 emit_side "$LOCAL_DU" "$LOCAL_ROLE" "$LOCAL_MAX_ORL" "$LOCAL_THREADS" "$LOCAL_MAX_GRP" \
     "$LOCAL_PATH" "$LOCAL_OMF" "$LOCAL_UNASSIGNED" "$LOCAL_UNASSIGNED_MB" || LOCAL_FIX_RC=$?
 
-if [[ "$PEER_REACHED" == "yes" ]]; then
-    PEER_FIX_RC=0
-    emit_side "$PEER_DU" "$PEER_ROLE" "$PEER_MAX_ORL" "$PEER_THREADS" "$PEER_MAX_GRP" \
-        "$PEER_PATH" "$PEER_OMF" "$PEER_UNASSIGNED" "$PEER_UNASSIGNED_MB" || PEER_FIX_RC=$?
-fi
+i=0
+while [[ $i -lt $P_N ]]; do
+    if [[ "${P_REACHED[$i]}" == "yes" ]]; then
+        # M21: every field is defaulted before use, as for the local side.
+        PEER_DU=""; PEER_ROLE=""; PEER_MAX_ORL=0; PEER_THREADS=""; PEER_MAX_GRP=0
+        PEER_PATH=""; PEER_OMF="NO"; PEER_PEER=""; PEER_UNASSIGNED=0; PEER_UNASSIGNED_MB=0
+        IFS='|' read -r PEER_DU PEER_ROLE PEER_MAX_ORL PEER_THREADS PEER_MAX_GRP \
+            PEER_PATH PEER_OMF PEER_PEER PEER_UNASSIGNED PEER_UNASSIGNED_MB <<<"${P_REC[$i]}"
+        PEER_MAX_ORL="${PEER_MAX_ORL:-0}"
+        PEER_MAX_GRP="${PEER_MAX_GRP:-0}"
+        PEER_OMF="${PEER_OMF:-NO}"
+        PEER_UNASSIGNED="${PEER_UNASSIGNED:-0}"
+        PEER_UNASSIGNED_MB="${PEER_UNASSIGNED_MB:-0}"
+        P_DU[$i]="$PEER_DU"
+        P_ROLE[$i]="$PEER_ROLE"
+        PEER_FIX_RC=0
+        emit_side "$PEER_DU" "$PEER_ROLE" "$PEER_MAX_ORL" "$PEER_THREADS" "$PEER_MAX_GRP" \
+            "$PEER_PATH" "$PEER_OMF" "$PEER_UNASSIGNED" "$PEER_UNASSIGNED_MB" || PEER_FIX_RC=$?
+        P_RC[$i]=$PEER_FIX_RC
+    fi
+    i=$((i + 1))
+done
 
 # rc 2 from emit_side means the side could not be evaluated (M22) - report
 # that as its own state, never as OK and never as "ACTION REQUIRED".
@@ -511,19 +596,31 @@ echo "============================================================"
 printf "  %-30s %s\n" "${LOCAL_DU} (${LOCAL_ROLE:-unknown role})" "$(_side_verdict "$LOCAL_FIX_RC")"
 
 PEER_UNCHECKED="no"
-if [[ "$PEER_REACHED" == "yes" ]]; then
-    printf "  %-30s %s\n" "${PEER_DU} (${PEER_ROLE:-unknown role})" "$(_side_verdict "$PEER_FIX_RC")"
-elif [[ "$PEER_MODE" != "skip" && -n "$LOCAL_PEER" ]]; then
-    PEER_UNCHECKED="yes"
-    printf "  %-30s %s\n" "${LOCAL_PEER} (peer)" "UNCHECKED - peer exists but was not verified (exit code 1)"
-fi
+i=0
+while [[ $i -lt $P_N ]]; do
+    if [[ "${P_REACHED[$i]}" == "yes" ]]; then
+        printf "  %-30s %s\n" "${P_DU[$i]} (${P_ROLE[$i]:-unknown role})" "$(_side_verdict "${P_RC[$i]}")"
+    else
+        PEER_UNCHECKED="yes"
+        printf "  %-30s %s\n" "${P_NAME[$i]} (peer)" "UNCHECKED - peer exists but was not verified (exit code 1)"
+    fi
+    i=$((i + 1))
+done
 
 EXIT_CODE=0
 [[ $LOCAL_FIX_RC -eq 1 ]] && EXIT_CODE=1
-[[ $PEER_FIX_RC  -eq 1 ]] && EXIT_CODE=1
-[[ "$PEER_UNCHECKED" == "yes" && $EXIT_CODE -eq 0 ]] && EXIT_CODE=1
+[[ "$PEER_UNCHECKED" == "yes" ]] && EXIT_CODE=1
+i=0
+while [[ $i -lt $P_N ]]; do
+    [[ "${P_RC[$i]}" -eq 1 ]] && EXIT_CODE=1
+    i=$((i + 1))
+done
 # A side that could not be evaluated outranks "DDL needed": nothing was
 # verified there, so the run is an error, not a finding.
 [[ $LOCAL_FIX_RC -gt 1 ]] && EXIT_CODE=2
-[[ $PEER_FIX_RC  -gt 1 ]] && EXIT_CODE=2
+i=0
+while [[ $i -lt $P_N ]]; do
+    [[ "${P_RC[$i]}" -gt 1 ]] && EXIT_CODE=2
+    i=$((i + 1))
+done
 exit $EXIT_CODE

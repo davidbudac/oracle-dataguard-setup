@@ -86,8 +86,12 @@ upper() { printf '%s' "$1" | tr '[:lower:]' '[:upper:]'; }
 # run_sql "sql" -> stdout. Connects '/ as sysdba' to the local instance.
 # The heredoc is unquoted so callers must escape dollar signs in view
 # names (v\$database) when building the SQL in double quotes.
+# SET DEFINE OFF comes first: callers embed passwords (CREATE/ALTER USER ...
+# IDENTIFIED BY "..."), and with substitution on, an '&' in a password is
+# taken for a substitution variable and the statement silently changes.
 run_sql() {
     "$ORACLE_HOME/bin/sqlplus" -s -L / as sysdba <<EOF
+set define off
 set pagesize 0 feedback off verify off heading off echo off trimspool on tab off linesize 32767
 whenever sqlerror exit 1
 $1
@@ -102,6 +106,7 @@ run_sql_as() {
     local __conn="$1" __sql="$2"
     # shellcheck disable=SC2086
     "$ORACLE_HOME/bin/sqlplus" -s -L $__conn <<EOF
+set define off
 set pagesize 0 feedback off verify off heading off echo off trimspool on tab off linesize 32767
 whenever sqlerror exit 1
 ${__sql}
@@ -110,26 +115,49 @@ EOF
 }
 
 # run_dgmgrl "<conn>" "cmd" ["cmd" ...] -> stdout+stderr merged.
-# NOTE: dgmgrl -silent exits 0 even when a command fails, so every caller
-# must judge the OUTPUT, never the exit status.
+# Return semantics: the status is dgmgrl's own, which -silent makes 0 even
+# when a command inside failed. Unlike run_dgmgrl in common/dg_functions.sh
+# and migrate_noncdb_to_pdb/_lib.sh (which fold the error scan into the
+# return code), every caller here must judge the OUTPUT with dgmgrl_failed
+# (or pattern-match it), never the exit status. Callers capture it as
+# out=$(run_dgmgrl ... || true), so pipefail/set -e never sees it.
 run_dgmgrl() {
     local __conn="$1"; shift
     printf '%s\n' "$@" | "$ORACLE_HOME/bin/dgmgrl" -silent "$__conn" 2>&1
 }
 
-# dgmgrl_failed "<output>" -> 0 when the output looks like a failure.
+# dgmgrl_failed "<output>" -> 0 when the output of a command that is expected
+# to produce a result looks like a failure. Same rules as
+# dgmgrl_output_has_error in common/dg_functions.sh (kept as a copy: this kit
+# is standalone), plus the empty-output case:
+#   - empty/whitespace-only output is a failure (dgmgrl could not start or
+#     connect and printed nothing; every caller expects a reply)
+#   - ORA-/DGM- codes count, except on a 'Warning:' line (a member-level
+#     'Warning: ORA-16789' is a health note, not a failed command)
+#   - a standalone 'Error: N' with N nonzero ('Error: 0' is a benign status)
+#   - a standalone 'Failed.' line
 dgmgrl_failed() {
-    printf '%s\n' "$1" | grep -qiE 'ORA-[0-9]|DGM-[0-9]|^Error:|Failed\.'
+    local __out="$1" __body
+    [[ -n "$(printf '%s' "$__out" | tr -d ' \t\r\n')" ]] || return 0
+    __body=$(printf '%s\n' "$__out" | grep -viE '^[[:space:]]*Warning:' || true)
+    printf '%s\n' "$__body" | grep -Eq 'ORA-[0-9]|DGM-[0-9]' && return 0
+    printf '%s\n' "$__body" | grep -Eiq '^[[:space:]]*Error:[[:space:]]*[1-9]' && return 0
+    printf '%s\n' "$__body" | grep -Eiq '^[[:space:]]*Failed\.[[:space:]]*$' && return 0
+    return 1
 }
 
 # ------------------------------------------------------------
 # Broker property extraction
 # ------------------------------------------------------------
 # broker_property "<SHOW DATABASE VERBOSE output>" PropertyName -> value
+# A missing property prints nothing and still returns 0: grep's status 1 on
+# no match would otherwise abort a set -e + pipefail caller, silently, before
+# any --*-host override or "re-run with ..." hint could be reached.
 broker_property() {
     printf '%s\n' "$1" \
         | grep -i "^[[:space:]]*${2}[[:space:]]*=" | head -1 \
-        | sed -e "s/^[^=]*=[[:space:]]*//" -e "s/^'//" -e "s/'.*\$//" -e "s/[[:space:]]*\$//"
+        | sed -e "s/^[^=]*=[[:space:]]*//" -e "s/^'//" -e "s/'.*\$//" -e "s/[[:space:]]*\$//" \
+        || true
 }
 
 # resolve_descriptor ALIAS -> the connect descriptor tnsping resolved,
@@ -147,8 +175,12 @@ resolve_descriptor() {
 }
 
 # descriptor_part "<descriptor>" HOST|PORT|SERVICE_NAME -> value or empty
+# The key match is case-insensitive ((host = x) is as valid as (HOST = x)),
+# done with [Hh][Oo][Ss][Tt] brackets because AIX sed has no I flag.
 descriptor_part() {
-    printf '%s' "$1" | sed -n "s/.*(${2}[[:space:]]*=[[:space:]]*\\([^)[:space:]]*\\).*/\\1/p" | head -1
+    local __key
+    __key=$(printf '%s' "$2" | awk '{ o = ""; for (i = 1; i <= length($0); i++) { c = substr($0, i, 1); u = toupper(c); l = tolower(c); o = o (u == l ? c : "[" u l "]") } print o }')
+    printf '%s' "$1" | sed -n "s/.*(${__key}[[:space:]]*=[[:space:]]*\\([^)[:space:]]*\\).*/\\1/p" | head -1
 }
 
 # tns_descriptor HOST PORT SERVICE -> a formatted DESCRIPTOR block

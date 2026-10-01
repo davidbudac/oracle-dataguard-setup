@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for parse_df_available_kb / get_available_space_kb
 # in common/dg_functions.sh

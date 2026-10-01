@@ -73,11 +73,84 @@ check_oracle_env() {
 # run_sql "sql" -> stdout. Connects '/ as sysdba' to the local instance.
 # The heredoc is unquoted so callers must escape dollar signs in view
 # names (v\$database) when building the SQL in double quotes.
+# SET DEFINE OFF comes first: callers embed passwords in the SQL, and with
+# substitution on an '&' in a password is read as a substitution variable.
 run_sql() {
     "$ORACLE_HOME/bin/sqlplus" -s -L / as sysdba <<EOF
-set pagesize 0 feedback off verify off heading off echo off trimspool on linesize 400
+set define off
+set pagesize 0 feedback off verify off heading off echo off trimspool on linesize 400 tab off
 whenever sqlerror exit 1
 $1
 exit
 EOF
+}
+
+# dgmgrl_output_has_error "<output>" -> 0 when the output looks like a failure.
+# dgmgrl -silent exits 0 even when the command failed, so the text is the only
+# signal. Anchored like migrate_noncdb_to_pdb/_lib.sh (kept standalone, so a
+# manual copy): ORA-/DGM- codes (ignoring "Warning:" lines, which carry
+# ORA- codes for non-failures), a nonzero "Error: N" line - "Error: 0" is the
+# benign per-member status in SHOW CONFIGURATION - and a standalone "Failed.".
+dgmgrl_output_has_error() {
+    local output="$1"
+    if printf '%s\n' "$output" | grep -Ev '^[[:space:]]*Warning:' | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+        return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Error:[[:space:]]*[1-9]'; then
+        return 0
+    fi
+    if printf '%s\n' "$output" | grep -Eiq '^[[:space:]]*Failed\.[[:space:]]*$'; then
+        return 0
+    fi
+    return 1
+}
+
+# wallet_credential_lines -> stdin: mkstore -listCredential output;
+# stdout: one "alias user" pair per credential ("1: prim SYS" -> "prim SYS").
+wallet_credential_lines() {
+    tr -d '\r' | sed -n 's/^[0-9][0-9]*:[[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]][[:space:]]*\([^[:space:]][^[:space:]]*\)[[:space:]]*$/\1 \2/p'
+}
+
+# sqlnet_wallet_dir FILE -> directory of the WALLET_LOCATION entry, or empty.
+# Case-insensitive, anchored to WALLET_LOCATION: a plain substring match would
+# also hit ENCRYPTION_WALLET_LOCATION (a TDE keystore, NOT a credential wallet).
+sqlnet_wallet_dir() {
+    awk '
+        toupper($0) ~ /^[[:space:]]*WALLET_LOCATION/ { grab = 1 }
+        grab { block = block " " $0 }
+        END {
+            if (match(toupper(block), /DIRECTORY[[:space:]]*=[[:space:]]*[^)[:space:]]+/)) {
+                s = substr(block, RSTART, RLENGTH)
+                sub(/^[Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy][[:space:]]*=[[:space:]]*/, "", s)
+                print s
+            }
+        }' "$1"
+}
+
+# canonical_dir DIR -> physical path when DIR exists, else DIR minus any
+# trailing slash. For comparing two spellings of the same wallet directory.
+canonical_dir() {
+    local d="$1" c=""
+    c=$(cd "$d" 2>/dev/null && pwd -P) || c=""
+    if [[ -z "$c" ]]; then
+        c=$(printf '%s' "$d" | sed 's|/*$||')
+    fi
+    printf '%s' "$c"
+}
+
+# broker_member_names -> stdin: SHOW CONFIGURATION output; stdout: the
+# member DB_UNIQUE_NAMEs, one per line (the "name - Primary database" lines
+# of the Members: block).
+broker_member_names() {
+    tr -d '\r' | awk '
+        $1 == "Members:" { m = 1; next }
+        m && NF == 0     { m = 0 }
+        m && $2 == "-"   { print $1 }'
+}
+
+# broker_property_value "<SHOW DATABASE VERBOSE output>" PropertyName -> value
+broker_property_value() {
+    printf '%s\n' "$1" | tr -d '\r' \
+        | grep -i "^[[:space:]]*${2}[[:space:]]*=" | head -1 \
+        | sed -e "s/^[^=]*=[[:space:]]*//" -e "s/'//g" -e "s/[[:space:]]*\$//"
 }

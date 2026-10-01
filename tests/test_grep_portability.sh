@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for grep portability (AIX/Linux compatible grep usage)
 # ============================================================

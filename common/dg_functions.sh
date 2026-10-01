@@ -23,6 +23,7 @@ VERBOSE="${VERBOSE:-0}"
 APPROVAL_MODE="${APPROVAL_MODE:-${SUSPICIOUS:-0}}"
 CHECK_ONLY="${CHECK_ONLY:-0}"
 VERBOSE_TRACE_PAUSED=0
+VERBOSE_TRACE_DEPTH=0
 ERROR_TRAP_ACTIVE=0
 CURRENT_PROGRESS_TITLE=""
 STEP_STATE_FILE=""
@@ -34,13 +35,69 @@ SQL_DIR="$(dirname "$DG_FUNCTIONS_DIR")/sql"
 # Logging Functions
 # ============================================================
 
+# Print the calling script's leading comment header (the '#' lines after the
+# shebang, up to the first non-comment line) with the comment marker and the
+# pure ==== / ---- separator lines stripped. Used by --help when the script
+# defines no usage() function.
+_dg_print_script_header() {
+    local script_file="$1"
+    [[ -r "$script_file" ]] || return 0
+    awk '
+        NR == 1 && /^#!/ { next }
+        /^#/ {
+            sub(/^# ?/, "")
+            if ($0 ~ /^[=-][=-][=-]*$/) next
+            print
+            next
+        }
+        { exit }
+    ' "$script_file"
+}
+
+# Shared argument parser for every numbered script. Handles the global flags
+# (-v, -a/-s, -n, --execute, --no-color, ...), -h/--help, and rejects anything
+# else, so a mistyped flag (--chek, --channel) or an unexpected positional
+# argument fails with exit 2 instead of silently running the real step.
+#
+# A script declares its OWN options BEFORE calling enable_verbose_mode:
+#   DG_SCRIPT_FLAGS='--regenerate -x --channels= -r='   # space-separated
+# A flag with a trailing '=' takes a value (next argument, or --flag=value).
+#   DG_SCRIPT_POSITIONAL=1   # script also takes positional (non-dash) args
+#   DG_SCRIPT_FLAGS='*'      # script's own parser is complete and rejects
+#                            # unknowns itself - skip these checks
+# The script still parses its own flags afterwards; this only validates them.
 enable_verbose_mode() {
     local args=("$@")
     local i=0
     local no_color_flag=false
+    local arg w name matched script_file
+    local declared="${DG_SCRIPT_FLAGS:-}"
+    local check_unknown=true
+    local end_of_opts=false
+
+    [[ "$declared" == "*" ]] && check_unknown=false
 
     while [[ $i -lt ${#args[@]} ]]; do
-        case "${args[$i]}" in
+        arg="${args[$i]}"
+        if $end_of_opts; then
+            if [[ "$check_unknown" == "true" && "${DG_SCRIPT_POSITIONAL:-0}" != "1" ]]; then
+                log_error "Unexpected argument: ${arg} (see --help)"
+                exit 2
+            fi
+            i=$((i + 1))
+            continue
+        fi
+        case "$arg" in
+            -h|--help)
+                script_file="${BASH_SOURCE[1]:-$0}"
+                if declare -F usage >/dev/null 2>&1; then
+                    # usage() conventionally ends in exit 1; --help is success
+                    ( usage ) || true
+                else
+                    _dg_print_script_header "$script_file"
+                fi
+                exit 0
+                ;;
             -v|--verbose)
                 VERBOSE=1
                 ;;
@@ -61,6 +118,44 @@ enable_verbose_mode() {
                 ;;
             --no-color)
                 no_color_flag=true
+                ;;
+            --)
+                end_of_opts=true
+                ;;
+            -?*)
+                if [[ "$check_unknown" == "true" ]]; then
+                    matched=""
+                    for w in $declared; do
+                        if [[ "$w" == *= ]]; then
+                            name="${w%=}"
+                            if [[ "$arg" == "$name" ]]; then
+                                if [[ $((i + 1)) -ge ${#args[@]} ]]; then
+                                    log_error "Option ${arg} requires a value (see --help)"
+                                    exit 2
+                                fi
+                                i=$((i + 1))
+                                matched=1
+                                break
+                            elif [[ "$arg" == "${name}="* ]]; then
+                                matched=1
+                                break
+                            fi
+                        elif [[ "$arg" == "$w" ]]; then
+                            matched=1
+                            break
+                        fi
+                    done
+                    if [[ -z "$matched" ]]; then
+                        log_error "Unknown option: ${arg} (see --help)"
+                        exit 2
+                    fi
+                fi
+                ;;
+            *)
+                if [[ "$check_unknown" == "true" && "${DG_SCRIPT_POSITIONAL:-0}" != "1" ]]; then
+                    log_error "Unexpected argument: ${arg} (see --help)"
+                    exit 2
+                fi
                 ;;
         esac
         i=$((i + 1))
@@ -95,17 +190,23 @@ enable_verbose_mode() {
 
 }
 
+# Pause/resume xtrace around password handling. Calls nest (a caller can pause
+# around a block that itself calls prompt_password or verify_sys_password,
+# which pause too): tracing comes back only when the outermost pause is
+# resumed, so a password is never traced in between.
 pause_verbose_trace() {
-    if [[ "$VERBOSE" == "1" && "$-" == *x* ]]; then
+    if [[ "$VERBOSE_TRACE_DEPTH" -eq 0 && "$VERBOSE" == "1" && "$-" == *x* ]]; then
         VERBOSE_TRACE_PAUSED=1
         set +x
-    else
-        VERBOSE_TRACE_PAUSED=0
     fi
+    VERBOSE_TRACE_DEPTH=$((VERBOSE_TRACE_DEPTH + 1))
 }
 
 resume_verbose_trace() {
-    if [[ "$VERBOSE_TRACE_PAUSED" == "1" ]]; then
+    if [[ "$VERBOSE_TRACE_DEPTH" -gt 0 ]]; then
+        VERBOSE_TRACE_DEPTH=$((VERBOSE_TRACE_DEPTH - 1))
+    fi
+    if [[ "$VERBOSE_TRACE_DEPTH" -eq 0 && "$VERBOSE_TRACE_PAUSED" == "1" ]]; then
         VERBOSE_TRACE_PAUSED=0
         set -x
     fi
@@ -293,8 +394,10 @@ init_log() {
         return 0
     fi
 
-    mkdir -p "$log_dir" 2>/dev/null
-    mkdir -p "$state_dir" 2>/dev/null
+    # || true: an unwritable share must fall through to the graceful
+    # "file logging disabled" path below, not die here under set -e.
+    mkdir -p "$log_dir" 2>/dev/null || true
+    mkdir -p "$state_dir" 2>/dev/null || true
     LOG_FILE="${log_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').log"
     STEP_STATE_FILE="${state_dir}/${script_name}_$(date '+%Y%m%d_%H%M%S').state"
 
@@ -401,8 +504,17 @@ create_temp_dir() {
     if command -v mktemp >/dev/null 2>&1; then
         mktemp -d 2>/dev/null && return
     fi
+    # No -p: an existing directory (pre-created by someone else under this
+    # guessable name) must fail rather than be reused, and an existing one
+    # that is not ours/700 is refused even if mkdir somehow succeeded.
     local dir="${TMPDIR:-/tmp}/dg_tmp_$$"
-    mkdir -m 700 -p "$dir" 2>/dev/null && printf '%s\n' "$dir"
+    mkdir -m 700 "$dir" 2>/dev/null || return 1
+    [[ -O "$dir" ]] || return 1
+    case "$(ls -ld "$dir" 2>/dev/null)" in
+        drwx------*) ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$dir"
 }
 
 # ============================================================
@@ -531,11 +643,21 @@ confirm_nfs_share() {
     export NFS_SHARE
 }
 
+# Path of the sqlplus to run: $ORACLE_HOME/bin/sqlplus when executable (the
+# same home rman and dgmgrl are taken from), else whatever is on PATH.
+dg_sqlplus_bin() {
+    if [[ -n "${ORACLE_HOME:-}" && -x "${ORACLE_HOME}/bin/sqlplus" ]]; then
+        printf '%s\n' "${ORACLE_HOME}/bin/sqlplus"
+    else
+        printf '%s\n' "sqlplus"
+    fi
+}
+
 check_db_connection() {
     log_info "Checking database connection..."
 
     local result
-    result=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/check_connection.sql" </dev/null)
+    result=$("$(dg_sqlplus_bin)" -s / as sysdba @"${SQL_DIR}/queries/check_connection.sql" </dev/null)
 
     if echo "$result" | grep -q "CONNECTED"; then
         log_info "Successfully connected to database"
@@ -557,7 +679,7 @@ run_sql_script() {
     local script="$1"
     shift
     confirm_approval_action "Run SQL script" "sqlplus -s / as sysdba @$script $(shell_join "$@")" || return 1
-    sqlplus -s / as sysdba @"$script" "$@" </dev/null
+    "$(dg_sqlplus_bin)" -s / as sysdba @"$script" "$@" </dev/null
 }
 
 # Run a SQL query script and return clean output
@@ -579,7 +701,7 @@ run_sql_query() {
     # The && rc=0 || rc=$? form keeps set -e from exiting on the failing
     # assignment before we get a chance to print the error to stderr.
     local output rc
-    output=$(sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null) && rc=0 || rc=$?
+    output=$("$(dg_sqlplus_bin)" -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null) && rc=0 || rc=$?
     printf '%s\n' "$output"
     if [[ $rc -ne 0 ]]; then
         printf 'ERROR: SQL query %s failed (exit %s). Output:\n%s\n' "$script_name" "$rc" "$output" >&2
@@ -594,7 +716,7 @@ run_sql_command() {
     local script_name="$1"
     shift
     confirm_approval_action "Run SQL command script" "sqlplus -s / as sysdba @${SQL_DIR}/commands/${script_name} $(shell_join "$@")" || return 1
-    sqlplus -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@" </dev/null
+    "$(dg_sqlplus_bin)" -s / as sysdba @"${SQL_DIR}/commands/${script_name}" "$@" </dev/null
 }
 
 # Run a SQL query script with headers (for display)
@@ -602,7 +724,7 @@ run_sql_command() {
 run_sql_display() {
     local script_name="$1"
     shift
-    sqlplus -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
+    "$(dg_sqlplus_bin)" -s / as sysdba @"${SQL_DIR}/queries/${script_name}" "$@" </dev/null
 }
 
 # Check whether a value is a plain non-negative integer (no sign, no
@@ -624,7 +746,12 @@ get_db_parameter() {
     local param_name="$1"
     local value
     value=$(run_sql_query "get_db_parameter.sql" "$param_name")
-    echo "$value" | tr -d ' \t\n\r'
+    # Trim only leading/trailing whitespace: interior spaces are significant
+    # (log_archive_dest_1 = "LOCATION=/arch VALID_FOR=(...)" - stripping them
+    # glued the attributes onto the path). Blank lines are dropped and the
+    # remaining lines joined, as before.
+    printf '%s\n' "$value" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n'
+    printf '\n'
 }
 
 # Get a database property value
@@ -901,6 +1028,79 @@ dgmgrl_output_has_error() {
     return 1
 }
 
+# Value of the broker's status field in captured SHOW CONFIGURATION /
+# SHOW DATABASE output: the "Configuration Status:" value, or failing that
+# the "Database Status:" value, uppercased - SUCCESS, WARNING, ERROR or
+# DISABLED. 19c DGMGRL normally puts it on the NEXT line
+#     Configuration Status:
+#     SUCCESS   (status updated 42 seconds ago)
+# older/other output keeps it on the same line; both are handled.
+# Prints nothing and returns 1 when no such field is found (empty output,
+# dgmgrl failure, unrecognized value) - callers must treat that as failure,
+# and under set -e use: v=$(dgmgrl_status_value "$out") || v=""
+# Usage: dgmgrl_status_value <output>
+dgmgrl_status_value() {
+    local output="$1"
+    local value
+    value=$(printf '%s\n' "$output" | tr -d '\r' | awk '
+    {
+        line = $0
+        if (want_kind != "") {
+            if (line ~ /^[ \t]*$/) next
+            kind = want_kind
+            want_kind = ""
+            rest = line
+        } else if (tolower(line) ~ /^[ \t]*(configuration|database)[ \t]+status:/) {
+            kind = (tolower(line) ~ /^[ \t]*configuration/) ? "c" : "d"
+            rest = line
+            sub(/^[^:]*:/, "", rest)
+            if (rest ~ /^[ \t]*$/) {
+                want_kind = kind
+                next
+            }
+        } else {
+            next
+        }
+        sub(/^[ \t]+/, "", rest)
+        n = split(rest, tok, /[ \t]+/)
+        v = toupper(tok[1])
+        if (v == "SUCCESS" || v == "WARNING" || v == "ERROR" || v == "DISABLED") {
+            if (kind == "c" && cval == "") cval = v
+            if (kind == "d" && dval == "") dval = v
+        }
+    }
+    END {
+        if (cval != "") print cval
+        else if (dval != "") print dval
+    }
+    ')
+    if [[ -z "$value" ]]; then
+        return 1
+    fi
+    printf '%s\n' "$value"
+}
+
+# True when captured broker output carries a real error: an "Error: <n>"
+# line with a nonzero code, or an ORA-/DGM- code that is NOT preceded on the
+# same line by "Warning:". Member-level warnings such as
+#     Warning: ORA-16789: standby redo logs configured incorrectly
+# are therefore not errors here (unlike dgmgrl_output_has_error, which
+# counts every ORA-/DGM- code and stays as is for its current callers).
+# Usage: dgmgrl_has_error_lines <output>
+dgmgrl_has_error_lines() {
+    local output="$1"
+    printf '%s\n' "$output" | awk '
+    tolower($0) ~ /^[ \t]*error:[ \t]*[1-9]/ { found = 1 }
+    {
+        if (match($0, /(ORA|DGM)-[0-9]/)) {
+            w = index(tolower($0), "warning:")
+            if (!(w > 0 && w < RSTART)) found = 1
+        }
+    }
+    END { exit(found ? 0 : 1) }
+    '
+}
+
 # Run a DGMGRL script from the sql/dgmgrl directory and check its output
 # for failure patterns, since the script's own exit code is always 0
 # (every sql/dgmgrl/*.dgmgrl script ends in EXIT;). Use this instead of
@@ -962,19 +1162,31 @@ run_dgmgrl_with_password() {
 prompt_password() {
     local prompt_text="$1"
     local password
+    local old_traps
 
     # Output prompt to stderr so it doesn't get captured by $()
     printf "${YELLOW}%s${NC}: " "$prompt_text" >&2
-    # AIX compatible: use stty instead of read -s
+    # Tracing stays paused until the password has been printed: xtrace would
+    # otherwise show the read value and the printf below (-v / C2).
     pause_verbose_trace
+    # Ctrl-C between stty -echo and stty echo would leave the terminal with
+    # echo off. Restore it on interrupt, then put any previous traps back.
+    old_traps=$(trap -p INT TERM HUP 2>/dev/null) || old_traps=""
+    trap 'stty echo 2>/dev/null || true; printf "\n" >&2; exit 130' INT TERM HUP
+    # AIX compatible: use stty instead of read -s
     stty -echo 2>/dev/null || true
     read -r password
     stty echo 2>/dev/null || true
-    resume_verbose_trace
+    trap - INT TERM HUP
+    if [[ -n "$old_traps" ]]; then
+        eval "$old_traps"
+    fi
     echo "" >&2
 
-    # Only the password goes to stdout (gets captured)
-    echo "$password"
+    # Only the password goes to stdout (gets captured). printf, not echo:
+    # a password such as -n or -e would be eaten as an echo option.
+    printf '%s\n' "$password"
+    resume_verbose_trace
 }
 
 prompt_with_default() {
@@ -1018,7 +1230,7 @@ verify_sys_password() {
     # 2>&1 is kept deliberately: the connection test inspects the error text
     # in $result, and callers read it back from VERIFY_SYS_ERROR_TEXT (which
     # holds sqlplus output only - never the password).
-    result=$(sqlplus -s /nolog <<SQL 2>&1
+    result=$("$(dg_sqlplus_bin)" -s /nolog <<SQL 2>&1
 SET DEFINE OFF
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 CONNECT sys/"${password}"@${tns_alias} AS SYSDBA
@@ -1078,7 +1290,9 @@ _first_ora_line() {
 # file the same way RMAN duplicate will later, so a bad password
 # fails fast at step 1 rather than deep into step 5.
 #
-# On success: exports SYS_PASSWORD with the verified password.
+# On success: sets SYS_PASSWORD (a plain shell variable, deliberately not
+# exported - children would see it in their environment) to the verified
+# password.
 # On failure (after _max_attempts attempts): exits non-zero.
 # ============================================================
 prompt_and_verify_local_sys_password() {
@@ -1121,13 +1335,18 @@ localhost ${first_port}"
     local pw="" cand_host cand_port target answered transport_error
 
     while [[ $attempt -le $max_attempts ]]; do
+        # Tracing stays paused while the password is held in $pw (read,
+        # tests, verify call, assignment) so -v never prints it (C2).
+        pause_verbose_trace
         pw=$(prompt_password "$prompt_text")
         if [[ -z "$pw" ]]; then
+            resume_verbose_trace
             log_warn "SYS password cannot be empty (attempt ${attempt}/${max_attempts})"
             attempt=$((attempt + 1))
             continue
         fi
         if [[ "$pw" == *'"'* ]]; then
+            resume_verbose_trace
             # verify_sys_password() (and RMAN's CONNECT string) embed the
             # password inside double quotes (sys/"<pw>"@...) - an embedded
             # quote breaks that syntax and would otherwise be misreported as
@@ -1145,7 +1364,8 @@ localhost ${first_port}"
 
             if verify_sys_password "$pw" "$target"; then
                 log_success "SYS password verified against the local primary database (${cand_host}:${cand_port}, SID ${ORACLE_SID})"
-                export SYS_PASSWORD="$pw"
+                SYS_PASSWORD="$pw"
+                resume_verbose_trace
                 return 0
             fi
 
@@ -1165,6 +1385,7 @@ localhost ${first_port}"
         done <<CANDIDATES
 ${pinned:-$candidates}
 CANDIDATES
+        resume_verbose_trace
 
         if [[ $answered -eq 0 ]]; then
             # Not a password problem - no candidate endpoint even reached the
@@ -1246,16 +1467,40 @@ tnsping_test() {
     fi
 }
 
+# Directory Oracle Net reads sqlnet.ora / tnsnames.ora / listener.ora from:
+# $TNS_ADMIN when set, else $ORACLE_HOME/network/admin. Shared or relocated
+# TNS_ADMIN directories are common (especially on AIX); editing the
+# ORACLE_HOME copy then changes files Oracle never reads.
+dg_net_admin_dir() {
+    printf '%s\n' "${TNS_ADMIN:-$ORACLE_HOME/network/admin}"
+}
+
+# True when listener.ora has an uncommented (GLOBAL_DBNAME = <name>) whose
+# value equals <name> exactly (case-insensitive, whitespace-insensitive).
+# Whole-value match: cdb1_stby must not be satisfied by cdb1_stby_DGMGRL.
 listener_has_global_dbname() {
     local listener_file="$1"
     local global_dbname="$2"
 
     awk -v target="$global_dbname" '
+    BEGIN {
+        t = tolower(target)
+        gsub(/[[:space:]]+/, "", t)
+    }
     {
         line = $0
+        sub(/#.*/, "", line)
         gsub(/[[:space:]]+/, "", line)
-        if (index(line, "GLOBAL_DBNAME=" target) > 0) {
-            found = 1
+        line = tolower(line)
+        while ((p = index(line, "global_dbname=")) > 0) {
+            rest = substr(line, p + 14)
+            q = index(rest, ")")
+            val = (q > 0) ? substr(rest, 1, q - 1) : rest
+            gsub(/["\047]/, "", val)
+            if (val == t) {
+                found = 1
+            }
+            line = rest
         }
     }
     END {
@@ -1291,8 +1536,12 @@ EOF
 
 # Add a SID_DESC entry to an existing SID_LIST_LISTENER block
 # Usage: add_sid_to_listener <listener.ora> <sid_desc_file>
-# Returns: 0 on success, 1 on failure
-# Output: Modified listener.ora (original backed up)
+# Returns: 0 on success, 1 on failure (including a one-line
+#          SID_LIST_LISTENER=(...) definition, which is refused rather than
+#          spliced into the wrong place - add the entry by hand)
+# Output: Modified listener.ora, rewritten in place (mode, owner and a
+#         symlink target are kept). This function takes NO backup: callers
+#         run backup_file "$listener_file" first (steps 3 and 4 do).
 #
 # Example sid_desc_file contents:
 #     (SID_DESC =
@@ -1315,7 +1564,9 @@ add_sid_to_listener() {
         return 1
     fi
 
-    if ! grep -q "SID_LIST_LISTENER" "$listener_file"; then
+    # Anchored on the definition itself (SID_LIST_LISTENER = ...), so a
+    # comment or another key that merely mentions the name does not count.
+    if ! grep -iq '^[[:space:]]*SID_LIST_LISTENER[[:space:]]*=' "$listener_file"; then
         echo "ERROR: SID_LIST_LISTENER not found in $listener_file" >&2
         return 1
     fi
@@ -1335,13 +1586,16 @@ add_sid_to_listener() {
         in_sid_list_listener = 0
         paren_count = 0
         found_line = 0
+        start_line = 0
     }
-    /SID_LIST_LISTENER/ {
+    !in_sid_list_listener && toupper($0) ~ /^[ \t]*SID_LIST_LISTENER[ \t]*=/ {
         in_sid_list_listener = 1
+        start_line = NR
     }
     in_sid_list_listener && !found_line {
-        # Count parens on this line
+        # Count parens on this line (ignoring comments)
         line = $0
+        sub(/#.*/, "", line)
         for (i = 1; i <= length(line); i++) {
             c = substr(line, i, 1)
             if (c == "(") {
@@ -1351,16 +1605,26 @@ add_sid_to_listener() {
                 paren_count--
                 # When paren_count drops to 0, this line closes SID_LIST
                 # We want to insert BEFORE this line
-                if (paren_count == 0) {
+                if (paren_count == 0 && !found_line) {
                     found_line = NR
                 }
             }
         }
     }
     END {
-        print found_line
+        # Whole definition on the starting line: nothing to insert before
+        if (found_line && found_line == start_line) {
+            print -1
+        } else {
+            print found_line
+        }
     }
     ' "$listener_file")
+
+    if [[ "$insert_line" == "-1" ]]; then
+        echo "ERROR: SID_LIST_LISTENER is defined on a single line in $listener_file - cannot insert automatically" >&2
+        return 1
+    fi
 
     if [[ -z "$insert_line" || "$insert_line" -eq 0 ]]; then
         echo "ERROR: Could not find SID_LIST closing bracket" >&2
@@ -1382,12 +1646,18 @@ add_sid_to_listener() {
     cat "$sid_desc_file" >> "$temp_file"
     tail -n "+${insert_line}" "$listener_file" >> "$temp_file"
 
-    # Replace original
-    if ! confirm_approval_action "Update listener file" "mv $temp_file $listener_file"; then
+    # Replace original. Copy the content over the existing file instead of
+    # mv-ing the temp file onto it: mv would replace a symlink with a plain
+    # file and drop the original's mode and owner.
+    if ! confirm_approval_action "Update listener file" "cat $temp_file > $listener_file"; then
         rm -rf "$temp_dir"
         return 1
     fi
-    mv "$temp_file" "$listener_file"
+    if ! cat "$temp_file" > "$listener_file"; then
+        echo "ERROR: Could not write $listener_file" >&2
+        rm -rf "$temp_dir"
+        return 1
+    fi
     rm -rf "$temp_dir"
 
     return 0
@@ -1531,17 +1801,63 @@ confirm_proceed() {
 #
 # Usage: confirm_proceed_or_check "<message>" && ... (same calling
 # convention as confirm_proceed - non-zero return means "do not proceed").
+# True when $1 is a dotted-quad IPv4 address
+_is_ipv4_addr() {
+    local re='^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$'
+    [[ "$1" =~ $re ]]
+}
+
+# This host's IPv4 addresses, one per line. DG_LOCAL_IPV4_ADDRS (space
+# separated) overrides discovery, mainly for tests. Otherwise `ifconfig -a`
+# (present on AIX, Linux net-tools and the BSDs; "inet 10.0.0.1 netmask ..."
+# or the older "inet addr:10.0.0.1"), then `ip -4 addr` where available.
+# `hostname -I` / `ip` are Linux-only and never required.
+_local_ipv4_addrs() {
+    if [[ -n "${DG_LOCAL_IPV4_ADDRS+x}" ]]; then
+        printf '%s\n' $DG_LOCAL_IPV4_ADDRS
+        return 0
+    fi
+    local out=""
+    if command -v ifconfig >/dev/null 2>&1; then
+        out=$(ifconfig -a 2>/dev/null | sed -n 's/^[[:space:]]*inet addr:\([0-9.]*\).*/\1/p;s/^[[:space:]]*inet \([0-9][0-9.]*\).*/\1/p') || out=""
+    fi
+    if [[ -z "$out" ]] && command -v ip >/dev/null 2>&1; then
+        out=$(ip -4 addr 2>/dev/null | sed -n 's/^[[:space:]]*inet \([0-9.]*\).*/\1/p') || out=""
+    fi
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    return 0
+}
+
 # Compare two hostnames tolerantly: case-insensitive, and a short name
 # matches its own FQDN (config files usually carry the short name while
 # `hostname` returns the FQDN, or vice versa). Only the first label is
 # compared when either side is unqualified; two different domains with the
 # same short name still match - acceptable for a "am I on the right host?"
 # sanity check, not for security decisions.
+# Dotted-quad IPv4 input is never truncated to its first octet: two IPs match
+# only when identical; an IP against a name matches only when the IP is one of
+# this host's own addresses (callers pass `hostname` as $1, so the question
+# is always "is this config entry me?").
 hostnames_match() {
     local a b
-    a=$(printf '%s' "${1%%.*}" | tr '[:upper:]' '[:lower:]')
-    b=$(printf '%s' "${2%%.*}" | tr '[:upper:]' '[:lower:]')
-    [[ -n "$a" && "$a" == "$b" ]]
+    a=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    b=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    [[ -n "$a" && -n "$b" ]] || return 1
+
+    if _is_ipv4_addr "$a" && _is_ipv4_addr "$b"; then
+        [[ "$a" == "$b" ]]
+        return
+    fi
+    if _is_ipv4_addr "$a" || _is_ipv4_addr "$b"; then
+        local ip="$a" addrs addr
+        _is_ipv4_addr "$ip" || ip="$b"
+        addrs=$(_local_ipv4_addrs)
+        for addr in $addrs; do
+            [[ "$addr" == "$ip" ]] && return 0
+        done
+        return 1
+    fi
+    [[ "${a%%.*}" == "${b%%.*}" ]]
 }
 
 confirm_proceed_or_check() {

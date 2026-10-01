@@ -8,8 +8,9 @@
 # Uses $ORACLE_SID (or auto-detects from running pmon)
 bash dg_status.sh
 
-# Explicit SID
+# Explicit SID (primary), and the standby's when several instances run there
 bash dg_status.sh -s cdb1
+bash dg_status.sh -s cdb1 --standby-sid cdb1_stby
 
 # Custom SSH config
 bash dg_status.sh -c /path/to/config.env
@@ -46,11 +47,13 @@ bash dg_status.sh --no-color
 | Role | `V$DATABASE.DATABASE_ROLE` | PHYSICAL STANDBY | - | Anything else |
 | Open Mode | `V$DATABASE.OPEN_MODE` | MOUNTED / READ ONLY | Anything else | - |
 | Protection Mode | `V$DATABASE.PROTECTION_MODE` | _(displayed, not graded)_ | | |
-| Switchover Status | `V$DATABASE.SWITCHOVER_STATUS` | NOT ALLOWED / SWITCHOVER PENDING | Anything else | - |
+| Switchover Status | `V$DATABASE.SWITCHOVER_STATUS` | NOT ALLOWED / SWITCHOVER PENDING | Anything else (`!!` icon only; not counted in the summary or exit code) | - |
+| Flashback | `V$DATABASE.FLASHBACK_ON` | YES | NO | - |
+| DG Broker | `V$PARAMETER (dg_broker_start)` | TRUE | - | FALSE |
 | Running Services | `V$ACTIVE_SERVICES` | _(displayed, not graded)_ | | |
 | MRP Status | `V$MANAGED_STANDBY (MRP0)` | APPLYING_LOG / WAIT_FOR_LOG | - | Not running / other |
-| Transport Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
-| Apply Lag | `V$DATAGUARD_STATS` | +00 00:00:00 | Any lag | - |
+| Transport Lag | `V$DATAGUARD_STATS` | <= `DG_LAG_WARN_SECONDS` (60 s) | Above that | - |
+| Apply Lag | `V$DATAGUARD_STATS` | <= `DG_LAG_WARN_SECONDS` (60 s) | Above that | - |
 | Sequences | `V$ARCHIVED_LOG` | Lag <= 1 | Lag 2-5 | Lag > 5 |
 | Replication state (summary row) | derived | IN SYNC | LAGGING / BEHIND / **UNKNOWN** | BEHIND (> `DG_SEQ_GAP_CRIT`) |
 | Standby Redo Logs | `V$STANDBY_LOG` | Count > 0 | - | NONE |
@@ -102,7 +105,9 @@ failover will not happen, and is graded as an **error** — the same grade
 The script uses the same config format as the E2E test suite. Required variables:
 
 ```bash
-# Jump host (set JUMP_HOST to the local hostname to skip ProxyJump)
+# Jump host. May be left empty to connect to the DB hosts directly; when set
+# it is skipped automatically if this machine IS the jump host (compared as a
+# whole short or fully-qualified name, so "jump" does not match "jump02").
 JUMP_HOST="bastion"
 JUMP_USER="db"
 JUMP_SSH_PORT="22"
@@ -135,7 +140,18 @@ The Oracle SID is resolved in this order:
 2. **`$ORACLE_SID` environment variable** -- uses whatever is set in your shell
 3. **Auto-detect** -- finds the running `ora_pmon_<SID>` process on the primary host
 
-The standby SID is always auto-detected from its own pmon process (it may differ from the primary SID).
+The standby SID is taken from `--standby-sid` when given, otherwise
+auto-detected from its own pmon process (it may differ from the primary SID).
+
+**Several instances on one host.** With more than one `ora_pmon_*` process (ASM
+excluded) the first one used to be picked silently. Now:
+
+- on the **standby**, each candidate is asked for its `DB_NAME` and the one that
+  equals the primary's `DB_NAME` (a physical standby shares it) is used; no
+  warning is needed when that decides;
+- when it cannot decide, or on the **primary** (nothing to match against), the
+  first candidate is used **and a warning is raised** naming all candidates and
+  the flag to use (`-s` / `--standby-sid`).
 
 Auto-detection is deliberately paranoid about what it parses. The remote side runs
 
@@ -157,10 +173,11 @@ Monitoring-friendly, matching `dg_triage_sid.sh` / `dg_diag_sid.sh`:
 
 - `0` -- healthy (no errors, no warnings)
 - `1` -- warnings only
-- `2` -- one or more errors (including an unreachable host or a primary with no running instance)
+- `2` -- one or more errors (including an unreachable host, a primary with no running instance, or a remote collection that timed out)
 - `3` -- **usage / pre-flight error**: unknown flag, an option missing its
-  argument, config file not found, config file missing a required setting, or a
-  SID that fails validation. Nothing was checked.
+  argument, config file not found, config file missing a required setting, a
+  SID that fails validation, a malformed threshold or `DG_REMOTE_TIMEOUT`
+  value, or no usable temporary directory. Nothing was checked.
 
 This lets cron/monitoring wrappers alert on the exit status instead of scraping
 the text output. `3` is separate from `1`/`2` on purpose: a typo in the command
@@ -183,6 +200,19 @@ line must not be reported as a Data Guard finding.
   entries)`. A missing **alert** log raises a warning (a running instance must
   have one); a missing **broker** log does not, since it legitimately does not
   exist until the broker has started.
+- **SSH noise is not a finding.** DGMGRL output is read without ssh's stderr
+  (`Warning: Permanently added ...`, login banners) and only from the
+  `Configuration -` line on, so it can no longer count as a broker warning.
+- **Remote collection is time-bounded.** All remote jobs run in parallel under
+  a watchdog: after `DG_REMOTE_TIMEOUT` seconds (default `120`) whatever is
+  still running is killed (including the ssh child), its partial output is
+  discarded, and an **error** naming the host and the cut-off jobs is recorded
+  - the run ends with exit `2`, never a silent pass. ssh itself also gets
+  `ServerAliveInterval=15` / `ServerAliveCountMax=3` / `ConnectTimeout=15` as
+  defaults (appended after `SSH_OPTS`, so values set there win).
+- **Same grading as the local tools.** The `Redo Apply` state, broker colours
+  and the primary/standby switchover, flashback and `dg_broker_start` checks
+  are shared with / matched to `dg_triage_sid.sh` and `dg_diag_sid.sh`.
 
 ## Thresholds
 
@@ -198,15 +228,26 @@ The warning/critical cutoffs are env-overridable (defaults shown):
 
 Example: `DG_FRA_WARN_PCT=70 DG_LAG_WARN_SECONDS=30 bash dg_status.sh`
 
+Each value must be a non-negative integer. `80%` or `abc` is rejected up front
+(exit `3` for `dg_status.sh`, `64` for the local tools) instead of making the
+checks silently always or never fire.
+
+Other environment variable: `DG_REMOTE_TIMEOUT` (default `120`) -- seconds
+before a hung remote job is killed and reported (see above).
+
+FRA sizes are produced with an explicit `NLS_NUMERIC_CHARACTERS` in the SQL, so
+a comma-decimal session `NLS_LANG` cannot turn `0.4` into `0,4`; the values are
+also validated as numeric before the percentage is computed.
+
 These same variables are honored by `dg_triage_sid.sh` and `dg_diag_sid.sh` (shared via `common/dg_render_common.sh`).
 
 ## How It Works
 
-The script runs all SSH connections in parallel (5 concurrent sessions) to minimise wall-clock time:
+The script runs all SSH connections in parallel (up to 8 concurrent sessions: 3 on the primary for SQL/DGMGRL, 1 on the standby for SQL, and the alert-log and broker-log reads on each side) to minimise wall-clock time. The remote shell gets `ORACLE_HOME`, `ORACLE_BASE`, `ORACLE_SID`, `PATH` and `LIBPATH` (AIX) exported explicitly, since a non-login ssh skips `.profile`:
 
 1. **Primary SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$PARAMETER`, `V$LOG`, `V$STANDBY_LOG`, `V$ARCHIVE_GAP`, `V$ARCHIVE_DEST`, `V$RECOVERY_FILE_DEST`, `V$ACTIVE_SERVICES`
 2. **Primary DGMGRL** -- `SHOW CONFIGURATION` and `SHOW FAST_START FAILOVER`
-3. **Standby SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$MANAGED_STANDBY`, `V$DATAGUARD_STATS`, `V$ARCHIVE_GAP`, `V$ARCHIVED_LOG`, `V$STANDBY_LOG`, `V$RECOVERY_FILE_DEST`, `V$ACTIVE_SERVICES`
+3. **Standby SQL** -- single `sqlplus` session querying `V$DATABASE`, `V$PARAMETER`, `V$MANAGED_STANDBY`, `V$DATAGUARD_STATS`, `V$ARCHIVE_GAP`, `V$ARCHIVED_LOG`, `V$STANDBY_LOG`, `V$RECOVERY_FILE_DEST`, `V$ACTIVE_SERVICES`
 
 Results are parsed and displayed with colour-coded status indicators:
 - **OK** (green) -- check passed
@@ -241,6 +282,8 @@ Results are parsed and displayed with colour-coded status indicators:
   Open Mode                MOUNTED                              OK
   Protection Mode          MAXIMUM AVAILABILITY
   Switchover Status        NOT ALLOWED                          OK
+  Flashback                YES                                  OK
+  DG Broker                TRUE                                 OK
   Running Services         CDB1_STBY
   MRP Status               APPLYING_LOG (seq# 1295)             OK
   Transport Lag            none                                 OK

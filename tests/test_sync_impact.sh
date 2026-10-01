@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Unit tests for dg_sync_impact.sh
 # ============================================================
@@ -11,6 +11,10 @@
 #   STUB_FAIL_QTAG  QTAG name whose query exits 1 (simulated ORA- error)
 #   STUB_AUTOBASE   AUTOBASE classification scenario: default (NOSYNC run
 #                   40-49, MIXED 50, SYNC 51-90), ALLSYNC, or NOSYNCONLY
+#   STUB_DEST_STATUS  STATUS of the SYNC destination row (default VALID)
+#   STUB_LOG        file the stub appends every query it receives to
+#   STUB_TAB        YES -> the PING reply carries tab padding (SET TAB OFF case)
+#   STUB_SLEEP_QTAG QTAG whose query touches $STUB_MARK and then sleeps (signals)
 #
 # Usage: bash tests/test_sync_impact.sh
 #
@@ -75,11 +79,15 @@ cat > "$STUB_BIN/sqlplus" <<'STUB'
 #!/bin/bash
 # sqlplus stub: reads the SQL from stdin, dispatches on the QTAG marker.
 IN=$(cat)
+if [[ -n "${STUB_LOG:-}" ]]; then printf '%s\n-----\n' "$IN" >> "$STUB_LOG"; fi
+if [[ -n "${STUB_SLEEP_QTAG:-}" && "$IN" == *"QTAG:${STUB_SLEEP_QTAG}"* ]]; then
+    touch "$STUB_MARK"; sleep 30
+fi
 fail_if() { if [[ "${STUB_FAIL_QTAG:-}" == "$1" ]]; then exit 1; fi; }
 case "$IN" in
 *QTAG:PING*)
     fail_if PING
-    echo "OK"
+    if [[ "${STUB_TAB:-}" == "YES" ]]; then printf '\tOK\t\n'; else echo "OK"; fi
     ;;
 *QTAG:DBINFO*)
     fail_if DBINFO
@@ -90,7 +98,7 @@ case "$IN" in
     if [[ "${STUB_NO_SYNC:-}" == "YES" ]]; then
         echo "DEST|2|cdb1_stby|ASYNCHRONOUS|NO|30|VALID"
     else
-        echo "DEST|2|cdb1_stby|PARALLELSYNC|NO|30|VALID"
+        echo "DEST|2|cdb1_stby|PARALLELSYNC|NO|30|${STUB_DEST_STATUS:-VALID}"
     fi
     ;;
 *QTAG:EVENTS*)
@@ -126,16 +134,18 @@ case "$IN" in
     fail_if AWRSNAP
     echo "SNAPWIN|100|268|169"
     ;;
-*QTAG:AWRAGG*)
+*QTAG:AWRAGG*|*QTAG:BASEAGG*)
     fail_if AWRAGG
+    fail_if BASEAGG
     if [[ "$IN" == *"BETWEEN 50 AND 90"* || "$IN" == *"BETWEEN 40 AND 49"* ]]; then
         echo "XAGG|604800|1800000|.6|.48|0|-|2700000|48000000"
     else
         echo "XAGG|604800|2000000|1.05|.5|1900000|.7|3000000|50000000"
     fi
     ;;
-*QTAG:BASEHIST*)
+*QTAG:BASEHIST*|*QTAG:AWRHIST*)
     fail_if BASEHIST
+    fail_if AWRHIST
     if [[ "$IN" == *"BETWEEN 50 AND 90"* || "$IN" == *"BETWEEN 40 AND 49"* ]]; then
         echo "HPCT|1|1|2|1800000"
     else
@@ -595,6 +605,222 @@ assert_contains "fallback keeps the numbers" "$OUT" "0.330 ms"
 assert_contains "fallback escapes markup" "$OUT" "&lt;= 1.024"
 assert_contains "page still closed" "$OUT" "</html>"
 assert_contains "fallback is announced" "$ERR" "HTML conversion failed"
+
+# ==== Test 14: option values (C5) ====
+echo "Test 14: a missing option value exits 2 with a message; leading zeros are decimal"
+for opt in --ash-hours --days --baseline-begin --baseline-end -o; do
+    run_script "$opt"
+    assert_eq "$opt without a value rc" "2" "$RC"
+    assert_contains "$opt without a value message" "$ERR" "$opt requires a value"
+done
+run_script --ash-hours 08 --days 09
+assert_eq "leading-zero --ash-hours/--days rc" "0" "$RC"
+assert_contains "leading-zero windows are decimal" "$OUT" "AWR last 9 day(s); ASH last 8 hour(s)"
+run_script --ash-hours 1234567890
+assert_eq "over-long --ash-hours rc" "2" "$RC"
+STUB_LOG="$TEST_TMP/q14.log"; : > "$STUB_LOG"; export STUB_LOG
+run_script --baseline-begin 050 --baseline-end 090
+unset STUB_LOG
+assert_eq "leading-zero snapshot IDs rc" "0" "$RC"
+assert_contains "snapshot IDs normalised in the SQL" "$(cat "$TEST_TMP/q14.log")" "BETWEEN 50 AND 90"
+run_script --baseline-begin 08 --baseline-end 09
+assert_eq "leading-zero snapshot IDs (08/09) rc" "0" "$RC"
+
+# ==== Test 15: date-only baselines (M21) ====
+echo "Test 15: a bare-date baseline is accepted: 00:00 .. end of that day"
+STUB_LOG="$TEST_TMP/q15.log"; : > "$STUB_LOG"; export STUB_LOG
+run_script --baseline-begin 2026-07-01 --baseline-end 2026-07-08
+unset STUB_LOG
+Q15=$(cat "$TEST_TMP/q15.log")
+assert_eq "date-only baseline rc" "0" "$RC"
+assert_contains "begin gets 00:00" "$Q15" "TO_DATE('2026-07-01 00:00','YYYY-MM-DD HH24:MI')"
+assert_contains "end covers the whole day" "$Q15" "TO_DATE('2026-07-08 00:00','YYYY-MM-DD HH24:MI') + 86399/86400"
+assert_contains "date-only baseline compares" "$OUT" "Empirical added latency per commit: 0.450 ms"
+STUB_LOG="$TEST_TMP/q15b.log"; : > "$STUB_LOG"; export STUB_LOG
+run_script --baseline-begin '2026-07-01 06:30' --baseline-end '2026-07-08 18:00'
+unset STUB_LOG
+Q15=$(cat "$TEST_TMP/q15b.log")
+assert_contains "timed begin untouched" "$Q15" "TO_DATE('2026-07-01 06:30','YYYY-MM-DD HH24:MI')"
+assert_contains "timed end has no padding" "$Q15" "TO_DATE('2026-07-08 18:00','YYYY-MM-DD HH24:MI') + 0"
+run_script --baseline-begin 2026-07-09 --baseline-end 2026-07-01
+assert_eq "reversed dates rc" "2" "$RC"
+assert_contains "reversed dates message" "$ERR" "after --baseline-end"
+run_script --baseline-begin 2026-07-08 --baseline-end 2026-07-08
+assert_eq "single-day baseline rc" "0" "$RC"
+
+# ==== Test 16: each query is recorded under its own name ====
+echo "Test 16: current and baseline AWR queries do not overwrite each other"
+run_script --baseline-begin 50 --baseline-end 90
+AWRAGG_BLOCK=$(printf '%s\n' "$OUT" | sed -n '/^-- QTAG:AWRAGG/,/^```/p')
+BASEAGG_BLOCK=$(printf '%s\n' "$OUT" | sed -n '/^-- QTAG:BASEAGG/,/^```/p')
+AWRHIST_BLOCK=$(printf '%s\n' "$OUT" | sed -n '/^-- QTAG:AWRHIST/,/^```/p')
+BASEHIST_BLOCK=$(printf '%s\n' "$OUT" | sed -n '/^-- QTAG:BASEHIST/,/^```/p')
+assert_contains "current agg query is the current window" "$AWRAGG_BLOCK" "BETWEEN 100 AND 268"
+assert_contains "baseline agg query is the baseline window" "$BASEAGG_BLOCK" "BETWEEN 50 AND 90"
+assert_contains "current histogram query is the current window" "$AWRHIST_BLOCK" "BETWEEN 100 AND 268"
+assert_contains "baseline histogram query is the baseline window" "$BASEHIST_BLOCK" "BETWEEN 50 AND 90"
+assert_contains "section 2 source names the AWR views" "$OUT" '`DBA_HIST_SYSTEM_EVENT`, '
+SEC2=$(printf '%s\n' "$OUT" | sed -n '/^## 2\./,/^## 3\./p')
+assert_contains "section 2 shows the AWR window query" "$SEC2" "-- QTAG:AWRAGG"
+
+# ==== Test 17: queries carry restart-safe, CDB-safe SQL ====
+echo "Test 17: startup partitioning, auto-baseline first-appearance, ASH fixes"
+STUB_LOG="$TEST_TMP/q17.log"; : > "$STUB_LOG"; export STUB_LOG
+run_script --auto-baseline
+unset STUB_LOG
+Q17=$(cat "$TEST_TMP/q17.log")
+assert_contains "AWR aggregates partition by startup" "$Q17" "PARTITION BY e.EVENT_NAME, sn.ST ORDER BY e.SNAP_ID"
+assert_contains "elapsed time sums only same-startup intervals" "$Q17" "SELECT SUM(D)*86400 SECS FROM ("
+assert_contains "trend partitions by startup" "$Q17" "PARTITION BY sn.ST ORDER BY x.SNAP_ID"
+# M23: the first snapshot holding the SYNC event must not be classed NOSYNC
+assert_contains "auto-baseline counts an absent SYNC row as 0 waits" "$Q17" "LAG(NVL(e.TOTAL_WAITS,0)) OVER (PARTITION BY sn.ST ORDER BY sn.SNAP_ID)"
+assert_contains "auto-baseline reads the event over every snapshot" "$Q17" "LEFT JOIN DBA_HIST_SYSTEM_EVENT e"
+# M22: one SQL_ID parsed in two PDBs must not raise ORA-01427
+assert_contains "ASH SQL text lookup is single-row" "$Q17" "NVL((SELECT MAX(REPLACE(REPLACE(REPLACE(SUBSTR(s.SQL_TEXT,1,60)"
+# hourly profile ordered by the truncated timestamp, not 'MM-DD HH24'
+assert_contains "ASH hourly groups by truncated hour" "$Q17" "GROUP BY TRUNC(SAMPLE_TIME,'HH24')"
+assert_contains "ASH hourly orders by the timestamp" "$Q17" "ORDER BY HR;"
+assert_contains "sqlplus preamble sets TAB OFF" "$Q17" "TRIMSPOOL ON TAB OFF"
+run_script
+assert_contains "NET_TIMEOUT column is labelled in seconds" "$OUT" "| NET_TIMEOUT (s) |"
+
+# ==== Test 18: tab padding from sqlplus ====
+echo "Test 18: tab-padded sqlplus output is cleaned"
+STUB_TAB=YES
+export STUB_TAB
+run_script
+unset STUB_TAB
+assert_eq "tab-padded PING rc" "0" "$RC"
+
+# ==== Test 19: destination status ====
+echo "Test 19: a SYNC destination that is not VALID is not active transport"
+STUB_DEST_STATUS=ERROR
+export STUB_DEST_STATUS
+run_script
+unset STUB_DEST_STATUS
+assert_eq "errored SYNC dest rc" "0" "$RC"
+assert_contains "errored SYNC dest not active" "$OUT" "No synchronous destination is active"
+assert_contains "errored SYNC dest reported separately" "$OUT" "Not counted as active synchronous transport:** cdb1_stby (ERROR)"
+assert_contains "errored SYNC dest warned" "$ERR" "not VALID"
+assert_contains "headline not applicable" "$OUT" "Not applicable - no synchronous destination"
+run_script
+assert_not_contains "valid SYNC dest has no not-counted note" "$OUT" "Not counted as active synchronous transport"
+
+# ==== Test 20: DG_SI_* thresholds ====
+echo "Test 20: invalid DG_SI_* values fall back to the defaults"
+STUB_LOG="$TEST_TMP/q20.log"; : > "$STUB_LOG"; export STUB_LOG
+DG_SI_MIN_WRITES=0 DG_SI_SYNC_RATIO='1;DROP' DG_SI_NOSYNC_RATIO=abc run_script --auto-baseline
+unset STUB_LOG
+Q20=$(cat "$TEST_TMP/q20.log")
+assert_eq "bad DG_SI_* rc" "0" "$RC"
+assert_contains "min-writes warning" "$ERR" "DG_SI_MIN_WRITES='0' is not a positive integer; using 50"
+assert_contains "sync-ratio warning" "$ERR" "DG_SI_SYNC_RATIO='1;DROP' is not a positive number; using 0.5"
+assert_contains "nosync-ratio warning" "$ERR" "DG_SI_NOSYNC_RATIO='abc'"
+assert_contains "defaults reach the SQL" "$Q20" "rw.DV < 50 OR"
+assert_not_contains "no injected text in the SQL" "$Q20" "DROP"
+DG_SI_NOSYNC_RATIO=0.9 run_script --auto-baseline
+assert_contains "inverted ratios warned" "$ERR" "must be below DG_SI_SYNC_RATIO"
+DG_SI_MIN_WRITES=007 run_script --auto-baseline
+assert_not_contains "valid min-writes accepted" "$ERR" "DG_SI_MIN_WRITES"
+
+# ==== Test 21: -o is checked before any collection ====
+echo "Test 21: an unwritable -o fails up front"
+STUB_LOG="$TEST_TMP/q21.log"; rm -f "$STUB_LOG"; export STUB_LOG
+run_script -o "$TEST_TMP/no_such_dir/report.md"
+unset STUB_LOG
+assert_eq "unwritable -o rc" "2" "$RC"
+assert_contains "unwritable -o message" "$ERR" "cannot write to the -o file"
+if [[ -e "$TEST_TMP/q21.log" ]]; then
+    echo "  FAIL: sqlplus was not called before the -o check"; FAIL=$((FAIL + 1))
+else
+    echo "  PASS: sqlplus was not called before the -o check"; PASS=$((PASS + 1))
+fi
+STUB_ROLE="PHYSICAL STANDBY"
+export STUB_ROLE
+run_script -o "$TEST_TMP/left_behind.md"
+unset STUB_ROLE
+assert_eq "fatal run rc" "1" "$RC"
+if [[ -e "$TEST_TMP/left_behind.md" ]]; then
+    echo "  FAIL: the -o pre-check leaves no empty file behind"; FAIL=$((FAIL + 1))
+else
+    echo "  PASS: the -o pre-check leaves no empty file behind"; PASS=$((PASS + 1))
+fi
+echo "keep me" > "$TEST_TMP/existing.md"
+STUB_ROLE="PHYSICAL STANDBY"
+export STUB_ROLE
+run_script -o "$TEST_TMP/existing.md"
+unset STUB_ROLE
+assert_eq "an existing -o file is not truncated by the pre-check" "keep me" "$(cat "$TEST_TMP/existing.md")"
+
+# ==== Test 22: temp dir fallback (A6) ====
+echo "Test 22: no mktemp -> mkdir fallback; no temp dir at all -> warning"
+NOMKTEMP_BIN="$TEST_TMP/nomktemp"
+mkdir -p "$NOMKTEMP_BIN"
+for t in sed tr grep head awk cat sort rm mkdir date wc uniq cut tail; do
+    tp=$(command -v "$t" 2>/dev/null) && ln -sf "$tp" "$NOMKTEMP_BIN/$t"
+done
+cp "$STUB_BIN/sqlplus" "$NOMKTEMP_BIN/sqlplus"
+FB_TMP="$TEST_TMP/fbtmp"
+mkdir -p "$FB_TMP"
+OUT=$(PATH="$NOMKTEMP_BIN" TMPDIR="$FB_TMP" ORACLE_SID=TESTSID ORACLE_HOME="$TEST_TMP" \
+      /bin/bash "$SCRIPT" 2>"$ERR_FILE")
+RC=$?
+ERR=$(cat "$ERR_FILE")
+assert_eq "no-mktemp rc" "0" "$RC"
+assert_contains "no-mktemp keeps the query blocks" "$OUT" '```sql'
+LEFT=$(ls "$FB_TMP" 2>/dev/null | wc -l | tr -d ' ')
+assert_eq "no-mktemp temp dir is cleaned up" "0" "$LEFT"
+OUT=$(PATH="$NOMKTEMP_BIN" TMPDIR="$TEST_TMP/no_such_tmp" ORACLE_SID=TESTSID ORACLE_HOME="$TEST_TMP" \
+      /bin/bash "$SCRIPT" 2>"$ERR_FILE")
+RC=$?
+ERR=$(cat "$ERR_FILE")
+assert_eq "no temp dir rc" "0" "$RC"
+assert_contains "no temp dir warning" "$ERR" "Could not create a temp directory"
+assert_not_contains "no temp dir -> no query blocks" "$OUT" '```sql'
+
+# ==== Test 23: signals end the run and clean up (C12) ====
+# The signal goes to the whole process group, as a terminal's Ctrl-C does.
+# python3 starts the child with default signal dispositions (a backgrounded
+# bash child would inherit SIGINT as ignored and could never be trapped).
+# preexec_fn resets SIGINT/SIGTERM explicitly: Popen does not, so a test run
+# launched from a shell that already ignores SIGINT would otherwise hand the
+# child an untrappable SIGINT and fail for reasons unrelated to the script.
+echo "Test 23: SIGINT/SIGTERM exit 130/143 and remove the temp dir"
+if command -v python3 >/dev/null 2>&1; then
+    for sig in INT TERM; do
+        SIG_TMP="$TEST_TMP/sig_$sig"
+        mkdir -p "$SIG_TMP"
+        RC=$(PATH="$STUB_BIN:$PATH" TMPDIR="$SIG_TMP" ORACLE_SID=TESTSID ORACLE_HOME="$TEST_TMP" \
+             STUB_SLEEP_QTAG=EVENTS STUB_MARK="$SIG_TMP/mark" SIGNAME="$sig" SCRIPT="$SCRIPT" \
+             python3 -c '
+import os, signal, subprocess, time
+def _default_signals():
+    signal.signal(signal.SIGINT, signal.SIG_DFL)
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+p = subprocess.Popen(["bash", os.environ["SCRIPT"]], stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True,
+                     preexec_fn=_default_signals)
+mark = os.environ["STUB_MARK"]
+for _ in range(100):
+    if os.path.exists(mark):
+        break
+    time.sleep(0.1)
+os.killpg(p.pid, getattr(signal, "SIG" + os.environ["SIGNAME"]))
+try:
+    p.wait(timeout=15)
+except subprocess.TimeoutExpired:
+    os.killpg(p.pid, signal.SIGKILL)
+    p.wait()
+print(p.returncode)
+' 2>/dev/null)
+        if [[ "$sig" == "INT" ]]; then want=130; else want=143; fi
+        assert_eq "SIG$sig exit status" "$want" "$RC"
+        LEFT=$(ls "$SIG_TMP" | grep -c '^dg_sync_impact\.' || true)
+        assert_eq "SIG$sig removes the temp dir" "0" "$LEFT"
+    done
+else
+    echo "  SKIP: python3 not available"
+fi
 
 # ==== Summary ====
 echo ""

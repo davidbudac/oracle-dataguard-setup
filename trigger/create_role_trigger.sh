@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Create Role-Aware Service Trigger
 # ============================================================
@@ -137,19 +137,35 @@ if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
     # a setup-time standby_config_*.env file if one happens to exist on the
     # NFS share - purely for this label; nothing else in this script depends
     # on it. Quiet and non-interactive: this is a best-effort label only.
-    CONFIG_CANDIDATE=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null | head -1) || true
-    if [[ -n "$CONFIG_CANDIDATE" ]]; then
+    # Only a .env whose PRIMARY_DB_UNIQUE_NAME equals the discovered one is
+    # used (another build may be running concurrently on the same share), and
+    # it is sourced in a subshell so nothing else it defines leaks into this
+    # script - in particular it cannot overwrite PRIMARY_DB_UNIQUE_NAME.
+    DISCOVERED_PRIMARY="$PRIMARY_DB_UNIQUE_NAME"
+    CONFIG_CANDIDATES=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null) || true
+    while IFS= read -r CONFIG_CANDIDATE; do
+        [[ -n "$CONFIG_CANDIDATE" ]] || continue
         # shellcheck disable=SC1090
-        source "$CONFIG_CANDIDATE"
-        log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME:-UNKNOWN}"
-    fi
+        STANDBY_FROM_ENV=$( (
+            source "$CONFIG_CANDIDATE" >/dev/null 2>&1 || true
+            if [[ "${PRIMARY_DB_UNIQUE_NAME:-}" == "$DISCOVERED_PRIMARY" ]]; then
+                printf '%s' "${STANDBY_DB_UNIQUE_NAME:-}"
+            fi
+        ) ) || true
+        STANDBY_FROM_ENV=$(printf '%s' "$STANDBY_FROM_ENV" | tr -d ' \t\n\r')
+        if [[ -n "$STANDBY_FROM_ENV" ]]; then
+            STANDBY_DB_UNIQUE_NAME="$STANDBY_FROM_ENV"
+            log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME}"
+            break
+        fi
+    done <<< "$CONFIG_CANDIDATES"
 fi
 
 log_info "Primary DB_UNIQUE_NAME: $PRIMARY_DB_UNIQUE_NAME"
 if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
     log_info "Standby DB_UNIQUE_NAME: $STANDBY_DB_UNIQUE_NAME"
 else
-    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
+    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no matching standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
     STANDBY_DB_UNIQUE_NAME="UNKNOWN"
 fi
 
@@ -196,9 +212,11 @@ resolve_service_name() {
     resolved=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 SELECT 'SVCNAME=' || name FROM (
-    SELECT name FROM DBA_SERVICES WHERE UPPER(name) = UPPER('${input}')
-    UNION
-    SELECT name FROM V\$ACTIVE_SERVICES WHERE UPPER(name) = UPPER('${input}')
+    SELECT name FROM (
+        SELECT name FROM DBA_SERVICES WHERE UPPER(name) = UPPER('${input}')
+        UNION
+        SELECT name FROM V\$ACTIVE_SERVICES WHERE UPPER(name) = UPPER('${input}')
+    ) ORDER BY CASE WHEN name = '${input}' THEN 0 ELSE 1 END, name
 ) WHERE ROWNUM = 1;
 EXIT;
 EOSQL
@@ -431,9 +449,37 @@ if [[ "$PKG_EXISTS" != "0" ]]; then
     echo "Existing objects will be replaced with the new definition."
     echo "This is safe - the new package will contain the updated service list."
     echo ""
-    if ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_info "Check mode: the existing package and triggers would be replaced"
+    elif ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
         log_info "Deployment cancelled by user"
         exit 0
+    fi
+fi
+
+# A dedicated-user deployment (create_role_trigger_dedicated_user.sh) uses the
+# same trigger names under another owner. Two trigger sets would both fire on
+# every role change and startup, possibly with different service lists.
+OTHER_TRIGGERS=$(sqlplus -s / as sysdba << 'EOSQL'
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT OWNER || '.' || TRIGGER_NAME FROM DBA_TRIGGERS
+WHERE TRIGGER_NAME IN ('TRG_MANAGE_SERVICES_ROLE_CHG', 'TRG_MANAGE_SERVICES_STARTUP')
+  AND OWNER <> 'SYS'
+ORDER BY OWNER, TRIGGER_NAME;
+EXIT;
+EOSQL
+)
+OTHER_TRIGGERS=$(printf '%s\n' "$OTHER_TRIGGERS" | grep -E '^[A-Za-z0-9_$#.]+$' || true)
+if [[ -n "$OTHER_TRIGGERS" ]]; then
+    log_warn "Role-trigger objects from another variant already exist (non-SYS owner):"
+    printf '%s\n' "$OTHER_TRIGGERS" | sed 's/^/    /'
+    log_warn "Deploying the SYS variant as well leaves two trigger sets that both manage services on every role change and startup."
+    log_warn "Drop the other set first (see the removal commands in its generated SQL file), or keep only one variant."
+    if [[ "$CHECK_ONLY" != "1" && -t 0 ]]; then
+        if ! confirm_proceed "Deploy the SYS variant alongside the existing one anyway?"; then
+            log_info "Deployment cancelled by user"
+            exit 0
+        fi
     fi
 fi
 
@@ -458,6 +504,23 @@ done
 echo ""
 echo "Objects will replicate to standby via redo apply."
 echo ""
+
+# Write the generated SQL to the NFS share when one is mounted and writable
+# (keeps parity with the previous config-driven workflow); otherwise fall back
+# to the current directory with a clear notice, since this script no longer
+# requires NFS.
+if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
+    log_warn "NFS share (${NFS_SHARE}) not available/writable - generated SQL goes to the current directory instead"
+fi
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: generated SQL would be written to: $SQL_OUTPUT_FILE"
+    log_info "Check mode: no changes made"
+    finish_check_mode "Role-trigger preflight complete. No database objects were created or replaced."
+fi
 
 if ! confirm_proceed "Deploy DG_SERVICE_MGR package and triggers?"; then
     log_info "Deployment cancelled by user"
@@ -548,6 +611,7 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     PROCEDURE MANAGE_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
+        l_active   NUMBER;
     BEGIN
         SELECT DATABASE_ROLE INTO l_role FROM V\$DATABASE;
         l_services := get_service_list();
@@ -556,7 +620,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
             -- Start services on PRIMARY
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    DBMS_SERVICE.START_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active = 0 THEN
+                        DBMS_SERVICE.START_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('START', l_services(i), SQLERRM);
@@ -566,7 +633,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
             -- Stop services on STANDBY (any non-PRIMARY role)
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active > 0 THEN
+                        DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('STOP', l_services(i), SQLERRM);
@@ -652,6 +722,13 @@ fi
 
 if [[ "$DEPLOY_OK" != "true" ]]; then
     log_error "Deployment verification failed"
+    # Show what the database said: the ORA-/PLS- lines (and compilation
+    # warnings) are the only clue to why the objects are missing or invalid.
+    DEPLOY_ERRORS=$( { printf '%s\n' "$DEPLOY_RESULT" | grep -E '^(ORA-|PLS-|SP2-|Warning:)' || true; } )
+    [[ -n "$DEPLOY_ERRORS" ]] || DEPLOY_ERRORS="$DEPLOY_RESULT"
+    echo ""
+    echo "Database output:"
+    printf '%s\n' "$DEPLOY_ERRORS" | sed 's/^/  /'
     echo ""
     echo "Check for compilation errors:"
     echo "  SELECT * FROM DBA_ERRORS WHERE OWNER = 'SYS' AND NAME = 'DG_SERVICE_MGR';"
@@ -664,16 +741,6 @@ fi
 # ============================================================
 
 log_section "Saving Generated SQL"
-
-# Write to the NFS share when one is mounted and writable (keeps parity with
-# the previous config-driven workflow); otherwise fall back to the current
-# directory with a clear notice, since this script no longer requires NFS.
-if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
-    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
-else
-    SQL_OUTPUT_FILE="./dg_service_mgr_${PRIMARY_DB_UNIQUE_NAME}.sql"
-    log_warn "NFS share (${NFS_SHARE}) not available/writable - writing generated SQL to the current directory instead"
-fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
@@ -724,6 +791,7 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     PROCEDURE MANAGE_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
+        l_active   NUMBER;
     BEGIN
         SELECT DATABASE_ROLE INTO l_role FROM V\$DATABASE;
         l_services := get_service_list();
@@ -731,7 +799,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         IF l_role = 'PRIMARY' THEN
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    DBMS_SERVICE.START_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active = 0 THEN
+                        DBMS_SERVICE.START_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('START', l_services(i), SQLERRM);
@@ -740,7 +811,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         ELSE
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active > 0 THEN
+                        DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('STOP', l_services(i), SQLERRM);

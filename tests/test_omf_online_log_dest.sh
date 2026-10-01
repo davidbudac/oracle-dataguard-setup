@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for the OMF inherited-parameter helpers in
 # common/dg_functions.sh:

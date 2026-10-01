@@ -33,7 +33,8 @@ bash dg_triage_sid.sh --no-color
 Warning/critical thresholds (FRA %, sequence gaps, lag seconds) are
 env-overridable via `DG_FRA_WARN_PCT`, `DG_FRA_CRIT_PCT`, `DG_SEQ_GAP_WARN`,
 `DG_SEQ_GAP_CRIT`, `DG_LAG_WARN_SECONDS` -- see
-[DG_STATUS.md](DG_STATUS.md#thresholds) for defaults and meaning.
+[DG_STATUS.md](DG_STATUS.md#thresholds) for defaults and meaning. A value that
+is not a non-negative integer (`80%`) is a usage error (exit `64`).
 
 ## Command Roles
 
@@ -57,7 +58,8 @@ Exit codes:
 - `0` healthy
 - `1` warning or degraded data source
 - `2` error (including a local instance that is down — see below)
-- `64` usage or preflight failure
+- `64` usage or preflight failure (unknown flag, `ORACLE_SID`/`ORACLE_HOME`
+  unset, malformed threshold variable)
 
 ### `dg_diag_sid.sh`
 
@@ -107,7 +109,8 @@ Both commands use the same shared collector and grading rules. The difference is
 
 - Database role and open mode
 - Protection mode
-- Switchover status
+- Switchover status -- anything other than `TO STANDBY` / `SESSIONS ACTIVE` is a
+  **warning**, as in `dg_status.sh`
 - Force logging
 - Flashback
 - `dg_broker_start` -- **only when the command is running on the primary.**
@@ -136,6 +139,11 @@ Both commands use the same shared collector and grading rules. The difference is
 - Apply lag
 - Apply finish time
 - Sequence lag
+- Replication state (`Redo Apply` row) -- derived by the same function
+  `dg_status.sh` uses (`dg_repl_state` in `common/dg_render_common.sh`). When
+  the standby returned no transport lag, apply lag *and* no sequence data the
+  row reads `UNKNOWN` and a warning is raised; it is never a green `IN SYNC`
+  by default
 - Standby redo count
 - Archive gaps
 - FRA usage and thresholds
@@ -144,7 +152,8 @@ Both commands use the same shared collector and grading rules. The difference is
 ### Broker / FSFO checks
 
 - Configuration presence
-- Overall broker status (`ERROR` -> error/exit 2, `WARNING` -> warning/exit 1)
+- Overall broker status (`ERROR` -> error/exit 2, red; `WARNING` -> warning/exit 1,
+  amber -- the same colours and icons `dg_status.sh` uses)
 - Member warnings / errors. 19c prints a member's diagnosis on the line *after*
   the member line:
 
@@ -209,6 +218,27 @@ These commands work best with wallet-based peer authentication configured via [W
 sqlplus /@peer_tns_alias as sysdba
 ```
 
+The wallet probe connects with the alias **exactly as the broker reports it**
+(`/@alias`). (Confirmed on a 19c lab: a credential stored under the alias
+connects as `/@alias` but fails with ORA-01017 when the same address is given
+as an inline `(DESCRIPTION=...)`.) The external password store matches
+credentials on the connect string text, and `common/setup_dg_wallet.sh` stores them under the alias, so
+the alias is never rewritten into a descriptor for this connect. The probe is
+time-bounded from outside instead (`REMOTE_TEST_TIMEOUT`, default 5 s): the
+`timeout` binary when present, otherwise a portable background-and-kill
+watchdog (AIX has no `timeout`). Descriptor-level connect timeouts are used
+only on the SYS-password path, where there is no stored-credential match to
+break.
+
+### Password prompt
+
+`dg_diag_sid.sh` (and `-P`) prompt for the peer SYS password with echo off; Ctrl-C
+or a termination signal restores the terminal. The password is sent to
+`sqlplus` on stdin after `SET DEFINE OFF`, so a `&` in it is not treated as a
+substitution variable. A password containing a double quote (`"`) cannot be
+passed in a quoted `CONNECT` and is rejected with a message; the tool then
+continues in broker-only mode.
+
 ## Standby Redo Log Checker: `dg_check_srl.sh`
 
 A separate local tool that verifies standby redo logs on **both** sides and
@@ -224,13 +254,20 @@ bash dg_check_srl.sh -d /u02/oradata/srl   # override the dir used in generated 
 ```
 
 Rules: each thread needs at least `online_redo_groups + 1` SRL groups, all
-sized to the largest online redo log.
+at least as large as the largest online redo log (larger is fine; only a
+smaller SRL is flagged).
+
+Every peer in `V$DATAGUARD_CONFIG` is checked, each reached via its broker
+`DGConnectIdentifier`. If an online redo log size cannot be read, the tool
+exits `2` and prints no DDL rather than guessing.
 
 ### Thread accounting (`THREAD#=0`)
 
-An SRL added **without** a `THREAD` clause — which is exactly what this repo's
-own step 4 and `sql/commands/add_standby_logfile.sql` do — reports `THREAD#=0`
-until Oracle binds it on first use. Counting SRLs strictly per thread therefore
+An SRL added **without** a `THREAD` clause reports `THREAD#=0` until Oracle
+binds it on first use. This repo's step 4 created its SRLs that way before
+2026-08 (it now assigns `THREAD` explicitly, as does
+`sql/commands/add_standby_logfile.sql`), and so does any SRL added by hand
+without the clause, so builds from before that change still look like this. Counting SRLs strictly per thread therefore
 saw zero on a never-switched primary and demanded DDL that would have created
 duplicate groups on an already-compliant database.
 

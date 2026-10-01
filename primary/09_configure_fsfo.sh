@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 9: Configure Fast-Start Failover
 # ============================================================
@@ -35,6 +35,34 @@ enable_verbose_mode "$@"
 
 # Default FSFO threshold (seconds)
 FSFO_THRESHOLD="${FSFO_THRESHOLD:-30}"
+
+# Number of V$PWFILE_USERS rows granting SYSDG to the observer user. SYSDG is
+# a password-file privilege and never appears in DBA_ROLE_PRIVS, so this is
+# the authoritative post-condition for the user setup. Prints nothing and
+# returns 1 when the query itself failed.
+observer_sysdg_count() {
+    local out
+    out=$(sqlplus -s / as sysdba << EOSQL
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
+SELECT COUNT(*) FROM V\$PWFILE_USERS WHERE USERNAME = '${OBSERVER_USER}' AND SYSDG = 'TRUE';
+EXIT;
+EOSQL
+) || return 1
+    printf '%s\n' "$out" | tr -d ' \t\n\r'
+}
+
+# Stop the step on a failed observer-user statement, showing the ORA- text
+# (with the password redacted). Nothing after this point runs, so FSFO is
+# never enabled with an observer that cannot log in.
+# Usage: fail_observer_sql "<message>" "<sqlplus output>" <rc>
+fail_observer_sql() {
+    local msg="$1" out="$2" rc="$3"
+    [[ -n "${OBSERVER_PASSWORD:-}" ]] && out=${out//"$OBSERVER_PASSWORD"/********}
+    log_error "$msg (sqlplus exit code ${rc})"
+    [[ -n "$out" ]] && printf '%s\n' "$out"
+    exit 1
+}
 
 # ============================================================
 # Main Script
@@ -100,7 +128,7 @@ CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
 
 if echo "$CONFIG_STATUS" | grep -q "ORA-16532"; then
     log_error "No Data Guard Broker configuration found"
-    log_error "Please complete Data Guard setup (Steps 1-8) before configuring FSFO"
+    log_error "Please complete Data Guard setup (Steps 1-7) before configuring FSFO"
     exit 1
 fi
 
@@ -115,8 +143,13 @@ elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
     # prompting, and a non-interactive real run aborts explicitly instead
     # of silently misreading stdin.
     if ! confirm_proceed_or_check "Continue with FSFO configuration?"; then
-        log_info "FSFO configuration cancelled by user"
-        exit 0
+        # A non-interactive abort is a failure; a typed "no" is not.
+        if [[ -t 0 ]]; then
+            log_info "FSFO configuration cancelled by user"
+            exit 0
+        fi
+        log_error "FSFO configuration aborted: broker is not SUCCESS and stdin is not a terminal"
+        exit 1
     fi
 else
     log_error "Data Guard Broker configuration is not healthy"
@@ -276,6 +309,8 @@ echo ""
 
 if ! confirm_proceed "Proceed with FSFO configuration?"; then
     log_info "FSFO configuration cancelled by user"
+    # Declined (or no answer on a non-terminal stdin): nothing was configured
+    [[ -t 0 ]] || exit 1
     exit 0
 fi
 
@@ -315,18 +350,32 @@ EOF
     else
         log_info "Granting SYSDG privilege to $OBSERVER_USER..."
         confirm_approval_action "Grant SYSDG and CREATE SESSION to observer user" "GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
-        sqlplus -s / as sysdba << EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
+        GRANT_RC=0
+        RESULT=$(sqlplus -s / as sysdba << EOF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
 GRANT SYSDG TO ${OBSERVER_USER};
 GRANT CREATE SESSION TO ${OBSERVER_USER};
+SELECT 'SUCCESS' FROM DUAL;
 EXIT;
 EOF
+) || GRANT_RC=$?
+        if [[ $GRANT_RC -ne 0 ]] || ! echo "$RESULT" | grep -q "SUCCESS" || echo "$RESULT" | grep -Eq '(ORA|SP2)-[0-9]'; then
+            fail_observer_sql "Failed to grant SYSDG to $OBSERVER_USER" "$RESULT" "$GRANT_RC"
+        fi
+        HAS_SYSDG=$(observer_sysdg_count) || HAS_SYSDG=""
+        if [[ "$HAS_SYSDG" != "1" ]]; then
+            log_error "SYSDG was granted but $OBSERVER_USER is not listed with SYSDG in V\$PWFILE_USERS"
+            log_error "Check REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE and the password file format, then re-run this step"
+            exit 1
+        fi
         log_info "SYSDG privilege granted"
     fi
 
     if ! confirm_proceed "Do you want to reset the password for $OBSERVER_USER?"; then
         log_info "Keeping existing password for $OBSERVER_USER"
     else
+        pause_verbose_trace
         OBSERVER_PASSWORD=$(prompt_password "Enter new password for $OBSERVER_USER")
 
         if [[ -z "$OBSERVER_PASSWORD" ]]; then
@@ -342,25 +391,26 @@ EOF
         log_info "Updating password for $OBSERVER_USER..."
         log_cmd "sqlplus / as sysdba:" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***"
         confirm_approval_action "Update observer user password" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***" || exit 1
+        PW_RC=0
         RESULT=$(sqlplus -s / as sysdba << EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
 ALTER USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
 SELECT 'SUCCESS' FROM DUAL;
 EXIT;
 EOF
-)
+) || PW_RC=$?
 
-        if ! echo "$RESULT" | grep -q "SUCCESS"; then
-            log_error "Failed to update password for $OBSERVER_USER"
-            [[ -n "$OBSERVER_PASSWORD" ]] && RESULT=${RESULT//"$OBSERVER_PASSWORD"/********}
-            echo "$RESULT"
-            exit 1
+        if [[ $PW_RC -ne 0 ]] || ! echo "$RESULT" | grep -q "SUCCESS" || echo "$RESULT" | grep -Eq '(ORA|SP2)-[0-9]'; then
+            fail_observer_sql "Failed to update password for $OBSERVER_USER" "$RESULT" "$PW_RC"
         fi
 
+        resume_verbose_trace
         log_info "Password updated for $OBSERVER_USER"
     fi
 else
     # Prompt for password
+    pause_verbose_trace
     OBSERVER_PASSWORD=$(prompt_password "Enter password for new user $OBSERVER_USER")
 
     if [[ -z "$OBSERVER_PASSWORD" ]]; then
@@ -384,24 +434,33 @@ else
     log_info "Creating user $OBSERVER_USER with SYSDG privilege..."
     log_cmd "sqlplus / as sysdba:" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***"
     confirm_approval_action "Create observer user with SYSDG privilege" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***; GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
+    CREATE_RC=0
     RESULT=$(sqlplus -s / as sysdba << EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
 CREATE USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
 GRANT SYSDG TO ${OBSERVER_USER};
 GRANT CREATE SESSION TO ${OBSERVER_USER};
 SELECT 'SUCCESS' FROM DUAL;
 EXIT;
 EOF
-)
+) || CREATE_RC=$?
 
-    if ! echo "$RESULT" | grep -q "SUCCESS"; then
-        log_error "Failed to create user $OBSERVER_USER"
-        [[ -n "$OBSERVER_PASSWORD" ]] && RESULT=${RESULT//"$OBSERVER_PASSWORD"/********}
-        echo "$RESULT"
+    if [[ $CREATE_RC -ne 0 ]] || ! echo "$RESULT" | grep -q "SUCCESS" || echo "$RESULT" | grep -Eq '(ORA|SP2)-[0-9]'; then
+        # A CREATE USER that succeeded before a later GRANT failed is picked
+        # up by the existing-user branch on re-run.
+        fail_observer_sql "Failed to create user $OBSERVER_USER with SYSDG" "$RESULT" "$CREATE_RC"
+    fi
+
+    resume_verbose_trace
+    HAS_SYSDG=$(observer_sysdg_count) || HAS_SYSDG=""
+    if [[ "$HAS_SYSDG" != "1" ]]; then
+        log_error "User $OBSERVER_USER was created but is not listed with SYSDG in V\$PWFILE_USERS"
+        log_error "Check REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE and the password file format, then re-run this step"
         exit 1
     fi
 
-    log_info "User $OBSERVER_USER created successfully"
+    log_info "User $OBSERVER_USER created successfully with SYSDG"
     log_info "Note: User will be replicated to standby via redo transport"
 fi
 
@@ -517,10 +576,43 @@ log_cmd "dgmgrl / :" "ENABLE FAST_START FAILOVER"
 # approval-mode prompt into $ENABLE_RESULT while still blocking on `read`.
 ENABLE_RESULT=$(run_dgmgrl "enable_fsfo.dgmgrl" || true)
 
-if echo "$ENABLE_RESULT" | grep -qiE "error|fail"; then
+# Positive check, not a scan for failure words: empty output (approval
+# declined, dgmgrl failed to start) must not count as "enabled", and "fail"
+# matches the phrase "Fast-Start Failover" itself. Read the state back from
+# SHOW CONFIGURATION and require "Fast-Start Failover: Enabled ..." (the
+# broker may take a moment to reflect the change).
+FSFO_ENABLED_OK=0
+FSFO_SHOW=""
+FSFO_TRY=0
+while [[ $FSFO_TRY -lt 3 ]]; do
+    FSFO_SHOW=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
+    if printf '%s\n' "$FSFO_SHOW" | grep -Eiq '^[[:space:]]*Fast-Start Failover:[[:space:]]*Enabled'; then
+        FSFO_ENABLED_OK=1
+        break
+    fi
+    FSFO_TRY=$((FSFO_TRY + 1))
+    [[ $FSFO_TRY -lt 3 ]] && sleep 2
+done
+
+FSFO_CFG_STATUS=$(dgmgrl_status_value "$FSFO_SHOW") || FSFO_CFG_STATUS=""
+
+# No observer exists yet at this point (it is set up after this step), so the
+# broker's "observer not started / not observing" codes are expected here and
+# must not count as an enable failure.
+ENABLE_RESULT_ERRCHK=$(printf '%s\n' "$ENABLE_RESULT" | grep -Ev 'ORA-1681[9]|ORA-16820' || true)
+FSFO_SHOW_ERRCHK=$(printf '%s\n' "$FSFO_SHOW" | grep -Ev 'ORA-1681[9]|ORA-16820' || true)
+
+if [[ $FSFO_ENABLED_OK -ne 1 ]] \
+    || dgmgrl_has_error_lines "$ENABLE_RESULT_ERRCHK" \
+    || dgmgrl_has_error_lines "$FSFO_SHOW_ERRCHK" \
+    || [[ "$FSFO_CFG_STATUS" == "ERROR" ]]; then
     log_error "Failed to enable Fast-Start Failover"
     echo ""
-    echo "$ENABLE_RESULT"
+    echo "ENABLE FAST_START FAILOVER output:"
+    echo "${ENABLE_RESULT:-<none>}"
+    echo ""
+    echo "SHOW CONFIGURATION output:"
+    echo "${FSFO_SHOW:-<none>}"
     exit 1
 fi
 
@@ -532,26 +624,33 @@ log_info "Fast-Start Failover enabled"
 
 log_section "Preparing Files for Observer Server"
 
-# Check if password file already exists on NFS
+# Same name step 1 writes and standby/03 reads (orapw<primary SID>), and
+# refreshed on every run: the SYSDG observer user created above lives in the
+# password file, so a copy staged by step 1 before that user existed is stale.
 ORAPW_FILE="$ORACLE_HOME/dbs/orapw${ORACLE_SID}"
-NFS_ORAPW_FILE="${NFS_SHARE}/orapw${PRIMARY_DB_NAME}"
+NFS_ORAPW_FILE="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID:-$ORACLE_SID}"
 
-if [[ -f "$NFS_ORAPW_FILE" ]]; then
-    log_info "Password file already exists on NFS share"
+if [[ -f "$NFS_ORAPW_FILE" && -f "$ORAPW_FILE" ]] && cmp -s "$ORAPW_FILE" "$NFS_ORAPW_FILE"; then
+    log_info "Password file on NFS share is already current: $NFS_ORAPW_FILE"
 else
     if [[ -f "$ORAPW_FILE" ]]; then
-        log_info "Copying password file to NFS share..."
+        if [[ -f "$NFS_ORAPW_FILE" ]]; then
+            log_info "Refreshing password file on NFS share (it must carry ${OBSERVER_USER})..."
+        else
+            log_info "Copying password file to NFS share..."
+        fi
         # chmod 600 (owner-only): this file contains the SYS password hash
         # and the share is group-readable, so don't leave it group-readable
         # too. Run common/cleanup_nfs_artifacts.sh once the observer is
         # configured to remove it from the share entirely.
-        confirm_approval_action "Copy primary password file for observer" "cp $ORAPW_FILE $NFS_ORAPW_FILE && chmod 600 $NFS_ORAPW_FILE" || exit 1
-        ( umask 077; cp "$ORAPW_FILE" "$NFS_ORAPW_FILE" )
+        confirm_approval_action "Copy primary password file for observer" "cp -f $ORAPW_FILE $NFS_ORAPW_FILE && chmod 600 $NFS_ORAPW_FILE" || exit 1
+        ( umask 077; cp -f "$ORAPW_FILE" "$NFS_ORAPW_FILE" )
         chmod 600 "$NFS_ORAPW_FILE"
         log_info "Password file copied to: $NFS_ORAPW_FILE"
     else
         log_warn "Password file not found: $ORAPW_FILE"
         log_warn "Observer server may need manual password file configuration"
+        [[ -f "$NFS_ORAPW_FILE" ]] && log_warn "The copy already on the NFS share ($NFS_ORAPW_FILE) was NOT refreshed and may lack ${OBSERVER_USER}"
     fi
 fi
 
@@ -572,7 +671,7 @@ if ! grep -q "^FSFO_ENABLED=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
 # ============================================================
 FSFO_ENABLED="YES"
 FSFO_THRESHOLD="${FSFO_THRESHOLD}"
-OBSERVER_USER="${OBSERVER_USER}"
+OBSERVER_USER='${OBSERVER_USER}'
 OBSERVER_WALLET_DIR="${FSFO_WALLET_PATH}"
 EOF
     log_info "Added FSFO settings to configuration file"
@@ -581,7 +680,7 @@ else
     sed \
         -e "s/^FSFO_ENABLED=.*/FSFO_ENABLED=\"YES\"/" \
         -e "s/^FSFO_THRESHOLD=.*/FSFO_THRESHOLD=\"${FSFO_THRESHOLD}\"/" \
-        -e "s/^OBSERVER_USER=.*/OBSERVER_USER=\"${OBSERVER_USER}\"/" \
+        -e "s/^OBSERVER_USER=.*/OBSERVER_USER='${OBSERVER_USER}'/" \
         -e "s|^OBSERVER_WALLET_DIR=.*|OBSERVER_WALLET_DIR=\"${FSFO_WALLET_PATH}\"|" \
         "$STANDBY_CONFIG_FILE" > "${STANDBY_CONFIG_FILE}.tmp"
     mv "${STANDBY_CONFIG_FILE}.tmp" "$STANDBY_CONFIG_FILE"
@@ -593,7 +692,7 @@ else
         echo "FSFO_THRESHOLD=\"${FSFO_THRESHOLD}\"" >> "$STANDBY_CONFIG_FILE"
     fi
     if ! grep -q "^OBSERVER_USER=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
-        echo "OBSERVER_USER=\"${OBSERVER_USER}\"" >> "$STANDBY_CONFIG_FILE"
+        echo "OBSERVER_USER='${OBSERVER_USER}'" >> "$STANDBY_CONFIG_FILE"
     fi
     if ! grep -q "^OBSERVER_WALLET_DIR=" "$STANDBY_CONFIG_FILE" 2>/dev/null; then
         echo "OBSERVER_WALLET_DIR=\"${FSFO_WALLET_PATH}\"" >> "$STANDBY_CONFIG_FILE"

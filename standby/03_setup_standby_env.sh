@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 3: Setup Standby Environment
 # ============================================================
@@ -230,7 +230,15 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
         while [[ $_m -lt ${#MOUNT_POINTS[@]} ]]; do
             _mount_required_mb=$(( ${MOUNT_REQUIRED_MB[$_m]} * 12 / 10 ))
             _mount_available_kb=$(get_available_space_kb "${MOUNT_CHECK_PATHS[$_m]}")
-            _mount_available_mb=$(( ${_mount_available_kb:-0} / 1024 ))
+
+            if ! is_numeric "$_mount_available_kb"; then
+                # df gave nothing usable: unknown, not "0 MB free" (which
+                # would be a false shortfall) and not a pass either.
+                log_warn "  ${MOUNT_POINTS[$_m]}: required ${_mount_required_mb} MB (incl. 20% buffer), available space could not be determined - verify manually"
+                _m=$(( _m + 1 ))
+                continue
+            fi
+            _mount_available_mb=$(( _mount_available_kb / 1024 ))
 
             if [[ "$_mount_available_mb" -lt "$_mount_required_mb" ]]; then
                 log_error "  ${MOUNT_POINTS[$_m]}: required ${_mount_required_mb} MB (incl. 20% buffer), available ${_mount_available_mb} MB - SHORTFALL $(( _mount_required_mb - _mount_available_mb )) MB"
@@ -278,23 +286,31 @@ if [[ -n "$REQUIRED_SPACE_MB" && "$REQUIRED_SPACE_MB" -gt 0 ]]; then
         # Get available space in MB (AIX-compatible: df -Pk normalizes the
         # column layout so field 4 is always available KB, not %Used)
         AVAILABLE_SPACE_KB=$(get_available_space_kb "$CHECK_PATH")
-        AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
 
-        log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
-        log_info "Required space:  ${REQUIRED_SPACE_MB} MB"
-
-        if [[ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]]; then
-            log_error "INSUFFICIENT DISK SPACE!"
-            log_error "  Available: ${AVAILABLE_SPACE_MB} MB"
-            log_error "  Required:  ${REQUIRED_SPACE_MB} MB"
-            log_error "  Shortfall: $((REQUIRED_SPACE_MB - AVAILABLE_SPACE_MB)) MB"
-            log_error ""
-            log_error "Please free up space or add storage before proceeding."
-            exit 1
+        if ! is_numeric "$AVAILABLE_SPACE_KB"; then
+            # Empty/garbled df output is "unknown": neither a pass nor a
+            # shortfall (and never an arithmetic syntax error).
+            log_warn "Could not determine available space on $CHECK_PATH (df returned no usable value)"
+            log_warn "Required space: ${REQUIRED_SPACE_MB} MB - please verify free space manually before step 5"
         else
-            SPACE_REMAINING=$((AVAILABLE_SPACE_MB - REQUIRED_SPACE_MB))
-            log_info "PASS: Sufficient disk space available"
-            log_info "  Space remaining after clone: ${SPACE_REMAINING} MB"
+            AVAILABLE_SPACE_MB=$((AVAILABLE_SPACE_KB / 1024))
+
+            log_info "Available space: ${AVAILABLE_SPACE_MB} MB"
+            log_info "Required space:  ${REQUIRED_SPACE_MB} MB"
+
+            if [[ "$AVAILABLE_SPACE_MB" -lt "$REQUIRED_SPACE_MB" ]]; then
+                log_error "INSUFFICIENT DISK SPACE!"
+                log_error "  Available: ${AVAILABLE_SPACE_MB} MB"
+                log_error "  Required:  ${REQUIRED_SPACE_MB} MB"
+                log_error "  Shortfall: $((REQUIRED_SPACE_MB - AVAILABLE_SPACE_MB)) MB"
+                log_error ""
+                log_error "Please free up space or add storage before proceeding."
+                exit 1
+            else
+                SPACE_REMAINING=$((AVAILABLE_SPACE_MB - REQUIRED_SPACE_MB))
+                log_info "PASS: Sufficient disk space available"
+                log_info "  Space remaining after clone: ${SPACE_REMAINING} MB"
+            fi
         fi
     fi
 else
@@ -349,27 +365,40 @@ if [[ "$STANDBY_STORAGE_MODE" != "OMF" ]] \
         log_info "SRL storage required: ${SRL_REQUIRED_MB} MB (${REDO_LOG_SIZE_MB} MB x ${STANDBY_REDO_GROUPS} groups + 20% buffer)"
 
         SRL_AVAILABLE_KB=$(get_available_space_kb "$SRL_CHECK_PATH")
-        SRL_AVAILABLE_MB=$(( SRL_AVAILABLE_KB / 1024 ))
-        log_info "SRL filesystem available: ${SRL_AVAILABLE_MB} MB"
-
-        if [[ "$SRL_AVAILABLE_MB" -lt "$SRL_REQUIRED_MB" ]]; then
-            log_error "INSUFFICIENT SPACE ON SRL FILESYSTEM!"
-            log_error "  Path:      $SRL_CHECK_PATH"
-            log_error "  Available: ${SRL_AVAILABLE_MB} MB"
-            log_error "  Required:  ${SRL_REQUIRED_MB} MB"
-            log_error "  Shortfall: $(( SRL_REQUIRED_MB - SRL_AVAILABLE_MB )) MB"
-            log_error ""
-            log_error "Free up space on the SRL mount or reconfigure STANDBY_SRL_PATH."
-            exit 1
+        if ! is_numeric "$SRL_AVAILABLE_KB"; then
+            log_warn "Could not determine available space on $SRL_CHECK_PATH (df returned no usable value)"
+            log_warn "SRL storage required: ${SRL_REQUIRED_MB} MB - please verify free space manually before step 5"
         else
-            log_info "PASS: Sufficient space on SRL filesystem"
+            SRL_AVAILABLE_MB=$(( SRL_AVAILABLE_KB / 1024 ))
+            log_info "SRL filesystem available: ${SRL_AVAILABLE_MB} MB"
+
+            if [[ "$SRL_AVAILABLE_MB" -lt "$SRL_REQUIRED_MB" ]]; then
+                log_error "INSUFFICIENT SPACE ON SRL FILESYSTEM!"
+                log_error "  Path:      $SRL_CHECK_PATH"
+                log_error "  Available: ${SRL_AVAILABLE_MB} MB"
+                log_error "  Required:  ${SRL_REQUIRED_MB} MB"
+                log_error "  Shortfall: $(( SRL_REQUIRED_MB - SRL_AVAILABLE_MB )) MB"
+                log_error ""
+                log_error "Free up space on the SRL mount or reconfigure STANDBY_SRL_PATH."
+                exit 1
+            else
+                log_info "PASS: Sufficient space on SRL filesystem"
+            fi
         fi
     fi
 fi
 
-# Check Oracle environment
-if [[ -z "$ORACLE_HOME" ]]; then
-    # Try to set from config
+# Check Oracle environment. Prefer a locally-set ORACLE_HOME when it points
+# at a usable installation (bin/sqlplus present); fall back to
+# STANDBY_ORACLE_HOME from the config otherwise. Same rule as
+# 05_clone_standby.sh, so both steps resolve the same home.
+if [[ -n "$ORACLE_HOME" && -x "$ORACLE_HOME/bin/sqlplus" ]]; then
+    if [[ -n "$STANDBY_ORACLE_HOME" && "$ORACLE_HOME" != "$STANDBY_ORACLE_HOME" ]]; then
+        log_warn "Locally-set ORACLE_HOME ($ORACLE_HOME) differs from config STANDBY_ORACLE_HOME ($STANDBY_ORACLE_HOME)"
+        log_warn "Using the locally-set ORACLE_HOME"
+    fi
+    export ORACLE_HOME
+else
     export ORACLE_HOME="$STANDBY_ORACLE_HOME"
 fi
 
@@ -378,6 +407,16 @@ if [[ -z "$ORACLE_SID" ]]; then
 fi
 
 check_oracle_env || exit 1
+
+# Net configuration files live in $TNS_ADMIN when set, else
+# $ORACLE_HOME/network/admin (C6) - editing the wrong copy changes files
+# Oracle never reads.
+NET_ADMIN_DIR=$(dg_net_admin_dir)
+if [[ ! -d "$NET_ADMIN_DIR" ]]; then
+    log_error "Oracle Net admin directory does not exist: $NET_ADMIN_DIR"
+    log_error "Check TNS_ADMIN (or create \$ORACLE_HOME/network/admin) and re-run this step"
+    exit 1
+fi
 
 # ============================================================
 # Review Planned Changes
@@ -411,7 +450,7 @@ print_list_block "This Step Will Change" \
     "$_dir_summary" \
     "Install the standby password file at ${ORACLE_HOME}/dbs/orapw${STANDBY_ORACLE_SID}." \
     "Install the standby pfile at ${ORACLE_HOME}/dbs/init${STANDBY_ORACLE_SID}.ora." \
-    "Update ${ORACLE_HOME}/network/admin/listener.ora and ${ORACLE_HOME}/network/admin/tnsnames.ora." \
+    "Update ${NET_ADMIN_DIR}/listener.ora and ${NET_ADMIN_DIR}/tnsnames.ora." \
     "Append ${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N to /etc/oratab when missing."
 
 print_list_block "This Step Will Not Change" \
@@ -423,8 +462,8 @@ print_list_block "Files and Paths" \
     "Config source: ${STANDBY_CONFIG_FILE}" \
     "Password file source: ${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}" \
     "Pfile source: ${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora" \
-    "Listener file: ${ORACLE_HOME}/network/admin/listener.ora" \
-    "TNS file: ${ORACLE_HOME}/network/admin/tnsnames.ora"
+    "Listener file: ${NET_ADMIN_DIR}/listener.ora" \
+    "TNS file: ${NET_ADMIN_DIR}/tnsnames.ora"
 
 print_list_block "Recovery If This Step Fails" \
     "Restore any .bak timestamped files created for listener.ora, tnsnames.ora, or the dbs files." \
@@ -714,13 +753,7 @@ record_artifact "pfile:${DEST_PFILE}"
 
 progress_step "Configuring Listener"
 
-LISTENER_ORA="${ORACLE_HOME}/network/admin/listener.ora"
-LISTENER_ENTRY_FILE="${NFS_SHARE}/listener_${STANDBY_DB_UNIQUE_NAME}.ora"
-
-if [[ ! -f "$LISTENER_ENTRY_FILE" ]]; then
-    log_error "Listener entry file not found: $LISTENER_ENTRY_FILE"
-    exit 1
-fi
+LISTENER_ORA="${NET_ADMIN_DIR}/listener.ora"
 
 # Static services required for RMAN duplicate and broker switchover
 # Private temp dir + EXIT-trap cleanup: create_temp_dir prefers `mktemp -d`,
@@ -809,7 +842,7 @@ record_artifact "listener:${LISTENER_ORA}"
 
 progress_step "Configuring TNS Names"
 
-TNSNAMES_ORA="${ORACLE_HOME}/network/admin/tnsnames.ora"
+TNSNAMES_ORA="${NET_ADMIN_DIR}/tnsnames.ora"
 TNSNAMES_ENTRY_FILE="${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
 
 if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
@@ -817,34 +850,59 @@ if [[ ! -f "$TNSNAMES_ENTRY_FILE" ]]; then
     exit 1
 fi
 
-# Check if tnsnames.ora exists
-if [[ -f "$TNSNAMES_ORA" ]]; then
-    backup_file "$TNSNAMES_ORA"
+# The generated entries file holds BOTH the primary and standby alias
+# stanzas. Check and append each alias independently: appending the whole
+# file when only one alias is missing would define the other one twice, and
+# Oracle Net resolves to the FIRST definition, so a stale one would keep
+# winning (same approach as primary/04_prepare_primary_dg.sh).
+extract_tns_alias_block() {
+    # Prints alias $2's stanza (from its "<alias> =" line up to the
+    # next blank line, or EOF for the last stanza) from file $1.
+    local _file="$1" _alias="$2" _alias_re
+    _alias_re=$(printf '%s' "$_alias" | sed 's/[.]/\\./g')
+    sed -n "/^${_alias_re}[[:space:]]*=/,/^$/p" "$_file"
+}
 
-    # Check if entries already exist (anchor on an alias definition line;
-    # aliases may contain dots, so escape them for the regex)
-    PRIMARY_ALIAS_RE=$(printf '%s' "$PRIMARY_TNS_ALIAS" | sed 's/[.]/\\./g')
-    STANDBY_ALIAS_RE=$(printf '%s' "$STANDBY_TNS_ALIAS" | sed 's/[.]/\\./g')
-    if grep -qiE "^[[:space:]]*${PRIMARY_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA" && grep -qiE "^[[:space:]]*${STANDBY_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA"; then
-        log_warn "TNS entries already exist for both primary and standby"
-        log_info "Please verify tnsnames.ora manually if needed"
+TNS_APPEND_BLOCKS=""
+for TNS_ALIAS_TO_CHECK in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
+    # Aliases may contain dots, so escape them for the regex
+    TNS_ALIAS_RE=$(printf '%s' "$TNS_ALIAS_TO_CHECK" | sed 's/[.]/\\./g')
+    if [[ -f "$TNSNAMES_ORA" ]] && grep -qiE "^[[:space:]]*${TNS_ALIAS_RE}[[:space:]]*=" "$TNSNAMES_ORA"; then
+        log_info "TNS entry for '$TNS_ALIAS_TO_CHECK' already exists"
     else
-        # Append entries
-        log_info "Adding TNS entries to tnsnames.ora"
-        confirm_approval_action "Append Data Guard TNS entries" "append Data Guard entries to $TNSNAMES_ORA" || exit 1
-        echo "" >> "$TNSNAMES_ORA"
-        echo "# Data Guard TNS entries - Added $(date)" >> "$TNSNAMES_ORA"
-        cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
-        log_info "TNS entries added successfully"
+        TNS_BLOCK=$(extract_tns_alias_block "$TNSNAMES_ENTRY_FILE" "$TNS_ALIAS_TO_CHECK")
+        if [[ -z "$TNS_BLOCK" ]]; then
+            log_error "Could not find the '$TNS_ALIAS_TO_CHECK' stanza in $TNSNAMES_ENTRY_FILE"
+            exit 1
+        fi
+        log_info "TNS entry for '$TNS_ALIAS_TO_CHECK' is missing - will be added"
+        TNS_APPEND_BLOCKS="${TNS_APPEND_BLOCKS}${TNS_BLOCK}
+"
     fi
+done
+
+if [[ -z "$TNS_APPEND_BLOCKS" ]]; then
+    log_info "All required TNS entries already exist"
+    log_info "Please verify tnsnames.ora manually if needed"
+elif [[ -f "$TNSNAMES_ORA" ]]; then
+    backup_file "$TNSNAMES_ORA"
+    log_info "Adding missing TNS entries to tnsnames.ora"
+    confirm_approval_action "Append Data Guard TNS entries" "append Data Guard entries to $TNSNAMES_ORA" || exit 1
+    {
+        echo ""
+        echo "# Data Guard TNS entries - Added $(date)"
+        printf '%s\n' "$TNS_APPEND_BLOCKS"
+    } >> "$TNSNAMES_ORA"
+    log_info "TNS entries added successfully"
 else
-    # Create new tnsnames.ora
     log_info "Creating new tnsnames.ora"
     confirm_approval_action "Create standby tnsnames.ora" "write $TNSNAMES_ORA" || exit 1
-    echo "# TNS Names for Data Guard" > "$TNSNAMES_ORA"
-    echo "# Created: $(date)" >> "$TNSNAMES_ORA"
-    echo "" >> "$TNSNAMES_ORA"
-    cat "$TNSNAMES_ENTRY_FILE" >> "$TNSNAMES_ORA"
+    {
+        echo "# TNS Names for Data Guard"
+        echo "# Created: $(date)"
+        echo ""
+        printf '%s\n' "$TNS_APPEND_BLOCKS"
+    } > "$TNSNAMES_ORA"
     log_info "tnsnames.ora created successfully"
 fi
 record_artifact "tnsnames:${TNSNAMES_ORA}"
@@ -856,13 +914,26 @@ record_artifact "tnsnames:${TNSNAMES_ORA}"
 progress_step "Updating oratab"
 
 ORATAB="/etc/oratab"
+ORATAB_LINE="${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N"
 if [[ -f "$ORATAB" ]]; then
     if grep -q "^${STANDBY_ORACLE_SID}:" "$ORATAB"; then
         log_info "Entry for $STANDBY_ORACLE_SID already exists in oratab"
+    elif [[ ! -w "$ORATAB" ]]; then
+        # /etc/oratab is normally root-owned (or oracle:oinstall 664);
+        # a bare append would abort the step under set -e.
+        log_warn "$ORATAB is not writable by $(id -un 2>/dev/null || echo this user) - not updated"
+        log_warn "Add this line to $ORATAB manually (as root):"
+        log_warn "  $ORATAB_LINE"
     else
         log_info "Adding $STANDBY_ORACLE_SID to oratab"
-        confirm_approval_action "Update /etc/oratab" "append ${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N to $ORATAB" || exit 1
-        echo "${STANDBY_ORACLE_SID}:${ORACLE_HOME}:N" >> "$ORATAB"
+        confirm_approval_action "Update /etc/oratab" "append ${ORATAB_LINE} to $ORATAB" || exit 1
+        # A last line without a newline would glue our entry onto it
+        # (command substitution strips a trailing newline, so a non-empty
+        # result means the file does not end with one).
+        if [[ -s "$ORATAB" && -n "$(tail -c 1 "$ORATAB" 2>/dev/null)" ]]; then
+            printf '\n' >> "$ORATAB"
+        fi
+        printf '%s\n' "$ORATAB_LINE" >> "$ORATAB"
     fi
 else
     log_warn "oratab not found at $ORATAB"

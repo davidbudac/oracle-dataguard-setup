@@ -25,11 +25,10 @@
 #
 # Exit codes: 0 success, 1 fatal, 2 bad arguments
 #
-# Note on mkstore and `ps -ef`: mkstore has no stdin-based way to pass a
-# credential password to -createCredential (only the wallet password can
-# be fed via heredoc), so the observer password is briefly visible on the
-# argv of those two mkstore calls. One-time setup exposure, not a
-# long-lived service argv.
+# Note on mkstore and `ps -ef`: with the credential password left off the
+# command line, `mkstore -createCredential <alias> <user>` reads three lines
+# from stdin (the credential password, its confirmation, then the wallet
+# password), so no password ever appears on an argv.
 # ============================================================
 
 set -e
@@ -160,8 +159,31 @@ done
 log_section "Oracle Net Configuration"
 
 alias_present() {
+    local __re
     [[ -f "$TNSNAMES_FILE" ]] || return 1
-    grep -qiE "^[[:space:]]*${1}[[:space:]]*=" "$TNSNAMES_FILE"
+    __re=$(printf '%s' "$1" | sed 's/[.]/\\./g')
+    grep -qiE "^[[:space:]]*${__re}[[:space:]]*=" "$TNSNAMES_FILE"
+}
+
+# extract_tns_alias_block FILE ALIAS -> ALIAS's stanza from FILE: the
+# "ALIAS =" line plus the continuation lines up to the next blank line, the
+# next top-level entry/comment, or EOF. The name is compared as a string
+# (aliases contain dots), case-insensitively. POSIX awk, no arrays.
+extract_tns_alias_block() {
+    awk -v want="$2" '
+        BEGIN { want = tolower(want); on = 0 }
+        {
+            if (on) {
+                if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^[^[:space:])]/) exit
+                print
+                next
+            }
+            if ($0 ~ /^[^[:space:]#]/) {
+                key = $0
+                sub(/[[:space:]]*=.*/, "", key)
+                if (tolower(key) == want) { on = 1; print }
+            }
+        }' "$1"
 }
 
 if ! $INSTALL_TNS; then
@@ -170,23 +192,34 @@ elif [[ ! -f "${SCRIPT_DIR}/tnsnames_observer.ora" ]]; then
     log_warn "tnsnames_observer.ora is not in this directory - not installing TNS entries."
     log_warn "Make sure ${TNSNAMES_FILE} already resolves both aliases."
 else
-    NEED_INSTALL=false
+    # Append only the aliases that are missing. Appending the whole generated
+    # file when just one is absent would define the other one twice, and
+    # Oracle Net takes the FIRST match - so a stale older definition would
+    # silently keep winning.
+    TNS_APPEND_BLOCKS=""
     for a in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
         if alias_present "$a"; then
             log_info "Alias '${a}' is already defined in ${TNSNAMES_FILE}"
         else
-            NEED_INSTALL=true
+            TNS_BLOCK=$(extract_tns_alias_block "${SCRIPT_DIR}/tnsnames_observer.ora" "$a")
+            [[ -n "$TNS_BLOCK" ]] \
+                || die "Could not find the '${a}' entry in ${SCRIPT_DIR}/tnsnames_observer.ora"
+            log_info "Alias '${a}' is missing - will be added"
+            TNS_APPEND_BLOCKS="${TNS_APPEND_BLOCKS}${TNS_BLOCK}
+"
         fi
     done
 
-    if $NEED_INSTALL; then
+    if [[ -n "$TNS_APPEND_BLOCKS" ]]; then
         if [[ -f "$TNSNAMES_FILE" ]]; then
             cp "$TNSNAMES_FILE" "${TNSNAMES_FILE}.bak.$(date '+%Y%m%d_%H%M%S')"
             log_info "Backed up the existing tnsnames.ora"
         fi
-        printf '\n' >> "$TNSNAMES_FILE"
-        cat "${SCRIPT_DIR}/tnsnames_observer.ora" >> "$TNSNAMES_FILE"
-        log_info "Appended the observer TNS entries to ${TNSNAMES_FILE}"
+        {
+            printf '\n# Data Guard FSFO observer entries - added %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+            printf '%s\n' "$TNS_APPEND_BLOCKS"
+        } >> "$TNSNAMES_FILE"
+        log_info "Appended the missing observer TNS entries to ${TNSNAMES_FILE}"
     fi
 
     # A default domain silently gets appended to every unqualified alias,
@@ -211,8 +244,25 @@ tcp_check() {
         fi
         return 0
     fi
-    # bash's /dev/tcp, when nc is absent
-    if (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1; then
+    # bash's /dev/tcp, when nc is absent (always the case on AIX). A bare
+    # connect has no timeout of its own and blocks for the kernel's connect
+    # timeout - minutes - on an unreachable host, so the probe runs in the
+    # background and is killed after ~5 s. Preferred over a tnsping against a
+    # raw descriptor: it needs nothing but bash, tests exactly the TCP
+    # question being asked, and its deadline is enforced here rather than by
+    # a CONNECT_TIMEOUT whose handling varies between client versions.
+    local pid i=0
+    (exec 3<>"/dev/tcp/${host}/${port}") >/dev/null 2>&1 &
+    pid=$!
+    while [[ $i -lt 5 ]] && kill -0 "$pid" 2>/dev/null; do
+        sleep 1
+        i=$((i + 1))
+    done
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        log_warn "TCP ${host}:${port} NOT reachable from this host (no answer within 5s - firewall? wrong port?)"
+    elif wait "$pid" 2>/dev/null; then
         log_info "TCP ${host}:${port} reachable"
     else
         log_warn "TCP ${host}:${port} NOT reachable from this host (firewall? wrong port?)"
@@ -312,10 +362,9 @@ add_credential() {
     "$MKSTORE" -wrl "$WALLET_DIR" -deleteCredential "$alias" <<EOF >/dev/null 2>&1 || true
 ${WALLET_PASSWORD}
 EOF
-    if ! mk_out=$("$MKSTORE" -wrl "$WALLET_DIR" -createCredential "$alias" "$OBSERVER_USER" "$OBSERVER_PASSWORD" <<EOF 2>&1
-${WALLET_PASSWORD}
-EOF
-    ); then
+    # printf is a shell builtin, so the passwords stay off every argv.
+    if ! mk_out=$(printf '%s\n%s\n%s\n' "$OBSERVER_PASSWORD" "$OBSERVER_PASSWORD" "$WALLET_PASSWORD" \
+            | "$MKSTORE" -wrl "$WALLET_DIR" -createCredential "$alias" "$OBSERVER_USER" 2>&1); then
         printf '%s\n' "$mk_out" >&2
         die "Failed to add the credential for ${alias}."
     fi

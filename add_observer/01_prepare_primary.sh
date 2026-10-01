@@ -275,7 +275,7 @@ log_info "Flashback Database (primary, V\$DATABASE.FLASHBACK_ON): ${FLASHBACK_PR
 # member on its own "<db_unique_name>:  On|Off" line; keep only those lines.
 FLASHBACK_BLOCK=$(printf '%s\n' "$VALIDATE_OUT" \
     | sed -n '/[Ff]lashback [Dd]atabase [Ss]tatus/,/^[[:space:]]*$/p' \
-    | grep -iE ':[[:space:]]*(On|Off)[[:space:]]*$' | trim)
+    | grep -iE ':[[:space:]]*(On|Off)[[:space:]]*$' | trim) || FLASHBACK_BLOCK=""
 if [[ -n "$FLASHBACK_BLOCK" ]]; then
     log_info "Flashback Database (both members, VALIDATE DATABASE):"
     printf '%s\n' "$FLASHBACK_BLOCK" | sed 's/^/    /'
@@ -521,6 +521,7 @@ log_info "Bundle directory: ${OUTDIR}"
 
 ${PRIMARY_TNS_ALIAS} =
 $(tns_descriptor "$PRIMARY_HOST" "$PRIMARY_PORT" "$PRIMARY_SERVICE")
+
 ${STANDBY_TNS_ALIAS} =
 $(tns_descriptor "$STANDBY_HOST" "$STANDBY_PORT" "$STANDBY_SERVICE")
 EOF
@@ -669,10 +670,11 @@ listed in \`SHOW OBSERVER\`.
 ## 5. Survive a reboot
 
 The observer is a plain background \`dgmgrl\` process — nothing restarts it for
-you. Install one of the two starters:
+you. Install one of the starters it prints:
 
 \`\`\`bash
-./03_observer_ctl.sh boot          # prints a systemd unit and a cron @reboot line
+./03_observer_ctl.sh boot          # prints a systemd unit, a cron @reboot line (Linux)
+                                   # and an inittab / rc.d entry (AIX), plus a watchdog
 \`\`\`
 
 ## Day-to-day

@@ -139,24 +139,29 @@ verdict, 2 report generated with ERROR verdict, 3 usage or connection error.
 EOF
 }
 
+# Usage errors are exit 3 (see the exit-code list in usage()); a bare
+# `shift 2` on a missing value would instead die silently with rc 1 under set -e.
+usage_error() { echo "ERROR: $*" >&2; usage >&2; exit 3; }
+need_value() { [[ $1 -ge 2 ]] || usage_error "$2 requires a value"; }
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -o|--output)        OUTPUT_FILE="$2"; shift 2 ;;
-        --primary-host)     PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
-        --standby-host)     STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
-        --port)             PORT_OVERRIDE="$2"; shift 2 ;;
-        --standby-tns-alias) STANDBY_TNS_ALIAS="$2"; shift 2 ;;
+        -o|--output)        need_value $# "$1"; OUTPUT_FILE="$2"; shift 2 ;;
+        --primary-host)     need_value $# "$1"; PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
+        --standby-host)     need_value $# "$1"; STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
+        --port)             need_value $# "$1"; PORT_OVERRIDE="$2"; shift 2 ;;
+        --standby-tns-alias) need_value $# "$1"; STANDBY_TNS_ALIAS="$2"; shift 2 ;;
         --all-flavors)      ALL_FLAVORS=1; shift ;;
-        --impact-reference) IMPACT_REFERENCE_OVERRIDE="$2"; shift 2 ;;
-        --env)              ENV_LABEL="$2"; shift 2 ;;
-        --contact)          CONTACT_INFO="$2"; shift 2 ;;
-        --service)          SERVICE_FILTER+=("$2"); shift 2 ;;
-        --exclude-service)  SERVICE_EXCLUDE+=("$2"); shift 2 ;;
-        --connect-timeout)   TNS_CT="$2"; shift 2 ;;
-        --transport-timeout) TNS_TCT="$2"; shift 2 ;;
-        --retry-count)       TNS_RC="$2"; shift 2 ;;
-        --retry-delay)       TNS_RD="$2"; shift 2 ;;
-        --previous)         PREVIOUS_JSON_OVERRIDE="$2"; shift 2 ;;
+        --impact-reference) need_value $# "$1"; IMPACT_REFERENCE_OVERRIDE="$2"; shift 2 ;;
+        --env)              need_value $# "$1"; ENV_LABEL="$2"; shift 2 ;;
+        --contact)          need_value $# "$1"; CONTACT_INFO="$2"; shift 2 ;;
+        --service)          need_value $# "$1"; SERVICE_FILTER+=("$2"); shift 2 ;;
+        --exclude-service)  need_value $# "$1"; SERVICE_EXCLUDE+=("$2"); shift 2 ;;
+        --connect-timeout)   need_value $# "$1"; TNS_CT="$2"; shift 2 ;;
+        --transport-timeout) need_value $# "$1"; TNS_TCT="$2"; shift 2 ;;
+        --retry-count)       need_value $# "$1"; TNS_RC="$2"; shift 2 ;;
+        --retry-delay)       need_value $# "$1"; TNS_RD="$2"; shift 2 ;;
+        --previous)         need_value $# "$1"; PREVIOUS_JSON_OVERRIDE="$2"; shift 2 ;;
         --no-json)          NO_JSON=1; shift ;;
         --no-pack)          NO_PACK=1; shift ;;
         -h|--help)          usage; exit 0 ;;
@@ -166,6 +171,8 @@ done
 
 # Descriptor knobs must be non-negative integers: they are used in shell
 # arithmetic (the worst-case math) and printed verbatim into descriptors.
+# Normalised with 10# afterwards: bash reads a leading-zero value such as 08
+# as octal and aborts the arithmetic.
 for _pair in "CONNECT_TIMEOUT=${TNS_CT}" "TRANSPORT_CONNECT_TIMEOUT=${TNS_TCT}" \
              "RETRY_COUNT=${TNS_RC}" "RETRY_DELAY=${TNS_RD}"; do
     _name="${_pair%%=*}"
@@ -177,6 +184,26 @@ for _pair in "CONNECT_TIMEOUT=${TNS_CT}" "TRANSPORT_CONNECT_TIMEOUT=${TNS_TCT}" 
             ;;
     esac
 done
+TNS_CT=$((10#$TNS_CT))
+TNS_TCT=$((10#$TNS_TCT))
+TNS_RC=$((10#$TNS_RC))
+TNS_RD=$((10#$TNS_RD))
+
+if [[ -n "$PORT_OVERRIDE" ]]; then
+    case "$PORT_OVERRIDE" in
+        *[!0-9]*) usage_error "--port must be a number between 1 and 65535 (got '${PORT_OVERRIDE}')" ;;
+    esac
+    PORT_OVERRIDE=$((10#$PORT_OVERRIDE))
+    if [[ $PORT_OVERRIDE -lt 1 || $PORT_OVERRIDE -gt 65535 ]]; then
+        usage_error "--port must be a number between 1 and 65535 (got '${PORT_OVERRIDE}')"
+    fi
+fi
+
+# An explicit baseline that does not exist would silently read as "first
+# report" and hide every change - refuse instead.
+if [[ -n "$PREVIOUS_JSON_OVERRIDE" && ! -f "$PREVIOUS_JSON_OVERRIDE" ]]; then
+    usage_error "--previous file not found: ${PREVIOUS_JSON_OVERRIDE}"
+fi
 
 # ============================================================
 # Pre-flight
@@ -251,9 +278,14 @@ EOF
 # script is deliberately standalone and does not source dg_functions.sh.
 # DGMGRL always exits 0, so the captured text is the only failure signal.
 # Returns 0 (true) when the output contains a real broker/Oracle error.
+# A member-level "Warning: ORA-16789 ..." line is a WARNING (it comes with
+# Configuration Status WARNING), not an error, so ORA-/DGM- text counts only
+# on lines that are not "Warning:" lines. No grep -q on the second stage:
+# under pipefail an early-closing reader can SIGPIPE the first grep.
 broker_output_has_error() {
     local output="$1"
-    if printf '%s\n' "$output" | grep -Eq 'ORA-[0-9]|DGM-[0-9]'; then
+    if printf '%s\n' "$output" | grep -Eiv '^[[:space:]]*Warning:' \
+            | grep -E 'ORA-[0-9]|DGM-[0-9]' >/dev/null; then
         return 0
     fi
     # A standalone "Error:" line with a nonzero code. "Error: 0" is the
@@ -408,7 +440,8 @@ dg_interval_to_seconds() {
 }
 
 get_sqlnet_expire_time() {
-    local sqlnet="${ORACLE_HOME}/network/admin/sqlnet.ora"
+    # TNS_ADMIN (shared / relocated Net config) wins over the home's own dir
+    local sqlnet="${TNS_ADMIN:-${ORACLE_HOME}/network/admin}/sqlnet.ora"
     if [[ ! -f "$sqlnet" ]]; then
         printf 'not set (sqlnet.ora not found)'
         return
@@ -522,6 +555,14 @@ SELECT COUNT(*) FROM V\$ARCHIVE_GAP;" | clean | head -1); then
     note_discovery_failure "archive gap count"
 fi
 GAP_COUNT="${GAP_COUNT:-0}"
+# V$ARCHIVE_GAP is populated on the STANDBY; on the primary it is effectively
+# always empty, so a 0 there proves nothing. GAP_ASSESSED=0 means "0 is not
+# evidence" until the standby's own view is read (--standby-tns-alias, below).
+# A nonzero local count is a real signal wherever it comes from.
+GAP_ASSESSED=1
+if [[ "$DB_ROLE" == "PRIMARY" ]]; then
+    GAP_ASSESSED=0
+fi
 
 # FSFO
 if ! FSFO_RAW=$(run_sql "-- QTAG:fsfo_status
@@ -638,6 +679,11 @@ TRANSPORT_LAG_SECONDS=""
 
 if [[ "$DG_BROKER_START" == "TRUE" ]]; then
     BROKER_OUTPUT=$(run_dgmgrl_cmd "SHOW CONFIGURATION;" || true)
+    # DGMGRL exits 0 even when it cannot talk to the broker, so empty output
+    # is the only symptom - it must not read as a healthy configuration.
+    if [[ -z "$BROKER_OUTPUT" ]]; then
+        note_discovery_failure "broker configuration (DGMGRL SHOW CONFIGURATION returned no output)"
+    fi
 
     extract_host_from_show_db() {
         # SHOW DATABASE VERBOSE prints the broker's own "HostName = '...'"
@@ -711,11 +757,12 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
     # querying (and reporting) it otherwise produced a spurious value and a
     # spurious discovery warning on every non-FSFO configuration.
     if [[ "$FSFO_ENABLED" == "YES" ]]; then
-        if [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]]; then
-            FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}' 'FastStartFailoverThreshold';" | parse_broker_property || true)
-        fi
+        # FastStartFailoverThreshold is a CONFIGURATION property, not a
+        # database property. SHOW FAST_START FAILOVER prints it as
+        # "Threshold:  30 seconds"; the property query is the fallback.
+        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
         if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
-            FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
+            FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW CONFIGURATION FastStartFailoverThreshold;" | parse_broker_property || true)
         fi
         if [[ -z "$FSFO_THRESHOLD" ]]; then
             FSFO_THRESHOLD="unknown"
@@ -755,6 +802,7 @@ WHENEVER SQLERROR EXIT 1
 SELECT 'OPENMODE=' || OPEN_MODE FROM V$DATABASE;
 SELECT 'DGSTAT=' || NAME || '=' || VALUE FROM V$DATAGUARD_STATS
  WHERE NAME IN ('apply lag', 'transport lag');
+SELECT 'ARCHGAP=' || COUNT(*) FROM V$ARCHIVE_GAP;
 EXIT;
 EOSQL
 )
@@ -766,6 +814,13 @@ EOSQL
     else
         warn "Direct standby query via ${STANDBY_TNS_ALIAS} returned no OPEN_MODE (wallet/alias/standby down?); using broker-derived values."
     fi
+    # The standby's own V$ARCHIVE_GAP is the one that can be non-empty.
+    _direct_gap=$( { printf '%s\n' "$STANDBY_DIRECT_OUTPUT" | grep 'ARCHGAP=' || true; } \
+        | sed 's/.*ARCHGAP=//' | head -1 | clean)
+    case "$_direct_gap" in
+        ''|*[!0-9]*) ;;
+        *) GAP_COUNT=$((10#$_direct_gap)); GAP_ASSESSED=1 ;;
+    esac
     # V$DATAGUARD_STATS values are interval strings like '+00 00:00:03'.
     # They come from the standby itself, so they win over the broker text.
     _dg_apply=$( { printf '%s\n' "$STANDBY_DIRECT_OUTPUT" | grep 'DGSTAT=apply lag=' || true; } \
@@ -834,7 +889,22 @@ SELECT c.NAME || '|' || s.NAME || '|' ||
 FROM V\$ACTIVE_SERVICES s
 JOIN V\$CONTAINERS c ON s.CON_ID = c.CON_ID
 WHERE s.NAME NOT LIKE 'SYS\$%'
-  AND UPPER(s.NAME) NOT LIKE '%XDB%'
+  AND UPPER(s.NAME) NOT IN (
+      SELECT UPPER(n) FROM (
+          SELECT NAME || 'XDB' AS n FROM V\$DATABASE
+          UNION ALL SELECT DB_UNIQUE_NAME || 'XDB' FROM V\$DATABASE
+          UNION ALL SELECT INSTANCE_NAME || 'XDB' FROM V\$INSTANCE
+          UNION ALL SELECT c2.NAME || 'XDB' FROM V\$CONTAINERS c2
+          UNION ALL SELECT d.NAME || 'XDB.' || p.VALUE FROM V\$DATABASE d, V\$PARAMETER p
+                     WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+          UNION ALL SELECT d.DB_UNIQUE_NAME || 'XDB.' || p.VALUE FROM V\$DATABASE d, V\$PARAMETER p
+                     WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+          UNION ALL SELECT i.INSTANCE_NAME || 'XDB.' || p.VALUE FROM V\$INSTANCE i, V\$PARAMETER p
+                     WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+          UNION ALL SELECT c2.NAME || 'XDB.' || p.VALUE FROM V\$CONTAINERS c2, V\$PARAMETER p
+                     WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+      ) WHERE n IS NOT NULL
+  )
   AND UPPER(s.NAME) NOT LIKE '%\_CFG' ESCAPE '\'
   AND UPPER(s.NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
   AND c.NAME <> 'PDB\$SEED'
@@ -1141,7 +1211,7 @@ render_driver_examples() {
     local ez="$1"
     printf '**ODP.NET**\n\n```\nUser Id=app_user;Password=<pwd>;Data Source=%s\n```\n\n' "$ez"
     printf '**python-oracledb**\n\n```\noracledb.connect(user="app_user", password="<pwd>", dsn="%s")\n```\n\n' "$ez"
-    printf '**SQLAlchemy**\n\n```\noracle+oracledb://app_user:<pwd>@%s\n```\n\n' "$ez"
+    printf '**SQLAlchemy**\n\n```\ncreate_engine("oracle+oracledb://@", connect_args={"user": "app_user", "password": "<pwd>", "dsn": "%s"})\n```\n\n' "$ez"
     printf '**SQL*Plus**\n\n```\nsqlplus app_user/<pwd>@'\''%s'\''\n```\n\n' "$ez"
 }
 
@@ -1308,7 +1378,7 @@ handoff_md_to_html() {
     }
     function inline_fmt(s,   out2, m, p, txt, url) {
         out2 = ""
-        while (match(s, /\[[^\]]+\]\([^)]+\)/)) {
+        while (match(s, /\[[^]]+\]\([^)]+\)/)) {
             m = substr(s, RSTART, RLENGTH)
             p = index(m, "](")
             txt = substr(m, 2, p - 2)
@@ -1331,8 +1401,8 @@ handoff_md_to_html() {
         return out2 s
     }
     function trimcell(s) {
-        sub(/^[ \t]+/, "", s)
-        sub(/[ \t]+$/, "", s)
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
         return s
     }
     # Output is buffered (out[]/on) so the table of contents can be
@@ -1347,8 +1417,8 @@ handoff_md_to_html() {
         gsub(/[][]/, "", s)
         gsub(/\*/, "", s)
         gsub(/`/, "", s)
-        sub(/^[ \t]+/, "", s)
-        sub(/[ \t]+$/, "", s)
+        sub(/^[[:space:]]+/, "", s)
+        sub(/[[:space:]]+$/, "", s)
         return s
     }
     function slugify(s,   base, k) {
@@ -1466,7 +1536,7 @@ handoff_md_to_html() {
 
         # bullet continuation (two-space indent while a bullet is open)
         if (li != "" && line ~ /^  [^ ]/) {
-            sub(/^[ \t]+/, "", line)
+            sub(/^[[:space:]]+/, "", line)
             li = li " " line
             next
         }
@@ -1519,7 +1589,7 @@ handoff_md_to_html() {
             next
         }
         flush_bq()
-        if (line ~ /^[ \t]*$/) { flush_p(); next }
+        if (line ~ /^[[:space:]]*$/) { flush_p(); next }
         pbuf = (pbuf == "") ? line : pbuf " " line
     }
     END {
@@ -1801,7 +1871,9 @@ main{min-width:0}
 <body data-stale-days="${_dg_stale_days}">
 <div class="brandbar">${_dg_logo_html}<span class="eyebrow">${_dg_brand_name_esc}</span></div>
 HTMLHEAD
-    handoff_md_to_html
+    # Explicit: called from an `if`, errexit is off inside this function, so a
+    # dying converter would otherwise leave a truncated page and a 0 status.
+    handoff_md_to_html || return 1
     cat <<'HTMLFOOT'
 <script>
 document.querySelectorAll('pre').forEach(function (pre) {
@@ -1882,24 +1954,20 @@ HTMLFOOT
 # and the baseline the NEXT run diffs against for the "Changes Since Last
 # Report" section.
 
-# JSON string escaping. Backslash and quote first, then tab, then join
-# multi-line values with a literal \n. Replacement strings carry doubled
-# backslashes because POSIX awk's gsub() interprets '\\' in a replacement
-# as one literal backslash.
+# JSON string escaping. Done with sed rather than awk: whether awk turns '\\'
+# into one backslash in a gsub() replacement differs between implementations
+# (bwk/AIX awk does not), which produced invalid JSON for any value holding a
+# quote, a backslash or a tab. CR and the other control characters are
+# stripped with an explicit octal range ([[:cntrl:]] also matches 0x80-0x9F
+# under an ISO8859-1 locale and would corrupt UTF-8 text such as the em dash
+# in verdict notes); tab is kept and escaped. Multi-line values are joined
+# with a literal \n.
 json_escape() {
-    printf '%s' "$1" | tr -d '\r' | awk -v TAB="$(printf '\t')" '
-        BEGIN { first = 1 }
-        {
-            s = $0
-            gsub(/\\/, "\\\\\\\\", s)
-            gsub(/"/, "\\\\\"", s)
-            gsub(TAB, "\\\\t", s)
-            gsub(/[[:cntrl:]]/, " ", s)
-            if (!first) printf "\\n"
-            printf "%s", s
-            first = 0
-        }
-    '
+    printf '%s' "$1" \
+        | tr -d '\r' \
+        | tr -d '\001-\010\013\014\016-\037\177' \
+        | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' -e "s/$(printf '\t')/\\\\t/g" \
+        | awk 'NR > 1 { printf "%s", "\\n" } { printf "%s", $0 }'
 }
 
 # '  "key": "escaped",'  - or '  "key": null,' for an empty value.
@@ -1963,12 +2031,12 @@ json_prev_scalar() {
         BEGIN { pat = "\"" k "\":" }
         {
             line = $0
-            sub(/^[ \t]+/, "", line)
+            sub(/^[[:space:]]+/, "", line)
             if (index(line, pat) == 1) {
                 v = substr(line, length(pat) + 1)
-                sub(/^[ \t]+/, "", v)
+                sub(/^[[:space:]]+/, "", v)
                 sub(/,$/, "", v)
-                sub(/[ \t]+$/, "", v)
+                sub(/[[:space:]]+$/, "", v)
                 if (substr(v, 1, 1) == "\"")
                     v = substr(v, 2, length(v) - 2)
                 print v
@@ -1985,7 +2053,7 @@ json_prev_array() {
         BEGIN { pat = "\"" k "\": ["; inarr = 0 }
         {
             line = $0
-            sub(/^[ \t]+/, "", line)
+            sub(/^[[:space:]]+/, "", line)
             if (inarr) {
                 if (index(line, "]") == 1) { inarr = 0; exit }
                 sub(/,$/, "", line)
@@ -2030,7 +2098,7 @@ json_prev_services() {
         BEGIN { }
         {
             line = $0
-            sub(/^[ \t]+/, "", line)
+            sub(/^[[:space:]]+/, "", line)
             if (substr(line, 1, 9) != "{\"name\": ") next
             print jget(line, "name") "|" jget(line, "container") "|" \
                   jget(line, "class") "|" jget(line, "role_aware") "|" \
@@ -2130,10 +2198,17 @@ USAGE
 while [ \$# -gt 0 ]; do
     case "\$1" in
         -u|--user)
-            APP_USER="\${2%%/*}"
-            APP_PASSWORD="\${2#*/}"
+            # No "shift 2" on a missing value: without set -e it would fail
+            # silently and this loop would spin forever.
+            [ \$# -ge 2 ] || { echo "\$1 requires a value" >&2; usage >&2; exit 2; }
+            case "\$2" in
+                */*) APP_USER="\${2%%/*}"; APP_PASSWORD="\${2#*/}" ;;
+                *)   APP_USER="\$2"; APP_PASSWORD="" ;;
+            esac
             shift 2 ;;
-        --expect-db-unique-name) EXPECT_DB_UNIQUE_NAME="\$2"; shift 2 ;;
+        --expect-db-unique-name)
+            [ \$# -ge 2 ] || { echo "\$1 requires a value" >&2; usage >&2; exit 2; }
+            EXPECT_DB_UNIQUE_NAME="\$2"; shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) echo "Unknown option: \$1" >&2; usage >&2; exit 2 ;;
     esac
@@ -2148,21 +2223,35 @@ fail() { echo "FAIL  \$*"; FAIL_COUNT=\$((FAIL_COUNT + 1)); }
 skip() { echo "SKIP  \$*"; SKIP_COUNT=\$((SKIP_COUNT + 1)); }
 
 # ---- 1. Name resolution ----
+# Only resolvers that honour /etc/hosts count (getent; AIX host; the resolver
+# behind ping). nslookup and Linux host/dig query DNS only and would report a
+# false FAIL for a name that lives in /etc/hosts. With none of them available
+# the check is skipped, never failed.
 resolve_host() {
     _h="\$1"
     if command -v getent >/dev/null 2>&1; then
         if getent hosts "\$_h" >/dev/null 2>&1; then pass "resolve \$_h (getent)"; else fail "resolve \$_h (getent found no address)"; fi
         return 0
     fi
-    if command -v nslookup >/dev/null 2>&1; then
-        if nslookup "\$_h" >/dev/null 2>&1; then pass "resolve \$_h (nslookup)"; else fail "resolve \$_h (nslookup found no address)"; fi
+    if [ "\$(uname -s 2>/dev/null)" = "AIX" ] && command -v host >/dev/null 2>&1; then
+        if host "\$_h" >/dev/null 2>&1; then pass "resolve \$_h (host)"; else fail "resolve \$_h (host found no address)"; fi
         return 0
     fi
     if command -v ping >/dev/null 2>&1; then
-        if ping -c1 -W1 "\$_h" >/dev/null 2>&1; then pass "resolve \$_h (ping)"; else fail "resolve \$_h (ping got no reply - name or host down)"; fi
+        # No -W: not an option on AIX. A failed ping only counts as a name
+        # failure when ping says it could not resolve the name; a silent host
+        # (ICMP filtered) is left to the TCP check below.
+        _pout=\$(ping -c1 "\$_h" 2>&1); _prc=\$?
+        if [ "\$_prc" -eq 0 ]; then
+            pass "resolve \$_h (ping)"
+        elif printf '%s\n' "\$_pout" | grep -Ei 'unknown host|not found|not known|cannot resolve|could not resolve|name or service' >/dev/null 2>&1; then
+            fail "resolve \$_h (ping could not resolve the name)"
+        else
+            skip "resolve \$_h (resolved, but no ICMP reply - see the TCP check)"
+        fi
         return 0
     fi
-    skip "resolve \$_h (no getent/nslookup/ping on this host)"
+    skip "resolve \$_h (no getent, AIX host or ping on this host)"
 }
 
 # ---- 2. TCP reachability ----
@@ -2197,9 +2286,15 @@ if ! command -v sqlplus >/dev/null 2>&1; then
 elif [ -z "\$APP_USER" ] || [ -z "\$APP_PASSWORD" ]; then
     skip "end-to-end role check (set APP_USER/APP_PASSWORD or pass -u user/pass)"
 else
-    SQL_OUT=\$(sqlplus -s -L "\$APP_USER/\$APP_PASSWORD@\$EZCONNECT" <<'SQLEOF' 2>&1
-SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
+    # CONNECT goes in on stdin, not argv: the password never shows in ps, and
+    # SET DEFINE OFF keeps the "&" of the Easy Connect Plus string literal.
+    # The password and the connect identifier are double-quoted so "/", "?",
+    # "&" and "," in them are not interpreted.
+    SQL_OUT=\$(sqlplus -s -L /nolog <<SQLEOF 2>&1
+SET DEFINE OFF
 WHENEVER SQLERROR EXIT 1
+CONNECT \$APP_USER/"\$APP_PASSWORD"@"\$EZCONNECT"
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 200 TRIMSPOOL ON
 SELECT 'DGCHK=' || SYS_CONTEXT('USERENV','DB_UNIQUE_NAME') || '|' ||
        SYS_CONTEXT('USERENV','DATABASE_ROLE') || '|' ||
        SYS_CONTEXT('USERENV','SERVER_HOST') FROM DUAL;
@@ -2254,12 +2349,16 @@ LAG_WARN_SEQ="${DG_SEQ_GAP_WARN:-1}"
 LAG_CRIT_SEQ="${DG_SEQ_GAP_CRIT:-5}"
 case "$LAG_WARN_SEQ" in ''|*[!0-9]*) LAG_WARN_SEQ=1 ;; esac
 case "$LAG_CRIT_SEQ" in ''|*[!0-9]*) LAG_CRIT_SEQ=5 ;; esac
+# 10#: a leading-zero value (08) would otherwise be read as octal by [[ -gt ]]
+LAG_WARN_SEQ=$((10#$LAG_WARN_SEQ))
+LAG_CRIT_SEQ=$((10#$LAG_CRIT_SEQ))
 
 if [[ "$DB_ROLE" != "PRIMARY" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Local role is ${DB_ROLE}, expected PRIMARY — re-run this script on the primary host so service discovery and connect strings are complete")
 fi
 if [[ "${GAP_COUNT}" -gt 0 ]]; then
+    GAP_ASSESSED=1
     escalate_verdict "ERROR"
     VERDICT_NOTES+=("${GAP_COUNT} archive gap(s) detected — redo transport is broken; run dg_status.sh / check archive destinations before trusting the standby")
 fi
@@ -2283,6 +2382,7 @@ fi
 # read is and how much redo a failover would have to wait for.
 LAG_WARN_SECONDS="${DG_LAG_WARN_SECONDS:-60}"
 case "$LAG_WARN_SECONDS" in ''|*[!0-9]*) LAG_WARN_SECONDS=60 ;; esac
+LAG_WARN_SECONDS=$((10#$LAG_WARN_SECONDS))
 if [[ -n "$APPLY_LAG_SECONDS" && "$APPLY_LAG_SECONDS" -gt "$LAG_WARN_SECONDS" ]]; then
     escalate_verdict "WARNING"
     VERDICT_NOTES+=("Apply lag is ${APPLY_LAG_TEXT} (threshold ${LAG_WARN_SECONDS}s) — check MRP on the standby and redo transport; run dg_status.sh (or dg_triage_sid.sh on the standby host) to see where apply is stuck")
@@ -2302,7 +2402,9 @@ case "$(printf '%s' "$SWITCHOVER_STATUS" | tr '[:lower:]' '[:upper:]')" in
 esac
 
 # The broker's own verdict. DGMGRL always exits 0, so the captured text is
-# the only signal - scan it the same way the setup scripts do.
+# the only signal. Classified on the "Configuration Status:" value
+# (SUCCESS / WARNING / ERROR / DISABLED) plus real error text, so a
+# member-level "Warning: ORA-16789" stays a WARNING instead of an ERROR.
 if [[ -n "$BROKER_OUTPUT" ]]; then
     BROKER_CONFIG_STATUS=$(extract_configuration_status "$BROKER_OUTPUT")
     case "$BROKER_CONFIG_STATUS" in
@@ -2314,11 +2416,18 @@ if [[ -n "$BROKER_OUTPUT" ]]; then
             escalate_verdict "WARNING"
             VERDICT_NOTES+=("Broker Configuration Status is WARNING — see the Broker Configuration appendix; run DGMGRL SHOW CONFIGURATION for live detail")
             ;;
+        DISABLED)
+            escalate_verdict "WARNING"
+            VERDICT_NOTES+=("Broker configuration is DISABLED — the broker is not managing the standby; run DGMGRL ENABLE CONFIGURATION")
+            ;;
     esac
     if broker_output_has_error "$BROKER_OUTPUT"; then
         escalate_verdict "ERROR"
         VERDICT_NOTES+=("Broker reported ORA-/DGM- errors — see the Broker Configuration appendix for the exact messages")
     fi
+elif [[ "$DG_BROKER_START" == "TRUE" ]]; then
+    escalate_verdict "WARNING"
+    VERDICT_NOTES+=("Data Guard Broker is started but DGMGRL returned no configuration output — check the broker (DGMGRL SHOW CONFIGURATION) before trusting broker-derived fields")
 fi
 
 # Role-aware descriptors are only safe once the trigger is deployed.
@@ -2350,6 +2459,16 @@ fi
 
 if [[ ${#VERDICT_NOTES[@]} -eq 0 ]]; then
     VERDICT_NOTES+=("No role, transport, apply, broker or trigger issues detected")
+fi
+
+# What the report and the sidecar say about archive gaps. An unassessed 0 is
+# labelled, never claimed (the verdict above only fires on a real count).
+if [[ $GAP_ASSESSED -eq 1 ]]; then
+    GAP_DISPLAY="$GAP_COUNT"
+    GAP_JSON="$GAP_COUNT"
+else
+    GAP_DISPLAY="not assessable from the primary (V\$ARCHIVE_GAP is only populated on the standby; pass --standby-tns-alias)"
+    GAP_JSON=""
 fi
 
 # ============================================================
@@ -2465,6 +2584,14 @@ VERIFY_FILE="${PACK_BASE}_verify.sh"
 
 PREV_JSON_FILE="${PREVIOUS_JSON_OVERRIDE:-$JSON_FILE}"
 
+# The threshold is only meaningful (and only recorded in the sidecar) while
+# FSFO is enabled; the change diff must compare the same gated value or every
+# rerun with FSFO off reports a bogus "(none) -> unknown" change.
+FSFO_THRESHOLD_GATED=""
+if [[ "$FSFO_ENABLED" == "YES" ]]; then
+    FSFO_THRESHOLD_GATED="$FSFO_THRESHOLD"
+fi
+
 GEN_STAMP=$(date '+%Y-%m-%dT%H:%M:%S')
 GEN_TZ=$(date '+%Z')
 
@@ -2558,7 +2685,7 @@ if [[ $NO_JSON -eq 0 && -f "$PREV_JSON_FILE" ]]; then
     diff_scalar "Standby LogXptMode"         standby_logxptmode        "$STANDBY_LOGXPTMODE"
     diff_scalar "Standby open mode"          standby_open_mode         "$STANDBY_OPEN_MODE"
     diff_scalar "FSFO enabled"               fsfo_enabled              "$(json_bool_token "$FSFO_ENABLED")"
-    diff_scalar "FSFO threshold"             fsfo_threshold            "$FSFO_THRESHOLD"
+    diff_scalar "FSFO threshold"             fsfo_threshold            "$FSFO_THRESHOLD_GATED"
     diff_scalar "Role trigger ready"         role_trigger_ready        "$(json_bool_token "$ROLE_TRIGGER_READY")"
     diff_scalar "Database version"           db_version                "$DB_VERSION"
     diff_scalar "CONNECT_TIMEOUT"            connect_timeout           "$TNS_CT"
@@ -2929,7 +3056,7 @@ fi
     echo "- Sequences: NOORDER/CACHE sequences (default CACHE 20) discard cached values at role change - expect gaps of up to the CACHE size per sequence, and no ordering guarantee across a failover. Never use sequence values as gapless or strictly-ordered business keys."
     echo "- TAF, Transaction Guard and Application Continuity are per-service settings; section 1 states what each service actually has (discovered from the database, not assumed). Ask the DBA team to change a service's settings if your failure-handling design needs more."
     if [[ -n "$DB_DOMAIN" ]]; then
-        echo "- This database sets DB_DOMAIN=\`${DB_DOMAIN}\`. Clients whose \`sqlnet.ora\` sets \`NAMES.DEFAULT_DOMAIN\` append that domain to every unqualified TNS alias - define aliases fully qualified (as printed here) so resolution works with or without a default domain."
+        echo "- This database sets DB_DOMAIN=\`${DB_DOMAIN}\`. Clients whose \`sqlnet.ora\` sets \`NAMES.DEFAULT_DOMAIN\` append that domain to every unqualified TNS alias, and the aliases printed here (for example \`APP_SVC_HA\`) are unqualified - such a client must append that domain to the alias names in its \`tnsnames.ora\` (for example \`APP_SVC_HA.${DB_DOMAIN}\`), or use the Easy Connect Plus / JDBC strings, which involve no alias lookup."
     fi
     echo "- After a switchover nothing changes for clients on the role-aware descriptor. Host-specific strings silently point at the wrong database until this report is regenerated."
     echo ""
@@ -3017,7 +3144,7 @@ fi
     echo "| Apply lag (sequences) | ${APPLY_LAG_SEQ} |"
     echo "| Apply lag (time) | ${APPLY_LAG_TEXT} |"
     echo "| Transport lag (time) | ${TRANSPORT_LAG_TEXT} |"
-    echo "| Archive gaps | ${GAP_COUNT} |"
+    echo "| Archive gaps | ${GAP_DISPLAY} |"
     echo "| FSFO status | ${FSFO_STATUS:-N/A} |"
     echo "| FSFO observer present | ${FSFO_OBSERVER:-N/A} |"
     if [[ -n "$FSFO_OBSERVER_HOST" ]]; then
@@ -3134,8 +3261,30 @@ info "Report written: $OUTPUT_FILE"
 # Styled, self-contained HTML twin of the Markdown report
 HTML_FILE="${OUTPUT_FILE%.md}.html"
 [[ "$HTML_FILE" == "$OUTPUT_FILE" ]] && HTML_FILE="${OUTPUT_FILE}.html"
-render_handoff_html < "$OUTPUT_FILE" > "$HTML_FILE"
-info "HTML report written: $HTML_FILE"
+# Best-effort: the converter's awk can die on some platforms (AIX awk aborts
+# with 0602-558 on constructs other awks accept). That must cost the HTML
+# twin only - never the JSON sidecar, the pack, the stdout report or the
+# verdict exit code (2 here would read as an ERROR verdict). Rendered to a
+# temp file so a failure leaves no partial page behind.
+HTML_TMP="${HTML_FILE}.tmp.$$"
+if render_handoff_html < "$OUTPUT_FILE" > "$HTML_TMP" && [[ -s "$HTML_TMP" ]]; then
+    mv "$HTML_TMP" "$HTML_FILE"
+    info "HTML report written: $HTML_FILE"
+else
+    rm -f "$HTML_TMP" "$HTML_FILE"
+    warn "HTML twin failed (the converter's awk aborted); continuing without $(basename "$HTML_FILE")."
+    HTML_FILE=""
+    # The Markdown header was written before the render and lists the HTML
+    # twin in its Files chip - drop it so the chip stays true.
+    _md_tmp="${OUTPUT_FILE}.tmp.$$"
+    awk -v drop=", $(basename "${OUTPUT_FILE%.md}.html")" '
+        index($0, "- **Files:** ") == 1 {
+            i = index($0, drop)
+            if (i > 0) $0 = substr($0, 1, i - 1) substr($0, i + length(drop))
+        }
+        { print }
+    ' "$OUTPUT_FILE" > "$_md_tmp" && mv "$_md_tmp" "$OUTPUT_FILE" || rm -f "$_md_tmp"
+fi
 
 # ============================================================
 # JSON sidecar
@@ -3180,12 +3329,12 @@ if [[ $NO_JSON -eq 0 ]]; then
         json_str_line apply_lag_text       "$APPLY_LAG_TEXT"
         json_str_line transport_lag_seconds "$TRANSPORT_LAG_SECONDS"
         json_str_line transport_lag_text    "$TRANSPORT_LAG_TEXT"
-        json_str_line archive_gaps          "$GAP_COUNT"
+        json_str_line archive_gaps          "$GAP_JSON"
         json_bool_line fsfo_enabled         "$FSFO_ENABLED"
         json_str_line fsfo_status           "$FSFO_STATUS"
         json_bool_line fsfo_observer_present "$FSFO_OBSERVER"
         json_str_line fsfo_observer_host    "$FSFO_OBSERVER_HOST"
-        json_str_line fsfo_threshold        "$([[ "$FSFO_ENABLED" == "YES" ]] && printf '%s' "$FSFO_THRESHOLD")"
+        json_str_line fsfo_threshold        "$FSFO_THRESHOLD_GATED"
         json_bool_line role_trigger_ready   "$ROLE_TRIGGER_READY"
         json_str_line trigger_owners        "$TRIGGER_OWNERS"
         json_str_line sqlnet_expire_time    "$SQLNET_EXPIRE_TIME"
@@ -3247,10 +3396,9 @@ if [[ $NO_PACK -eq 0 ]]; then
         echo "# Data Guard role-aware TNS aliases - generated ${GEN_DATE}"
         echo "# Configuration: ${PRIMARY_DB_UNIQUE_NAME}${STANDBY_DB_UNIQUE_NAME:+ -> ${STANDBY_DB_UNIQUE_NAME}}"
         echo "# Source: $(basename "$OUTPUT_FILE"). Append these entries to the client's tnsnames.ora."
-        if [[ -n "$DB_DOMAIN" ]]; then
-            echo "# The service names are fully qualified (DB_DOMAIN=${DB_DOMAIN}), so they"
-            echo "# resolve identically with or without a client-side NAMES.DEFAULT_DOMAIN."
-        fi
+        echo "# The aliases below are unqualified. A client whose sqlnet.ora sets"
+        echo "# NAMES.DEFAULT_DOMAIN must append that domain to each alias name here"
+        echo "# (for example APP_SVC_HA.example.com), otherwise lookups fail with ORA-12154."
         echo ""
         _i=0
         while [[ $_i -lt ${#SERVICE_LIST[@]} ]]; do
@@ -3309,7 +3457,7 @@ if [[ ${#DISCOVERY_WARNINGS[@]} -gt 0 ]]; then
         warn "  - ${w}"
     done
 fi
-info "Verdict: ${VERDICT}  |  Apply lag: ${APPLY_LAG_SEQ} sequences, ${APPLY_LAG_TEXT}  |  Gaps: ${GAP_COUNT}  |  Services: ${#SERVICE_LIST[@]}"
+info "Verdict: ${VERDICT}  |  Apply lag: ${APPLY_LAG_SEQ} sequences, ${APPLY_LAG_TEXT}  |  Gaps: ${GAP_DISPLAY}  |  Services: ${#SERVICE_LIST[@]}"
 if [[ "$VERDICT" != "HEALTHY" ]]; then
     for n in "${VERDICT_NOTES[@]}"; do
         warn "  ${VERDICT}: ${n}"

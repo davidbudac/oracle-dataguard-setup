@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Unit test for the DB_FILE_NAME_CONVERT generation logic in
 # primary/02_generate_standby_config.sh

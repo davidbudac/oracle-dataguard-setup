@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 2: Generate Standby Configuration
 # ============================================================
@@ -19,6 +19,7 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+DG_SCRIPT_FLAGS='--regenerate'
 enable_verbose_mode "$@"
 
 # Check for --regenerate flag
@@ -214,6 +215,78 @@ build_convert_pairs() {
     fi
 }
 
+# Echo the standby directory that corresponds to the primary's single
+# representative directory $1, taken from the index-parallel arrays whose
+# NAMES are $2 (primary) and $3 (standby) - so an operator override (the
+# review table, or an edited .env) is honored. Matches on the primary side
+# ignoring one trailing slash. Returns 1 (echoing the FIRST standby entry as a
+# fallback) when no primary entry matches $1.
+# Used for STANDBY_DATA_PATH (the directory of the SYSTEM datafile, which
+# step 1 picks on purpose - on an OMF CDB the first sorted directory can be a
+# GUID/seed directory) and STANDBY_REDO_PATH; those singular paths drive the
+# control files, step 3's directory creation and step 5.
+pick_standby_for_primary() {
+    local _want="$1" _pa="$2" _sa="$3"
+    local _n _i=0 _p _s
+    eval "_n=\${#${_pa}[@]}"
+    while [[ $_i -lt $_n ]]; do
+        eval "_p=\${${_pa}[$_i]}"
+        if [[ "${_p%/}" == "${_want%/}" ]]; then
+            eval "_s=\${${_sa}[$_i]}"
+            printf '%s' "$_s"
+            return 0
+        fi
+        _i=$(( _i + 1 ))
+    done
+    eval "_s=\${${_sa}[0]:-}"
+    printf '%s' "$_s"
+    return 1
+}
+
+# Validators for the values typed at the standby prompts. They end up in sed
+# patterns, file names and the sourced .env, so they are restricted to the
+# characters Oracle accepts there; $ and # (legal in a DB_UNIQUE_NAME) are
+# deliberately excluded - they are metacharacters in the sed patterns and the
+# double-quoted .env values this script writes.
+is_valid_db_unique_name() {
+    local v="$1"
+    [[ ${#v} -ge 1 && ${#v} -le 30 ]] || return 1
+    case "$v" in
+        [A-Za-z]*) ;;
+        *) return 1 ;;
+    esac
+    case "$v" in
+        *[!A-Za-z0-9_]*) return 1 ;;
+    esac
+    return 0
+}
+
+is_valid_oracle_sid() {
+    local v="$1"
+    [[ ${#v} -ge 1 && ${#v} -le 12 ]] || return 1
+    case "$v" in
+        [A-Za-z]*) ;;
+        *) return 1 ;;
+    esac
+    case "$v" in
+        *[!A-Za-z0-9_]*) return 1 ;;
+    esac
+    return 0
+}
+
+is_valid_hostname() {
+    local v="$1"
+    [[ ${#v} -ge 1 && ${#v} -le 255 ]] || return 1
+    case "$v" in
+        [A-Za-z0-9]*) ;;
+        *) return 1 ;;
+    esac
+    case "$v" in
+        *[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    return 0
+}
+
 # ============================================================
 # Main Script
 # ============================================================
@@ -299,6 +372,32 @@ elif [[ "$_can_rebuild_pairs" == "1" ]]; then
     log_info "  DB_FILE_NAME_CONVERT:  $DB_FILE_NAME_CONVERT"
     log_info "  LOG_FILE_NAME_CONVERT: $LOG_FILE_NAME_CONVERT"
 
+    # Re-derive the SINGULAR standby paths from the (possibly edited) arrays
+    # too. STANDBY_DATA_PATH / STANDBY_REDO_PATH drive the control file
+    # locations, step 3's directory creation and step 5; keeping the stale
+    # stored values would silently defeat an edited layout, exactly like the
+    # stale convert strings. Rule (same as normal mode): the standby entry
+    # whose index-parallel PRIMARY entry equals the primary's singular path
+    # (PRIMARY_DATA_PATH = the SYSTEM datafile directory; PRIMARY_REDO_PATH =
+    # the first online redo directory); if no primary entry matches, the first
+    # standby entry. A stored value is kept when the arrays give nothing.
+    _old_sdp="${STANDBY_DATA_PATH:-}"
+    _old_srp="${STANDBY_REDO_PATH:-}"
+    # (the helper returns 1 on "no primary entry matched" but still echoes
+    # the first standby entry, hence the `if` instead of a bare assignment)
+    _new_sdp=""
+    _new_srp=""
+    if _new_sdp=$(pick_standby_for_primary "${PRIMARY_DATA_PATH:-}" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS); then :; fi
+    if _new_srp=$(pick_standby_for_primary "${PRIMARY_REDO_PATH:-}" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS); then :; fi
+    if [[ -n "$_new_sdp" ]]; then STANDBY_DATA_PATH="$_new_sdp"; fi
+    if [[ -n "$_new_srp" ]]; then STANDBY_REDO_PATH="$_new_srp"; fi
+    if [[ "$STANDBY_DATA_PATH" != "$_old_sdp" ]]; then
+        log_info "STANDBY_DATA_PATH re-derived: ${_old_sdp:-<unset>} -> $STANDBY_DATA_PATH"
+    fi
+    if [[ "$STANDBY_REDO_PATH" != "$_old_srp" ]]; then
+        log_info "STANDBY_REDO_PATH re-derived: ${_old_srp:-<unset>} -> $STANDBY_REDO_PATH"
+    fi
+
     # Persist the rebuilt strings back into the .env. This is NOT
     # cosmetic: standby/05_clone_standby.sh takes DB_FILE_NAME_CONVERT
     # from the .env for RMAN's SPFILE SET clause, which overrides the
@@ -306,13 +405,19 @@ elif [[ "$_can_rebuild_pairs" == "1" ]]; then
     # ignores edited path arrays (found by live asymmetric-layout E2E).
     # AIX-safe: no sed -i; write to a temp file and move into place.
     _env_tmp="${STANDBY_CONFIG_FILE}.tmp.$$"
-    if awk -v db="DB_FILE_NAME_CONVERT=\"${DB_FILE_NAME_CONVERT}\"" \
-        -v lg="LOG_FILE_NAME_CONVERT=\"${LOG_FILE_NAME_CONVERT}\"" '
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_info "Check mode: not persisting the rebuilt convert strings / standby paths to $STANDBY_CONFIG_FILE"
+    elif awk -v db="DB_FILE_NAME_CONVERT=\"${DB_FILE_NAME_CONVERT}\"" \
+        -v lg="LOG_FILE_NAME_CONVERT=\"${LOG_FILE_NAME_CONVERT}\"" \
+        -v sd="STANDBY_DATA_PATH=\"${STANDBY_DATA_PATH}\"" \
+        -v sr="STANDBY_REDO_PATH=\"${STANDBY_REDO_PATH}\"" '
         /^DB_FILE_NAME_CONVERT=/  { print db; next }
         /^LOG_FILE_NAME_CONVERT=/ { print lg; next }
+        /^STANDBY_DATA_PATH=/     { print sd; next }
+        /^STANDBY_REDO_PATH=/     { print sr; next }
         { print }
     ' "$STANDBY_CONFIG_FILE" > "$_env_tmp" && mv "$_env_tmp" "$STANDBY_CONFIG_FILE"; then
-        log_info "Updated convert strings persisted to $STANDBY_CONFIG_FILE"
+        log_info "Updated convert strings and standby data/redo paths persisted to $STANDBY_CONFIG_FILE"
     else
         # L11: an unchecked failure here (e.g. NFS share full or gone
         # read-only mid-write) previously fell through to the success
@@ -374,8 +479,11 @@ if [[ "$LOG_MODE" != "ARCHIVELOG" ]]; then
     log_error "then re-run 01_gather_primary_info.sh before continuing."
     exit 1
 fi
-if [[ "$REMOTE_LOGIN_PASSWORDFILE" != "EXCLUSIVE" && "$REMOTE_LOGIN_PASSWORDFILE" != "SHARED" ]]; then
-    log_error "Primary REMOTE_LOGIN_PASSWORDFILE is not EXCLUSIVE/SHARED (current: $REMOTE_LOGIN_PASSWORDFILE) per $PRIMARY_INFO_FILE"
+# EXCLUSIVE only, matching step 1: SHARED makes the password file read-only
+# and SYS-only, so the SYSDG observer user (step 9) and password changes that
+# must reach the standby cannot work.
+if [[ "$REMOTE_LOGIN_PASSWORDFILE" != "EXCLUSIVE" ]]; then
+    log_error "Primary REMOTE_LOGIN_PASSWORDFILE is not EXCLUSIVE (current: $REMOTE_LOGIN_PASSWORDFILE) per $PRIMARY_INFO_FILE"
     log_error "Fix the primary (ALTER SYSTEM SET REMOTE_LOGIN_PASSWORDFILE=EXCLUSIVE SCOPE=SPFILE; then bounce the instance)"
     log_error "then re-run 01_gather_primary_info.sh before continuing."
     exit 1
@@ -405,22 +513,35 @@ echo ""
 echo "Please provide the following information for the standby database:"
 echo ""
 
-# Standby hostname
-prompt_with_default "Standby server hostname" "" STANDBY_HOSTNAME
-if [ -z "$STANDBY_HOSTNAME" ]; then
-    log_error "Standby hostname cannot be empty"
-    exit 1
-fi
+# Standby hostname. Validated because it lands in generated TNS/listener
+# files; a terminal re-prompts, piped stdin (E2E) fails without reading more.
+while :; do
+    prompt_with_default "Standby server hostname" "" STANDBY_HOSTNAME
+    if [ -z "$STANDBY_HOSTNAME" ]; then
+        log_error "Standby hostname cannot be empty"
+    elif is_valid_hostname "$STANDBY_HOSTNAME"; then
+        break
+    else
+        log_error "Invalid standby hostname '$STANDBY_HOSTNAME': use letters, digits, '.' and '-' only"
+    fi
+    [[ -t 0 ]] || exit 1
+done
 
 # Standby DB_UNIQUE_NAME
 echo ""
 echo "The standby DB_UNIQUE_NAME must be different from primary ($DB_UNIQUE_NAME)"
-printf "Standby DB_UNIQUE_NAME: "
-read STANDBY_DB_UNIQUE_NAME
-if [ -z "$STANDBY_DB_UNIQUE_NAME" ]; then
-    log_error "Standby DB_UNIQUE_NAME cannot be empty"
-    exit 1
-fi
+while :; do
+    printf "Standby DB_UNIQUE_NAME: "
+    read -r STANDBY_DB_UNIQUE_NAME
+    if [ -z "$STANDBY_DB_UNIQUE_NAME" ]; then
+        log_error "Standby DB_UNIQUE_NAME cannot be empty"
+    elif is_valid_db_unique_name "$STANDBY_DB_UNIQUE_NAME"; then
+        break
+    else
+        log_error "Invalid standby DB_UNIQUE_NAME '$STANDBY_DB_UNIQUE_NAME': start with a letter, then letters, digits and '_' only, at most 30 characters"
+    fi
+    [[ -t 0 ]] || exit 1
+done
 
 # Case-insensitive (M13): DB_UNIQUE_NAME collisions differing only in
 # case (e.g. PROD vs prod) pass this check, but the token remapper
@@ -433,9 +554,16 @@ if [[ "$(printf '%s' "$STANDBY_DB_UNIQUE_NAME" | tr '[:lower:]' '[:upper:]')" ==
     exit 1
 fi
 
-# Standby Oracle SID
+# Standby Oracle SID (feeds file names such as init<SID>_<name>.ora)
 echo ""
-prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
+while :; do
+    prompt_with_default "Standby ORACLE_SID" "$PRIMARY_ORACLE_SID" STANDBY_ORACLE_SID
+    if is_valid_oracle_sid "$STANDBY_ORACLE_SID"; then
+        break
+    fi
+    log_error "Invalid standby ORACLE_SID '$STANDBY_ORACLE_SID': start with a letter, then letters, digits and '_' only, at most 12 characters"
+    [[ -t 0 ]] || exit 1
+done
 
 # ============================================================
 # Token remapping helpers (case-aware, substring-safe)
@@ -797,16 +925,12 @@ case "$_archive_choice" in
         # DB_UNIQUE_NAME) -> derived from primary archive dest -> empty
         _fra_default=""
         if [[ -n "$DB_RECOVERY_FILE_DEST" ]]; then
-            _fra_default=$(echo "$DB_RECOVERY_FILE_DEST" \
-                | sed "s|/${DB_UNIQUE_NAME}/|/${STANDBY_DB_UNIQUE_NAME}/|g; s|/${DB_UNIQUE_NAME}$|/${STANDBY_DB_UNIQUE_NAME}|")
-            # If no substitution happened, keep primary path (FRA dirs
-            # in many setups are not DB_UNIQUE_NAME-scoped at the path
-            # level - Oracle creates subdirs under it).
-            if [[ "$_fra_default" == "$DB_RECOVERY_FILE_DEST" ]]; then
-                _fra_default="$DB_RECOVERY_FILE_DEST"
-            fi
-            # Q1b filesystem remap (no-op when the map is empty)
-            _fra_default=$(apply_fs_map "$_fra_default")
+            # Same derivation as every other standby path: the Q1b
+            # filesystem map, then a case-aware, component-bounded
+            # DB_UNIQUE_NAME swap. A path with no such component (FRA dirs
+            # in many setups are not DB_UNIQUE_NAME-scoped - Oracle creates
+            # subdirs under it) comes back unchanged.
+            _fra_default=$(derive_standby_path "$DB_RECOVERY_FILE_DEST")
         fi
         prompt_with_default "Standby FRA path (db_recovery_file_dest)" "$_fra_default" STANDBY_FRA
         if [[ -z "$STANDBY_FRA" ]]; then
@@ -931,13 +1055,26 @@ STANDBY_DATA_PATHS=()
 for _p in "${PRIMARY_DATA_PATHS[@]}"; do
     STANDBY_DATA_PATHS+=("$(derive_standby_path "$_p")")
 done
-STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
 
 STANDBY_REDO_PATHS=()
 for _p in "${PRIMARY_REDO_PATHS[@]}"; do
     STANDBY_REDO_PATHS+=("$(derive_standby_path "$_p")")
 done
-STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
+
+# Singular paths (control files, step 3 and step 5): the standby
+# counterpart of the primary's SYSTEM-datafile directory (PRIMARY_DATA_PATH),
+# not simply the first entry of the sorted array. Re-picked after the review
+# below so an operator override is carried through.
+if ! STANDBY_DATA_PATH=$(pick_standby_for_primary "$PRIMARY_DATA_PATH" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS); then
+    if [[ -n "$PRIMARY_DATA_PATH" ]]; then
+        STANDBY_DATA_PATH=$(derive_standby_path "$PRIMARY_DATA_PATH")
+    fi
+fi
+if ! STANDBY_REDO_PATH=$(pick_standby_for_primary "$PRIMARY_REDO_PATH" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS); then
+    if [[ -n "$PRIMARY_REDO_PATH" ]]; then
+        STANDBY_REDO_PATH=$(derive_standby_path "$PRIMARY_REDO_PATH")
+    fi
+fi
 
 # ============================================================
 # Confirm / repair any path the token substitution could not remap
@@ -1065,8 +1202,16 @@ _review_path_mappings() {
 }
 _review_path_mappings
 
-STANDBY_DATA_PATH="${STANDBY_DATA_PATHS[0]}"
-STANDBY_REDO_PATH="${STANDBY_REDO_PATHS[0]}"
+if ! STANDBY_DATA_PATH=$(pick_standby_for_primary "$PRIMARY_DATA_PATH" PRIMARY_DATA_PATHS STANDBY_DATA_PATHS); then
+    if [[ -n "$PRIMARY_DATA_PATH" ]]; then
+        STANDBY_DATA_PATH=$(derive_standby_path "$PRIMARY_DATA_PATH")
+    fi
+fi
+if ! STANDBY_REDO_PATH=$(pick_standby_for_primary "$PRIMARY_REDO_PATH" PRIMARY_REDO_PATHS STANDBY_REDO_PATHS); then
+    if [[ -n "$PRIMARY_REDO_PATH" ]]; then
+        STANDBY_REDO_PATH=$(derive_standby_path "$PRIMARY_REDO_PATH")
+    fi
+fi
 
 # ============================================================
 # Standby Redo Log (SRL) Path Separation
@@ -1226,6 +1371,9 @@ done
 # Use STANDBY_DB_UNIQUE_NAME in filename to support concurrent builds
 STANDBY_CONFIG_FILE="${NFS_SHARE}/standby_config_${STANDBY_DB_UNIQUE_NAME}.env"
 
+# -n/--check: everything up to here only collected answers; the .env is the
+# first write (check mode skips it and stops before the generated files).
+if [[ "$CHECK_ONLY" != "1" ]]; then
 cat > "$STANDBY_CONFIG_FILE" <<EOF
 # ============================================================
 # Oracle Data Guard Standby Configuration
@@ -1422,6 +1570,7 @@ STANDBY_ADMIN_DIR="$STANDBY_ADMIN_DIR"
 # are managed by Data Guard Broker (DGMGRL), not set manually
 DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
 EOF
+fi  # end CHECK_ONLY write guard
 
 fi  # end REGENERATE check
 
@@ -1451,7 +1600,9 @@ if [[ "$STANDBY_STORAGE_MODE" != "OMF" && -z "${STANDBY_CONTROL_FILE_2_DIR:-}" ]
             [[ "$_control_file_2_dir" != "/" ]] && _control_file_2_dir="${_control_file_2_dir%/}"
             STANDBY_CONTROL_FILE_2_DIR="$_control_file_2_dir"
             log_info "Second control file copy will be created in: $STANDBY_CONTROL_FILE_2_DIR"
-            printf 'STANDBY_CONTROL_FILE_2_DIR="%s"\n' "$STANDBY_CONTROL_FILE_2_DIR" >> "$STANDBY_CONFIG_FILE"
+            if [[ "$CHECK_ONLY" != "1" ]]; then
+                printf 'STANDBY_CONTROL_FILE_2_DIR="%s"\n' "$STANDBY_CONTROL_FILE_2_DIR" >> "$STANDBY_CONFIG_FILE"
+            fi
         fi
     fi
 fi
@@ -1463,6 +1614,27 @@ fi
 # All required variables are set at this point, either from
 # the prompts (normal) or from the sourced config (regenerate).
 # ############################################################
+
+# ============================================================
+# Check mode: stop before the first generated file
+# ============================================================
+# Everything above was prompting, discovery and validation. In normal mode
+# the .env was the first write (skipped above); --regenerate would also have
+# persisted the rebuilt convert strings and standby paths into it.
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: stopping before writing the standby files. Would write:"
+    if [[ "$REGENERATE" == "1" ]]; then
+        log_info "  $STANDBY_CONFIG_FILE (rebuilt convert strings and standby data/redo paths)"
+    else
+        log_info "  $STANDBY_CONFIG_FILE"
+    fi
+    log_info "  ${NFS_SHARE}/init${STANDBY_ORACLE_SID}_${STANDBY_DB_UNIQUE_NAME}.ora"
+    log_info "  ${NFS_SHARE}/tnsnames_entries_${STANDBY_DB_UNIQUE_NAME}.ora"
+    log_info "  ${NFS_SHARE}/listener_${STANDBY_DB_UNIQUE_NAME}.ora"
+    log_info "  ${NFS_SHARE}/configure_broker_${STANDBY_DB_UNIQUE_NAME}.dgmgrl"
+    finish_check_mode "Standby configuration preflight complete. No files were written."
+fi
 
 # ============================================================
 # Generate Standby Init Parameter File
@@ -1665,7 +1837,11 @@ log_success "Standby listener snippet written to: $LISTENER_FILE"
 
 progress_step "Generating Broker Bootstrap Script"
 
-DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
+# --regenerate keeps a hand-edited name from the .env (step 6 reads it from
+# there); normal mode always derives it, matching what the .env was given.
+if [[ "$REGENERATE" != "1" || -z "${DG_BROKER_CONFIG_NAME:-}" ]]; then
+    DG_BROKER_CONFIG_NAME="${DB_NAME}_DG"
+fi
 # Include standby name in filename to support concurrent builds
 DGMGRL_SCRIPT="${NFS_SHARE}/configure_broker_${STANDBY_DB_UNIQUE_NAME}.dgmgrl"
 

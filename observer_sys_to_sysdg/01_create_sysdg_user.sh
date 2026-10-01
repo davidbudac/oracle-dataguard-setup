@@ -18,6 +18,13 @@
 # (dgmgrl connects at the root), so the name is auto-prefixed
 # with C## after confirmation.
 #
+# Password expiry: a new user lands in the DEFAULT profile, whose
+# PASSWORD_LIFE_TIME is 180 days on a stock 19c database. When the
+# observer's password expires its logins fail with ORA-28001 and FSFO
+# silently stops working, so the script reports the user's effective
+# PASSWORD_LIFE_TIME and (TTY only, default NO) offers a dedicated profile
+# with UNLIMITED life time. It never changes a profile without asking.
+#
 # Run interactively on the PRIMARY host with ORACLE_SID/ORACLE_HOME
 # set and 'sqlplus / as sysdba' working.
 #
@@ -137,6 +144,8 @@ set_password() {
     prompt_password pw2 "Confirm password"
     [[ "$pw" == "$pw2" ]] || die "Passwords do not match."
     [[ -n "$pw" ]] || die "Password cannot be empty."
+    # The password is embedded as IDENTIFIED BY "..." (run_sql sets DEFINE OFF,
+    # so '&' is safe); an embedded double quote would end the identifier.
     case "$pw" in
         *\"*) die 'Password must not contain a double quote (").' ;;
     esac
@@ -184,6 +193,62 @@ grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to $OBSERVER_USER."
         log_info "Password updated."
     else
         log_info "Keeping the existing password (you will need it for the wallet in step 02)."
+    fi
+fi
+
+# ============================================================
+# Password expiry (PASSWORD_LIFE_TIME)
+# ============================================================
+
+log_section "Password Expiry Check"
+
+# Effective PASSWORD_LIFE_TIME of the user's profile (a profile limit of
+# DEFAULT defers to the DEFAULT profile). Informational: a failed query
+# degrades to a warning, never a failed step.
+USER_PROFILE=$(run_sql "select profile from dba_users where username = '${OBSERVER_USER}';" | tr -d ' \t\r') || USER_PROFILE=""
+LIFE_TIME=""
+if [[ -n "$USER_PROFILE" ]]; then
+    LIFE_TIME=$(run_sql "select limit from dba_profiles where profile = '${USER_PROFILE}' and resource_name = 'PASSWORD_LIFE_TIME';" | tr -d ' \t\r') || LIFE_TIME=""
+    if [[ "$LIFE_TIME" == "DEFAULT" ]]; then
+        LIFE_TIME=$(run_sql "select limit from dba_profiles where profile = 'DEFAULT' and resource_name = 'PASSWORD_LIFE_TIME';" | tr -d ' \t\r') || LIFE_TIME=""
+    fi
+fi
+
+OBSERVER_PROFILE="DG_OBSERVER_PROFILE"
+PROFILE_CONTAINER_CLAUSE=""
+if [[ "$IS_CDB" == "YES" ]]; then
+    # A common user needs a common profile (C## prefix, created CONTAINER=ALL).
+    OBSERVER_PROFILE="C##DG_OBSERVER_PROFILE"
+    PROFILE_CONTAINER_CLAUSE=" container = all"
+fi
+PROFILE_SQL="create profile ${OBSERVER_PROFILE} limit password_life_time unlimited${PROFILE_CONTAINER_CLAUSE};
+alter user ${OBSERVER_USER} profile ${OBSERVER_PROFILE};"
+
+if [[ -z "$LIFE_TIME" ]]; then
+    log_warn "Could not read PASSWORD_LIFE_TIME for $OBSERVER_USER - check it yourself:"
+    log_warn "  select p.limit from dba_profiles p, dba_users u where u.username = '${OBSERVER_USER}'"
+    log_warn "    and p.profile = u.profile and p.resource_name = 'PASSWORD_LIFE_TIME';"
+elif [[ "$LIFE_TIME" == "UNLIMITED" ]]; then
+    log_info "Profile $USER_PROFILE: PASSWORD_LIFE_TIME is UNLIMITED - the password will not expire."
+else
+    log_warn "Profile $USER_PROFILE has PASSWORD_LIFE_TIME = $LIFE_TIME (days)."
+    log_warn "When $OBSERVER_USER's password expires the observer's logins fail with"
+    log_warn "ORA-28001 and Fast-Start Failover stops working WITHOUT any obvious alarm."
+    log_warn "Fix: give the observer user a dedicated profile with an unlimited life time:"
+    printf '%s\n' "$PROFILE_SQL" | sed 's/^/      /' >&2
+    if [[ -t 0 ]] && confirm_proceed "Create profile ${OBSERVER_PROFILE} (if missing) and assign it to $OBSERVER_USER now?"; then
+        PROFILE_EXISTS=$(run_sql "select count(*) from dba_profiles where profile = '${OBSERVER_PROFILE}';" | tr -d ' \t\r') || PROFILE_EXISTS="0"
+        if [[ "$PROFILE_EXISTS" == "0" ]]; then
+            run_sql_or_die "create profile ${OBSERVER_PROFILE} limit password_life_time unlimited${PROFILE_CONTAINER_CLAUSE};" \
+                "Failed to create profile $OBSERVER_PROFILE."
+        else
+            log_info "Profile $OBSERVER_PROFILE already exists - assigning it as is."
+        fi
+        run_sql_or_die "alter user ${OBSERVER_USER} profile ${OBSERVER_PROFILE};" \
+            "Failed to assign profile $OBSERVER_PROFILE to $OBSERVER_USER."
+        log_info "$OBSERVER_USER now uses profile $OBSERVER_PROFILE (PASSWORD_LIFE_TIME inherited from it)."
+    else
+        log_warn "Profile left unchanged - schedule a password rotation (and a wallet update) before it expires."
     fi
 fi
 

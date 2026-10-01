@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for the SID-detection/validation pipeline used by
 # dg_status.sh (_detect_pmon_sid / _validate_sid).
@@ -10,12 +10,11 @@
 # read), so this test REPLICATES the extraction pipeline and validation
 # regex as local helper functions instead of sourcing the real script.
 #
-# *** KEEP THIS IN SYNC WITH dg_status.sh ***
-# The helpers below mirror dg_status.sh's _detect_pmon_sid/_validate_sid
-# (see the "Resolve SID" section, around the comment
-# "Priority: -s flag > $ORACLE_SID > auto-detect from pmon"). If that
-# pipeline or regex changes in dg_status.sh, update this file's copies
-# to match, or this test silently drifts from what's actually shipped.
+# The pure helpers (_pmon_sids_from_stream, _select_sid_by_dbname,
+# _validate_sid) are extracted from dg_status.sh by name and eval'ed, so the
+# tested code is the shipped code. Only the REMOTE half
+# (_simulate_remote_pmon_cmd) is a local simulation of what the ssh command
+# prints.
 #
 # Pipeline under test (M23):
 #   REMOTE (inside the ssh command):
@@ -49,20 +48,22 @@ _simulate_remote_pmon_cmd() {
     printf '%s\n' "$ps_output" | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'
 }
 
-# Mirrors the LOCAL half of dg_status.sh:_detect_pmon_sid - it takes the raw
-# stdout stream coming back from ssh.
-_detect_pmon_sid_from_stream() {
-    local stream="$1"
-    local pmon_line sid
-    pmon_line=$(printf '%s\n' "$stream" | grep '^DG_PMON|' | grep 'ora_pmon_' | head -1)
-    if [[ -z "$pmon_line" ]]; then
-        printf ''
-        return 0
+# The LOCAL half is no longer mirrored: the real _pmon_sids_from_stream and
+# _select_sid_by_dbname (both pure, stdin -> stdout) and _validate_sid are
+# extracted from dg_status.sh and eval'ed, so this test cannot drift from what
+# ships. _detect_pmon_sid_from_stream keeps the old "first SID" contract.
+SCRIPT_UNDER_TEST="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/dg_status.sh"
+for _fn in _pmon_sids_from_stream _select_sid_by_dbname _validate_sid; do
+    _src=$(sed -n "/^${_fn}() {/,/^}/p" "$SCRIPT_UNDER_TEST")
+    if [[ -z "$_src" ]]; then
+        echo "FATAL: ${_fn} not found in dg_status.sh"
+        exit 1
     fi
-    sid=$(printf '%s' "$pmon_line" \
-        | sed 's/[[:space:]]*$//' \
-        | sed -n 's/.*ora_pmon_\([A-Za-z][A-Za-z0-9_$]*\)$/\1/p')
-    printf '%s' "$sid"
+    eval "$_src"
+done
+
+_detect_pmon_sid_from_stream() {
+    printf '%s\n' "$1" | _pmon_sids_from_stream | head -1
 }
 
 # Convenience wrapper for the common "clean host, no banner" case: run the
@@ -78,11 +79,6 @@ _detect_pmon_sid_with_banner() {
     stream="${banner}
 $(_simulate_remote_pmon_cmd "$ps_output")"
     _detect_pmon_sid_from_stream "$stream"
-}
-
-# Mirrors dg_status.sh:_validate_sid verbatim.
-_validate_sid() {
-    [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_$]*$ ]]
 }
 
 assert_eq() {
@@ -220,6 +216,33 @@ assert_valid "'orcl_1' is a valid SID shape (digits/underscore allowed after fir
 assert_invalid "'1CDB' is invalid (must start with a letter)" "1CDB"
 assert_invalid "empty string is invalid" ""
 assert_invalid "'+ASM' is invalid (must start with a letter, not '+')" "+ASM"
+
+# ============================================================
+# Case 7 (M11): several instances on one host
+# ============================================================
+echo "Case 7: multiple pmon processes are all reported, in order, without duplicates"
+PS_MULTI="oracle    1234     1  0 10:00 ?        00:00:01 ora_pmon_ORCL
+oracle    1300     1  0 10:00 ?        00:00:01 ora_pmon_CDB1
+oracle    1301     1  0 10:00 ?        00:00:01 ora_pmon_CDB1
+oracle     900     1  0 09:55 ?        00:00:01 ora_pmon_+ASM"
+all_sids=$(_simulate_remote_pmon_cmd "$PS_MULTI" | _pmon_sids_from_stream | tr '\n' ' ')
+assert_eq "all non-ASM SIDs listed once each" "ORCL CDB1 " "$all_sids"
+sid=$(_detect_pmon_sid_from_ps "$PS_MULTI")
+assert_eq "first candidate is the default pick" "ORCL" "$sid"
+
+echo "Case 7b: banner noise does not add candidates"
+all_sids=$( { printf '%s\n' "$BANNER"; _simulate_remote_pmon_cmd "$PS_MULTI"; } | _pmon_sids_from_stream | tr '\n' ' ')
+assert_eq "banner lines are not candidates" "ORCL CDB1 " "$all_sids"
+
+echo "Case 8 (M11): DB_NAME matching selects the standby instance"
+pick=$(printf 'ORCL|ORCL\nCDB1STBY|CDB1\n' | _select_sid_by_dbname "CDB1")
+assert_eq "SID whose DB_NAME equals the primary's is chosen" "CDB1STBY" "$pick"
+pick=$(printf 'ORCL|ORCL\nCDB1STBY|cdb1\n' | _select_sid_by_dbname "CDB1")
+assert_eq "DB_NAME comparison is case-insensitive" "CDB1STBY" "$pick"
+pick=$(printf 'ORCL|ORCL\nOTHER|\n' | _select_sid_by_dbname "CDB1")
+assert_eq "no match yields empty (caller warns and uses the first)" "" "$pick"
+pick=$(printf 'ORCL|\n' | _select_sid_by_dbname "")
+assert_eq "unknown primary DB_NAME never matches an unqueryable instance" "" "$pick"
 
 echo ""
 echo "============================================================"

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script demonstrating why `((VAR++))` / `((VAR--))` is banned
 # in scripts that run under `set -e`, and sweeping the repo to make

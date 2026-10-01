@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for AIX 7.2 portability of the shipped scripts
 # ============================================================

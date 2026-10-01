@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 1: Gather Primary Information
 # ============================================================
@@ -95,11 +95,40 @@ progress_step "Gathering Oracle Environment Information"
 
 # AIX-compatible hostname detection
 PRIMARY_HOSTNAME=$(hostname 2>/dev/null)
-# Try to get FQDN if possible
-if command -v host >/dev/null 2>&1; then
-    FQDN=$(host "$PRIMARY_HOSTNAME" 2>/dev/null | awk '/has address/{print $1; exit}' || true)
-    [[ -n "$FQDN" ]] && PRIMARY_HOSTNAME="$FQDN"
-fi
+
+# Best-effort FQDN for a short hostname; prints the short name unchanged when
+# nothing resolves. Only a result containing a dot counts as qualified.
+#   1. host(1): Linux/BIND prints "name has address a.b.c.d"; AIX prints
+#      "name is a.b.c.d" (an alias line "x is an alias for y" never matches
+#      because the third field must be an IPv4 address)
+#   2. nslookup: the first "Name:" line is the answer
+#   3. /etc/hosts: first alias of the form <short>.<domain> (hosts without DNS)
+resolve_fqdn() {
+    local short="$1" cand=""
+    if command -v host >/dev/null 2>&1; then
+        cand=$(host "$short" 2>/dev/null | awk '
+            ($2 == "has" && $3 == "address") || ($2 == "is" && $3 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) {print $1; exit}' || true)
+        cand="${cand%.}"
+    fi
+    if [[ "$cand" != *.* ]] && command -v nslookup >/dev/null 2>&1; then
+        cand=$(nslookup "$short" 2>/dev/null | awk '/^Name:/{print $2; exit}' || true)
+        cand="${cand%.}"
+    fi
+    if [[ "$cand" != *.* && -r /etc/hosts ]]; then
+        cand=$(awk -v s="$short" '
+            $1 ~ /^#/ {next}
+            {for (i = 2; i <= NF; i++) {
+                if ($i ~ /^#/) break
+                if (index($i, s ".") == 1) {print $i; exit}
+            }}' /etc/hosts 2>/dev/null || true)
+    fi
+    if [[ "$cand" == *.* ]]; then
+        printf '%s' "$cand"
+    else
+        printf '%s' "$short"
+    fi
+}
+PRIMARY_HOSTNAME=$(resolve_fqdn "$PRIMARY_HOSTNAME")
 PRIMARY_ORACLE_HOME="$ORACLE_HOME"
 PRIMARY_ORACLE_BASE="${ORACLE_BASE:-$(dirname $(dirname $ORACLE_HOME))}"
 PRIMARY_ORACLE_SID="$ORACLE_SID"
@@ -318,14 +347,15 @@ if ! is_numeric "$REDOLOG_SIZE_MB"; then
     exit 1
 fi
 
-# Total size with 20% buffer for growth and standby redo logs
+# Redo logs here are every ORL member plus the SRLs (existing or planned), so
+# the 20% buffer below is for growth only.
 TOTAL_DB_SIZE_MB=$((DATAFILE_SIZE_MB + TEMPFILE_SIZE_MB + REDOLOG_SIZE_MB))
 REQUIRED_SPACE_MB=$((TOTAL_DB_SIZE_MB * 120 / 100))
 
 log_info "Database size breakdown:"
 log_info "  Datafiles:     ${DATAFILE_SIZE_MB} MB"
 log_info "  Tempfiles:     ${TEMPFILE_SIZE_MB} MB"
-log_info "  Redo logs:     ${REDOLOG_SIZE_MB} MB"
+log_info "  Redo logs:     ${REDOLOG_SIZE_MB} MB (online members + standby redo logs)"
 log_info "  Total:         ${TOTAL_DB_SIZE_MB} MB"
 log_info "  Required (with 20% buffer): ${REQUIRED_SPACE_MB} MB"
 
@@ -614,7 +644,13 @@ if [[ "$REDO_ARCHIVED_LOG_COUNT" -eq 0 ]]; then
         assign_numeric_field REDO_AVG_MB_PER_HOUR "$STARTUP_STATS_RAW" 3
         # Uptime is reported in hours by the query; the .env stays in days.
         REDO_HISTORY_DAYS=$(awk -v h="$REDO_HISTORY_DAYS" 'BEGIN{printf "%.2f", h/24}')
-        REDO_AVG_MB_PER_DAY=$((REDO_AVG_MB_PER_HOUR * 24))
+        # Under a day of uptime, report the observed total instead of
+        # multiplying a short window up to 24 hours.
+        if awk -v d="$REDO_HISTORY_DAYS" 'BEGIN{exit !(d < 1)}'; then
+            REDO_AVG_MB_PER_DAY="$REDO_TOTAL_MB"
+        else
+            REDO_AVG_MB_PER_DAY=$((REDO_AVG_MB_PER_HOUR * 24))
+        fi
         # Without per-hour history there is no observed peak; the average
         # is the only honest estimate, and it is labelled as such below.
         REDO_PEAK_MB_PER_HOUR="$REDO_AVG_MB_PER_HOUR"
@@ -661,11 +697,16 @@ else
     _redo_window_label="${REDO_HISTORY_DAYS} days of archive history, ${REDO_ARCHIVED_LOG_COUNT} logs"
     _redo_peak_suffix=""
 fi
+# Less than a day of history: per-day figures are observed totals, not rates.
+_redo_day_suffix=""
+if [[ "$REDO_TOTAL_MB" -gt 0 ]] && awk -v d="$REDO_HISTORY_DAYS" 'BEGIN{exit !(d < 1)}'; then
+    _redo_day_suffix=" (observed total - under 1 day of history, not extrapolated)"
+fi
 
 print_status_block "Redo Generation Statistics" \
     "Observed Window" "$_redo_window_label" \
     "Total Redo" "${REDO_TOTAL_MB} MB" \
-    "Average per Day" "${REDO_AVG_MB_PER_DAY} MB (${REDO_AVG_GB_PER_DAY} GB)" \
+    "Average per Day" "${REDO_AVG_MB_PER_DAY} MB (${REDO_AVG_GB_PER_DAY} GB)${_redo_day_suffix}" \
     "Peak Day" "${REDO_PEAK_MB_PER_DAY} MB (${REDO_PEAK_GB_PER_DAY} GB) on ${REDO_PEAK_DAY}" \
     "Average per Hour" "${REDO_AVG_MB_PER_HOUR} MB (${REDO_AVG_MB_PER_SEC} MB/s)" \
     "Peak Hour" "${REDO_PEAK_MB_PER_HOUR} MB (${REDO_PEAK_MB_PER_SEC} MB/s) at ${REDO_PEAK_HOUR}${_redo_peak_suffix}" \
@@ -710,42 +751,67 @@ fi
 
 log_section "Gathering Network Configuration"
 
-# Get listener port - try multiple methods
+# Get listener port - try multiple methods, most authoritative first: the
+# port the DATABASE reports for its own local listener (V$LISTENER_NETWORK,
+# then the local_listener parameter) beats the first PORT= in `lsnrctl
+# status`, which describes the DEFAULT listener (LISTENER) and is wrong for a
+# database served by a non-default one.
 LISTENER_PORT=""
 
-# Method 1: Get from running listener using lsnrctl status
-log_info "Detecting listener port from running listener..."
-LSNRCTL_OUTPUT=$("$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null || true)
-if [[ -n "$LSNRCTL_OUTPUT" ]]; then
-    # Extract PORT from listener output (e.g., "(PORT = 1521)")
-    # AIX-compatible: use sed instead of grep -P
-    LISTENER_PORT=$(echo "$LSNRCTL_OUTPUT" | sed -n 's/.*PORT[[:space:]]*=[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -1)
-    if [[ -n "$LISTENER_PORT" ]]; then
-        log_info "Listener port detected from lsnrctl: $LISTENER_PORT"
+# Echo the first numeric PORT=<n> found in the text on stdin (an address
+# such as (ADDRESS=(PROTOCOL=TCP)(HOST=h)(PORT=1521)), or lsnrctl output);
+# nothing when there is none. POSIX awk only - no grep -o / sed -E.
+extract_port() {
+    awk '{
+        t = toupper($0)
+        if (match(t, /PORT[[:space:]]*=[[:space:]]*[0-9]+/)) {
+            s = substr(t, RSTART, RLENGTH)
+            gsub(/[^0-9]/, "", s)
+            print s
+            exit
+        }
+    }'
+}
+
+# Accept only a real TCP port; anything else is discarded so a garbled
+# value can never reach the .env, the TNS entries or local_listener.
+valid_port_or_empty() {
+    if is_numeric "$1" && [[ "$1" -ge 1 && "$1" -le 65535 ]]; then
+        printf '%s' "$1"
     fi
+}
+
+# Method 1: V$LISTENER_NETWORK (the VALUE column holds the whole address)
+log_info "Detecting listener port from the database (V\$LISTENER_NETWORK)..."
+LISTENER_PORT_RAW=""
+if _lp_out=$(run_sql_query "get_listener_port.sql" 2>/dev/null); then
+    LISTENER_PORT_RAW="$_lp_out"
+fi
+LISTENER_PORT=$(valid_port_or_empty "$(printf '%s\n' "$LISTENER_PORT_RAW" | extract_port)")
+if [[ -n "$LISTENER_PORT" ]]; then
+    log_info "Listener port from V\$LISTENER_NETWORK: $LISTENER_PORT"
 fi
 
-# Method 2: Try V$LISTENER_NETWORK view
-if [[ -z "$LISTENER_PORT" ]]; then
-    LISTENER_PORT=$(run_sql_query "get_listener_port.sql")
-    LISTENER_PORT=$(echo "$LISTENER_PORT" | tr -d '[:space:]')
-    if [[ -n "$LISTENER_PORT" ]]; then
-        log_info "Listener port from V\$LISTENER_NETWORK: $LISTENER_PORT"
-    fi
-fi
-
-# Method 3: Try local_listener parameter
+# Method 2: local_listener parameter (an address, or an alias without a port)
 if [[ -z "$LISTENER_PORT" ]]; then
     LOCAL_LISTENER=$(get_db_parameter "local_listener")
     if [[ -n "$LOCAL_LISTENER" ]]; then
-        # AIX-compatible: use sed to extract 4-5 digit port numbers
-        LISTENER_PORT=$(echo "$LOCAL_LISTENER" | sed -n 's/.*[^0-9]\([0-9]\{4,5\}\)[^0-9].*/\1/p' | head -1)
-        # If sed didn't match, try a simpler pattern
-        if [[ -z "$LISTENER_PORT" ]]; then
-            LISTENER_PORT=$(echo "$LOCAL_LISTENER" | tr -cs '0-9\n' '\n' | awk 'length>=4 && length<=5 {print; exit}')
-        fi
+        LISTENER_PORT=$(valid_port_or_empty "$(printf '%s\n' "$LOCAL_LISTENER" | extract_port)")
         if [[ -n "$LISTENER_PORT" ]]; then
             log_info "Listener port from local_listener parameter: $LISTENER_PORT"
+        fi
+    fi
+fi
+
+# Method 3: running default listener (lsnrctl status). Last resort: it
+# reports the default listener LISTENER, not necessarily this database's.
+if [[ -z "$LISTENER_PORT" ]]; then
+    log_info "Detecting listener port from the default listener (lsnrctl status)..."
+    LSNRCTL_OUTPUT=$("$ORACLE_HOME/bin/lsnrctl" status 2>/dev/null || true)
+    if [[ -n "$LSNRCTL_OUTPUT" ]]; then
+        LISTENER_PORT=$(valid_port_or_empty "$(printf '%s\n' "$LSNRCTL_OUTPUT" | extract_port)")
+        if [[ -n "$LISTENER_PORT" ]]; then
+            log_info "Listener port detected from lsnrctl (default listener): $LISTENER_PORT"
         fi
     fi
 fi
@@ -793,16 +859,61 @@ fi
 # Check REMOTE_LOGIN_PASSWORDFILE
 REMOTE_LOGIN_PWFILE=$(get_db_parameter "remote_login_passwordfile")
 if [[ "$REMOTE_LOGIN_PWFILE" != "EXCLUSIVE" ]]; then
+    # SHARED is not enough for this workflow: the password file is then
+    # read-only and holds only SYS, so the SYSDG observer user (step 9) and
+    # password changes that must propagate to the standby cannot work.
+    # Step 2 applies the same rule.
     log_error "PREREQUISITE FAILED: REMOTE_LOGIN_PASSWORDFILE is not EXCLUSIVE (current: $REMOTE_LOGIN_PWFILE)"
     PREREQ_PASS=false
 else
     log_info "PASS: REMOTE_LOGIN_PASSWORDFILE is EXCLUSIVE"
 fi
 
-# Check password file exists
-PWD_FILE="${ORACLE_HOME}/dbs/orapw${ORACLE_SID}"
-if [[ ! -f "$PWD_FILE" ]]; then
-    log_error "PREREQUISITE FAILED: Password file not found: $PWD_FILE"
+# Check password file exists. Ask the database first (V$PASSWORDFILE_INFO,
+# 18c+, names the file the instance really uses), then fall back to the
+# conventional names: orapw<SID> and orapw<DB_NAME>, under $ORACLE_HOME/dbs
+# and - on a read-only Oracle home - under $ORACLE_BASE_HOME/dbs.
+# (`if` form: a pre-18c "view does not exist" must degrade quietly, not trip
+# the ERR trap.)
+_pwf_db=""
+if _pwf_raw=$(run_sql_query "get_password_file_name.sql" 2>/dev/null); then
+    _pwf_db=$(printf '%s\n' "$_pwf_raw" | sed -n 's/^[[:space:]]*//;s/[[:space:]]*$//;/./{p;q;}')
+fi
+_pwf_dirs=("${ORACLE_HOME}/dbs")
+_obh=""
+if [[ -x "${ORACLE_HOME}/bin/orabasehome" ]]; then
+    _obh=$("${ORACLE_HOME}/bin/orabasehome" 2>/dev/null || true)
+fi
+if [[ -n "$_obh" && "$_obh" != "$ORACLE_HOME" && -d "${_obh}/dbs" ]]; then
+    _pwf_dirs+=("${_obh}/dbs")
+fi
+_pwf_candidates=()
+if [[ -n "$_pwf_db" ]]; then
+    if [[ "$_pwf_db" == +* ]]; then
+        log_warn "The database reports its password file in ASM ($_pwf_db); this script copies"
+        log_warn "  a filesystem file - falling back to orapw<SID>/orapw<DB_NAME> on disk"
+    else
+        _pwf_candidates+=("$_pwf_db")
+    fi
+fi
+for _d in "${_pwf_dirs[@]}"; do
+    _pwf_candidates+=("${_d}/orapw${ORACLE_SID}")
+    if [[ "$DB_NAME" != "$ORACLE_SID" ]]; then
+        _pwf_candidates+=("${_d}/orapw${DB_NAME}")
+    fi
+done
+PWD_FILE=""
+for _c in "${_pwf_candidates[@]}"; do
+    if [[ -f "$_c" ]]; then
+        PWD_FILE="$_c"
+        break
+    fi
+done
+if [[ -z "$PWD_FILE" ]]; then
+    log_error "PREREQUISITE FAILED: Password file not found. Checked:"
+    for _c in "${_pwf_candidates[@]}"; do
+        log_error "  $_c"
+    done
     PREREQ_PASS=false
 else
     log_info "PASS: Password file exists: $PWD_FILE"
@@ -823,10 +934,30 @@ fi
 # Write Output File
 # ============================================================
 
-progress_step "Writing Primary Information to NFS"
-
 # Use DB_UNIQUE_NAME in filename to support concurrent builds
 OUTPUT_FILE="${NFS_SHARE}/primary_info_${DB_UNIQUE_NAME}.env"
+PWD_DEST="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
+
+# -n/--check: everything above is read-only discovery and validation; stop
+# before the first write. The exit status mirrors a real run (1 when a
+# prerequisite failed) so the check is usable as a gate.
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: stopping before writing primary info to the NFS share. Would write:"
+    log_info "  $OUTPUT_FILE"
+    if [[ -n "$PWD_FILE" ]]; then
+        log_info "  $PWD_DEST (copy of $PWD_FILE)"
+    fi
+    if [[ "$PREREQ_PASS" == "true" ]]; then
+        finish_check_mode "Primary preflight complete. No files were written."
+    fi
+    record_state_value "status" "CHECK_ONLY"
+    print_summary "WARNING" "Primary preflight found prerequisite issues. No files were written."
+    echo ""
+    echo "Please resolve the prerequisite issues before proceeding."
+    exit 1
+fi
+
+progress_step "Writing Primary Information to NFS"
 
 cat > "$OUTPUT_FILE" <<EOF
 # ============================================================
@@ -957,10 +1088,11 @@ log_info "Primary info written to: $OUTPUT_FILE"
 # contains the SYS password hash and the share is group-readable, so
 # don't leave it group-readable too. Run common/cleanup_nfs_artifacts.sh
 # once Data Guard setup is verified to remove it from the share entirely.
-PWD_DEST="${NFS_SHARE}/orapw${PRIMARY_ORACLE_SID}"
-if [[ -f "$PWD_FILE" ]]; then
-    confirm_approval_action "Copy primary password file to NFS share" "cp $PWD_FILE $PWD_DEST && chmod 600 $PWD_DEST" || exit 1
-    cp "$PWD_FILE" "$PWD_DEST"
+if [[ -n "$PWD_FILE" ]]; then
+    confirm_approval_action "Copy primary password file to NFS share" "(umask 077; cp $PWD_FILE $PWD_DEST) && chmod 600 $PWD_DEST" || exit 1
+    # umask 077 so the copy is never group-readable, not even briefly; the
+    # chmod also tightens a copy left by an earlier run (cp keeps its mode).
+    ( umask 077; cp "$PWD_FILE" "$PWD_DEST" )
     chmod 600 "$PWD_DEST"
     log_success "Password file copied to: $PWD_DEST"
 fi

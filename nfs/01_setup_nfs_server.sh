@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # NFS Server Setup for Oracle Data Guard
 # ============================================================
@@ -117,7 +117,7 @@ NFS_OWNER="${NFS_OWNER:-$DEFAULT_NFS_OWNER}"
 
 echo ""
 log_info "NFS share path: $NFS_SHARE_PATH"
-log_info "Allowed hosts: $PRIMARY_HOST, $STANDBY_HOST"
+log_info "Requested hosts: $PRIMARY_HOST, $STANDBY_HOST"
 log_info "Share owner: $NFS_OWNER"
 echo ""
 
@@ -184,11 +184,29 @@ if [[ -f "$EXPORTS_FILE" ]]; then
     log_info "Backed up existing exports to: $BACKUP_FILE"
 fi
 
+# Active (non-comment) export lines whose path is exactly the share: a bare
+# substring grep also matched comments and longer paths such as
+# /OINSTALL/_dataguard_setup2.
+existing_export_lines() {
+    awk -v p="$NFS_SHARE_PATH" '$1 == p' "$EXPORTS_FILE" 2>/dev/null
+}
+
+# What the summary reports as "allowed": the hosts this script wrote, or - when
+# an entry was already there and is left untouched - what that entry says.
+EXISTING_EXPORT=$(existing_export_lines || true)
+EXPORT_PRESERVED="no"
+
 # Check if entry already exists
-if grep -q "$NFS_SHARE_PATH" "$EXPORTS_FILE" 2>/dev/null; then
-    log_warn "Entry for $NFS_SHARE_PATH already exists in /etc/exports"
-    log_warn "Please verify it manually:"
-    grep "$NFS_SHARE_PATH" "$EXPORTS_FILE"
+if [[ -n "$EXISTING_EXPORT" ]]; then
+    EXPORT_PRESERVED="yes"
+    log_warn "Entry for $NFS_SHARE_PATH already exists in /etc/exports - leaving it unchanged:"
+    printf '%s\n' "$EXISTING_EXPORT" | sed 's/^/    /'
+    for _requested in "$PRIMARY_HOST" "$STANDBY_HOST"; do
+        if ! printf '%s\n' "$EXISTING_EXPORT" | grep -qF "$_requested"; then
+            log_warn "The existing entry does not mention $_requested - it may not be allowed to mount the share"
+        fi
+    done
+    log_warn "Edit /etc/exports and run 'exportfs -ra' if the host list is wrong"
 else
     # Add new export entries
     echo "" >> "$EXPORTS_FILE"
@@ -239,7 +257,7 @@ if command -v firewall-cmd &> /dev/null; then
         log_info "Firewall configured for NFS"
     fi
 elif command -v ufw &> /dev/null; then
-    if ufw status | grep -q "active"; then
+    if ufw status | grep -q '^Status: active'; then
         log_info "Configuring ufw for NFS..."
         ufw allow from "$PRIMARY_HOST" to any port nfs
         ufw allow from "$STANDBY_HOST" to any port nfs
@@ -279,7 +297,12 @@ echo "============================================================"
 echo ""
 echo "NFS Share: $NFS_SHARE_PATH"
 echo "Owner: $NFS_OWNER (permissions 750)"
-echo "Allowed hosts: $PRIMARY_HOST, $STANDBY_HOST"
+if [[ "$EXPORT_PRESERVED" == "yes" ]]; then
+    echo "Allowed hosts: as in the EXISTING /etc/exports entry (not modified by this run):"
+    printf '%s\n' "$EXISTING_EXPORT" | sed 's/^/    /'
+else
+    echo "Allowed hosts: $PRIMARY_HOST, $STANDBY_HOST"
+fi
 echo ""
 echo "NEXT STEPS:"
 echo "==========="

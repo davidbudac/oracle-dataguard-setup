@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 10: Generate Handoff Report
 # ============================================================
@@ -136,17 +136,33 @@ HANDOFF_RC=0
 bash "$HANDOFF_SCRIPT" "${HANDOFF_ARGS[@]}" || HANDOFF_RC=$?
 echo ""
 
-if [[ "$HANDOFF_RC" -eq 3 ]]; then
-    log_error "dg_handoff.sh could not run (usage or connection error). No report was generated."
+# Only the documented verdict codes are trusted. Anything else (127 not
+# found, 126 not executable, 130/137/141 killed or broken pipe, ...) means
+# dg_handoff.sh did not finish its job and must not read as HEALTHY.
+VERDICT=""
+case "$HANDOFF_RC" in
+    0) VERDICT="HEALTHY" ;;
+    1) VERDICT="WARNING" ;;
+    2) VERDICT="ERROR" ;;
+    3)
+        log_error "dg_handoff.sh could not run (usage or connection error). No report was generated."
+        print_summary "ERROR" "Handoff report generation failed"
+        exit 1
+        ;;
+    *)
+        log_error "dg_handoff.sh exited with unexpected status ${HANDOFF_RC} (not a verdict code). The report is not trustworthy."
+        print_summary "ERROR" "Handoff report generation failed"
+        exit 1
+        ;;
+esac
+
+# A verdict code with no report behind it (output path not writable, run
+# interrupted after the verdict was decided) is still a failed handoff.
+if [[ ! -s "$REPORT_FILE" ]]; then
+    log_error "dg_handoff.sh reported ${VERDICT} but the report file is missing or empty: ${REPORT_FILE}"
     print_summary "ERROR" "Handoff report generation failed"
     exit 1
 fi
-
-VERDICT="HEALTHY"
-case "$HANDOFF_RC" in
-    1) VERDICT="WARNING" ;;
-    2) VERDICT="ERROR" ;;
-esac
 
 print_status_block "Handoff Report" \
     "Configuration"   "${PRIMARY_DB_UNIQUE_NAME} -> ${STANDBY_DB_UNIQUE_NAME}" \

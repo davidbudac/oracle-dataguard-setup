@@ -19,7 +19,16 @@
 #   5. Smoke-test the new PDB and confirm it is applied on the CDB standby.
 #
 # By default, step 06 (decommission / drop non-CDB) is skipped. Pass
-# --decommission to enable, --drop to actually drop.
+# --decommission to enable, --drop to actually drop (this also exports
+# MIGRATE_ALLOW_DROP=1: MIGRATE_NONINTERACTIVE=1 alone never authorises a DROP).
+#
+# Standby prerequisites (step 01 refuses without them): a wallet entry for the
+# CDB standby alias on the primary host (common/setup_dg_wallet.sh), and the
+# new PDB's datafile directory on the standby host. Pass them through the
+# environment of this driver, e.g.
+#   STANDBY_SSH_TARGET=oracle@<standby>    # step 01 checks/creates the dir over ssh
+#   STANDBY_DIRS_CONFIRMED=yes             # ... or: you created it yourself
+#   TARGET_CDB_STANDBY_TNS_ALIAS, STANDBY_STAGE_DIR   (optional)
 #
 # Usage:
 #   bash ./run_migration_test.sh                   # safe end-to-end
@@ -235,6 +244,10 @@ NFS_SHARE=\"${NFS_SHARE}\"
 TARGET_PDB_DATAFILE_DIR=\"${TARGET_PDB_DATAFILE_DIR}\"
 SKIP_DECOMMISSION=\"${SKIP_DECOMMISSION:-true}\"
 ALLOW_DROP_NONCDB=\"${ALLOW_DROP_NONCDB:-no}\"
+${TARGET_CDB_STANDBY_TNS_ALIAS:+TARGET_CDB_STANDBY_TNS_ALIAS=\"${TARGET_CDB_STANDBY_TNS_ALIAS}\"}
+${STANDBY_STAGE_DIR:+STANDBY_STAGE_DIR=\"${STANDBY_STAGE_DIR}\"}
+${STANDBY_SSH_TARGET:+STANDBY_SSH_TARGET=\"${STANDBY_SSH_TARGET}\"}
+${STANDBY_DIRS_CONFIRMED:+STANDBY_DIRS_CONFIRMED=\"${STANDBY_DIRS_CONFIRMED}\"}
 EOF
     cat '${cfg_path}'"
     log_pass "Migration config rendered to ${cfg_path}"
@@ -244,7 +257,7 @@ run_remote_step() {
     local script="$1"
     local label="$2"
     log_phase "STEP: ${label}"
-    if ssh_run_capture PRIMARY "MIGRATE_NONINTERACTIVE=1 bash '${REPO_DIR}/migrate_noncdb_to_pdb/${script}'"; then
+    if ssh_run_capture PRIMARY "MIGRATE_NONINTERACTIVE=1 MIGRATE_ALLOW_DROP='${MIGRATE_ALLOW_DROP:-0}' bash '${REPO_DIR}/migrate_noncdb_to_pdb/${script}'"; then
         log_pass "${label}"
     else
         log_fail "${label}"
@@ -349,11 +362,15 @@ main() {
 
     SKIP_DECOMMISSION="true"
     ALLOW_DROP_NONCDB="no"
+    MIGRATE_ALLOW_DROP="0"
     if [[ "$decommission" == "true" ]]; then
         SKIP_DECOMMISSION="false"
-        [[ "$drop" == "true" ]] && ALLOW_DROP_NONCDB="I_UNDERSTAND"
+        if [[ "$drop" == "true" ]]; then
+            ALLOW_DROP_NONCDB="I_UNDERSTAND"
+            MIGRATE_ALLOW_DROP="1"
+        fi
     fi
-    export SKIP_DECOMMISSION ALLOW_DROP_NONCDB
+    export SKIP_DECOMMISSION ALLOW_DROP_NONCDB MIGRATE_ALLOW_DROP
 
     cat > "$ISSUES_FILE" <<EOF
 # Migration test issues — ${TIMESTAMP}

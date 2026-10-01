@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # NFS Client Mount for Oracle Data Guard
 # ============================================================
@@ -41,6 +41,100 @@ log_warn() {
 
 log_error() {
     printf "${RED}[ERROR]${NC} %s\n" "$1"
+}
+
+# ============================================================
+# Mount / address helpers
+# ============================================================
+
+# True when something is mounted at $1. `mountpoint` is absent on minimal
+# images, so fall back to /proc/mounts and finally `mount` output.
+is_mounted() {
+    local path="$1"
+    if command -v mountpoint >/dev/null 2>&1; then
+        mountpoint -q "$path" 2>/dev/null
+    elif [ -r /proc/mounts ]; then
+        awk -v p="$path" '$2 == p { found = 1 } END { exit !found }' /proc/mounts
+    else
+        mount 2>/dev/null | grep -q " on ${path} "
+    fi
+}
+
+# One address per line for every local interface (loopback included).
+local_addresses() {
+    if command -v ip >/dev/null 2>&1; then
+        ip -o addr show 2>/dev/null | awk '{ sub(/\/.*/, "", $4); print $4 }'
+    fi
+    hostname -I 2>/dev/null | tr ' ' '\n'
+    if command -v ifconfig >/dev/null 2>&1; then
+        ifconfig -a 2>/dev/null | awk '$1 == "inet" || $1 == "inet6" { a = $2; sub(/^addr:/, "", a); print a }'
+    fi
+    return 0
+}
+
+# One address per line for $1: the literal itself when it already is an
+# address, otherwise whatever the resolver (getent, so /etc/hosts and DNS as
+# the mount itself would see them) returns. Empty when it does not resolve.
+resolve_addresses() {
+    local name="$1"
+    case "$name" in
+        *:*) printf '%s\n' "$name"; return 0 ;;
+        *[!0-9.]*) ;;
+        *) printf '%s\n' "$name"; return 0 ;;
+    esac
+    if command -v getent >/dev/null 2>&1; then
+        getent ahosts "$name" 2>/dev/null | awk '{ print $1 }' | sort -u
+    fi
+    return 0
+}
+
+# True when $1 (hostname, FQDN or address, as typed by the operator) is this host.
+is_local_host() {
+    local name addr locals h_full h_short h_fqdn srv_short resolved
+    name=$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')
+    [ -n "$name" ] || return 1
+
+    case "$name" in
+        localhost|localhost.*) return 0 ;;
+    esac
+
+    h_full=$(hostname 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    h_short=$(hostname -s 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    h_fqdn=$(hostname -f 2>/dev/null | tr '[:upper:]' '[:lower:]')
+    if [ "$name" = "$h_full" ] || [ "$name" = "$h_short" ] || [ "$name" = "$h_fqdn" ]; then
+        return 0
+    fi
+
+    # Address comparison is authoritative whenever the name resolves: an
+    # operator-typed FQDN (host.example.com) rarely equals `hostname`, but it
+    # resolves to one of this host's own addresses (or to loopback).
+    locals=$(local_addresses)
+    resolved=$(resolve_addresses "$name")
+    if [ -n "$resolved" ]; then
+        for addr in $resolved; do
+            case "$addr" in
+                127.*|::1) return 0 ;;
+            esac
+            if printf '%s\n' "$locals" | grep -Fxq "$addr"; then
+                return 0
+            fi
+        done
+        return 1
+    fi
+
+    # Unresolvable name: last resort is the short name (host.example.com vs
+    # `hostname` = host). Skipped for address literals, whose "short name"
+    # would be their first octet.
+    case "$name" in
+        *:*) return 1 ;;
+        *[!0-9.]*)
+            srv_short="${name%%.*}"
+            if [ -n "$srv_short" ] && { [ "$srv_short" = "$h_short" ] || [ "$srv_short" = "${h_full%%.*}" ]; }; then
+                return 0
+            fi
+            ;;
+    esac
+    return 1
 }
 
 # ============================================================
@@ -130,7 +224,7 @@ echo ""
 # Check if already mounted
 # ============================================================
 
-if mountpoint -q "$NFS_MOUNT_PATH" 2>/dev/null; then
+if is_mounted "$NFS_MOUNT_PATH"; then
     log_info "NFS share is already mounted at $NFS_MOUNT_PATH"
     echo ""
     df -h "$NFS_MOUNT_PATH"
@@ -180,22 +274,12 @@ NFS_SOURCE="$NFS_SERVER:$NFS_MOUNT_PATH"
 # Found live: the walkthrough runs this script on both DB hosts, and the
 # NFS server is usually one of them.
 
+# Match by name (short, FQDN) and by address: the operator may type the
+# server as an FQDN or an alias that `hostname` never reports, which used to
+# slip past this check and self-mount over the export.
 _is_local_nfs_server="no"
-if [ "$NFS_SERVER" = "$(hostname 2>/dev/null)" ] || [ "$NFS_SERVER" = "$(hostname -s 2>/dev/null)" ]; then
+if is_local_host "$NFS_SERVER"; then
     _is_local_nfs_server="yes"
-elif hostname -I >/dev/null 2>&1; then
-    # Linux: match against every local interface address
-    for _local_ip in $(hostname -I 2>/dev/null); do
-        if [ "$NFS_SERVER" = "$_local_ip" ]; then
-            _is_local_nfs_server="yes"
-            break
-        fi
-    done
-elif command -v ifconfig >/dev/null 2>&1; then
-    # AIX/other: fall back to ifconfig -a output
-    if ifconfig -a 2>/dev/null | grep -w "inet" | awk '{print $2}' | grep -qx "$NFS_SERVER"; then
-        _is_local_nfs_server="yes"
-    fi
 fi
 
 if [ "$_is_local_nfs_server" = "yes" ]; then
@@ -297,6 +381,16 @@ log_info "Mounting NFS share..."
 # interactive mount actually exercises what will be used on every reboot
 # instead of the (different) kernel defaults.
 if mount -t nfs4 -o "$FSTAB_OPTIONS" "$NFS_SOURCE" "$NFS_MOUNT_PATH"; then
+    # FSTAB_OPTIONS carries `bg`: when the first attempt fails mount.nfs
+    # backgrounds the retry loop and exits 0, so a zero status does not mean
+    # the share is mounted. Check, rather than trust the exit code.
+    if ! is_mounted "$NFS_MOUNT_PATH"; then
+        log_error "mount reported success but nothing is mounted at $NFS_MOUNT_PATH"
+        log_error "(the 'bg' option backgrounds failed attempts and still exits 0 - the server is"
+        log_error "unreachable, the export is missing, or this host is not allowed to mount it)"
+        log_error "Try mounting manually without bg: mount -t nfs4 -o ${FSTAB_OPTIONS/,bg,/,} $NFS_SOURCE $NFS_MOUNT_PATH"
+        exit 1
+    fi
     log_info "NFS share mounted successfully"
 else
     log_error "Failed to mount NFS share"

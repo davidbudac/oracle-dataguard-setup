@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Create Role-Aware Service Trigger
 #                           (CDB / PDB-aware, SYS-owned)
@@ -60,6 +60,8 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+# Own parser below rejects unknown options
+DG_SCRIPT_FLAGS='*'
 enable_verbose_mode "$@"
 
 usage() {
@@ -75,6 +77,8 @@ Options:
   -o, --output FILE   Write the generated SQL to FILE
                       (default: \${NFS_SHARE}/dg_service_mgr_cdb_<DB>.sql, or
                       ./dg_service_mgr_cdb_<DB>.sql when NFS is unavailable)
+  -n, --check         Discover and validate, print the plan, then stop before
+                      changing anything
   -v, --verbose       Verbose output
   -h, --help          Show this help
 USAGE
@@ -96,7 +100,8 @@ while [[ $# -gt 0 ]]; do
         -h|--help)    usage; exit 0 ;;
         # Global flags consumed by enable_verbose_mode - accept as no-ops
         -v|--verbose|--no-verbose|-a|--approval-mode|--no-approval-mode) shift ;;
-        -s|--suspicious|--no-suspicious|-n|--check|--plan|--execute)     shift ;;
+        # -n/--check is parsed by enable_verbose_mode; this script honours CHECK_ONLY
+        -s|--suspicious|--no-suspicious|-n|--check|--plan|--execute|--no-color) shift ;;
         -*)           printf "Unknown option: %s\n\n" "$1"; usage; exit 1 ;;
         *)            printf "Unexpected argument: %s\n\n" "$1"; usage; exit 1 ;;
     esac
@@ -320,13 +325,15 @@ resolve_service_name() {
     resolved=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 SELECT 'SVCNAME=' || name FROM (
-    SELECT s.name AS name
-    FROM CDB_SERVICES s JOIN V\$CONTAINERS c ON c.CON_ID = s.CON_ID
-    WHERE UPPER(s.name) = UPPER('${svc}') AND UPPER(c.name) = UPPER('${pdb}')
-    UNION
-    SELECT s.name
-    FROM V\$ACTIVE_SERVICES s JOIN V\$CONTAINERS c ON c.CON_ID = s.CON_ID
-    WHERE UPPER(s.name) = UPPER('${svc}') AND UPPER(c.name) = UPPER('${pdb}')
+    SELECT name FROM (
+        SELECT s.name AS name
+        FROM CDB_SERVICES s JOIN V\$CONTAINERS c ON c.CON_ID = s.CON_ID
+        WHERE UPPER(s.name) = UPPER('${svc}') AND UPPER(c.name) = UPPER('${pdb}')
+        UNION
+        SELECT s.name
+        FROM V\$ACTIVE_SERVICES s JOIN V\$CONTAINERS c ON c.CON_ID = s.CON_ID
+        WHERE UPPER(s.name) = UPPER('${svc}') AND UPPER(c.name) = UPPER('${pdb}')
+    ) ORDER BY CASE WHEN name = '${svc}' THEN 0 ELSE 1 END, name
 ) WHERE ROWNUM = 1;
 EXIT;
 EOSQL
@@ -561,7 +568,9 @@ if [[ "$PKG_EXISTS" != "0" ]]; then
     echo "Existing objects will be replaced with the new definition."
     echo "This is safe - the new package will contain the updated service list."
     echo ""
-    if ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_info "Check mode: the existing package and triggers would be replaced"
+    elif ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
         log_info "Deployment cancelled by user"
         exit 0
     fi
@@ -586,6 +595,23 @@ print_service_list
 echo ""
 echo "Objects will replicate to standby via redo apply."
 echo ""
+
+# Default the output location to the NFS share when one is available (keeps
+# parity with the config-driven workflow); otherwise fall back to the current
+# directory so the script stays fully standalone. -o/--output overrides both.
+if [[ -n "$OUTPUT_FILE" ]]; then
+    SQL_OUTPUT_FILE="$OUTPUT_FILE"
+elif [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
+fi
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: generated SQL would be written to: $SQL_OUTPUT_FILE"
+    log_info "Check mode: no changes made"
+    finish_check_mode "Role-trigger preflight complete. No database objects were created or replaced."
+fi
 
 if ! confirm_proceed "Deploy DG_SERVICE_MGR package and triggers?"; then
     log_info "Deployment cancelled by user"
@@ -708,7 +734,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
     BEGIN
         IF p_pdb IS NULL OR UPPER(p_pdb) = 'CDB\$ROOT' THEN
             -- Root-level service: act in the current (root) container.
-            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+            -- V\$ACTIVE_SERVICES in the root lists the services of EVERY container: a same-named
+            -- PDB service would hide a not-running root service (or get a root one stopped).
+            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES
+             WHERE name = p_svc AND con_id = SYS_CONTEXT('USERENV', 'CON_ID');
             IF p_start AND l_active = 0 THEN
                 DBMS_SERVICE.START_SERVICE(p_svc);
             ELSIF NOT p_start AND l_active > 0 THEN
@@ -858,6 +887,13 @@ fi
 
 if [[ "$DEPLOY_OK" != "true" ]]; then
     log_error "Deployment verification failed"
+    # Show what the database said: the ORA-/PLS- lines (and compilation
+    # warnings) are the only clue to why the objects are missing or invalid.
+    DEPLOY_ERRORS=$( { printf '%s\n' "$DEPLOY_RESULT" | grep -E '^(ORA-|PLS-|SP2-|Warning:)' || true; } )
+    [[ -n "$DEPLOY_ERRORS" ]] || DEPLOY_ERRORS="$DEPLOY_RESULT"
+    echo ""
+    echo "Database output:"
+    printf '%s\n' "$DEPLOY_ERRORS" | sed 's/^/  /'
     echo ""
     echo "Check for compilation errors:"
     echo "  SELECT * FROM DBA_ERRORS WHERE OWNER = 'SYS' AND NAME = 'DG_SERVICE_MGR';"
@@ -870,17 +906,6 @@ fi
 # ============================================================
 
 log_section "Saving Generated SQL"
-
-# Default the output location to the NFS share when one is available (keeps
-# parity with the config-driven workflow); otherwise fall back to the current
-# directory so the script stays fully standalone. -o/--output overrides both.
-if [[ -n "$OUTPUT_FILE" ]]; then
-    SQL_OUTPUT_FILE="$OUTPUT_FILE"
-elif [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
-    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
-else
-    SQL_OUTPUT_FILE="./dg_service_mgr_cdb_${PRIMARY_DB_UNIQUE_NAME}.sql"
-fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
@@ -946,7 +971,10 @@ CREATE OR REPLACE PACKAGE BODY SYS.DG_SERVICE_MGR AS
         l_active NUMBER;
     BEGIN
         IF p_pdb IS NULL OR UPPER(p_pdb) = 'CDB\$ROOT' THEN
-            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES WHERE name = p_svc;
+            -- V\$ACTIVE_SERVICES in the root lists the services of EVERY container: a same-named
+            -- PDB service would hide a not-running root service (or get a root one stopped).
+            SELECT COUNT(*) INTO l_active FROM V\$ACTIVE_SERVICES
+             WHERE name = p_svc AND con_id = SYS_CONTEXT('USERENV', 'CON_ID');
             IF p_start AND l_active = 0 THEN
                 DBMS_SERVICE.START_SERVICE(p_svc);
             ELSIF NOT p_start AND l_active > 0 THEN

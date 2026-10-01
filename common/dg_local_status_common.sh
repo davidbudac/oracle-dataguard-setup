@@ -248,12 +248,49 @@ run_remote_sql() {
     # sqlplus command line, so a password-based connect string (sys/pw@tns)
     # never appears in `ps -ef`. Works the same for wallet-based connects
     # (/@tns) - no password involved there either way.
+    # SET DEFINE OFF comes first: with DEFINE on, an '&' in the password makes
+    # SQL*Plus try to substitute a variable inside the CONNECT line.
     sqlplus -s /nolog <<SQL
+SET DEFINE OFF
 CONNECT ${connect} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
 ${query}
 EXIT;
 SQL
+}
+
+# Portable time bound for hosts without the `timeout` binary (stock AIX):
+# run run_remote_sql in the background, poll with `sleep 1`, kill it when the
+# deadline passes. `exec` makes the background PID the sqlplus process itself,
+# so one kill reaches it. Output is captured in a private temp file and
+# printed afterwards, as a plain `$(...)` capture would see it.
+run_remote_sql_watchdog() {
+    local timeout_secs="$1" connect="$2" query="$3"
+    local out pid waited=0 script
+    out="${TMPDIR:-/tmp}/dg_rsql.$$.${RANDOM:-0}"
+    ( umask 077; : > "$out" ) 2>/dev/null || return 1
+    script="SET DEFINE OFF
+CONNECT ${connect} AS SYSDBA
+SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
+${query}
+EXIT;"
+    ( exec sqlplus -s /nolog ) > "$out" 2>&1 <<SQL &
+${script}
+SQL
+    pid=$!
+    while kill -0 "$pid" 2>/dev/null; do
+        if (( waited >= timeout_secs )); then
+            kill "$pid" 2>/dev/null
+            sleep 1
+            kill -9 "$pid" 2>/dev/null
+            break
+        fi
+        sleep 1
+        waited=$((waited + 1))
+    done
+    { wait "$pid"; } 2>/dev/null
+    cat "$out" 2>/dev/null
+    rm -f "$out"
 }
 
 # Inject CONNECT_TIMEOUT/TRANSPORT_CONNECT_TIMEOUT/RETRY_COUNT into a TNS
@@ -297,13 +334,18 @@ run_remote_sql_timeout() {
     local timeout_secs="$1" connect="$2" query="$3"
     local auth identifier
 
-    # Embed connect-time timeouts in the connect identifier itself (see
-    # build_timeout_connect_string) - this protects the connect regardless
-    # of whether the `timeout` binary exists. When `timeout` IS present we
-    # additionally wrap the whole sqlplus call with it as a second layer,
-    # since it also catches non-network hangs (e.g. sqlplus blocking on an
-    # unexpected prompt) that a connect-time parameter cannot cover.
-    if [[ "$connect" == *@* ]]; then
+    # Wallet connects (/@alias) must keep the alias TEXT exactly as given. The
+    # secure external password store matches credentials on the connect string
+    # as written (common/setup_dg_wallet.sh stores them under the alias), so
+    # rewriting /@alias into /@(DESCRIPTION=...) never finds the credential
+    # and every wallet probe would fail. Those connects are bounded from
+    # outside instead (timeout binary, else the background-and-kill watchdog).
+    #
+    # Only the password path (user/pw@alias) has no such constraint, so it
+    # gets connect-time timeouts embedded in the descriptor (see
+    # build_timeout_connect_string) - the SQL*Net-level bound that works
+    # even where neither timeout nor a watchdog helps a hung connect.
+    if [[ "$connect" != /@* && "$connect" == *@* ]]; then
         auth="${connect%@*}"
         identifier="${connect##*@}"
         connect="${auth}@$(build_timeout_connect_string "$timeout_secs" "$identifier")"
@@ -316,13 +358,15 @@ run_remote_sql_timeout() {
     # a command-line logon does.
     if command -v timeout >/dev/null 2>&1; then
         timeout "${timeout_secs}"s sqlplus -s /nolog <<SQL
+SET DEFINE OFF
 CONNECT ${connect} AS SYSDBA
 SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
 ${query}
 EXIT;
 SQL
     else
-        run_remote_sql "$connect" "$query"
+        run_remote_sql_watchdog "$timeout_secs" "$connect" "$query" \
+            || run_remote_sql "$connect" "$query"
     fi
 }
 
@@ -332,8 +376,8 @@ SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
 " 2>&1)
 
     LOC_ID_STATUS=$(printf '%s\n' "$LOCAL_ID_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-    LOC_ROLE=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $1}' | xargs)
-    LOC_DBUNIQ=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $2}' | xargs)
+    LOC_ROLE=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_DBUNIQ=$(printf '%s' "$LOC_ID_STATUS" | awk -F'|' '{print $2}' | dg_trim)
 
     # H12: with the instance down, every field parses empty, every
     # assessment below is gated on a non-empty role so none of them fire,
@@ -368,7 +412,7 @@ collect_broker_data() {
     DGMGRL_CONFIG=$(dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1)
     DGMGRL_FSFO=$(dgmgrl -silent / 'SHOW FAST_START FAILOVER' 2>&1)
 
-    BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | xargs)
+    BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | dg_trim)
     BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | extract_first_status)
 
     if $IS_PRIMARY; then
@@ -385,6 +429,10 @@ collect_broker_data() {
     else
         DGMGRL_PEER=""
     fi
+}
+
+_dg_restore_echo() {
+    stty echo 2>/dev/null || true
 }
 
 attempt_remote_connection() {
@@ -424,6 +472,13 @@ SELECT 'WALLET_OK' FROM DUAL;
 
     if $PROMPT_PASSWORD || $REMOTE_DEFAULT_PROMPT; then
         printf " Enter SYS password for remote connection (or press Enter to skip): "
+        # C12: restore echo if the operator hits Ctrl-C (or the script is
+        # terminated) while it is off, otherwise the terminal is left silent.
+        # EXIT is trapped as well as INT/TERM; all three are cleared again as
+        # soon as the read returns.
+        trap '_dg_restore_echo' EXIT
+        trap '_dg_restore_echo; printf "\n"; trap - EXIT; exit 130' INT
+        trap '_dg_restore_echo; printf "\n"; trap - EXIT; exit 143' TERM
         stty -echo 2>/dev/null || true
         # WS4.6: on EOF/closed stdin, `read` fails and SYS_PASS is left
         # empty - `|| SYS_PASS=""` makes that explicit rather than relying
@@ -434,14 +489,21 @@ SELECT 'WALLET_OK' FROM DUAL;
         # real answers into these scripts over a non-tty stdin, and that
         # must keep working exactly as before.
         read -r SYS_PASS || SYS_PASS=""
-        stty echo 2>/dev/null || true
+        _dg_restore_echo
+        trap - EXIT INT TERM
         printf "\n"
 
-        if [[ -n "$SYS_PASS" ]]; then
+        if [[ "$SYS_PASS" == *\"* ]]; then
+            # A double quote cannot be embedded in a quoted CONNECT password.
+            printf " ERROR: the SYS password contains a double quote (\"), which cannot be passed in a quoted CONNECT; skipping the password connection.\n" >&2
+            REMOTE_CONNECTION_RESULT="SYS password contains a double quote and cannot be used; continuing with broker-only view"
+        elif [[ -n "$SYS_PASS" ]]; then
             # Quote the password inside the connect string (handles most
-            # special characters an operator might type); run_remote_sql
-            # and run_remote_sql_timeout feed this whole string to sqlplus
-            # via a CONNECT statement on stdin, never on the command line.
+            # special characters an operator might type, '&' included -
+            # SET DEFINE OFF is the first line of the CONNECT script);
+            # run_remote_sql and run_remote_sql_timeout feed this whole
+            # string to sqlplus via a CONNECT statement on stdin, never on
+            # the command line.
             REMOTE_CONNECT="sys/\"${SYS_PASS}\"@${PEER_TNS}"
             PASS_TEST=$(run_remote_sql_timeout "$REMOTE_TEST_TIMEOUT" "$REMOTE_CONNECT" "SELECT 'PASS_OK' FROM DUAL;" 2>&1)
             if printf '%s' "$PASS_TEST" | grep -q 'PASS_OK'; then
@@ -505,53 +567,53 @@ ${DG_SQL_SELECT_RECMODE}
 
 parse_local_sql() {
     LOC_DBSTATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-    LOC_ROLE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
-    LOC_OPEN=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
-    LOC_PROTECT=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
-    LOC_SWITCH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
-    LOC_FORCE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
-    LOC_FLASH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
-    LOC_DBUNIQ=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+    LOC_ROLE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_OPEN=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_PROTECT=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $3}' | dg_trim)
+    LOC_SWITCH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $4}' | dg_trim)
+    LOC_FORCE=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $5}' | dg_trim)
+    LOC_FLASH=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $6}' | dg_trim)
+    LOC_DBUNIQ=$(printf '%s' "$LOC_DBSTATUS" | awk -F'|' '{print $7}' | dg_trim)
 
-    LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
-    LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
-    LOC_UNNAMED=$(printf '%s\n' "$LOCAL_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+    LOC_BROKER=$(printf '%s\n' "$LOCAL_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | dg_trim)
+    LOC_ARCHGAP=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | dg_trim)
+    LOC_UNNAMED=$(printf '%s\n' "$LOCAL_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | dg_trim)
     case "$LOC_UNNAMED" in ''|*[!0-9]*) LOC_UNNAMED="" ;; esac
     LOC_REDO=$(printf '%s\n' "$LOCAL_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
-    LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | xargs)
-    LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | xargs)
-    LOC_SRL=$(printf '%s\n' "$LOCAL_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
+    LOC_REDO_CNT=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_REDO_MB=$(printf '%s' "$LOC_REDO" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_SRL=$(printf '%s\n' "$LOCAL_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | dg_trim)
 
-    LOC_DEST2_STATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | xargs)
-    LOC_DEST2_DBUNIQ=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | xargs)
-    LOC_DEST2_ERROR=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $5}' | xargs)
+    LOC_DEST2_STATUS=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | dg_trim)
+    LOC_DEST2_DBUNIQ=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | dg_trim)
+    LOC_DEST2_ERROR=$(printf '%s\n' "$LOCAL_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $5}' | dg_trim)
 
     LOC_FSFODB=$(printf '%s\n' "$LOCAL_SQL" | grep '^FSFODB|' | head -1 | sed 's/^FSFODB|//')
-    LOC_FSFO_STATUS=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $1}' | xargs)
-    LOC_FSFO_OBSERVER_PRESENT=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $2}' | xargs)
-    LOC_FSFO_OBSERVER_HOST=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $3}' | xargs)
+    LOC_FSFO_STATUS=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_FSFO_OBSERVER_PRESENT=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_FSFO_OBSERVER_HOST=$(printf '%s' "$LOC_FSFODB" | awk -F'|' '{print $3}' | dg_trim)
 
     LOC_FRA=$(printf '%s\n' "$LOCAL_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
-    LOC_FRA_PATH=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $1}' | xargs)
-    LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | xargs)
-    LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | xargs)
-    LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | xargs)
-    LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | xargs)
+    LOC_FRA_PATH=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_FRA_SIZE=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_FRA_USED=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $3}' | dg_trim)
+    LOC_FRA_RECLAIM=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $4}' | dg_trim)
+    LOC_FRA_FILES=$(printf '%s' "$LOC_FRA" | awk -F'|' '{print $5}' | dg_trim)
 
     LOC_SERVICES=$(format_services "$(printf '%s\n' "$LOCAL_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
     LOC_MRP=$(printf '%s\n' "$LOCAL_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
-    LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | xargs)
-    LOC_MRP_SEQ=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $3}' | xargs)
+    LOC_MRP_STATUS=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_MRP_SEQ=$(printf '%s' "$LOC_MRP" | awk -F'|' '{print $3}' | dg_trim)
 
-    LOC_TRANSPORT_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
-    LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
-    LOC_APPLY_FINISH=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply finish time' | awk -F'|' '{print $3}' | xargs)
+    LOC_TRANSPORT_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | dg_trim)
+    LOC_APPLY_LAG=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | dg_trim)
+    LOC_APPLY_FINISH=$(printf '%s\n' "$LOCAL_SQL" | grep 'apply finish time' | awk -F'|' '{print $3}' | dg_trim)
 
     LOC_APPLYINFO=$(printf '%s\n' "$LOCAL_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
-    LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
-    LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
-    LOC_RECOVERY_MODE=$(printf '%s\n' "$LOCAL_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
+    LOC_LAST_APPLIED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $1}' | dg_trim)
+    LOC_LAST_RECEIVED=$(printf '%s' "$LOC_APPLYINFO" | awk -F'|' '{print $2}' | dg_trim)
+    LOC_RECOVERY_MODE=$(printf '%s\n' "$LOCAL_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | dg_trim)
 }
 
 parse_remote_sql() {
@@ -587,47 +649,47 @@ parse_remote_sql() {
     fi
 
     REM_DBSTATUS=$(printf '%s\n' "$REMOTE_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-    REM_ROLE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
-    REM_OPEN=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
-    REM_PROTECT=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
-    REM_SWITCH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
-    REM_FORCE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
-    REM_FLASH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
-    REM_DBUNIQ=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+    REM_ROLE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $1}' | dg_trim)
+    REM_OPEN=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $2}' | dg_trim)
+    REM_PROTECT=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $3}' | dg_trim)
+    REM_SWITCH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $4}' | dg_trim)
+    REM_FORCE=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $5}' | dg_trim)
+    REM_FLASH=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $6}' | dg_trim)
+    REM_DBUNIQ=$(printf '%s' "$REM_DBSTATUS" | awk -F'|' '{print $7}' | dg_trim)
 
     REM_REDO=$(printf '%s\n' "$REMOTE_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
-    REM_REDO_CNT=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $1}' | xargs)
-    REM_REDO_MB=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $2}' | xargs)
-    REM_SRL=$(printf '%s\n' "$REMOTE_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
-    REM_ARCHGAP=$(printf '%s\n' "$REMOTE_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
-    REM_UNNAMED=$(printf '%s\n' "$REMOTE_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+    REM_REDO_CNT=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $1}' | dg_trim)
+    REM_REDO_MB=$(printf '%s' "$REM_REDO" | awk -F'|' '{print $2}' | dg_trim)
+    REM_SRL=$(printf '%s\n' "$REMOTE_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | dg_trim)
+    REM_ARCHGAP=$(printf '%s\n' "$REMOTE_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | dg_trim)
+    REM_UNNAMED=$(printf '%s\n' "$REMOTE_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | dg_trim)
     case "$REM_UNNAMED" in ''|*[!0-9]*) REM_UNNAMED="" ;; esac
 
     REM_FRA=$(printf '%s\n' "$REMOTE_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
-    REM_FRA_PATH=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $1}' | xargs)
-    REM_FRA_SIZE=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $2}' | xargs)
-    REM_FRA_USED=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $3}' | xargs)
-    REM_FRA_RECLAIM=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $4}' | xargs)
-    REM_FRA_FILES=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $5}' | xargs)
+    REM_FRA_PATH=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $1}' | dg_trim)
+    REM_FRA_SIZE=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $2}' | dg_trim)
+    REM_FRA_USED=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $3}' | dg_trim)
+    REM_FRA_RECLAIM=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $4}' | dg_trim)
+    REM_FRA_FILES=$(printf '%s' "$REM_FRA" | awk -F'|' '{print $5}' | dg_trim)
 
     REM_SERVICES=$(format_services "$(printf '%s\n' "$REMOTE_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
     REM_MRP=$(printf '%s\n' "$REMOTE_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
-    REM_MRP_STATUS=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $2}' | xargs)
-    REM_MRP_SEQ=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $3}' | xargs)
+    REM_MRP_STATUS=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $2}' | dg_trim)
+    REM_MRP_SEQ=$(printf '%s' "$REM_MRP" | awk -F'|' '{print $3}' | dg_trim)
 
-    REM_TRANSPORT_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
-    REM_APPLY_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
-    REM_APPLY_FINISH=$(printf '%s\n' "$REMOTE_SQL" | grep 'apply finish time' | awk -F'|' '{print $3}' | xargs)
+    REM_TRANSPORT_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | dg_trim)
+    REM_APPLY_LAG=$(printf '%s\n' "$REMOTE_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | dg_trim)
+    REM_APPLY_FINISH=$(printf '%s\n' "$REMOTE_SQL" | grep 'apply finish time' | awk -F'|' '{print $3}' | dg_trim)
 
     REM_APPLYINFO=$(printf '%s\n' "$REMOTE_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
-    REM_LAST_APPLIED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
-    REM_LAST_RECEIVED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
-    REM_RECOVERY_MODE=$(printf '%s\n' "$REMOTE_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
+    REM_LAST_APPLIED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $1}' | dg_trim)
+    REM_LAST_RECEIVED=$(printf '%s' "$REM_APPLYINFO" | awk -F'|' '{print $2}' | dg_trim)
+    REM_RECOVERY_MODE=$(printf '%s\n' "$REMOTE_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | dg_trim)
 }
 
 collect_log_matches() {
-    LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" 2>/dev/null | xargs)
+    LOC_ALERT_TRACE=$(run_local_sql "SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';" 2>/dev/null | dg_trim)
     # Guard against an empty/failed V$DIAG_INFO query producing paths like
     # "/alert_cdb1.log" that would look like a plain "file not found".
     if [[ -z "$LOC_ALERT_TRACE" ]]; then
@@ -809,6 +871,12 @@ assess_primary() {
             PRI_OK=false
             add_summary_error "Primary open mode is ${PRI_OPEN}"
         }
+    fi
+
+    # M12: dg_status.sh has always graded this; the local engine now does too
+    # (same accepted values as the dashboard's warn_icon).
+    if [[ -n "${PRI_SWITCH:-}" ]] && ! printf '%s' "$PRI_SWITCH" | grep -qiE "TO STANDBY|SESSIONS ACTIVE"; then
+        add_summary_warning "Primary switchover status is ${PRI_SWITCH}"
     fi
 
     if [[ -n "${PRI_FORCE:-}" ]] && ! printf '%s' "$PRI_FORCE" | grep -qi "YES"; then
@@ -1002,10 +1070,10 @@ assess_broker() {
         fi
     done <<< "$DGMGRL_CONFIG"
 
-    FSFO_MODE=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Fast-Start Failover:' | head -1 | sed 's/.*: *//' | xargs)
-    FSFO_TARGET=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Target:' | sed 's/.*: *//' | xargs)
-    FSFO_OBS=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Observer:' | sed 's/.*: *//' | xargs)
-    FSFO_THRESHOLD=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Threshold:' | sed 's/.*: *//' | xargs)
+    FSFO_MODE=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Fast-Start Failover:' | head -1 | sed 's/.*: *//' | dg_trim)
+    FSFO_TARGET=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Target:' | sed 's/.*: *//' | dg_trim)
+    FSFO_OBS=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Observer:' | sed 's/.*: *//' | dg_trim)
+    FSFO_THRESHOLD=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Threshold:' | sed 's/.*: *//' | dg_trim)
 
     if [[ -n "${FSFO_MODE:-}" ]]; then
         if printf '%s' "$FSFO_MODE" | grep -qi "Enabled"; then
@@ -1032,6 +1100,22 @@ assess_data_source() {
 }
 
 compute_state_labels() {
+    # M12: the replication state is derived first because "no lag data"
+    # raises a warning, and OVERALL_STATE / the headline counts below must
+    # agree with it. The derivation itself is the shared dg_repl_state.
+    REPL_STATE_TOKEN=""
+    if ! $LOCAL_INSTANCE_AVAILABLE; then
+        REPL_STATE="${RED}UNKNOWN${NC}"
+    elif $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
+        REPL_STATE="PEER_SOURCE"
+    else
+        REPL_STATE_TOKEN=$(dg_repl_state "${STB_TRANSPORT_LAG:-}" "${STB_APPLY_LAG:-}" "${SEQ_LAG:-}")
+        REPL_STATE=$(dg_repl_state_text "$REPL_STATE_TOKEN")
+        if [[ "$REPL_STATE_TOKEN" == "UNKNOWN" ]]; then
+            add_summary_warning "Replication state unknown: no transport lag, apply lag or sequence data returned for the standby"
+        fi
+    fi
+
     # H12
     if $LOCAL_INSTANCE_AVAILABLE; then
         LOCAL_INSTANCE_STATE="${GREEN}UP${NC}"
@@ -1067,8 +1151,11 @@ compute_state_labels() {
         BROKER_STATE="${RED}NOT CONFIGURED${NC}"
     elif [[ "${BROKER_OVERALL:-}" == "SUCCESS" ]]; then
         BROKER_STATE="${GREEN}SUCCESS${NC}"
+    elif [[ "${BROKER_OVERALL:-}" == "WARNING" ]]; then
+        BROKER_STATE="${YELLOW}WARNING${NC}"
     elif [[ -n "${BROKER_OVERALL:-}" ]]; then
-        BROKER_STATE="${YELLOW}${BROKER_OVERALL}${NC}"
+        # M12: ERROR is red here exactly as in dg_status.sh.
+        BROKER_STATE="${RED}${BROKER_OVERALL}${NC}"
     else
         BROKER_STATE="${YELLOW}UNKNOWN${NC}"
     fi
@@ -1081,21 +1168,8 @@ compute_state_labels() {
         PEER_SOURCE_STATE="${GREEN}RUNTIME SQL${NC}"
     fi
 
-    if ! $LOCAL_INSTANCE_AVAILABLE; then
-        REPL_STATE="${RED}UNKNOWN${NC}"
-    elif $IS_PRIMARY && [[ "$REMOTE_DATA_SOURCE" != "runtime" ]]; then
-        REPL_STATE="$PEER_SOURCE_STATE"
-    elif [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
-        REPL_STATE="${YELLOW}LAGGING${NC}"
-    elif [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
-        REPL_STATE="${YELLOW}LAGGING${NC}"
-    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_CRIT" ]]; then
-        REPL_STATE="${RED}BEHIND${NC}"
-    elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_WARN" ]]; then
-        REPL_STATE="${YELLOW}BEHIND${NC}"
-    else
-        REPL_STATE="${GREEN}IN SYNC${NC}"
-    fi
+    # Placeholder resolved now that PEER_SOURCE_STATE exists.
+    [[ "$REPL_STATE" == "PEER_SOURCE" ]] && REPL_STATE="$PEER_SOURCE_STATE"
 }
 
 assess_all() {
@@ -1269,10 +1343,10 @@ render_standby_triage() {
 render_peer_broker_view() {
     local expected="$1"
     local peer_role peer_state peer_tlag peer_alag peer_db_status
-    peer_role=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | xargs)
-    peer_state=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | xargs)
-    peer_tlag=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | xargs)
-    peer_alag=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//' | xargs)
+    peer_role=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Role:' | sed 's/.*Role: *//' | dg_trim)
+    peer_state=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Intended State:' | sed 's/.*Intended State: *//' | dg_trim)
+    peer_tlag=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Transport Lag:' | sed 's/.*Transport Lag: *//' | dg_trim)
+    peer_alag=$(printf '%s\n' "$DGMGRL_PEER" | grep 'Apply Lag:' | sed 's/.*Apply Lag: *//' | dg_trim)
     peer_db_status=$(printf '%s\n' "$DGMGRL_PEER" | tail -3 | extract_first_status)
 
     if [[ -n "$peer_role" ]]; then
@@ -1296,7 +1370,7 @@ render_broker_triage() {
     fi
 
     row "Configuration" "${BROKER_CFG_NAME:-unknown}"
-    [[ -n "${BROKER_OVERALL:-}" ]] && row "Overall Status" "${BROKER_OVERALL}" "$(status_icon "${BROKER_OVERALL:-}" "SUCCESS")"
+    [[ -n "${BROKER_OVERALL:-}" ]] && row "Overall Status" "${BROKER_OVERALL}" "$(dg_broker_overall_icon "${BROKER_OVERALL:-}")"
 
     if [[ -n "${FSFO_MODE:-}" ]]; then
         if printf '%s' "$FSFO_MODE" | grep -qi "Enabled"; then
@@ -1510,7 +1584,7 @@ render_broker_diag() {
     fi
 
     row "Configuration" "${BROKER_CFG_NAME:-unknown}"
-    [[ -n "${BROKER_OVERALL:-}" ]] && row "Overall Status" "${BROKER_OVERALL}" "$(status_icon "${BROKER_OVERALL:-}" "SUCCESS")"
+    [[ -n "${BROKER_OVERALL:-}" ]] && row "Overall Status" "${BROKER_OVERALL}" "$(dg_broker_overall_icon "${BROKER_OVERALL:-}")"
 
     # M20: attribute a following Error:/Warning: line to the member it
     # belongs to (19c never puts the diagnosis on the member line itself).
@@ -1678,6 +1752,7 @@ dg_local_status_main() {
     parse_args "$DG_SCRIPT_NAME" "$@" || return $?
     $SHOW_HELP && return 0
 
+    dg_validate_thresholds || return 64
     verify_oracle_env || return $?
     collect_all_status_data
 

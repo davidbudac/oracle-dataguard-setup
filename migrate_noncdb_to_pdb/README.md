@@ -7,7 +7,14 @@ standby), **without recreating either standby**.
 The CDB standby is rebuilt for the new PDB **automatically through redo apply**
 by pointing it at a staging copy of the non-CDB datafiles via
 `STANDBY_PDB_SOURCE_FILE_DIRECTORY` -- no RMAN duplicate, no RESTORE, no manual
-file copy on the standby host.
+file copy on the standby host. That parameter is set **on the CDB standby
+instance** (it is not carried in redo), so the scripts need a direct connection
+to the standby (wallet `/@<alias>`, or a prompted SYS password) and the share
+must be visible from the standby host (`STANDBY_STAGE_DIR`).
+
+The scripts are conservative: where a precondition cannot be proven (standby
+unreachable, wrong database behind `SOURCE_ORACLE_SID`, PDB not replicated) they
+refuse rather than warn. Step 06 is the destructive one; see "Safety gates".
 
 ## When to use this
 
@@ -33,6 +40,7 @@ migrate_noncdb_to_pdb/
 ├── 04_plug_into_cdb.sh          CREATE PLUGGABLE DATABASE + noncdb_to_pdb.sql
 ├── 05_verify_pdb_dataguard.sh   confirm PDB is applied on the CDB standby
 ├── 06_decommission_noncdb.sh    optional: shut down + drop the old non-CDB
+├── run_minimal.sh               LAB-ONLY shortcut for the poug-dg1/dg2 lab (see MINIMAL_STEPS.md)
 ├── tests/
 │   └── run_migration_test.sh    end-to-end test driver (jump host → DB hosts)
 ├── README.md
@@ -57,6 +65,37 @@ cd migrate_noncdb_to_pdb
 # Optional, destructive:
 # ./06_decommission_noncdb.sh
 ```
+
+Each step requires its predecessor (`state.env` flags `preflight_ok`,
+`noncdb_quiesced`, `describe_done`, `plug_done`, `verify_done`) and clears its own
+and later flags when it starts, and `01_preflight.sh` resets all of them - a stale
+flag from an earlier run cannot gate step 06. Step 04 cannot be resumed once the
+PDB exists (it says how to proceed).
+
+**Unattended runs** set `MIGRATE_NONINTERACTIVE=1`, which auto-answers the YES
+prompts. It does **not** authorise `DROP DATABASE`: that also needs
+`ALLOW_DROP_NONCDB="I_UNDERSTAND"` in the config **and** `MIGRATE_ALLOW_DROP=1`
+in the environment. Without a terminal, standby host directories are only
+accepted via `STANDBY_SSH_TARGET` (checked over ssh) or
+`STANDBY_DIRS_CONFIRMED=yes`.
+
+## Safety gates
+
+* **01** checks the CDB standby directly: `standby_file_management=AUTO`,
+  `db_file_name_convert` (or OMF `db_create_file_dest`) covers the PDB
+  directory, the resulting directory exists on the standby host, and the staging
+  dir is visible there. Also versions/COMPATIBLE as integers, DBNAME of both SIDs,
+  free space for the staged copy and the PDB's COPY.
+* **04** sets `STANDBY_PDB_SOURCE_FILE_DIRECTORY` on the standby, reads it back,
+  and after `CREATE PLUGGABLE DATABASE` checks every PDB datafile landed under
+  `TARGET_PDB_DATAFILE_DIR/<PDB>/`.
+* **05** passes only if the standby (direct connection) has the PDB with
+  `RECOVERY_STATUS=ENABLED`, no `UNNAMED` datafiles, the same datafile count as
+  the primary, and its applied SCN has reached an SCN taken after a write inside
+  the PDB. An unreachable standby is a failure.
+* **06** proves, before touching anything, that `SOURCE_ORACLE_SID` is the
+  non-CDB `SOURCE_DB_NAME` (not a CDB, PRIMARY, OPEN READ ONLY, same DBID as
+  preflight recorded) and that the new PDB is OPEN READ WRITE in the CDB.
 
 See `WALKTHROUGH.md` for the full step-by-step explanation, expected output,
 rollback procedure, and troubleshooting.

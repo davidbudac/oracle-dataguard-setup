@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Unit test for the Q1b per-filesystem remap logic in
 # primary/02_generate_standby_config.sh

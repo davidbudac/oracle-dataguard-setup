@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 5: Clone Standby Database
 # ============================================================
@@ -6,9 +6,10 @@
 # It performs RMAN duplicate to create the standby database.
 #
 # RMAN tuning flags:
-#   -c, --channels NUM   Number of parallel auxiliary channels (default: 1)
-#   -r, --rate RATE      Per-channel throughput limit (e.g. 200M, 1G)
-#                        Default: unlimited
+#   -c, --channels NUM   Number of parallel channels (default: 1). Allocated on
+#                        BOTH sides (NUM target + NUM auxiliary, see below)
+#   -r, --rate RATE      Per-channel throughput limit: integer with optional
+#                        K/M/G suffix (e.g. 200M, 1G). Default: unlimited
 #
 # Example: bash ./standby/05_clone_standby.sh -c 4 -r 200M
 # ============================================================
@@ -21,6 +22,8 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+# RMAN tuning flags parsed below (-c/--channels and -r/--rate take a value)
+DG_SCRIPT_FLAGS='-c= --channels= -r= --rate='
 enable_verbose_mode "$@"
 
 # ============================================================
@@ -30,17 +33,32 @@ enable_verbose_mode "$@"
 RMAN_CHANNELS=1
 RMAN_RATE=""
 
+# Mirrors DG_SCRIPT_FLAGS above: enable_verbose_mode already rejected unknown
+# options, so this loop only extracts the two valued flags (both the
+# "--channels 4" and "--channels=4" spellings).
 _args=("$@")
 _i=0
+RMAN_CHANNELS_SET=0
+RMAN_RATE_SET=0
 while [[ $_i -lt ${#_args[@]} ]]; do
     case "${_args[$_i]}" in
         -c|--channels)
             _i=$((_i + 1))
             RMAN_CHANNELS="${_args[$_i]:-}"
+            RMAN_CHANNELS_SET=1
+            ;;
+        --channels=*)
+            RMAN_CHANNELS="${_args[$_i]#--channels=}"
+            RMAN_CHANNELS_SET=1
             ;;
         -r|--rate)
             _i=$((_i + 1))
             RMAN_RATE="${_args[$_i]:-}"
+            RMAN_RATE_SET=1
+            ;;
+        --rate=*)
+            RMAN_RATE="${_args[$_i]#--rate=}"
+            RMAN_RATE_SET=1
             ;;
     esac
     _i=$((_i + 1))
@@ -48,6 +66,14 @@ done
 
 if ! [[ "$RMAN_CHANNELS" =~ ^[1-9][0-9]*$ ]]; then
     log_error "Invalid --channels value: '$RMAN_CHANNELS' (must be a positive integer)"
+    exit 1
+fi
+
+# The rate is pasted into the RMAN script (ALLOCATE ... RATE <value>), so it
+# must be RMAN's "integer [K|M|G]" form and nothing else. An empty value
+# after -r/--rate would otherwise silently mean "unlimited".
+if [[ "$RMAN_RATE_SET" == "1" ]] && ! [[ "$RMAN_RATE" =~ ^[1-9][0-9]*[KkMmGg]?$ ]]; then
+    log_error "Invalid --rate value: '$RMAN_RATE' (use a positive integer with optional K, M or G suffix, e.g. 200M)"
     exit 1
 fi
 
@@ -80,6 +106,17 @@ source "$STANDBY_CONFIG_FILE"
 
 # Reinitialize log with standby DB name
 init_log "05_clone_standby_${STANDBY_DB_UNIQUE_NAME}"
+
+# Verify we're on the standby host (same check as step 3). This step starts,
+# and may SHUTDOWN ABORT, an instance addressed only by ORACLE_SID, so running
+# it on the wrong host would act on whatever that SID is there.
+CURRENT_HOST=$(hostname 2>/dev/null)
+if ! hostnames_match "$CURRENT_HOST" "$STANDBY_HOSTNAME"; then
+    log_warn "Current hostname ($CURRENT_HOST) does not match expected standby hostname ($STANDBY_HOSTNAME)"
+    if ! confirm_proceed_or_check "Continue anyway?"; then
+        exit 1
+    fi
+fi
 
 # Verify one standby db_create_online_log_dest_<n> value: shell/RMAN-safe,
 # and (unless it is an ASM '+' value) an existing, writable directory on
@@ -158,8 +195,11 @@ if ! "$ORACLE_HOME/bin/lsnrctl" status > /dev/null 2>&1; then
     exit 1
 fi
 
-# Check for static registration
-if ! "$ORACLE_HOME/bin/lsnrctl" status 2>&1 | grep -q "$STANDBY_DB_UNIQUE_NAME"; then
+# Check for static registration. Match the service line itself, not any
+# mention of the name: the bare name also occurs in <name>_DGMGRL, host names
+# and paths. Case-insensitive; an optional ".domain" suffix is allowed.
+_svc_name_re=$(printf '%s' "$STANDBY_DB_UNIQUE_NAME" | sed 's/[.]/\\./g')
+if ! "$ORACLE_HOME/bin/lsnrctl" status 2>&1 | grep -qiE "^[[:space:]]*Service \"${_svc_name_re}(\.[^\" ]*)?\" has"; then
     log_error "Static registration not found for $STANDBY_DB_UNIQUE_NAME"
     log_error "Please verify listener.ora configuration"
     exit 1
@@ -174,9 +214,9 @@ log_info "Listener is running with static registration"
 progress_step "Reviewing Planned Changes"
 
 print_list_block "This Step Will Change" \
-    "Shut down any existing standby instance for ${STANDBY_ORACLE_SID} before restarting it in NOMOUNT." \
+    "After you type the confirmation, shut down any leftover standby instance for ${STANDBY_ORACLE_SID} (refused if it is not a PHYSICAL STANDBY) and restart it in NOMOUNT." \
     "Run RMAN DUPLICATE FROM ACTIVE DATABASE against ${PRIMARY_TNS_ALIAS} -> ${STANDBY_TNS_ALIAS}." \
-    "Create or verify the SPFILE and start managed recovery."
+    "Verify the SPFILE built by RMAN and start managed recovery."
 
 print_list_block "This Step Will Not Change" \
     "It will not create the broker configuration." \
@@ -190,7 +230,7 @@ print_list_block "Files and Commands" \
     "RMAN log: ${NFS_SHARE}/logs/rman_duplicate_<timestamp>.log"
 
 print_status_block "RMAN Tuning" \
-    "Auxiliary channels" "$RMAN_CHANNELS" \
+    "Channels (target + auxiliary, each)" "$RMAN_CHANNELS" \
     "Per-channel rate" "${RMAN_RATE:-unlimited}"
 
 print_list_block "Recovery If This Step Fails" \
@@ -258,6 +298,10 @@ log_info "tnsping to standby successful"
 progress_step "Authenticating to Primary"
 
 echo ""
+# Everything from the prompt to the end of verification reads or holds the
+# SYS password: keep xtrace (-v) off so it is never printed (C2). The calls
+# nest, so verify_sys_password/prompt_password pausing again inside is fine.
+pause_verbose_trace
 SYS_PASSWORD=$(prompt_password "Enter SYS password for primary database")
 
 # L16: verify_sys_password() and the RMAN CONNECT lines below both embed
@@ -271,25 +315,14 @@ fi
 # Verify password against primary
 log_info "Verifying SYS password against primary..."
 if ! verify_sys_password "$SYS_PASSWORD" "$PRIMARY_TNS_ALIAS"; then
-    # verify_sys_password() only reports pass/fail. Make a direct connection
-    # attempt here so we can inspect the actual error text and distinguish a
-    # locked SYS account (ORA-28000) from a plain bad password or
-    # connectivity failure, and point the operator at the right fix.
-    # CONNECT is fed on stdin (sqlplus -s /nolog), not the sqlplus command
-    # line, so SYS_PASSWORD never appears in `ps -ef`. WHENEVER SQLERROR EXIT
-    # makes a failed CONNECT end the session immediately (error text still
-    # lands in $VERIFY_ERROR_TEXT) instead of falling through to
-    # check_connection.sql.
-    pause_verbose_trace
-    VERIFY_ERROR_TEXT=$(sqlplus -s /nolog <<SQL 2>&1
-SET DEFINE OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE
-CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
-@${SQL_DIR}/queries/check_connection.sql
-SQL
-) || true
+    # verify_sys_password() only reports pass/fail, but leaves the sqlplus
+    # output (never the password) in VERIFY_SYS_ERROR_TEXT. Inspect that to
+    # distinguish a locked SYS account (ORA-28000) from a plain bad password
+    # or connectivity failure and point the operator at the right fix. Do NOT
+    # connect a second time to fetch the error: every extra failed logon
+    # counts toward FAILED_LOGIN_ATTEMPTS and locks SYS sooner.
     resume_verbose_trace
-    if echo "$VERIFY_ERROR_TEXT" | grep -q "ORA-28000"; then
+    if echo "$VERIFY_SYS_ERROR_TEXT" | grep -q "ORA-28000"; then
         log_error "SYS account on the primary is LOCKED (ORA-28000)"
         log_error ""
         log_error "To proceed with this clone, temporarily unlock and reset SYS on the PRIMARY:"
@@ -304,6 +337,7 @@ SQL
     fi
     exit 1
 fi
+resume_verbose_trace
 log_info "Password verified successfully"
 
 # ============================================================
@@ -398,16 +432,94 @@ ${_omf_sets}"
 fi
 
 # ============================================================
+# Broker Configuration Files (best effort, both storage modes)
+# ============================================================
+# RMAN DUPLICATE ... SPFILE copies the primary's spfile, so an EXPLICIT
+# dg_broker_config_file1/2 on the primary (a path under the primary's
+# ORACLE_HOME, say) would be inherited and may not exist on this host. When
+# the primary sets them, point the standby's at its own dbs directory, named
+# after the standby DB_UNIQUE_NAME (the default naming). When both are
+# defaults, set nothing: that keeps read-only-home defaults working. Not a
+# blocker - the broker files are re-created - so a failed query only warns.
+BROKER_FILE_SETS=""
+pause_verbose_trace
+_bcf_rc=0
+BROKER_CFG_RAW=$(sqlplus -s /nolog <<SQL 2>&1
+SET DEFINE OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
+@${SQL_DIR}/queries/get_dg_broker_config_files.sql
+SQL
+) || _bcf_rc=$?
+resume_verbose_trace
+
+if [[ $_bcf_rc -ne 0 ]]; then
+    log_warn "Could not read dg_broker_config_file1/2 from the primary (sqlplus exit ${_bcf_rc}): $(_first_ora_line "$BROKER_CFG_RAW")"
+    log_warn "Continuing; if the primary sets them to explicit paths, the standby inherits those - fix with ALTER SYSTEM after the clone"
+else
+    _bcf_explicit=0
+    for _bcf_name in dg_broker_config_file1 dg_broker_config_file2; do
+        _bcf_line=$(printf '%s\n' "$BROKER_CFG_RAW" | tr -d '\r' | grep -i "^${_bcf_name}|" | head -1) || _bcf_line=""
+        [[ -z "$_bcf_line" ]] && continue
+        _bcf_default=$(printf '%s' "$_bcf_line" | awk -F'|' '{print toupper($NF)}')
+        if [[ "$_bcf_default" == "FALSE" ]]; then
+            _bcf_explicit=1
+            log_info "Primary sets ${_bcf_name} explicitly: $(printf '%s' "$_bcf_line" | awk -F'|' '{print $2}')"
+        fi
+    done
+    if [[ $_bcf_explicit -eq 1 ]]; then
+        _bcf_dir="${ORACLE_HOME}/dbs"
+        if is_safe_omf_dest_path "$_bcf_dir"; then
+            BROKER_FILE_SETS="
+    SET DG_BROKER_CONFIG_FILE1='${_bcf_dir}/dr1${STANDBY_DB_UNIQUE_NAME}.dat'
+    SET DG_BROKER_CONFIG_FILE2='${_bcf_dir}/dr2${STANDBY_DB_UNIQUE_NAME}.dat'"
+            log_info "Standby dg_broker_config_file1/2 will be set to ${_bcf_dir}/dr[12]${STANDBY_DB_UNIQUE_NAME}.dat (the inherited primary paths would not apply here)"
+        else
+            log_warn "ORACLE_HOME dbs directory '${_bcf_dir}' has characters not safe for RMAN - not setting dg_broker_config_file1/2"
+            log_warn "The standby will inherit the primary's explicit paths; fix with ALTER SYSTEM after the clone"
+        fi
+    else
+        log_info "Primary uses default dg_broker_config_file1/2 - nothing to override"
+    fi
+fi
+
+# ============================================================
 # Start Instance in NOMOUNT
 # ============================================================
 
 progress_step "Starting Standby Instance"
 
-# Check if instance is already running
+# The typed confirmation comes BEFORE anything is touched: the SHUTDOWN ABORT
+# below used to run first, so declining left the standby down. Declining now
+# changes nothing and exits non-zero.
+if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for ${STANDBY_DB_UNIQUE_NAME}." "${STANDBY_DB_UNIQUE_NAME}"; then
+    log_warn "RMAN duplicate cancelled by user - nothing was changed"
+    exit 1
+fi
+
+# Check if instance is already running (a leftover auxiliary instance from an
+# earlier attempt, normally)
 INSTANCE_STATUS=$(run_sql_query "get_instance_status.sql" 2>&1 || true)
+INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 if echo "$INSTANCE_STATUS" | grep -qE "STARTED|MOUNTED|OPEN"; then
-    log_warn "Instance is already running"
+    log_warn "Instance ${ORACLE_SID} is already running (status: ${INSTANCE_STATUS})"
+
+    # ORACLE_SID alone picks the instance, so a wrong SID/host would abort a
+    # primary. A NOMOUNT (STARTED) instance has no V$DATABASE yet and is the
+    # expected leftover auxiliary, so it is allowed. Once the control file is
+    # read (MOUNTED/OPEN) it must report PHYSICAL STANDBY, else refuse.
+    if [[ "$INSTANCE_STATUS" != "STARTED" ]]; then
+        EXISTING_ROLE=$(run_sql_query "get_db_role.sql" 2>/dev/null | tr -d '\r' | awk 'NF { sub(/^[ \t]+/, ""); sub(/[ \t]+$/, ""); print; exit }') || EXISTING_ROLE=""
+        if [[ "$EXISTING_ROLE" != "PHYSICAL STANDBY" ]]; then
+            log_error "The running instance ${ORACLE_SID} is ${INSTANCE_STATUS} with database role '${EXISTING_ROLE:-unknown}', not PHYSICAL STANDBY"
+            log_error "Refusing to SHUTDOWN ABORT it. Check ORACLE_SID/ORACLE_HOME and that this is the standby host."
+            log_error "If it really is the leftover standby instance, shut it down yourself and re-run this step."
+            exit 1
+        fi
+        log_info "Existing instance is a PHYSICAL STANDBY (leftover from an earlier attempt)"
+    fi
+
     log_info "Shutting down existing instance..."
     log_cmd "sqlplus / as sysdba:" "SHUTDOWN ABORT"
     run_sql_command "shutdown_abort.sql"
@@ -443,11 +555,6 @@ echo "Watch the RMAN output below for channel allocation, restore, and recovery 
 echo "================================================================"
 echo ""
 
-if ! confirm_typed_value "This will start the non-restartable RMAN duplicate for ${STANDBY_DB_UNIQUE_NAME}." "${STANDBY_DB_UNIQUE_NAME}"; then
-    log_info "RMAN duplicate cancelled by user"
-    exit 0
-fi
-
 # Create RMAN script (cmdfile). It will hold the CONNECT TARGET/AUXILIARY
 # lines (see below) needed to authenticate to primary and standby, so SYS
 # credentials never appear on the rman process argv (visible via `ps -ef`
@@ -474,9 +581,24 @@ else
     LOG_ARCHIVE_DEST_1_SETTING="LOCATION=${STANDBY_ARCHIVE_DEST} VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}"
 fi
 
-# Build optional RUN { ... } wrapper with auxiliary channel allocation.
-# Allocated only when channels > 1 or rate is set; otherwise the bare
-# DUPLICATE statement is used (preserving the default behavior).
+# Build optional RUN { ... } wrapper with channel allocation. Allocated only
+# when channels > 1 or rate is set; otherwise the bare DUPLICATE statement is
+# used (preserving the default behavior: RMAN picks its own channels).
+#
+# Why BOTH target and auxiliary channels: ACTIVE duplication has two methods
+# and the channel type that does the work differs (Oracle 19c Backup and
+# Recovery User's Guide, "Duplicating Databases"):
+#   - image copies ("push"): the TARGET channels do the principal work;
+#   - backup sets ("pull"): the AUXILIARY channels do it.
+# This step connects to the primary by net service name and uses neither
+# USING BACKUPSET nor SECTION SIZE, so RMAN picks backup sets exactly when
+# (auxiliary channels allocated) >= (target channels allocated), else image
+# copies. Allocating only auxiliary channels left the target side at the
+# primary's CONFIGURE PARALLELISM, so a primary configured with more channels
+# than --channels silently flipped to push and --rate (set on the auxiliary
+# channels) throttled nothing. Allocating the same number on both sides keeps
+# the method deterministic (equal => backup sets) and puts the rate on every
+# channel that can do the work.
 RMAN_PROLOGUE=""
 RMAN_EPILOGUE=""
 if [[ "$RMAN_CHANNELS" -gt 1 || -n "$RMAN_RATE" ]]; then
@@ -486,7 +608,8 @@ if [[ "$RMAN_CHANNELS" -gt 1 || -n "$RMAN_RATE" ]]; then
     _channel_lines=""
     _i=1
     while [[ $_i -le $RMAN_CHANNELS ]]; do
-        _channel_lines="${_channel_lines}  ALLOCATE AUXILIARY CHANNEL aux${_i} TYPE DISK${_rate_clause};
+        _channel_lines="${_channel_lines}  ALLOCATE CHANNEL tgt${_i} TYPE DISK${_rate_clause};
+  ALLOCATE AUXILIARY CHANNEL aux${_i} TYPE DISK${_rate_clause};
 "
         _i=$((_i + 1))
     done
@@ -495,7 +618,18 @@ if [[ "$RMAN_CHANNELS" -gt 1 || -n "$RMAN_RATE" ]]; then
 ${_channel_lines}"
     RMAN_EPILOGUE="}"
 
-    log_info "RMAN tuning: ${RMAN_CHANNELS} auxiliary channel(s)${RMAN_RATE:+, rate ${RMAN_RATE} per channel}"
+    log_info "RMAN tuning: ${RMAN_CHANNELS} target + ${RMAN_CHANNELS} auxiliary channel(s)${RMAN_RATE:+, rate ${RMAN_RATE} per channel}"
+fi
+
+# DIAGNOSTIC_DEST: step 2's pfile sets it from the standby ORACLE_BASE, but
+# the pfile is only used to start the auxiliary instance - the SPFILE that
+# DUPLICATE builds is the primary's copy plus the SET list, so without this
+# the standby keeps the primary's ADR base (wrong when the ORACLE_BASE
+# differs). Skipped for a config that predates STANDBY_ORACLE_BASE.
+DIAG_DEST_SET=""
+if [[ -n "${STANDBY_ORACLE_BASE:-}" ]]; then
+    DIAG_DEST_SET="
+    SET DIAGNOSTIC_DEST='${STANDBY_ORACLE_BASE}'"
 fi
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
@@ -512,7 +646,7 @@ DUPLICATE TARGET DATABASE
   FROM ACTIVE DATABASE
   DORECOVER
   SPFILE
-    SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'
+    SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'${DIAG_DEST_SET}${BROKER_FILE_SETS}
     SET DB_CREATE_FILE_DEST='${STANDBY_DB_CREATE_FILE_DEST}'${OMF_ONLINE_LOG_DEST_SETS}
     SET DB_RECOVERY_FILE_DEST='${STANDBY_DB_RECOVERY_FILE_DEST}'
     SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}'
@@ -546,8 +680,8 @@ DUPLICATE TARGET DATABASE
   FROM ACTIVE DATABASE
   DORECOVER
   SPFILE
-    SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'
-    SET CONTROL_FILES='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_DATA_PATH}/control02.ctl'
+    SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'${DIAG_DEST_SET}${BROKER_FILE_SETS}
+    SET CONTROL_FILES='${STANDBY_DATA_PATH}/control01.ctl','${STANDBY_CONTROL_FILE_2_DIR:-$STANDBY_DATA_PATH}/control02.ctl'
     SET LOG_ARCHIVE_DEST_1='${LOG_ARCHIVE_DEST_1_SETTING}'
 ${FRA_SETTINGS}
     SET DB_FILE_NAME_CONVERT=${DB_FILE_NAME_CONVERT}
@@ -565,11 +699,14 @@ fi
 # Write the CONNECT lines first (RMAN requires TARGET/AUXILIARY connected
 # before DUPLICATE can run), then the duplicate statement body. The file
 # was created with chmod 600 above, before either password was written.
+# xtrace is paused around the password-bearing printf lines (C2).
+pause_verbose_trace
 {
     printf 'CONNECT TARGET SYS/"%s"@%s;\n' "${SYS_PASSWORD}" "${PRIMARY_TNS_ALIAS}"
     printf 'CONNECT AUXILIARY SYS/"%s"@%s;\n' "${SYS_PASSWORD}" "${STANDBY_TNS_ALIAS}"
     printf '%s\n' "$RMAN_BODY"
 } >> "$RMAN_SCRIPT"
+resume_verbose_trace
 
 log_info "RMAN script created: $RMAN_SCRIPT"
 # RMAN masks credentials in its own echo of a script-embedded CONNECT
@@ -677,15 +814,25 @@ INSTANCE_STATUS=$(echo "$INSTANCE_STATUS" | tr -d ' \t\n\r')
 
 log_info "Current instance status: $INSTANCE_STATUS"
 
-# The RMAN duplicate with SPFILE option should have created an spfile
-# Verify spfile exists
+# The RMAN duplicate with SPFILE option must have created an spfile. If it is
+# missing, do NOT build one from the minimal step-3 pfile (sga_target=0,
+# processes=300, no primary memory settings): that would silently give the
+# standby a different parameter set than the primary. Accept an spfile the
+# instance reports being started with; otherwise fail and point at the log.
 SPFILE="${ORACLE_HOME}/dbs/spfile${ORACLE_SID}.ora"
 if [[ -f "$SPFILE" ]]; then
     log_info "SPFILE exists: $SPFILE"
 else
-    log_info "Creating SPFILE from PFILE..."
-    log_cmd "sqlplus / as sysdba:" "CREATE SPFILE FROM PFILE='${PFILE}'"
-    run_sql_command "create_spfile.sql" "$PFILE"
+    SPFILE_IN_USE=$(get_db_parameter "spfile" 2>/dev/null) || SPFILE_IN_USE=""
+    if [[ -n "$SPFILE_IN_USE" ]]; then
+        SPFILE="$SPFILE_IN_USE"
+        log_info "SPFILE in use: $SPFILE"
+    else
+        log_error "RMAN reported success but no SPFILE exists at $SPFILE and the instance is not running from one"
+        log_error "Not creating one from the minimal pfile: it lacks the primary's parameters (memory, processes, ...)"
+        log_error "Review the RMAN log for the SPFILE/restore section: $RMAN_LOG"
+        exit 1
+    fi
 fi
 record_artifact "spfile:${SPFILE}"
 
@@ -734,7 +881,9 @@ run_sql_command "start_mrp.sql"
 # Verify MRP is running
 sleep 5
 
-MRP_STATUS=$(run_sql_query "get_mrp_status.sql")
+# A transient failure here must not abort the step after a successful clone;
+# an empty result just falls through to the "could not be verified" warning.
+MRP_STATUS=$(run_sql_query "get_mrp_status.sql" 2>/dev/null) || MRP_STATUS=""
 
 if echo "$MRP_STATUS" | grep -q "MRP0"; then
     log_info "Managed Recovery Process (MRP) is running"
@@ -797,7 +946,7 @@ print_status_block "Standby Clone Result" \
 print_list_block "Completed Actions" \
     "Started the standby instance in NOMOUNT." \
     "Ran RMAN DUPLICATE FROM ACTIVE DATABASE." \
-    "Verified or created the SPFILE." \
+    "Verified the SPFILE." \
     "Started Managed Recovery Process (MRP)." \
     "Configured RMAN archivelog deletion policy."
 

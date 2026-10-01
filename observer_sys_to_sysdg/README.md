@@ -26,12 +26,16 @@ for new builds; this kit retrofits the same shape onto existing ones.)
 
 | Script | Runs on | Does |
 |---|---|---|
-| `01_create_sysdg_user.sh` | **PRIMARY** | Creates/verifies the dedicated user with exactly `CREATE SESSION` + `SYSDG` (CDB-aware: auto-prefixes `C##`). Idempotent. |
+| `01_create_sysdg_user.sh` | **PRIMARY** | Creates/verifies the dedicated user with exactly `CREATE SESSION` + `SYSDG` (CDB-aware: auto-prefixes `C##`). Idempotent. Checks the user's `PASSWORD_LIFE_TIME` (see below). |
 | `02_switch_observer_credentials.sh` | **OBSERVER host** | Replaces SYS credentials in the existing wallet — or creates a wallet if the observer used `sys/password@alias` directly — tests both databases with the new user, then (optionally) restarts the observer under the new identity. |
 | `03_verify_conversion.sh` | anywhere | `SHOW CONFIGURATION` / `SHOW FAST_START FAILOVER` / `SHOW OBSERVER` + `V$DATABASE` observer columns + `V$PWFILE_USERS`. Exit 0 = observer present. |
 | `_lib.sh` | — | Shared helpers sourced by the three scripts. |
 
-All passwords are prompted at runtime — never accepted via argv, env, or files.
+All passwords are prompted at runtime — never accepted via argv, env, or files,
+and never placed on a process argv either (`mkstore -createCredential` is fed the
+credential password and the wallet password over stdin).
+A password may contain `&` (SQL*Plus substitution is switched off); a double
+quote is rejected, because the password is embedded as `IDENTIFIED BY "..."`.
 
 ## Before you start: know how your observer authenticates today
 
@@ -68,6 +72,16 @@ Safe to run at any time: it touches no observer, no broker property, no
 transport. It verifies the grant landed via `V$PWFILE_USERS` (administrative
 privileges appear there, never in `DBA_ROLE_PRIVS`).
 
+**Password expiry.** A new user lands in the `DEFAULT` profile, whose
+`PASSWORD_LIFE_TIME` is 180 days on a stock database. When the observer's
+password expires its logins fail with `ORA-28001` and Fast-Start Failover stops
+working without an obvious alarm. Script 01 reports the user's effective
+`PASSWORD_LIFE_TIME` and, if it is not `UNLIMITED`, prints the fix and (on a
+terminal, default **No**) offers to create `DG_OBSERVER_PROFILE`
+(`C##DG_OBSERVER_PROFILE` on a CDB, `CONTAINER = ALL`) with an unlimited life
+time and assign it to the user. It never changes a profile without asking; if you
+keep the stock profile, schedule a password rotation *and* a wallet update.
+
 **Standby password file.** The observer must also log into the *standby* (that
 is how it completes a failover), and `AS SYSDG` logins on a mounted standby are
 authenticated purely against its password file. On 12.2+ a physical standby
@@ -89,9 +103,22 @@ primary$ scp $ORACLE_HOME/dbs/orapw<PRIMARY_SID>  standby:$ORACLE_HOME/dbs/orapw
 
 What it does, in order:
 
-1. Finds the wallet (from `sqlnet.ora`'s `WALLET_LOCATION`, or `-w DIR`).
-2. **Wallet exists** → lists its credentials (you'll see the SYS entries) and
-   replaces them with the new user for both TNS aliases.
+1. Finds the wallet (from `sqlnet.ora`'s `WALLET_LOCATION`, or `-w DIR`). A
+   `-w DIR` that differs from `sqlnet.ora`'s `WALLET_LOCATION` is **refused**:
+   sqlplus/dgmgrl read the `sqlnet.ora` wallet, so editing another one would
+   change nothing the observer uses (and the connection test could still pass on
+   the old SYS entry, since SYS can log in `AS SYSDG`).
+2. **Wallet exists** → lists its credentials (you'll see the SYS entries), copies
+   the wallet to `<wallet-dir>.bak.<YYYYmmddHHMMSS>` **before the first change**,
+   and replaces the entries with the new user for both TNS aliases. Any failure
+   from then on prints the backup path and the exact restore command. A wallet
+   that has `ewallet.p12` but no `cwallet.sso` also gets auto-login enabled
+   (`mkstore -createSSO`), otherwise the unattended observer could not open it.
+   Afterwards the wallet is re-listed: both aliases must map to the new user, and
+   any credential for **SYS** still present under another key (an FQDN-qualified
+   alias, the broker's `DGConnectIdentifier`) is reported loudly — the script
+   only converts the two aliases you typed, and finishes with
+   "CREDENTIAL SWITCH FINISHED - WITH WARNINGS" instead of "COMPLETE".
    **Wallet password lost?** It offers to move the old wallet to a timestamped
    `.bak` and build a fresh one (`--rebuild-wallet` forces this path).
    **Auto-login-only wallet** (`cwallet.sso` without `ewallet.p12`)? Rebuild is
@@ -105,10 +132,25 @@ What it does, in order:
    failure (ORA-01017) aborts with the password-file fix above — an observer
    whose credentials the standby rejects cannot complete a failover, so
    restarting it in that state would be strictly worse than doing nothing.
-4. Tests `dgmgrl /@primary "show configuration"`.
+   The test also requires `SYS_CONTEXT('USERENV','AUTHENTICATED_IDENTITY')` to
+   equal the new user (an `AS SYSDG` session reports `USER` = `SYSDG` whichever
+   user logged in, so only this value proves the new credential was used); SYS or
+   any other value fails it.
+4. Tests `dgmgrl /@primary "show configuration"`, then reads each member's broker
+   `DGConnectIdentifier` — the string the observer actually resolves and looks up
+   in the wallet — and checks that the wallet maps it to the new user and that a
+   connection through it works. A mismatch (typically an FQDN or easy-connect
+   identifier different from the typed alias) is warned about, and the restart
+   needs an explicit confirmation; re-run with that identifier as
+   `--standby-tns` to fix it.
 5. Offers to `STOP OBSERVER` + `START OBSERVER IN BACKGROUND FILE IS ...
    LOGFILE IS ...` (files under `--observer-dir`, default `~/fsfo_observer`).
    Decline (or pass `--no-restart`) to get the exact commands printed instead.
+   `dgmgrl` exits 0 even when `START OBSERVER` fails, so the output is parsed
+   (`ORA-`/`DGM-` codes outside `Warning:` lines, `Error: N`, `Failed.`) and
+   `FS_FAILOVER_OBSERVER_PRESENT` is polled for up to 60 seconds. If no observer
+   is present at the end the script says so plainly — the old one is already
+   stopped — prints the manual start command and **exits 1**.
 
 **The restart gap.** Between STOP and START (seconds) there is no observer: no
 automatic failover can trigger, and the primary keeps running normally. The
@@ -164,10 +206,11 @@ stop-then-start:
 
 Everything the kit changes is reversible and backed up:
 
-- **Wallet**: replaced-in-place credentials can be re-pointed at SYS with
-  `mkstore -createCredential` (after `-deleteCredential`); a rebuilt wallet's
-  predecessor sits next to it as `<wallet-dir>.bak.<timestamp>`. Move it back
-  and restart the observer.
+- **Wallet**: before an in-place edit the wallet is copied to
+  `<wallet-dir>.bak.<YYYYmmddHHMMSS>`; a rebuild moves the old wallet there
+  instead. The script prints the exact restore command on any failure
+  (`rm -rf <wallet-dir> && cp -p -R <backup> <wallet-dir>`, or `mv` after a
+  rebuild). Restore it and restart the observer.
 - **sqlnet.ora**: timestamped `.bak` copy next to the original.
 - **The SYSDG user**: harmless to leave; `DROP USER <user>;` on the primary to
   remove (the drop replicates to the standby, and the password-file entry
@@ -184,6 +227,9 @@ Everything the kit changes is reversible and backed up:
 | `ORA-65096` creating the user | CDB needs a common user; accept the `C##` prefix that script 01 offers. |
 | `mkstore` rejects the wallet password | The old wallet's password is lost (common for wallets built by someone long gone). Script 02 offers a backup-and-rebuild. |
 | `mkstore` edits "succeed" but connects still fail ORA-01017 | The wallet is auto-login-only (`cwallet.sso` without `ewallet.p12`) — mkstore has no password to verify, so edits exit 0 without producing usable credentials. Script 02 detects this and rebuilds automatically; use `--rebuild-wallet` on older copies of the kit. |
+| Script 02 ends "WITH WARNINGS" listing SYS keys | The wallet held SYS credentials under keys other than the two aliases you typed (FQDN-qualified alias, broker `DGConnectIdentifier`). Re-run with that key as `--primary-tns`/`--standby-tns`, or `mkstore -wrl <dir> -deleteCredential <key>` once nothing uses it. |
+| Script 02 refuses with "Wallet directory mismatch" | `-w` names a different directory than `sqlnet.ora`'s `WALLET_LOCATION`. Omit `-w`, or change `WALLET_LOCATION` first. |
+| Observer logins start failing with `ORA-28001` months later | The observer user's password expired (`DEFAULT` profile `PASSWORD_LIFE_TIME` 180). Give the user a profile with an unlimited life time (script 01 offers it) and reset the password + wallet entry. |
 | `STOP OBSERVER` errors | The old observer process is dead or unreachable — kill its `dgmgrl` process on its host, then start the new one. With multiple observers registered, name it: `STOP OBSERVER <name>` (see `SHOW OBSERVER`). |
 | Observer present but `SHOW OBSERVER` shows the wrong host | Something (cron/systemd) restarted the old SYS observer elsewhere. Find and fix the starter, `STOP OBSERVER`, start yours. |
 | Host uses TDE | Unrelated: TDE's keystore is `ENCRYPTION_WALLET_LOCATION`; the observer credential wallet is `WALLET_LOCATION` + `SQLNET.WALLET_OVERRIDE`. The scripts only ever match the latter (anchored), and `WALLET_OVERRIDE` does not affect TDE. |

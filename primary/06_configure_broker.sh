@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 6: Configure Data Guard Broker
 # ============================================================
@@ -251,13 +251,14 @@ log_info "Standby database added successfully"
 # ============================================================
 # The StaticConnectIdentifier set below points at the _DGMGRL service
 # registered in listener.ora by step 4 (primary) / step 3 (standby).
-# Step 4 deliberately does not reload the listener, so if nobody ran
-# 'lsnrctl reload' since then, the service is configured on disk but
-# NOT actually being served yet - StaticConnectIdentifier will look
-# correct but every switchover/FSFO connect attempt fails with
-# ORA-12514 the first time it's needed, weeks later (M15). Only the
-# PRIMARY's own listener can be checked from here; warn about the
-# standby too since the same gap applies there.
+# Step 4 reloads the primary listener after editing listener.ora, but
+# that reload can be declined or fail (and the standby listener is never
+# reloaded from here). If the service is configured on disk but NOT
+# actually being served, StaticConnectIdentifier will look correct but
+# every switchover/FSFO connect attempt fails with ORA-12514 the first
+# time it's needed, weeks later (M15). Only the PRIMARY's own listener
+# can be checked from here; warn about the standby too since the same
+# gap applies there.
 # ============================================================
 
 progress_step "Verifying _DGMGRL Static Service Registration"
@@ -271,7 +272,8 @@ if echo "$_lsnrctl_status" | grep -qi "$_primary_dgmgrl_service"; then
     log_info "Primary listener is serving ${_primary_dgmgrl_service}"
 else
     log_warn "Primary listener does NOT show the ${_primary_dgmgrl_service} static service."
-    log_warn "listener.ora was updated in step 4, but the listener has not been reloaded since -"
+    log_warn "listener.ora was updated in step 4, but this listener is not serving it (the step 4"
+    log_warn "reload was declined or failed, or the listener was restarted from another TNS_ADMIN) -"
     log_warn "without it, DGMGRL switchover/failover connect attempts to this database will fail"
     log_warn "with ORA-12514. Also confirm the standby listener serves ${_standby_dgmgrl_service}."
     log_warn "Fix: lsnrctl reload   (run on both the primary and standby listeners)"
@@ -338,35 +340,41 @@ fi
 # more members are working on their tasks") to converge after ENABLE
 # CONFIGURATION. Poll SHOW CONFIGURATION instead, mirroring
 # 13_set_max_availability.sh's reference poll loop: every 10s, up to
-# ~120s, accepting SUCCESS or WARNING as stable and treating
-# ORA-16610/"in progress" (or any other transient output) as "keep
-# waiting" rather than a final verdict.
+# ~120s. Only SUCCESS ends the wait early: a WARNING during initial
+# status propagation is routinely transient, so it keeps polling and is
+# reported as WARNING only if it is still the last word at the timeout.
+# The status comes from the "Configuration Status:" field, not from a
+# grep for the words anywhere in the output.
 log_info "Waiting for configuration to stabilize..."
 CONFIG_STATUS=""
 BROKER_STATUS=""
+_last_status=""
 _poll_attempt=0
 _poll_max_attempts=12   # 12 * 10s = ~120s
 while [[ $_poll_attempt -lt $_poll_max_attempts ]]; do
     CONFIG_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
-    if echo "$CONFIG_STATUS" | grep -q "SUCCESS"; then
+    _poll_status=$(dgmgrl_status_value "$CONFIG_STATUS") || _poll_status=""
+    if [[ "$_poll_status" == "SUCCESS" ]]; then
         BROKER_STATUS="SUCCESS"
         break
-    elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
-        BROKER_STATUS="WARNING"
-        break
+    fi
+    if [[ "$_poll_status" == "WARNING" ]]; then
+        _last_status="WARNING"
+    else
+        _last_status=""
     fi
     _poll_attempt=$((_poll_attempt + 1))
     if [[ $_poll_attempt -lt $_poll_max_attempts ]]; then
         if echo "$CONFIG_STATUS" | grep -Eqi "ORA-16610|in progress"; then
             log_info "Broker configuration still converging (attempt ${_poll_attempt}/${_poll_max_attempts}) - retrying in 10s..."
         else
-            log_info "Configuration not yet SUCCESS/WARNING (attempt ${_poll_attempt}/${_poll_max_attempts}) - retrying in 10s..."
+            log_info "Configuration not yet SUCCESS (status: ${_poll_status:-unknown}; attempt ${_poll_attempt}/${_poll_max_attempts}) - retrying in 10s..."
         fi
         sleep 10
     fi
 done
 if [[ -z "$BROKER_STATUS" ]]; then
-    BROKER_STATUS="ERROR"
+    BROKER_STATUS="${_last_status:-ERROR}"
 fi
 
 # ============================================================

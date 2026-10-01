@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for the dataguard-doc visualizer link helpers
 # embedded in dg_handoff.sh and get_dg_config_url.sh
@@ -249,6 +249,89 @@ JSON=$(decode_cfg "$URL")
 assert_contains "quotes and backslashes escaped" "$JSON" '"hostPrimary":"host\"with\\quirks"'
 assert_not_contains "non-numeric port dropped"      "$JSON" '"port"'
 assert_not_contains "non-numeric threshold dropped" "$JSON" '"threshold"'
+
+# ============================================================
+# Test 6: get_dg_config_url.sh itself, against a stub sqlplus / dgmgrl
+# ============================================================
+echo "Test 6: get_dg_config_url.sh option parsing, discovery and service choice"
+GURL="$REPO_DIR/get_dg_config_url.sh"
+G_TMP=$(mktemp -d "${TMPDIR:-/tmp}/viz_url_test.XXXXXX") || {
+    echo "FATAL: cannot create temp dir"; exit 1; }
+trap 'rm -rf "$G_TMP"' EXIT
+mkdir -p "$G_TMP/bin" "$G_TMP/oh/bin"
+
+# The stub dispatches on the SQL text (this script's queries carry no QTAG).
+cat > "$G_TMP/bin/sqlplus" <<'STUB'
+#!/bin/bash
+IN=$(cat)
+case "$IN" in
+    *"SELECT 'OK' FROM DUAL"*)        echo "OK" ;;
+    *"DATABASE_ROLE||'|'||PROTECTION_MODE"*) echo "PRIMARY|MAXIMUM AVAILABILITY" ;;
+    *"SELECT DB_UNIQUE_NAME FROM V\$DATABASE"*) printf 'cdb1\t\n' ;;
+    *"dg_broker_start"*)              echo "TRUE" ;;
+    *"V\$DATAGUARD_CONFIG"*)          echo "cdb1_stby" ;;
+    *"FS_FAILOVER_STATUS"*)           echo "TARGET UNDER LAG LIMIT|obs1.example.com" ;;
+    *"V\$LISTENER_NETWORK"*)          echo "(ADDRESS=(PROTOCOL=TCP)(HOST=pri.example.com)(PORT=1521))" ;;
+    *"V\$ACTIVE_SERVICES"*)
+        printf '%s\n' "$IN" > "$G_TMP/service.sql"
+        printf 'app_svc\t\n' ;;
+esac
+exit 0
+STUB
+cat > "$G_TMP/oh/bin/dgmgrl" <<'STUB'
+#!/bin/bash
+CMD=$(head -1)
+case "$CMD" in
+    *"VERBOSE 'cdb1_stby'"*) echo "  HostName = 'stb.example.com'" ;;
+    *"VERBOSE 'cdb1'"*)      echo "  HostName = 'pri.example.com'" ;;
+    *"'LogXptMode'"*)        echo "  LogXptMode = 'FASTSYNC'" ;;
+    "SHOW CONFIGURATION FastStartFailoverThreshold;") echo "  FastStartFailoverThreshold = '45'" ;;
+    "SHOW FAST_START FAILOVER;") [ "${G_FSFO_SHOW:-}" = "none" ] || echo "  Threshold:          30 seconds" ;;
+esac
+exit 0
+STUB
+chmod +x "$G_TMP/bin/sqlplus" "$G_TMP/oh/bin/dgmgrl"
+
+run_gurl() {
+    G_OUT=$(G_TMP="$G_TMP" PATH="$G_TMP/bin:$PATH" ORACLE_SID=cdb1 ORACLE_HOME="$G_TMP/oh" \
+            bash "$GURL" "$@" 2>"$G_TMP/err"); G_RC=$?
+    G_ERR=$(cat "$G_TMP/err")
+}
+
+# C5: a missing value is a usage error (this tool's documented code is 2)
+for opt in --primary-host --standby-host --observer-host --port --service --base-url; do
+    run_gurl "$opt"
+    assert_eq "$opt without a value exits 2" "2" "$G_RC"
+    assert_contains "$opt without a value says so" "$G_ERR" "$opt requires a value"
+done
+run_gurl --port abc
+assert_eq "--port abc exits 2" "2" "$G_RC"
+run_gurl --port 70000
+assert_eq "--port 70000 exits 2" "2" "$G_RC"
+
+# Happy path; the stub's trailing tabs must not leak into the topology
+run_gurl -q
+assert_eq "discovery run rc" "0" "$G_RC"
+G_JSON=$(decode_cfg "$G_OUT")
+assert_contains "service has no tab"    "$G_JSON" '"service":"app_svc"'
+assert_contains "primary host"          "$G_JSON" '"hostPrimary":"pri.example.com"'
+assert_contains "threshold from SHOW FAST_START FAILOVER" "$G_JSON" '"threshold":30'
+G_FSFO_SHOW=none run_gurl -q
+G_JSON=$(decode_cfg "$G_OUT")
+assert_contains "threshold falls back to SHOW CONFIGURATION property" "$G_JSON" '"threshold":45'
+
+run_gurl -q --port 01522
+assert_eq "--port 01522 rc" "0" "$G_RC"
+assert_contains "leading-zero port normalised" "$(decode_cfg "$G_OUT")" '"port":1522'
+
+# C10: the service query excludes the DB_DOMAIN-qualified and container
+# defaults (as dg_handoff.sh does) and keeps only USER services
+G_SQL=$(cat "$G_TMP/service.sql")
+assert_contains "service query joins V\$CONTAINERS" "$G_SQL" 'JOIN V$CONTAINERS c'
+assert_contains "service query excludes qualified defaults" "$G_SQL" "UPPER(c.NAME) || '.' ||"
+assert_contains "service query keeps USER services only" "$G_SQL" "WHERE CLS = 'USER'"
+assert_not_contains "service query has no %XDB% wildcard" "$G_SQL" "%XDB%"
+assert_contains "service query excludes the exact XDB dispatcher names" "$G_SQL" "|| 'XDB'"
 
 # ============================================================
 echo ""

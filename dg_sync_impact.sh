@@ -73,10 +73,12 @@ on the local PRIMARY database, connecting via 'sqlplus / as sysdba'.
 Options:
       --ash-hours N         ASH attribution window in hours (default: 24)
       --days N              AWR trend window in days (default: 7)
-      --baseline-begin V    Baseline window start: 'YYYY-MM-DD HH24:MI' or a
-                            pure-digit AWR snapshot ID. Enables the empirical
-                            before/after comparison against a pre-SYNC period.
-      --baseline-end V      Baseline window end (same formats; both or neither)
+      --baseline-begin V    Baseline window start: 'YYYY-MM-DD HH24:MI', a bare
+                            'YYYY-MM-DD' (from 00:00) or a pure-digit AWR
+                            snapshot ID. Enables the empirical before/after
+                            comparison against a pre-SYNC period.
+      --baseline-end V      Baseline window end (same formats; both or neither;
+                            a bare date runs to the end of that day)
       --auto-baseline       Detect the pre-SYNC baseline window from AWR history
       --no-pack             Skip AWR/ASH sections (no Diagnostics Pack license);
                             only freely usable V\$ views are queried
@@ -114,29 +116,49 @@ baseline_kind() {
     esac
 }
 
+arg_error() { echo "ERROR: $*" >&2; usage >&2; exit 2; }
+
+# need_value OPTION ARGC: a value-taking option without its value must exit 2
+# (bad arguments), not die in a bare `shift 2` under `set -e` with a silent 1.
+need_value() { [[ "$2" -ge 2 ]] || arg_error "$1 requires a value"; }
+
+# uint_norm VALUE -> decimal value without leading zeros ('08' is not octal
+# here). Callers guarantee is_uint; more than 9 digits is refused so bash
+# arithmetic cannot overflow.
+uint_norm() {
+    [[ ${#1} -le 9 ]] || return 1
+    printf '%s' "$((10#$1))"
+}
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --ash-hours)        ASH_HOURS="$2"; shift 2 ;;
-        --days)             AWR_DAYS="$2"; shift 2 ;;
-        --baseline-begin)   BASELINE_BEGIN="$2"; shift 2 ;;
-        --baseline-end)     BASELINE_END="$2"; shift 2 ;;
+        --ash-hours)        need_value "$1" $#; ASH_HOURS="$2"; shift 2 ;;
+        --days)             need_value "$1" $#; AWR_DAYS="$2"; shift 2 ;;
+        --baseline-begin)   need_value "$1" $#; BASELINE_BEGIN="$2"; shift 2 ;;
+        --baseline-end)     need_value "$1" $#; BASELINE_END="$2"; shift 2 ;;
         --auto-baseline)    AUTO_BASELINE="YES"; shift ;;
         --no-pack)          NO_PACK="YES"; shift ;;
         --html)             OUTPUT_FORMAT="html"; shift ;;
-        -o|--output)        OUTPUT_FILE="$2"; shift 2 ;;
+        -o|--output)        need_value "$1" $#; OUTPUT_FILE="$2"; shift 2 ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
 
-arg_error() { echo "ERROR: $*" >&2; usage >&2; exit 2; }
-
 is_uint "$ASH_HOURS" || arg_error "--ash-hours must be a positive integer (got '${ASH_HOURS}')."
 is_uint "$AWR_DAYS"  || arg_error "--days must be a positive integer (got '${AWR_DAYS}')."
+ASH_HOURS=$(uint_norm "$ASH_HOURS") || arg_error "--ash-hours is too large (at most 9 digits)."
+AWR_DAYS=$(uint_norm "$AWR_DAYS")   || arg_error "--days is too large (at most 9 digits)."
 [[ "$ASH_HOURS" -gt 0 ]] || arg_error "--ash-hours must be greater than zero."
 [[ "$AWR_DAYS"  -gt 0 ]] || arg_error "--days must be greater than zero."
 
+# Baseline window as the SQL needs it. A bare date means 00:00 for the begin
+# and the last second of that day for the end (BASELINE_END_PAD is added to
+# the end TO_DATE), so '--baseline-end 2026-07-08' includes the whole 8th.
 BASELINE_MODE=""
+BASELINE_BEGIN_SQL=""
+BASELINE_END_SQL=""
+BASELINE_END_PAD="0"
 if [[ -n "$BASELINE_BEGIN" || -n "$BASELINE_END" ]]; then
     [[ -n "$BASELINE_BEGIN" && -n "$BASELINE_END" ]] \
         || arg_error "--baseline-begin and --baseline-end must be given together."
@@ -149,8 +171,27 @@ if [[ -n "$BASELINE_BEGIN" || -n "$BASELINE_END" ]]; then
     [[ "$BK1" == "$BK2" ]] \
         || arg_error "Baseline begin/end must use the same format (both dates or both snap IDs)."
     BASELINE_MODE="$BK1"
-    if [[ "$BASELINE_MODE" == "snap" && "$BASELINE_BEGIN" -ge "$BASELINE_END" ]]; then
-        arg_error "--baseline-begin snapshot must be lower than --baseline-end."
+    if [[ "$BASELINE_MODE" == "snap" ]]; then
+        BASELINE_BEGIN=$(uint_norm "$BASELINE_BEGIN") || arg_error "--baseline-begin snapshot ID is too large (at most 9 digits)."
+        BASELINE_END=$(uint_norm "$BASELINE_END")     || arg_error "--baseline-end snapshot ID is too large (at most 9 digits)."
+        if [[ "$BASELINE_BEGIN" -ge "$BASELINE_END" ]]; then
+            arg_error "--baseline-begin snapshot must be lower than --baseline-end."
+        fi
+    else
+        BASELINE_BEGIN_SQL="$BASELINE_BEGIN"
+        BASELINE_END_SQL="$BASELINE_END"
+        _end_cmp="$BASELINE_END"
+        if [[ ${#BASELINE_BEGIN} -eq 10 ]]; then
+            BASELINE_BEGIN_SQL="${BASELINE_BEGIN} 00:00"
+        fi
+        if [[ ${#BASELINE_END} -eq 10 ]]; then
+            BASELINE_END_SQL="${BASELINE_END} 00:00"
+            BASELINE_END_PAD="86399/86400"
+            _end_cmp="${BASELINE_END} 23:59"
+        fi
+        if [[ "$BASELINE_BEGIN_SQL" > "$_end_cmp" ]]; then
+            arg_error "--baseline-begin is after --baseline-end."
+        fi
     fi
 fi
 
@@ -159,6 +200,19 @@ if [[ "$AUTO_BASELINE" == "YES" ]]; then
         || arg_error "--auto-baseline cannot be combined with --baseline-begin/--baseline-end."
     [[ "$NO_PACK" == "NO" ]] \
         || arg_error "--auto-baseline requires AWR and cannot be combined with --no-pack."
+fi
+
+# An unwritable -o would otherwise fail only after every collector has run.
+# Appending nothing neither truncates an existing file nor needs sqlplus; a
+# file this check creates is removed again.
+if [[ -n "$OUTPUT_FILE" ]]; then
+    _out_existed="NO"
+    [[ -e "$OUTPUT_FILE" ]] && _out_existed="YES"
+    if ! ( : >> "$OUTPUT_FILE" ) 2>/dev/null; then
+        echo "ERROR: cannot write to the -o file '${OUTPUT_FILE}'." >&2
+        exit 2
+    fi
+    [[ "$_out_existed" == "YES" ]] || rm -f "$OUTPUT_FILE"
 fi
 
 # ============================================================
@@ -190,10 +244,23 @@ info "Pre-flight checks passed."
 # so a variable set in run_sql would never reach the emitter. Best-effort -
 # without a writable temp dir the report simply omits the query blocks.
 QDIR=""
-if QDIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_sync_impact.XXXXXX" 2>/dev/null); then
-    trap 'rm -rf "$QDIR"' EXIT INT TERM
+if command -v mktemp >/dev/null 2>&1; then
+    QDIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_sync_impact.XXXXXX" 2>/dev/null) || QDIR=""
+fi
+if [[ -z "$QDIR" ]]; then
+    # No mktemp (AIX base system) or it failed: a plain mkdir -m 700 without
+    # -p, so a directory (or symlink) that already exists is never reused.
+    QDIR="${TMPDIR:-/tmp}/dg_sync_impact.$$"
+    mkdir -m 700 "$QDIR" 2>/dev/null || QDIR=""
+fi
+if [[ -n "$QDIR" ]]; then
+    # EXIT cleans up; a signal must also end the run (a trap without an exit
+    # would let the script carry on after Ctrl-C and finish with status 0).
+    trap 'rm -rf "$QDIR"' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
 else
-    QDIR=""
+    warn "Could not create a temp directory; the report will omit the per-table query blocks."
 fi
 
 # recorded_sql TAG -> the exact text of the TAG query, empty if unrecorded
@@ -210,7 +277,7 @@ run_sql() {
         [[ -n "$tag" ]] && printf '%s\n' "$sql" > "$QDIR/$tag.sql"
     fi
     sqlplus -s -L / as sysdba <<EOF
-SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON
+SET HEADING OFF FEEDBACK OFF VERIFY OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON TAB OFF
 WHENEVER SQLERROR EXIT 1
 ALTER SESSION SET NLS_NUMERIC_CHARACTERS='.,';
 ${sql}
@@ -218,7 +285,7 @@ EXIT;
 EOF
 }
 
-clean() { tr -d ' \r' | sed '/^$/d'; }
+clean() { tr -d ' \t\r' | sed '/^$/d'; }
 # Like clean(), but keeps embedded spaces - event names, ISO timestamps
 # and SQL text fragments contain meaningful spaces.
 trim()  { tr -d '\r' | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e '/^$/d'; }
@@ -248,6 +315,30 @@ fmt_or_na() {
         printf 'n/a'
     fi
 }
+
+# DG_SI_* are interpolated into the auto-baseline query, so anything that is
+# not a plain number falls back to the default (with a warning) instead of
+# reaching Oracle - DG_SI_MIN_WRITES=0, for one, makes the ratio divide by 0
+# (ORA-01476).
+if ! is_num "$DG_SI_SYNC_RATIO" || ! awk "BEGIN{exit !($DG_SI_SYNC_RATIO > 0)}"; then
+    warn "DG_SI_SYNC_RATIO='${DG_SI_SYNC_RATIO}' is not a positive number; using 0.5."
+    DG_SI_SYNC_RATIO="0.5"
+fi
+if ! is_num "$DG_SI_NOSYNC_RATIO"; then
+    warn "DG_SI_NOSYNC_RATIO='${DG_SI_NOSYNC_RATIO}' is not a non-negative number; using 0.05."
+    DG_SI_NOSYNC_RATIO="0.05"
+fi
+if ! awk "BEGIN{exit !($DG_SI_NOSYNC_RATIO < $DG_SI_SYNC_RATIO)}"; then
+    warn "DG_SI_NOSYNC_RATIO (${DG_SI_NOSYNC_RATIO}) must be below DG_SI_SYNC_RATIO (${DG_SI_SYNC_RATIO}); using 0.5 / 0.05."
+    DG_SI_SYNC_RATIO="0.5"
+    DG_SI_NOSYNC_RATIO="0.05"
+fi
+if ! is_uint "$DG_SI_MIN_WRITES" || [[ ${#DG_SI_MIN_WRITES} -gt 9 ]] || [[ "$((10#$DG_SI_MIN_WRITES))" -lt 1 ]]; then
+    warn "DG_SI_MIN_WRITES='${DG_SI_MIN_WRITES}' is not a positive integer; using 50."
+    DG_SI_MIN_WRITES="50"
+else
+    DG_SI_MIN_WRITES=$((10#$DG_SI_MIN_WRITES))
+fi
 
 # qblock TAG... - fenced SQL block(s) carrying the exact text of the query
 # that produced the table above. A fenced block in the Markdown; the HTML
@@ -373,21 +464,33 @@ DESTS_RAW=$(printf '%s\n' "$_out" | trim | grep '^DEST[|]' || true)
 # attribute: SYNCHRONOUS and PARALLELSYNC are both synchronous
 # transport, ASYNCHRONOUS is not. AFFIRM vs NOAFFIRM (FASTSYNC) is NOT
 # encoded in TRANSMIT_MODE - only the separate AFFIRM column carries it.
+# Only a destination whose STATUS is VALID is shipping redo, so only those
+# count as active synchronous transport; a SYNC destination that is DEFERRED,
+# in ERROR, etc. is listed separately (SYNC_NONVALID) - commits are not
+# waiting on it.
 SYNC_DEST_COUNT=0
 SYNC_TARGETS=""
 SYNC_AFFIRM_ANY="NO"
+SYNC_NONVALID=""
 if [[ -n "$DESTS_RAW" ]]; then
     while IFS='|' read -r _tag _id _dbun _tmode _affirm _nt _status; do
         case "$_tmode" in
             SYNCHRONOUS|PARALLELSYNC)
-                SYNC_DEST_COUNT=$((SYNC_DEST_COUNT + 1))
-                SYNC_TARGETS="${SYNC_TARGETS:+${SYNC_TARGETS}, }${_dbun}"
-                [[ "$_affirm" == "YES" ]] && SYNC_AFFIRM_ANY="YES"
+                if [[ "$_status" == "VALID" ]]; then
+                    SYNC_DEST_COUNT=$((SYNC_DEST_COUNT + 1))
+                    SYNC_TARGETS="${SYNC_TARGETS:+${SYNC_TARGETS}, }${_dbun}"
+                    [[ "$_affirm" == "YES" ]] && SYNC_AFFIRM_ANY="YES"
+                else
+                    SYNC_NONVALID="${SYNC_NONVALID:+${SYNC_NONVALID}, }${_dbun} (${_status})"
+                fi
                 ;;
         esac
     done <<< "$DESTS_RAW"
 fi
 
+if [[ -n "$SYNC_NONVALID" ]]; then
+    warn "Synchronous destination(s) configured but not VALID, not counted as active: ${SYNC_NONVALID}."
+fi
 if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
     warn "No synchronous (SYNC/FASTSYNC) destination is active - the report will show current commit latency without a transport overhead estimate."
 else
@@ -548,20 +651,34 @@ AB_N_SYNC=""
 AB_N_NOSYNC=""
 AB_N_OTHER=""
 
-# collect_awr_agg MIN_SNAP MAX_SNAP -> XAGG row on stdout
+# The AWR window queries partition every LAG() by the snapshot's STARTUP_TIME:
+# a delta that spans an instance restart is meaningless (the counters were
+# reset), so it is dropped - and, with it, the length of that interval from
+# the elapsed time. Summing only the surviving intervals keeps the rates
+# (waits/hour, commits/s) from being understated by restart downtime.
+
+# collect_awr_agg TAG MIN_SNAP MAX_SNAP -> XAGG row on stdout. TAG names the
+# recorded query (AWRAGG for the current window, BASEAGG for the baseline) so
+# the two never overwrite each other's block.
 collect_awr_agg() {
-    local mins="$1" maxs="$2"
-    run_sql "-- QTAG:AWRAGG
-WITH ev AS (
-  SELECT EVENT_NAME,
-         TOTAL_WAITS - LAG(TOTAL_WAITS)
-             OVER (PARTITION BY EVENT_NAME ORDER BY SNAP_ID) DW,
-         TIME_WAITED_MICRO - LAG(TIME_WAITED_MICRO)
-             OVER (PARTITION BY EVENT_NAME ORDER BY SNAP_ID) DT
-  FROM DBA_HIST_SYSTEM_EVENT
+    local tag="$1" mins="$2" maxs="$3"
+    run_sql "-- QTAG:${tag}
+WITH sn AS (
+  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET, STARTUP_TIME ST
+  FROM DBA_HIST_SNAPSHOT
   WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
     AND SNAP_ID BETWEEN ${mins} AND ${maxs}
-    AND EVENT_NAME IN ('log file sync','log file parallel write','SYNC Remote Write')
+),
+ev AS (
+  SELECT e.EVENT_NAME,
+         e.TOTAL_WAITS - LAG(e.TOTAL_WAITS)
+             OVER (PARTITION BY e.EVENT_NAME, sn.ST ORDER BY e.SNAP_ID) DW,
+         e.TIME_WAITED_MICRO - LAG(e.TIME_WAITED_MICRO)
+             OVER (PARTITION BY e.EVENT_NAME, sn.ST ORDER BY e.SNAP_ID) DT
+  FROM DBA_HIST_SYSTEM_EVENT e, sn
+  WHERE e.DBID=${DBID} AND e.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND e.SNAP_ID = sn.SNAP_ID
+    AND e.EVENT_NAME IN ('log file sync','log file parallel write','SYNC Remote Write')
 ),
 ea AS (
   SELECT
@@ -575,26 +692,23 @@ ea AS (
 ),
 cm AS (
   SELECT SUM(CASE WHEN DC>=0 THEN DC END) COMMITS FROM (
-    SELECT VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DC
-    FROM DBA_HIST_SYSSTAT
-    WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-      AND STAT_NAME='user commits'
-      AND SNAP_ID BETWEEN ${mins} AND ${maxs})
+    SELECT x.VALUE - LAG(x.VALUE) OVER (PARTITION BY sn.ST ORDER BY x.SNAP_ID) DC
+    FROM DBA_HIST_SYSSTAT x, sn
+    WHERE x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+      AND x.STAT_NAME='user commits'
+      AND x.SNAP_ID = sn.SNAP_ID)
 ),
 tm AS (
   SELECT SUM(CASE WHEN DV>=0 THEN DV END)/1000 DBTIME_MS FROM (
-    SELECT VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DV
-    FROM DBA_HIST_SYS_TIME_MODEL
-    WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-      AND STAT_NAME='DB time'
-      AND SNAP_ID BETWEEN ${mins} AND ${maxs})
+    SELECT x.VALUE - LAG(x.VALUE) OVER (PARTITION BY sn.ST ORDER BY x.SNAP_ID) DV
+    FROM DBA_HIST_SYS_TIME_MODEL x, sn
+    WHERE x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+      AND x.STAT_NAME='DB time'
+      AND x.SNAP_ID = sn.SNAP_ID)
 ),
 w AS (
-  SELECT (MAX(CAST(END_INTERVAL_TIME AS DATE))
-         -MIN(CAST(END_INTERVAL_TIME AS DATE)))*86400 SECS
-  FROM DBA_HIST_SNAPSHOT
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND SNAP_ID BETWEEN ${mins} AND ${maxs}
+  SELECT SUM(D)*86400 SECS FROM (
+    SELECT ET - LAG(ET) OVER (PARTITION BY ST ORDER BY SNAP_ID) D FROM sn)
 )
 SELECT 'XAGG|'||NVL(TO_CHAR(ROUND(w.SECS)),'-')
   ||'|'||NVL(TO_CHAR(ea.LFS_CNT),'-')
@@ -607,19 +721,22 @@ SELECT 'XAGG|'||NVL(TO_CHAR(ROUND(w.SECS)),'-')
 FROM ea, cm, tm, w;" | trim | grep '^XAGG|' | head -1
 }
 
-# collect_hist_pct MIN_SNAP MAX_SNAP -> HPCT row (log file sync ms-bucket
-# percentiles across the window) on stdout
+# collect_hist_pct TAG MIN_SNAP MAX_SNAP -> HPCT row (log file sync ms-bucket
+# percentiles across the window) on stdout; TAG as for collect_awr_agg
+# (AWRHIST current, BASEHIST baseline)
 collect_hist_pct() {
-    local mins="$1" maxs="$2"
-    run_sql "-- QTAG:BASEHIST
+    local tag="$1" mins="$2" maxs="$3"
+    run_sql "-- QTAG:${tag}
 WITH d AS (
-  SELECT WAIT_TIME_MILLI UB,
-         WAIT_COUNT - LAG(WAIT_COUNT)
-             OVER (PARTITION BY WAIT_TIME_MILLI ORDER BY SNAP_ID) DC
-  FROM DBA_HIST_EVENT_HISTOGRAM
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND EVENT_NAME='log file sync'
-    AND SNAP_ID BETWEEN ${mins} AND ${maxs}
+  SELECT x.WAIT_TIME_MILLI UB,
+         x.WAIT_COUNT - LAG(x.WAIT_COUNT)
+             OVER (PARTITION BY x.WAIT_TIME_MILLI, s.STARTUP_TIME ORDER BY x.SNAP_ID) DC
+  FROM DBA_HIST_EVENT_HISTOGRAM x, DBA_HIST_SNAPSHOT s
+  WHERE x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND x.EVENT_NAME='log file sync'
+    AND x.SNAP_ID BETWEEN ${mins} AND ${maxs}
+    AND s.DBID = x.DBID AND s.INSTANCE_NUMBER = x.INSTANCE_NUMBER
+    AND s.SNAP_ID = x.SNAP_ID
 ),
 h AS (
   SELECT UB, SUM(CASE WHEN DC>0 THEN DC END) CNT
@@ -661,46 +778,46 @@ WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
         warn "Not enough AWR snapshots in the window; skipping AWR trend/aggregates."
     else
         info "AWR window: snapshots ${SNAP_MIN}-${SNAP_MAX} (${SNAP_CNT} snaps)."
-        AWRAGG_RAW=$(collect_awr_agg "$SNAP_MIN" "$SNAP_MAX") \
+        AWRAGG_RAW=$(collect_awr_agg AWRAGG "$SNAP_MIN" "$SNAP_MAX") \
             || { AWRAGG_RAW=""; degraded "AWR window aggregates (DBA_HIST_SYSTEM_EVENT)"; }
-        CURHPCT_RAW=$(collect_hist_pct "$SNAP_MIN" "$SNAP_MAX") \
+        CURHPCT_RAW=$(collect_hist_pct AWRHIST "$SNAP_MIN" "$SNAP_MAX") \
             || { CURHPCT_RAW=""; degraded "AWR log file sync histogram (DBA_HIST_EVENT_HISTOGRAM)"; }
 
         info "Collecting AWR per-snapshot trend..."
         _out=$(run_sql "-- QTAG:TREND
 WITH sn AS (
-  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET
+  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET, STARTUP_TIME ST
   FROM DBA_HIST_SNAPSHOT
   WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
     AND END_INTERVAL_TIME >= SYSDATE - (${AWR_DAYS} + 1)
 ),
 ev AS (
-  SELECT SNAP_ID, EVENT_NAME,
-         TOTAL_WAITS - LAG(TOTAL_WAITS)
-             OVER (PARTITION BY EVENT_NAME ORDER BY SNAP_ID) DW,
-         TIME_WAITED_MICRO - LAG(TIME_WAITED_MICRO)
-             OVER (PARTITION BY EVENT_NAME ORDER BY SNAP_ID) DT
-  FROM DBA_HIST_SYSTEM_EVENT
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND EVENT_NAME IN ('log file sync','log file parallel write','SYNC Remote Write')
-    AND SNAP_ID IN (SELECT SNAP_ID FROM sn)
+  SELECT e.SNAP_ID, e.EVENT_NAME,
+         e.TOTAL_WAITS - LAG(e.TOTAL_WAITS)
+             OVER (PARTITION BY e.EVENT_NAME, sn.ST ORDER BY e.SNAP_ID) DW,
+         e.TIME_WAITED_MICRO - LAG(e.TIME_WAITED_MICRO)
+             OVER (PARTITION BY e.EVENT_NAME, sn.ST ORDER BY e.SNAP_ID) DT
+  FROM DBA_HIST_SYSTEM_EVENT e, sn
+  WHERE e.DBID=${DBID} AND e.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND e.EVENT_NAME IN ('log file sync','log file parallel write','SYNC Remote Write')
+    AND e.SNAP_ID = sn.SNAP_ID
 ),
 cm AS (
-  SELECT SNAP_ID, VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DC
-  FROM DBA_HIST_SYSSTAT
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND STAT_NAME='user commits'
-    AND SNAP_ID IN (SELECT SNAP_ID FROM sn)
+  SELECT x.SNAP_ID, x.VALUE - LAG(x.VALUE) OVER (PARTITION BY sn.ST ORDER BY x.SNAP_ID) DC
+  FROM DBA_HIST_SYSSTAT x, sn
+  WHERE x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND x.STAT_NAME='user commits'
+    AND x.SNAP_ID = sn.SNAP_ID
 ),
 tm AS (
-  SELECT SNAP_ID, VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DV
-  FROM DBA_HIST_SYS_TIME_MODEL
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND STAT_NAME='DB time'
-    AND SNAP_ID IN (SELECT SNAP_ID FROM sn)
+  SELECT x.SNAP_ID, x.VALUE - LAG(x.VALUE) OVER (PARTITION BY sn.ST ORDER BY x.SNAP_ID) DV
+  FROM DBA_HIST_SYS_TIME_MODEL x, sn
+  WHERE x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND x.STAT_NAME='DB time'
+    AND x.SNAP_ID = sn.SNAP_ID
 ),
 el AS (
-  SELECT SNAP_ID, ET, (ET - LAG(ET) OVER (ORDER BY SNAP_ID))*86400 SECS
+  SELECT SNAP_ID, ET, (ET - LAG(ET) OVER (PARTITION BY ST ORDER BY SNAP_ID))*86400 SECS
   FROM sn
 ),
 p AS (
@@ -759,8 +876,8 @@ SELECT 'BASEWIN|'||NVL(TO_CHAR(MIN(SNAP_ID)),'-')
   ||'|'||NVL(TO_CHAR(MAX(END_INTERVAL_TIME),'YYYY-MM-DD HH24:MI'),'-')
 FROM DBA_HIST_SNAPSHOT
 WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-  AND END_INTERVAL_TIME >= TO_DATE('${BASELINE_BEGIN}','YYYY-MM-DD HH24:MI')
-  AND END_INTERVAL_TIME <= TO_DATE('${BASELINE_END}','YYYY-MM-DD HH24:MI') + CASE WHEN LENGTH('${BASELINE_END}') = 10 THEN 1 ELSE 0 END;" | trim | grep '^BASEWIN|' | head -1) \
+  AND END_INTERVAL_TIME >= TO_DATE('${BASELINE_BEGIN_SQL}','YYYY-MM-DD HH24:MI')
+  AND END_INTERVAL_TIME <= TO_DATE('${BASELINE_END_SQL}','YYYY-MM-DD HH24:MI') + ${BASELINE_END_PAD};" | trim | grep '^BASEWIN|' | head -1) \
                 || { BASEWIN_RAW=""; degraded "baseline snapshot window (DBA_HIST_SNAPSHOT)"; }
         fi
     elif [[ "$AUTO_BASELINE" == "YES" ]]; then
@@ -774,25 +891,39 @@ WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
         # transition usually predates it) and take the most recent run
         # of consecutive no-sync snapshots as the baseline.
         info "Scanning AWR history for the pre-SYNC baseline window (--auto-baseline)..."
+        # The SYNC event's delta is taken over EVERY snapshot (a snapshot
+        # with no row for the event counts as 0 cumulative waits), not just
+        # the ones that have a row. AWR only stores an event once it has
+        # occurred, so the first snapshot holding 'SYNC Remote Write' used to
+        # have LAG() = NULL, which NVL turned into 0 and classed as NOSYNC -
+        # making the first genuinely-SYNC interval the LAST snapshot of the
+        # baseline. Counting the absent row as 0 makes that delta equal the
+        # waits seen in the interval, so it is classified SYNC. (LAG(x,1,0)
+        # would also fix that case but would misread the oldest retained
+        # snapshot - whose waits predate the window - as one interval's worth.)
         _out=$(run_sql "-- QTAG:AUTOBASE
 WITH sn AS (
-  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET
+  SELECT SNAP_ID, CAST(END_INTERVAL_TIME AS DATE) ET, STARTUP_TIME ST
   FROM DBA_HIST_SNAPSHOT
   WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
 ),
 srw AS (
-  SELECT SNAP_ID,
-         TOTAL_WAITS - LAG(TOTAL_WAITS) OVER (ORDER BY SNAP_ID) DW
-  FROM DBA_HIST_SYSTEM_EVENT
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND EVENT_NAME='SYNC Remote Write'
+  SELECT sn.SNAP_ID,
+         NVL(e.TOTAL_WAITS,0)
+           - LAG(NVL(e.TOTAL_WAITS,0)) OVER (PARTITION BY sn.ST ORDER BY sn.SNAP_ID) DW
+  FROM sn
+  LEFT JOIN DBA_HIST_SYSTEM_EVENT e
+         ON e.SNAP_ID = sn.SNAP_ID
+        AND e.DBID=${DBID} AND e.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+        AND e.EVENT_NAME='SYNC Remote Write'
 ),
 rw AS (
-  SELECT SNAP_ID,
-         VALUE - LAG(VALUE) OVER (ORDER BY SNAP_ID) DV
-  FROM DBA_HIST_SYSSTAT
-  WHERE DBID=${DBID} AND INSTANCE_NUMBER=${INSTANCE_NUMBER}
-    AND STAT_NAME='redo writes'
+  SELECT sn.SNAP_ID,
+         x.VALUE - LAG(x.VALUE) OVER (PARTITION BY sn.ST ORDER BY sn.SNAP_ID) DV
+  FROM sn, DBA_HIST_SYSSTAT x
+  WHERE x.SNAP_ID = sn.SNAP_ID
+    AND x.DBID=${DBID} AND x.INSTANCE_NUMBER=${INSTANCE_NUMBER}
+    AND x.STAT_NAME='redo writes'
 )
 SELECT 'CLS|'||sn.SNAP_ID
   ||'|'||TO_CHAR(sn.ET,'YYYY-MM-DD HH24:MI')
@@ -882,9 +1013,9 @@ ORDER BY sn.SNAP_ID;") \
             warn "Baseline window contains fewer than 2 AWR snapshots; skipping the before/after comparison."
         else
             info "Baseline window: snapshots ${BASE_MIN}-${BASE_MAX} (${BASE_CNT} snaps)."
-            BASEAGG_RAW=$(collect_awr_agg "$BASE_MIN" "$BASE_MAX") \
+            BASEAGG_RAW=$(collect_awr_agg BASEAGG "$BASE_MIN" "$BASE_MAX") \
                 || { BASEAGG_RAW=""; degraded "baseline aggregates (DBA_HIST_SYSTEM_EVENT)"; }
-            BASEHPCT_RAW=$(collect_hist_pct "$BASE_MIN" "$BASE_MAX") \
+            BASEHPCT_RAW=$(collect_hist_pct BASEHIST "$BASE_MIN" "$BASE_MAX") \
                 || { BASEHPCT_RAW=""; degraded "baseline log file sync histogram (DBA_HIST_EVENT_HISTOGRAM)"; }
         fi
     fi
@@ -907,7 +1038,7 @@ WHERE SESSION_TYPE='FOREGROUND'
   AND SAMPLE_TIME > SYSDATE - ${ASH_HOURS}/24;
 SELECT 'ASHSQL|'||SQL_ID||'|'||CNT||'|'||TXT FROM (
   SELECT a.SQL_ID, COUNT(*) CNT,
-         NVL((SELECT REPLACE(REPLACE(REPLACE(SUBSTR(s.SQL_TEXT,1,60),'|',' '),CHR(10),' '),CHR(13),' ')
+         NVL((SELECT MAX(REPLACE(REPLACE(REPLACE(SUBSTR(s.SQL_TEXT,1,60),'|',' '),CHR(10),' '),CHR(13),' '))
               FROM V\$SQLAREA s WHERE s.SQL_ID = a.SQL_ID),'-') TXT
   FROM V\$ACTIVE_SESSION_HISTORY a
   WHERE a.SESSION_TYPE='FOREGROUND'
@@ -937,14 +1068,17 @@ SELECT 'ASHSVC|'||SVC||'|'||CNT FROM (
   GROUP BY a.SERVICE_HASH
   ORDER BY COUNT(*) DESC
 ) WHERE ROWNUM <= 10;
-SELECT 'ASHHR|'||TO_CHAR(SAMPLE_TIME,'MM-DD HH24')
-  ||'|'||SUM(CASE WHEN EVENT='log file sync' THEN 1 ELSE 0 END)
-  ||'|'||COUNT(*)
-FROM V\$ACTIVE_SESSION_HISTORY
-WHERE SESSION_TYPE='FOREGROUND'
-  AND SAMPLE_TIME > SYSDATE - ${ASH_HOURS}/24
-GROUP BY TO_CHAR(SAMPLE_TIME,'MM-DD HH24')
-ORDER BY 1;") \
+SELECT 'ASHHR|'||TO_CHAR(HR,'MM-DD HH24')||'|'||LFS||'|'||TOT
+FROM (
+  SELECT TRUNC(SAMPLE_TIME,'HH24') HR,
+         SUM(CASE WHEN EVENT='log file sync' THEN 1 ELSE 0 END) LFS,
+         COUNT(*) TOT
+  FROM V\$ACTIVE_SESSION_HISTORY
+  WHERE SESSION_TYPE='FOREGROUND'
+    AND SAMPLE_TIME > SYSDATE - ${ASH_HOURS}/24
+  GROUP BY TRUNC(SAMPLE_TIME,'HH24')
+)
+ORDER BY HR;") \
         || { _out=""; degraded "ASH attribution (V\$ACTIVE_SESSION_HISTORY)"; }
     ASH_RAW=$(printf '%s\n' "$_out" | trim | grep -E '^ASH(SUM|SQL|MOD|SVC|HR)[|]' || true)
 fi
@@ -1084,12 +1218,17 @@ emit_report() {
     if [[ -z "$DESTS_RAW" ]]; then
         printf '_Remote destination data unavailable (V$ARCHIVE_DEST query failed)._\n\n'
     else
-        printf '| Dest | Target DB_UNIQUE_NAME | Transmit mode | AFFIRM | NET_TIMEOUT | Status |\n'
-        printf '|------|----------------------|---------------|--------|-------------|--------|\n'
+        printf '| Dest | Target DB_UNIQUE_NAME | Transmit mode | AFFIRM | NET_TIMEOUT (s) | Status |\n'
+        printf '|------|----------------------|---------------|--------|-----------------|--------|\n'
         while IFS='|' read -r _tag _id _dbun _tmode _affirm _nt _status; do
             printf '| %s | %s | %s | %s | %s | %s |\n' "$_id" "$_dbun" "$_tmode" "$_affirm" "$_nt" "$_status"
         done <<< "$DESTS_RAW"
         printf '\n'
+        if [[ -n "$SYNC_NONVALID" ]]; then
+            printf '> **Not counted as active synchronous transport:** %s. These destinations are\n' "$SYNC_NONVALID"
+            printf '> configured SYNC/FASTSYNC but their status is not VALID, so commits are not\n'
+            printf '> waiting on them right now.\n\n'
+        fi
         if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
             printf '> **No synchronous destination is active.** Commit latency currently carries no\n'
             printf '> remote-ack component; the sections below describe local commit behavior only\n'
@@ -1110,7 +1249,9 @@ emit_report() {
 
     # ---- 2. headline ----
     printf '## 2. Headline: estimated cost of synchronous transport\n\n'
-    printf '_Source: derived from sections 3 and 4 - no view of its own._\n\n'
+    printf '_Source: derived from sections 3 and 4 (V$ views since startup) and, when AWR is\n'
+    printf 'available, the AWR window aggregates `DBA_HIST_SNAPSHOT`, `DBA_HIST_SYSTEM_EVENT`,\n'
+    printf '`DBA_HIST_SYSSTAT`, `DBA_HIST_SYS_TIME_MODEL` (Diagnostics Pack; query below)._\n\n'
     if [[ "$SYNC_DEST_COUNT" -eq 0 ]]; then
         printf '_Not applicable - no synchronous destination is active._\n\n'
     elif [[ "$SRW_MISSING" == "YES" ]]; then
@@ -1130,6 +1271,7 @@ emit_report() {
         printf 'Reading: an average commit currently waits ~%s on `log file sync` (%s);\n' "$(fmt_or_na "$W_LFS_AVG" " ms")" "$W_SOURCE"
         printf 'without synchronous transport the model puts it at ~%s ms less. The estimate is\n' "$(fmt_or_na "${SCALE_MS:-}")"
         printf 'based on the %s; see section 9 for assumptions.\n\n' "${SCALE_BASIS:-event averages}"
+        qblock AWRAGG
     fi
 
     # ---- 3. LGWR pipeline ----
@@ -1239,7 +1381,7 @@ emit_report() {
             printf '`V$REDO_DEST_RESP_HISTOGRAM`, worst first; the view buckets by whole\n'
             printf 'seconds, so the 1000 ms bucket holds everything sub-second - these are\n'
             printf 'the actual worst remote acks, including e.g. standby restarts and\n'
-            printf 'network stalls, capped at NET_TIMEOUT):\n\n'
+            printf 'network stalls, capped at NET_TIMEOUT, in seconds):\n\n'
             printf '| Dest | Response time bucket (ms) | Responses | Last at |\n'
             printf '|------|--------------------------|-----------|---------|\n'
             printf '%s\n' "$RESP_RAW" | rows RESP | sort -t'|' -k2,2nr | head -10 \
@@ -1374,7 +1516,7 @@ emit_report() {
             printf '  (storage change?) - part of the empirical delta is not transport-related.\n'
         fi
         printf '\n'
-        qblock AWRAGG BASEHIST AUTOBASE
+        qblock AWRAGG AWRHIST BASEWIN BASEAGG BASEHIST AUTOBASE
     fi
 
     # ---- 8. ASH ----

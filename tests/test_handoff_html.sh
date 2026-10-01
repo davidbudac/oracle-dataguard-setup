@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Test script for the handoff HTML renderer embedded in
 # dg_handoff.sh (the single handoff report implementation;
@@ -66,7 +66,8 @@ extract_block() {
     sed -n '/^# ---- begin handoff html renderer ----$/,/^# ---- end handoff html renderer ----$/p' "$1" > "$2"
 }
 
-WORK_DIR=$(mktemp -d)
+WORK_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_handoff_html_test.XXXXXX") || {
+    echo "FATAL: cannot create temp dir"; exit 1; }
 trap 'rm -rf "$WORK_DIR"' EXIT
 
 echo "============================================================"

@@ -57,9 +57,20 @@ For each new datafile, the standby needs the **source bytes**. It looks in:
 
 We use option 2: the migration scripts copy the non-CDB datafiles to the NFS
 share (mounted with the same path on both hosts) and set
-`STANDBY_PDB_SOURCE_FILE_DIRECTORY` to that NFS path. The standby reads the
-files locally over NFS and copies them into its target PDB location, then
-continues redo apply. **No RMAN duplicate, no manual catalog entries.**
+`STANDBY_PDB_SOURCE_FILE_DIRECTORY` to that NFS path **on the standby
+instance**. The parameter is read by the standby's recovery process and
+`ALTER SYSTEM` is not carried in redo, so setting it on the primary (as the
+first version of these scripts did) does nothing for the standby; step 04 sets
+it through a direct standby connection and reads it back. The standby reads the
+files over NFS and copies them into its own PDB location, then continues redo
+apply. **No RMAN duplicate, no manual catalog entries.**
+
+What the standby needs on its own side (checked by step 01, not assumed):
+`standby_file_management=AUTO`; a way to name the new datafiles
+(`db_file_name_convert` covering the PDB directory, or OMF); the resulting
+directory on the standby host; and a view of the staging directory
+(`STANDBY_STAGE_DIR`, the same path as on the primary when the share is mounted
+identically).
 
 ---
 
@@ -76,9 +87,12 @@ truth. The important values:
 | `TARGET_CDB_ORACLE_SID` | ORACLE_SID for the CDB primary instance |
 | `NEW_PDB_NAME` | What the migrated database will be called inside the CDB |
 | `ORACLE_HOME` / `ORACLE_BASE` | Same on both hosts |
-| `NFS_SHARE` | Path mounted identically on both DB hosts |
-| `TARGET_PDB_DATAFILE_DIR` | Where the PDB's datafiles will live on the CDB primary |
-| `ALLOW_DROP_NONCDB` | Set to `I_UNDERSTAND` to enable destructive drop in step 06 |
+| `NFS_SHARE` | Path mounted identically on both DB hosts (must be mounted: the scripts refuse a missing/unwritable directory) |
+| `TARGET_PDB_DATAFILE_DIR` | Where the PDB's datafiles will live on the CDB **primary**. The standby derives its own directory from its `db_file_name_convert` (or OMF); step 01 computes and checks it |
+| `TARGET_CDB_STANDBY_TNS_ALIAS` | (optional) alias for the direct connection to the CDB standby; default `TARGET_CDB_STANDBY_UNIQUE_NAME`. Wallet `/@alias`, or a prompted SYS password |
+| `STANDBY_STAGE_DIR` | (optional) path under which the standby host sees the staged datafiles; default = the primary's staging path (identical NFS mount) |
+| `STANDBY_SSH_TARGET` | (optional) `user@standbyhost`: step 01 creates/checks the datafile dir and the staging dir over ssh. Without it, step 01 prints the commands and asks you to confirm (or `STANDBY_DIRS_CONFIRMED=yes`) |
+| `ALLOW_DROP_NONCDB` | Set to `I_UNDERSTAND` to enable destructive drop in step 06. With `MIGRATE_NONINTERACTIVE=1` the environment variable `MIGRATE_ALLOW_DROP=1` is also required |
 
 All scripts read this file via `_lib.sh` and write logs/state to
 `${NFS_SHARE}/logs/migrate_<src>_to_<tgt>/`.
@@ -93,13 +107,29 @@ safety check; it only queries.
 What it checks:
 
 * `sqlplus` and `dgmgrl` on PATH.
-* NFS staging dir is writable.
+* NFS share exists, staging dir is writable (a warning if the share sits on `/`,
+  i.e. may not be mounted).
 * **Source non-CDB:** role=PRIMARY, log_mode=ARCHIVELOG, force_logging=YES,
   cdb=NO, character set, version, COMPATIBLE, DG broker SUCCESS, no apply lag.
 * **Target CDB:** role=PRIMARY, READWRITE, ARCHIVELOG, FORCE_LOGGING=YES,
-  cdb=YES, version ≥ source, COMPATIBLE ≥ source, character set matches, DG
-  broker SUCCESS, no apply lag, `NEW_PDB_NAME` is unused.
-* Disk: target PDB datafile directory exists / can be created.
+  cdb=YES, version ≥ source, COMPATIBLE ≥ source (compared field by field as
+  integers), character set matches, DG broker SUCCESS, no apply lag,
+  `NEW_PDB_NAME` is unused. `v$database.name` of both SIDs must match the config
+  (a wrong `*_ORACLE_SID` is a blocker).
+* Disk: target PDB datafile directory exists / can be created, and the staging
+  area and the target directory have room for the source datafiles.
+* **CDB standby (direct connection):** role PHYSICAL STANDBY of the right CDB,
+  `standby_file_management=AUTO`, `db_file_name_convert` covers the PDB directory
+  (or `db_create_file_dest` is set), the resulting directory exists on the
+  standby host with room, and the staging dir is visible there. With
+  `STANDBY_SSH_TARGET` the directory is created/checked over ssh; otherwise the
+  exact `mkdir` is printed and you must confirm it. A standby that cannot be
+  reached is a blocker.
+
+Re-running step 01 resets the progress flags in `state.env`
+(`noncdb_quiesced`, `describe_done`, `plug_done`, `verify_done`, ...): it is the
+start of a migration attempt, not a status check to run mid-way. Every later
+step requires its predecessor's flag and refuses otherwise.
 
 If any of those fail, the script exits 1 with a per-check summary. **Do not
 proceed** until preflight is clean.
@@ -122,9 +152,16 @@ This is the moment you take the outage. The script:
    drains down to 0s lag.
 2. Bounces the primary into `OPEN READ ONLY` (clean dictionary close + reopen).
 3. Verifies `OPEN_MODE=READ ONLY`.
-4. Issues `EDIT DATABASE 'dgnonc_s' SET STATE='APPLY-OFF'` so the standby
-   datafiles are also frozen at the same SCN.
+4. Re-checks that the standby has applied everything the read-only reopen
+   produced (apply and transport lag 0), and only then issues
+   `EDIT DATABASE 'dgnonc_s' SET STATE='APPLY-OFF'`, so the standby datafiles
+   are frozen at the same state. If the lag does not drain the step fails with
+   apply still ON; re-running resumes at this point because the source is
+   already read-only.
 5. Records the quiesce SCN to the state file.
+
+Before the bounce it also proves `SOURCE_ORACLE_SID` is the non-CDB
+`SOURCE_DB_NAME` (name, `cdb=NO`, PRIMARY).
 
 After this point, no transactions can write to the non-CDB. The standby files
 are frozen and can be torn down once you're confident in the new PDB.
@@ -145,8 +182,12 @@ DBMS_PDB.DESCRIBE(pdb_descr_file => '/OINSTALL/.../migrate/.../dgnonc_manifest.x
 
 Then for each row in `v$datafile`, the script either hard-links (if NFS
 happens to be on the same filesystem -- usually no) or `cp`'s the file into
-`${MIGRATE_DATAFILE_STAGE}/`. Existing files of the same size are skipped, so
-the script is restartable.
+`${MIGRATE_DATAFILE_STAGE}/`. Every run re-copies (to `<name>.part`, renamed
+when complete): a file left by an earlier attempt is never trusted on size
+alone, and stale files in the stage are removed. The manifest from an earlier
+run is deleted before `DBMS_PDB.DESCRIBE`, and the step requires the
+`DESCRIBE_OK` marker. The datafile count is recorded; step 04 refuses to plug
+unless the stage holds exactly that many files.
 
 Output you should see:
 
@@ -169,16 +210,25 @@ staging path via the `MIGRATE_STAGE_DIR` override (edit `_lib.sh`).
 
 This is where the migration actually happens. The script:
 
-1. `ALTER SYSTEM SET STANDBY_PDB_SOURCE_FILE_DIRECTORY='<staged>/' SCOPE=BOTH;`
-   on the CDB. The trailing slash matters -- Oracle expects a directory.
+1. `ALTER SYSTEM SET STANDBY_PDB_SOURCE_FILE_DIRECTORY='<STANDBY_STAGE_DIR>/' SCOPE=BOTH;`
+   **on the CDB standby** (direct connection), read back from
+   `v$parameter`, and the standby prerequisites from step 01 re-checked. The
+   trailing slash matters -- Oracle expects a directory. (It is also set on the
+   primary, where it is not read.) The step refuses to continue if it cannot
+   connect to the standby or the read-back differs.
 2. `DBMS_PDB.CHECK_PLUG_COMPATIBILITY` to surface warnings before commit.
 3. ```sql
    CREATE PLUGGABLE DATABASE dgnonc_pdb
        USING '/.../dgnonc_manifest.xml'
        SOURCE_FILE_DIRECTORY = '/.../migrate/dgnonc_to_dgcdb/datafiles/'
        COPY
-       FILE_NAME_CONVERT = ('<staged>', '<target_pdb_dir>');
+       FILE_NAME_CONVERT = ('<staged>', '<target_pdb_dir>',
+                            '<original source dir>', '<target_pdb_dir>');
    ```
+   The convert is keyed on both the staging directory and the original
+   directories from the manifest; see "FILE_NAME_CONVERT keys" below.
+   Afterwards every `v$datafile` row of the new PDB must be under
+   `<target_pdb_dir>` or the step stops before `noncdb_to_pdb.sql`.
 4. `ALTER PLUGGABLE DATABASE dgnonc_pdb OPEN UPGRADE;`
 5. `@?/rdbms/admin/noncdb_to_pdb.sql` inside the PDB. **This is the long one**
    (10–30 minutes typical). Output is captured to its own log file.
@@ -194,6 +244,20 @@ directory we copied them to.
 `FILE_NAME_CONVERT` puts the CDB primary's copy of the new PDB datafiles in
 `${TARGET_PDB_DATAFILE_DIR}/${NEW_PDB_NAME}/`.
 
+**FILE_NAME_CONVERT keys (needs lab confirmation).** With
+`SOURCE_FILE_DIRECTORY`, Oracle finds the files in that directory by name; it is
+not documented whether `FILE_NAME_CONVERT` is then matched against the staging
+path or against the original paths in the manifest. The lab-tested
+`run_minimal.sh` keys on the original directories (and has no
+`SOURCE_FILE_DIRECTORY`). Step 04 lists both, which is correct under either
+reading (an unmatched pair is ignored), and the placement check above proves
+where the files really landed. Confirm on the lab that the pairs behave as
+intended and, if the original-directory pairs turn out to be unnecessary, drop
+them.
+
+Step 04 cannot be resumed once the PDB exists (`ORA-65012`): it detects that and
+tells you whether to run step 05 or to drop the leftover PDB first.
+
 The CDB standby, once it sees the redo, looks up
 `STANDBY_PDB_SOURCE_FILE_DIRECTORY`, finds the staged copies, and writes them
 into its own equivalent location.
@@ -204,20 +268,32 @@ into its own equivalent location.
 |---|---|---|
 | `ORA-65122: pluggable database GUID conflicts` | Reusing a manifest from a prior run, or a PDB with the same GUID exists | drop the prior PDB; re-run `03_describe_and_stage.sh` to generate a fresh manifest |
 | `noncdb_to_pdb.sql` exits with `ORA-65106` | Component invalid (e.g. APEX) in the source non-CDB | Address violations in `pdb_plug_in_violations`; usually you re-run the script after the fix |
-| Standby never picks up the PDB | `STANDBY_PDB_SOURCE_FILE_DIRECTORY` not visible from the standby host (different mount path) | Make sure NFS has the same path on both hosts; correct the parameter; trigger a log switch |
+| Standby never picks up the PDB / PDB recovery DISABLED on the standby | `STANDBY_PDB_SOURCE_FILE_DIRECTORY` not set on the standby, or the path not visible from the standby host (different mount path) | Set `STANDBY_STAGE_DIR` to the standby's path of the share; re-check with step 01; if the PDB already exists, drop it and re-run step 04 |
 
 ---
 
 ## 8. Verify (script `05_verify_pdb_dataguard.sh`)
 
-Loops `SHOW DATABASE VERBOSE` on the standby until both lags are `0 seconds`,
-then:
+Gates the destructive step 06, so it passes only when the PDB is provably
+replicated. It loops `SHOW DATABASE VERBOSE` on the standby until both lags are
+`0 seconds`, then:
 
 * Prints the broker `SHOW CONFIGURATION VERBOSE` snapshot.
+* Connects **directly to the standby** (a failed connection is a failure, not a
+  warning) and requires the new PDB in `v$pdbs` with `RECOVERY_STATUS=ENABLED`
+  (a standby that lacked the plug-in files applies the redo with the PDB's
+  recovery disabled and still shows lag 0), no `UNNAMED` datafile names, and the
+  same datafile count as the primary.
 * Checks `pdb_plug_in_violations` for any open `ERROR` rows.
 * Performs a write smoke test inside the new PDB (CREATE TABLE / INSERT /
-  COMMIT / DROP), forces a log switch, and confirms the standby's
-  `applied_scn` advances past the SCN we just produced.
+  COMMIT / DROP), takes an SCN after it, forces log switches and requires the
+  standby's `applied_scn` (from `v$archive_dest_status`) to reach that SCN. The
+  SCN is taken after the write, hence after the plug-in redo, so reaching it
+  proves the plug-in was applied; "the SCN a few seconds later" would be the
+  wrong gate because the SCN advances without redo on an idle system.
+
+`verify_done` is `false` from the start of the step and set to `true` only when
+every check passed.
 
 A successful tail looks like:
 
@@ -231,15 +307,27 @@ A successful tail looks like:
 
 ## 9. Decommission the non-CDB (script `06_decommission_noncdb.sh`, OPTIONAL)
 
-This is purely housekeeping:
+This is destructive. Before changing anything it proves what it acts on:
+`verify_done=true` with 0 failures from step 05; `SOURCE_ORACLE_SID` is the
+non-CDB `SOURCE_DB_NAME` (`v$database.name`, `cdb=NO`, PRIMARY, OPEN READ ONLY,
+and the DBID step 01 recorded); and the new PDB is OPEN READ WRITE in the target
+CDB primary. If the source instance is down it cannot prove this and refuses.
 
 * `REMOVE CONFIGURATION;` on the non-CDB DG.
-* `DG_BROKER_START=FALSE`, disable archivelog dest 2.
+* `DG_BROKER_START=FALSE`; the `LOG_ARCHIVE_DEST_STATE_n` of the destination
+  that ships to the non-CDB standby (looked up in `v$archive_dest`, not assumed
+  to be 2) is set to `DEFER`.
 * `SHUTDOWN IMMEDIATE` on the non-CDB primary.
 * If `ALLOW_DROP_NONCDB="I_UNDERSTAND"`:
   * `STARTUP MOUNT EXCLUSIVE RESTRICT; ALTER SYSTEM ENABLE RESTRICTED SESSION;
-    DROP DATABASE;`
-* `rm -rf` the NFS staging directory (manifest + staged datafiles).
+    DROP DATABASE;` -- a plain `DROP DATABASE`: RMAN backups and archived logs
+    outside the database files are not removed.
+  * Asks for a YES. `MIGRATE_NONINTERACTIVE=1` does **not** answer it; an
+    unattended drop also needs `MIGRATE_ALLOW_DROP=1` in the environment, and is
+    refused up front (before any shutdown) without it.
+* `rm -rf` the staged datafiles under the NFS staging directory. The manifest,
+  `state.env` and the logs are **kept**: the manifest cannot be regenerated once
+  the source is gone.
 
 The standby host still has `dgnonc_s` data files. Either:
 
@@ -296,8 +384,9 @@ Every script appends to:
 * `${MIGRATE_LOG_DIR}/migrate.log` -- combined transcript across all scripts
 * `${MIGRATE_STAGE_DIR}/state.env` -- machine-readable key=value state
 
-`state.env` is what step 06 inspects to refuse decommissioning if step 05
-hasn't recorded a clean run. You can also `cat` it to see SCNs, timings, and
+`state.env` is what each step inspects to refuse to run before its predecessor
+has completed (step 06 additionally requires a clean step 05). Step 01 resets
+the flags, so an old `verify_done=true` cannot survive into a new attempt. You can also `cat` it to see SCNs, timings, and
 pointers to each step's log file.
 
 ---

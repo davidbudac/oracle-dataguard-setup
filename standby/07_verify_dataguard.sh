@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 7: Verify Data Guard
 # ============================================================
@@ -108,6 +108,8 @@ progress_step "Authentication"
 
 echo ""
 echo "SYS password is required for DGMGRL network validation."
+# xtrace (-v) stays off while the password is read and tested (C2)
+pause_verbose_trace
 SYS_PASSWORD=$(prompt_password "Enter SYS password")
 
 if [ -z "$SYS_PASSWORD" ]; then
@@ -118,6 +120,7 @@ elif [[ "$SYS_PASSWORD" == *'"'* ]]; then
     log_error "SYS password must not contain a double-quote (\") character"
     exit 1
 fi
+resume_verbose_trace
 
 # ============================================================
 # Initialize Status Tracking
@@ -269,13 +272,37 @@ fi
 
 progress_step "Checking Data Guard Broker Configuration"
 
-# H5: previously these four DGMGRL calls were printed and discarded
-# (`2>&1 || true`) without ever being inspected - a missing/broken broker
-# config (ORA-16532 right above "SHOW CONFIGURATION") never touched
-# ERRORS/WARNINGS, so the summary below still printed "OVERALL STATUS:
-# HEALTHY". Capture each output, print it exactly as before, and run it
-# through dgmgrl_output_has_error() (the same helper run_dgmgrl_checked
-# uses) so a broker failure is actually counted.
+# H5: previously these DGMGRL calls were printed and discarded without ever
+# being inspected. C9: grade each capture from the broker's own status field
+# ("Configuration Status:" / "Database Status:": SUCCESS, WARNING, ERROR,
+# DISABLED) instead of treating any ORA-/DGM- text as an error - a member-level
+# "Warning: ORA-16789" is a WARNING, not a failure - and treat output that
+# carries no status at all (dgmgrl failed or printed nothing) as an error
+# rather than a pass.
+# Usage: grade_broker_output <label> <captured dgmgrl output>
+grade_broker_output() {
+    local label="$1" output="$2" status
+    status=$(dgmgrl_status_value "$output") || status=""
+    if [[ -z "$status" ]]; then
+        log_error "Could not read the broker status for ${label} (no status field in the dgmgrl output above)"
+        OVERALL_STATUS="ERROR"
+        ERRORS=$((ERRORS + 1))
+    elif [[ "$status" == "ERROR" || "$status" == "DISABLED" ]]; then
+        log_error "Broker status for ${label} is ${status} (see output above)"
+        OVERALL_STATUS="ERROR"
+        ERRORS=$((ERRORS + 1))
+    elif dgmgrl_has_error_lines "$output"; then
+        log_error "Broker output for ${label} contains an error (see output above)"
+        OVERALL_STATUS="ERROR"
+        ERRORS=$((ERRORS + 1))
+    elif [[ "$status" == "WARNING" ]]; then
+        log_warn "Broker status for ${label} is WARNING (see output above)"
+        [[ "$OVERALL_STATUS" == "HEALTHY" ]] && OVERALL_STATUS="WARNING"
+        WARNINGS=$((WARNINGS + 1))
+    else
+        log_info "PASS: Broker status for ${label} is SUCCESS"
+    fi
+}
 
 echo ""
 echo "Broker Configuration Status:"
@@ -286,42 +313,32 @@ if echo "$CONFIG_OUTPUT" | grep -q "ORA-16532"; then
     log_error "No Data Guard Broker configuration found - run ./primary/06_configure_broker.sh first"
     OVERALL_STATUS="ERROR"
     ERRORS=$((ERRORS + 1))
-elif dgmgrl_output_has_error "$CONFIG_OUTPUT"; then
-    log_error "Broker configuration reported an error (see output above)"
-    OVERALL_STATUS="ERROR"
-    ERRORS=$((ERRORS + 1))
 else
-    log_info "PASS: Broker configuration is healthy"
+    grade_broker_output "the configuration" "$CONFIG_OUTPUT"
 fi
 
 echo ""
 echo "Primary Database Status:"
 PRIMARY_DB_OUTPUT=$(run_dgmgrl "show_database.dgmgrl" "$PRIMARY_DB_UNIQUE_NAME" 2>&1 || true)
 echo "$PRIMARY_DB_OUTPUT"
-if dgmgrl_output_has_error "$PRIMARY_DB_OUTPUT"; then
-    log_error "Broker reported an error for $PRIMARY_DB_UNIQUE_NAME (see output above)"
-    OVERALL_STATUS="ERROR"
-    ERRORS=$((ERRORS + 1))
-else
-    log_info "PASS: No broker errors reported for $PRIMARY_DB_UNIQUE_NAME"
-fi
+grade_broker_output "$PRIMARY_DB_UNIQUE_NAME" "$PRIMARY_DB_OUTPUT"
 
 echo ""
 echo "Standby Database Status:"
 STANDBY_DB_OUTPUT=$(run_dgmgrl "show_database.dgmgrl" "$STANDBY_DB_UNIQUE_NAME" 2>&1 || true)
 echo "$STANDBY_DB_OUTPUT"
-if dgmgrl_output_has_error "$STANDBY_DB_OUTPUT"; then
-    log_error "Broker reported an error for $STANDBY_DB_UNIQUE_NAME (see output above)"
-    OVERALL_STATUS="ERROR"
-    ERRORS=$((ERRORS + 1))
-else
-    log_info "PASS: No broker errors reported for $STANDBY_DB_UNIQUE_NAME"
-fi
+grade_broker_output "$STANDBY_DB_UNIQUE_NAME" "$STANDBY_DB_OUTPUT"
 
 echo ""
 echo "Network Configuration Validation:"
-if [[ -n "$SYS_PASSWORD" ]]; then
+# The password test and the call below are traced with the expanded value
+# under -v unless tracing is paused around them (C2).
+pause_verbose_trace
+_have_sys_password=0
+[[ -n "$SYS_PASSWORD" ]] && _have_sys_password=1
+if [[ "$_have_sys_password" == "1" ]]; then
     NETWORK_VALIDATION_OUTPUT=$(run_dgmgrl_with_password "$SYS_PASSWORD" "$STANDBY_TNS_ALIAS" "validate_network.dgmgrl" 2>&1 || true)
+    resume_verbose_trace
     echo "$NETWORK_VALIDATION_OUTPUT"
     if dgmgrl_output_has_error "$NETWORK_VALIDATION_OUTPUT"; then
         log_warn "Network validation reported an error (see output above) - validation did not complete successfully"
@@ -330,6 +347,7 @@ if [[ -n "$SYS_PASSWORD" ]]; then
         log_info "PASS: Network validation completed without errors"
     fi
 else
+    resume_verbose_trace
     log_warn "Skipping network validation (no SYS password provided) - validation did not run"
 fi
 
@@ -416,7 +434,7 @@ print_status_row "Errors" "$ERRORS"
 print_status_row "Warnings" "$WARNINGS"
 echo ""
 
-if [[ "$OVERALL_STATUS" == "HEALTHY" && "$ERRORS" -eq 0 ]]; then
+if [[ "$OVERALL_STATUS" == "HEALTHY" && "$ERRORS" -eq 0 && "$WARNINGS" -eq 0 ]]; then
     printf "  ${GREEN}OVERALL STATUS: HEALTHY${NC}\n"
     print_summary "SUCCESS" "Data Guard configuration is healthy"
 elif [[ "$ERRORS" -gt 0 ]]; then
@@ -440,9 +458,9 @@ print_list_block "Useful Monitoring Commands" \
     "dgmgrl / \"show database '$PRIMARY_DB_UNIQUE_NAME'\"" \
     "dgmgrl / \"show database '$STANDBY_DB_UNIQUE_NAME'\"" \
     "dgmgrl / \"validate database '$STANDBY_DB_UNIQUE_NAME'\"" \
-    "SELECT NAME, VALUE, TIME_COMPUTED FROM V\\$DATAGUARD_STATS WHERE NAME LIKE '%lag%';" \
-    "SELECT PROCESS, STATUS, SEQUENCE# FROM V\\$MANAGED_STANDBY;" \
-    "SELECT * FROM V\\$ARCHIVE_GAP;" \
+    "SELECT NAME, VALUE, TIME_COMPUTED FROM V\$DATAGUARD_STATS WHERE NAME LIKE '%lag%';" \
+    "SELECT PROCESS, STATUS, SEQUENCE# FROM V\$MANAGED_STANDBY;" \
+    "SELECT * FROM V\$ARCHIVE_GAP;" \
     "ALTER SYSTEM SWITCH LOGFILE;" \
     "dgmgrl / \"switchover to '$STANDBY_DB_UNIQUE_NAME'\"" \
     "ALTER DATABASE RECOVER MANAGED STANDBY DATABASE CANCEL; ALTER DATABASE OPEN READ ONLY; ALTER DATABASE RECOVER MANAGED STANDBY DATABASE USING CURRENT LOGFILE DISCONNECT FROM SESSION;"

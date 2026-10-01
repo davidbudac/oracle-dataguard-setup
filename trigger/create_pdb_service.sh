@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Create a Role-Aware PDB Service
 # ============================================================
@@ -35,6 +35,8 @@ COMMON_DIR="$(dirname "$SCRIPT_DIR")/common"
 
 # Source common functions
 source "${COMMON_DIR}/dg_functions.sh"
+# Own parser below rejects unknown options and takes positionals
+DG_SCRIPT_FLAGS='*'
 enable_verbose_mode "$@"
 
 usage() {
@@ -50,6 +52,7 @@ Required:
 Options:
       --no-start         Create the service but do not start it
       --taf              Set basic TAF (FAILOVER_TYPE=SELECT, METHOD=BASIC)
+  -n, --check            Validate and print the plan, then stop before changing anything
   -v, --verbose          Verbose output
   -h, --help             Show this help
 
@@ -87,7 +90,7 @@ while [[ $# -gt 0 ]]; do
         -h|--help)    usage; exit 0 ;;
         # Global flags consumed by enable_verbose_mode - accept as no-ops
         -v|--verbose|--no-verbose|-a|--approval-mode|--no-approval-mode) shift ;;
-        -s|--suspicious|--no-suspicious|-n|--check|--plan|--execute)     shift ;;
+        -s|--suspicious|--no-suspicious|-n|--check|--plan|--execute|--no-color) shift ;;
         -*)           printf "Unknown option: %s\n\n" "$1"; usage; exit 1 ;;
         *)            POSITIONAL+=("$1"); shift ;;
     esac
@@ -101,6 +104,11 @@ if [[ -z "$PDB_NAME" && $pos_idx -lt ${#POSITIONAL[@]} ]]; then
 fi
 if [[ -z "$SERVICE_NAME" && $pos_idx -lt ${#POSITIONAL[@]} ]]; then
     SERVICE_NAME="${POSITIONAL[$pos_idx]}"; pos_idx=$((pos_idx + 1))
+fi
+
+# Surplus positionals are a mistake, not something to ignore silently.
+if [[ $pos_idx -lt ${#POSITIONAL[@]} ]]; then
+    printf "Unexpected argument: %s\n\n" "${POSITIONAL[$pos_idx]}"; usage; exit 1
 fi
 
 PDB_NAME=$(echo "$PDB_NAME" | tr -d ' \t\n\r')
@@ -128,10 +136,11 @@ if [[ -z "$PDB_NAME" ]] || [[ -z "$SERVICE_NAME" ]]; then
 fi
 
 # Service names: must start with a letter; letters, numbers, underscore,
-# dot, dollar thereafter
-if ! echo "$SERVICE_NAME" | grep -q '^[A-Za-z][A-Za-z0-9_.$]*$'; then
+# dot, hyphen, dollar thereafter (hyphen: domain-qualified names such as
+# "orders.corp-eu.example.com"; same rule as the role-trigger scripts)
+if ! echo "$SERVICE_NAME" | grep -q '^[A-Za-z][A-Za-z0-9_.$-]*$'; then
     log_error "Invalid service name: $SERVICE_NAME"
-    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, and dollar sign"
+    log_error "Service names must start with a letter and contain only letters, numbers, underscore, dot, hyphen, and dollar sign"
     exit 1
 fi
 if [[ ${#SERVICE_NAME} -gt 64 ]]; then
@@ -278,6 +287,11 @@ if [[ "$ENABLE_TAF" == "true" ]]; then
 fi
 echo ""
 
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: no changes made"
+    finish_check_mode "Service preflight complete. No service was created, modified or started."
+fi
+
 if ! confirm_proceed "Proceed with creating/configuring the service?"; then
     log_info "Cancelled by user"
     exit 0
@@ -327,10 +341,12 @@ log_section "Configuring Service in PDB"
 
 confirm_approval_action "Create/start service ${SERVICE_NAME} in PDB ${PDB_ACTUAL_NAME}" "sqlplus -s / as sysdba <DBMS_SERVICE in ${PDB_ACTUAL_NAME}>" || exit 1
 
-# Disable set -e around the call: WHENEVER SQLERROR EXIT makes sqlplus return
-# a non-zero code on any ORA- error, which would otherwise abort the script at
-# this assignment before we can capture and display the actual error.
-set +e
+# Capture the exit status with `|| DEPLOY_RC=$?`: WHENEVER SQLERROR EXIT makes
+# sqlplus return a non-zero code on any ORA- error, which would otherwise abort
+# the script (set -e) or fire the ERR trap at this assignment before we can
+# capture and display the actual error. (`set +e` alone does not silence the
+# ERR trap.)
+DEPLOY_RC=0
 DEPLOY_RESULT=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -353,9 +369,7 @@ SELECT 'SVC_ACTIVE='  || COUNT(*) FROM V\$ACTIVE_SERVICES WHERE NAME = '${SERVIC
 
 EXIT;
 EOSQL
-)
-DEPLOY_RC=$?
-set -e
+) || DEPLOY_RC=$?
 
 echo "$DEPLOY_RESULT" | while IFS= read -r line; do
     [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :

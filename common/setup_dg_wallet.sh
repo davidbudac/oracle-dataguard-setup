@@ -22,12 +22,10 @@
 #   - TNS entries for both databases in tnsnames.ora
 #   - mkstore available in $ORACLE_HOME/bin
 #
-# Note on mkstore and `ps -ef`: mkstore has no stdin-based way to pass the
-# credential password to -createCredential (only the wallet password itself
-# can be fed via stdin/heredoc). The SYS password therefore appears briefly
-# on the mkstore process argv at the -createCredential call sites below.
-# This is a short, one-time exposure at setup time (not a long-lived service
-# argv), and is called out with a comment at each call site.
+# Note on mkstore and `ps -ef`: the credential password is NOT put on the
+# mkstore argv. `-createCredential <alias> <user>` (secret omitted) reads the
+# secret, the secret again, then the wallet password, one per line from
+# stdin (verified on 19c), so the SYS password never shows up in `ps -ef`.
 #
 # Usage:
 #   bash common/setup_dg_wallet.sh              # Default wallet location
@@ -49,13 +47,37 @@ step()  { printf "\n ${BOLD}${CYAN}── %s${NC}\n" "$1"; }
 prompt_password() {
     local prompt_text="$1"
     printf " ${YELLOW}%s${NC}: " "$prompt_text" >&2
+    # Ctrl-C between stty -echo and stty echo would leave the terminal with
+    # echo off: restore it on interrupt, then put any previous traps back.
+    local old_traps
+    old_traps=$(trap -p INT TERM HUP 2>/dev/null) || old_traps=""
+    trap 'stty echo 2>/dev/null || true; printf "\n" >&2; exit 130' INT TERM HUP
     stty -echo 2>/dev/null || true
     local password
     read -r password
     stty echo 2>/dev/null || true
+    trap - INT TERM HUP
+    if [[ -n "$old_traps" ]]; then
+        eval "$old_traps"
+    fi
     printf "\n" >&2
     printf '%s' "$password"
 }
+
+# The staging wallet (auto-login cwallet.sso holding SYS credentials) must not
+# outlive the run: it is removed on every exit path, including Ctrl-C/TERM.
+# STAGING_CLEANUP_DIR is cleared once the wallet is activated, and on the
+# branches that deliberately leave the staged wallet behind for recovery.
+STAGING_CLEANUP_DIR=""
+cleanup_staging() {
+    if [[ -n "$STAGING_CLEANUP_DIR" && -d "$STAGING_CLEANUP_DIR" ]]; then
+        rm -rf "$STAGING_CLEANUP_DIR"
+    fi
+}
+trap cleanup_staging EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
 
 run_local_sql() {
     sqlplus -s / as sysdba <<SQL
@@ -343,6 +365,7 @@ if $CREATE_NEW_WALLET; then
         mkdir -p "$WORK_WALLET_DIR"
     fi
     chmod 700 "$WORK_WALLET_DIR"
+    STAGING_CLEANUP_DIR="$WORK_WALLET_DIR"
     info "Staging directory: ${WORK_WALLET_DIR}"
 
     if $AUTO_PASSWORD; then
@@ -401,6 +424,28 @@ fi
 # =============================================================================
 step "Adding credentials"
 
+# In-place update (-deleteCredential then -createCredential): if the create
+# fails, the live wallet has already lost the old entry. Back the directory up
+# first, the same way the RECREATE path keeps the replaced wallet.
+WALLET_UPDATE_BACKUP=""
+if ! $CREATE_NEW_WALLET; then
+    WALLET_UPDATE_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
+    if ! cp -pR "$WALLET_DIR" "$WALLET_UPDATE_BACKUP"; then
+        error "Could not back up the wallet before updating it: ${WALLET_DIR}"
+        unset SYS_PASSWORD WALLET_PASSWORD
+        exit 1
+    fi
+    info "Wallet backed up to: ${WALLET_UPDATE_BACKUP}"
+fi
+
+wallet_update_failed() {
+    if [[ -n "$WALLET_UPDATE_BACKUP" ]]; then
+        error "The wallet at ${WALLET_DIR} may be missing the credential that was being replaced"
+        error "Pre-update backup: ${WALLET_UPDATE_BACKUP}"
+        error "Restore with: rm -rf ${WALLET_DIR} && mv ${WALLET_UPDATE_BACKUP} ${WALLET_DIR}"
+    fi
+}
+
 add_credential() {
     local tns_alias="$1" username="$2" password="$3" label="$4"
 
@@ -409,17 +454,12 @@ add_credential() {
 ${WALLET_PASSWORD}
 EOF
 
-    # Add the credential
-    # NOTE: mkstore has no stdin-based way to supply the credential password
-    # to -createCredential (only the wallet password above can be piped in),
-    # so $password is briefly visible on this process's argv (`ps -ef`) for
-    # the short lifetime of this one mkstore invocation. This is a known
-    # limitation of the mkstore CLI, not something this script can route
-    # around; the exposure is a one-time setup event, not a persistent
-    # service argv.
-    if ! "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$tns_alias" "$username" "$password" <<EOF
-${WALLET_PASSWORD}
-EOF
+    # Add the credential. The secret is left off argv so it never appears in
+    # `ps -ef`: with it omitted, mkstore (19c) reads the secret, the secret
+    # again, then the wallet password from stdin, one per line. printf is a
+    # shell builtin, so these values are not on any process argv either.
+    if ! printf '%s\n%s\n%s\n' "$password" "$password" "$WALLET_PASSWORD" | \
+        "$ORACLE_HOME/bin/mkstore" -wrl "$WORK_WALLET_DIR" -createCredential "$tns_alias" "$username"
     then
         error "Failed to add credential for ${tns_alias}"
         return 1
@@ -430,6 +470,7 @@ EOF
 # Add peer credential
 add_credential "$PEER_TNS" "sys" "$SYS_PASSWORD" "${PEER_LABEL}" || {
     $CREATE_NEW_WALLET && rm -rf "$WORK_WALLET_DIR"
+    wallet_update_failed
     unset SYS_PASSWORD WALLET_PASSWORD
     exit 1
 }
@@ -438,6 +479,7 @@ add_credential "$PEER_TNS" "sys" "$SYS_PASSWORD" "${PEER_LABEL}" || {
 if [[ -n "${LOC_TNS:-}" ]] && [[ "$LOC_TNS" != "$PEER_TNS" ]]; then
     add_credential "$LOC_TNS" "sys" "$SYS_PASSWORD" "local" || {
         $CREATE_NEW_WALLET && rm -rf "$WORK_WALLET_DIR"
+        wallet_update_failed
         unset SYS_PASSWORD WALLET_PASSWORD
         exit 1
     }
@@ -461,6 +503,7 @@ if $CREATE_NEW_WALLET; then
             done
             error "Refusing to move this directory aside - use -w to point at a dedicated wallet directory"
             error "New wallet remains staged (not activated) at: ${WORK_WALLET_DIR}"
+            STAGING_CLEANUP_DIR=""
             unset SYS_PASSWORD WALLET_PASSWORD
             exit 1
         fi
@@ -468,6 +511,7 @@ if $CREATE_NEW_WALLET; then
         if ! mv "$WALLET_DIR" "$WALLET_SWAP_BACKUP"; then
             error "Failed to move existing wallet out of the way: ${WALLET_DIR}"
             error "New wallet remains staged (not activated) at: ${WORK_WALLET_DIR}"
+            STAGING_CLEANUP_DIR=""
             unset SYS_PASSWORD WALLET_PASSWORD
             exit 1
         fi
@@ -481,10 +525,12 @@ if $CREATE_NEW_WALLET; then
             mv "$WALLET_SWAP_BACKUP" "$WALLET_DIR" 2>/dev/null || error "Restore failed - previous wallet backup left at: ${WALLET_SWAP_BACKUP}"
         fi
         error "Staged wallet left at: ${WORK_WALLET_DIR} for manual recovery"
+        STAGING_CLEANUP_DIR=""
         unset SYS_PASSWORD WALLET_PASSWORD
         exit 1
     fi
 
+    STAGING_CLEANUP_DIR=""
     info "New wallet activated at: ${WALLET_DIR}"
 fi
 
@@ -496,29 +542,56 @@ unset SYS_PASSWORD WALLET_PASSWORD
 # =============================================================================
 step "Configuring sqlnet.ora"
 
-SQLNET_FILE="${ORACLE_HOME}/network/admin/sqlnet.ora"
+# TNS_ADMIN, when set, is where Oracle Net actually reads sqlnet.ora from
+# (same expression as dg_net_admin_dir in dg_functions.sh, which this
+# standalone script does not source).
+SQLNET_FILE="${TNS_ADMIN:-${ORACLE_HOME}/network/admin}/sqlnet.ora"
 
+WALLET_OVERRIDE_LINE="SQLNET.WALLET_OVERRIDE = TRUE"
+WALLET_LOCATION_LINE="WALLET_LOCATION = (SOURCE = (METHOD = FILE) (METHOD_DATA = (DIRECTORY = ${WALLET_DIR})))"
+
+# The (case-insensitive) SQLNET.WALLET_OVERRIDE state already in the file:
+# TRUE, FALSE (an explicit opt-out) or empty when unset.
+OVERRIDE_STATE=""
+if [[ -f "$SQLNET_FILE" ]]; then
+    OVERRIDE_STATE=$(sed -n 's/^[[:space:]]*[Ss][Qq][Ll][Nn][Ee][Tt]\.[Ww][Aa][Ll][Ll][Ee][Tt]_[Oo][Vv][Ee][Rr][Rr][Ii][Dd][Ee][[:space:]]*=[[:space:]]*\([A-Za-z]*\).*/\1/p' "$SQLNET_FILE" | head -1 | tr '[:lower:]' '[:upper:]')
+fi
+
+# Wallet config appended when WALLET_LOCATION is added; the override line is
+# left out when the file already sets it.
 WALLET_CONFIG="
 # Oracle Wallet Configuration (added for Data Guard connectivity)
-WALLET_LOCATION = (SOURCE = (METHOD = FILE) (METHOD_DATA = (DIRECTORY = ${WALLET_DIR})))
-SQLNET.WALLET_OVERRIDE = TRUE
+${WALLET_LOCATION_LINE}
 "
+if [[ -z "$OVERRIDE_STATE" ]]; then
+    WALLET_CONFIG="${WALLET_CONFIG}${WALLET_OVERRIDE_LINE}
+"
+elif [[ "$OVERRIDE_STATE" != "TRUE" ]]; then
+    warn "sqlnet.ora sets SQLNET.WALLET_OVERRIDE = ${OVERRIDE_STATE}; wallet credentials will not be used for /@alias logons"
+    warn "Set it to TRUE manually if that is not intended"
+fi
 
 if [[ -f "$SQLNET_FILE" ]]; then
     # Anchored to only match a WALLET_LOCATION entry, not
     # ENCRYPTION_WALLET_LOCATION (TDE keystore) - a plain substring grep
     # matches both, so on a TDE host this used to report the TDE keystore
     # path as the "existing" DG wallet and never wire the real one in.
-    if grep -Eq '^[[:space:]]*WALLET_LOCATION' "$SQLNET_FILE"; then
+    # Keys are case-insensitive in sqlnet.ora.
+    if grep -Eiq '^[[:space:]]*WALLET_LOCATION' "$SQLNET_FILE"; then
         # Scope the DIRECTORY lookup to the WALLET_LOCATION entry itself,
         # not the first DIRECTORY anywhere in the file (which could belong
         # to an earlier ENCRYPTION_WALLET_LOCATION block).
         EXISTING_DIR=$(awk '
-            /^[[:space:]]*WALLET_LOCATION/ { found=1 }
-            found && /DIRECTORY/ { print; exit }
-        ' "$SQLNET_FILE" | sed 's/.*DIRECTORY *= *//' | sed 's/[)].*//' | xargs)
+            toupper($0) ~ /^[ \t]*WALLET_LOCATION/ { found=1 }
+            found && toupper($0) ~ /DIRECTORY/ { print; exit }
+        ' "$SQLNET_FILE" | sed 's/.*[Dd][Ii][Rr][Ee][Cc][Tt][Oo][Rr][Yy] *= *//' | sed 's/[)].*//' | xargs)
         if [[ "$EXISTING_DIR" == "$WALLET_DIR" ]]; then
             info "sqlnet.ora already configured for: ${WALLET_DIR}"
+            if [[ -z "$OVERRIDE_STATE" ]]; then
+                cp -p "$SQLNET_FILE" "${SQLNET_FILE}.bak.$(date '+%Y%m%d_%H%M%S')"
+                printf '%s\n' "$WALLET_OVERRIDE_LINE" >> "$SQLNET_FILE"
+                info "Added ${WALLET_OVERRIDE_LINE} to sqlnet.ora (backup saved: ${SQLNET_FILE}.bak.*)"
+            fi
         else
             warn "sqlnet.ora has WALLET_LOCATION pointing to: ${EXISTING_DIR}"
             warn "Expected: ${WALLET_DIR}"
@@ -526,7 +599,7 @@ if [[ -f "$SQLNET_FILE" ]]; then
         fi
     else
         # Backup and append
-        cp "$SQLNET_FILE" "${SQLNET_FILE}.bak.$(date '+%Y%m%d_%H%M%S')"
+        cp -p "$SQLNET_FILE" "${SQLNET_FILE}.bak.$(date '+%Y%m%d_%H%M%S')"
         printf '%s\n' "$WALLET_CONFIG" >> "$SQLNET_FILE"
         info "Added wallet configuration to sqlnet.ora"
         info "Backup saved: ${SQLNET_FILE}.bak.*"
@@ -543,7 +616,7 @@ step "Testing wallet connection"
 
 info "Connecting to ${PEER_LABEL} via wallet: sqlplus /@${PEER_TNS} as sysdba"
 WALLET_TEST=$(printf "SET HEADING OFF FEEDBACK OFF\nSELECT 'WALLET_OK' FROM DUAL;\nEXIT;\n" | \
-    sqlplus -s "/@${PEER_TNS}" as sysdba 2>&1)
+    sqlplus -s -L "/@${PEER_TNS}" as sysdba 2>&1)
 
 if printf '%s' "$WALLET_TEST" | grep -q 'WALLET_OK'; then
     info "Wallet connection to ${PEER_LABEL} (${PEER_TNS}) successful"
@@ -557,7 +630,7 @@ fi
 if [[ -n "${LOC_TNS:-}" ]] && [[ "$LOC_TNS" != "$PEER_TNS" ]]; then
     info "Connecting to local via wallet: sqlplus /@${LOC_TNS} as sysdba"
     LOC_WALLET_TEST=$(printf "SET HEADING OFF FEEDBACK OFF\nSELECT 'WALLET_OK' FROM DUAL;\nEXIT;\n" | \
-        sqlplus -s "/@${LOC_TNS}" as sysdba 2>&1)
+        sqlplus -s -L "/@${LOC_TNS}" as sysdba 2>&1)
 
     if printf '%s' "$LOC_WALLET_TEST" | grep -q 'WALLET_OK'; then
         info "Wallet connection to local (${LOC_TNS}) successful"

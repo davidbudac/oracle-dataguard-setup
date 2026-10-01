@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Step 13: Set Maximum Availability
 # ============================================================
@@ -42,9 +42,11 @@ enable_verbose_mode "$@"
 TARGET_LOGXPT="FASTSYNC"
 
 # Extract a broker property value from SHOW DATABASE '<db>' '<prop>' output
-# (line looks like:   LogXptMode = 'ASYNC')
+# (line looks like:   LogXptMode = 'ASYNC'). Quotes are optional and the
+# value is uppercased, so the comparison against FASTSYNC does not depend
+# on how a given broker release cases or quotes it.
 parse_broker_property() {
-    printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*'\(.*\)'.*/\1/p" | head -1
+    printf '%s\n' "$1" | sed -n "s/^[[:space:]]*$2[[:space:]]*=[[:space:]]*'*\([^' ]*\).*/\1/p" | head -1 | tr '[:lower:]' '[:upper:]'
 }
 
 # ============================================================
@@ -116,22 +118,21 @@ if echo "$CONFIG_STATUS" | grep -q "ORA-16532"; then
     exit 1
 fi
 
-if echo "$CONFIG_STATUS" | grep -q "SUCCESS"; then
+# Classify from the "Configuration Status:" field, not from the words
+# appearing anywhere in the output.
+BROKER_HEALTH=$(dgmgrl_status_value "$CONFIG_STATUS") || BROKER_HEALTH=""
+BROKER_WARNING=0
+
+if [[ "$BROKER_HEALTH" == "SUCCESS" ]]; then
     log_info "Data Guard Broker configuration: SUCCESS"
-elif echo "$CONFIG_STATUS" | grep -q "WARNING"; then
+elif [[ "$BROKER_HEALTH" == "WARNING" ]]; then
+    # The decision to continue is asked further down, after the
+    # "already configured" check: a system that already matches the target
+    # exits 0 without prompting about warnings it is not going to act on.
+    BROKER_WARNING=1
     log_warn "Data Guard Broker has warnings - resolve them before raising the protection mode"
-    echo ""
-    echo "$CONFIG_STATUS"
-    echo ""
-    # M8: gated so a --check run reaches the preflight summary instead of
-    # prompting, and a non-interactive real run aborts explicitly instead
-    # of silently misreading stdin.
-    if ! confirm_proceed_or_check "Continue despite broker warnings?"; then
-        log_info "Protection mode change cancelled by user"
-        exit 0
-    fi
 else
-    log_error "Data Guard Broker configuration is not healthy"
+    log_error "Data Guard Broker configuration is not healthy (status: ${BROKER_HEALTH:-unknown})"
     echo ""
     echo "$CONFIG_STATUS"
     exit 1
@@ -168,6 +169,19 @@ if [[ "$MODE_CHANGE_NEEDED" == "0" && "$LOGXPT_CHANGE_NEEDED" == "0" ]]; then
         "LogXptMode (${PRIMARY_DB_UNIQUE_NAME})" "$PRIMARY_LOGXPT" \
         "LogXptMode (${STANDBY_DB_UNIQUE_NAME})" "$STANDBY_LOGXPT"
     exit 0
+fi
+
+if [[ "$BROKER_WARNING" == "1" ]]; then
+    echo ""
+    echo "$CONFIG_STATUS"
+    echo ""
+    # M8: gated so a --check run reaches the preflight summary instead of
+    # prompting, and a non-interactive real run aborts explicitly (exit 1)
+    # instead of silently misreading stdin.
+    if ! confirm_proceed_or_check "Continue despite broker warnings?"; then
+        log_info "Protection mode change cancelled by user"
+        exit 1
+    fi
 fi
 
 # ============================================================
@@ -214,7 +228,7 @@ for DB in "$PRIMARY_DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME"; do
     # database answered) - the genuine static-registration failure is
     # ORA-12514/ORA-12154, which stays fatal below. Strip only the benign
     # pattern before scanning for real errors.
-    VALIDATE_SCAN=$(printf '%s\n' "$VALIDATE_OUTPUT" | grep -v 'ORA-01017')
+    VALIDATE_SCAN=$(printf '%s\n' "$VALIDATE_OUTPUT" | grep -v 'ORA-01017' || true)
     if printf '%s\n' "$VALIDATE_OUTPUT" | grep -q 'ORA-01017'; then
         log_info "${DB}: static connect identifier probe returned ORA-01017 - expected under OS authentication (the static service itself resolved and responded)"
     fi
@@ -334,7 +348,10 @@ echo ""
 
 if ! confirm_proceed "Proceed with protection mode change?"; then
     log_info "Protection mode change cancelled by user"
-    exit 0
+    # A declined prompt at a terminal is a deliberate cancel; with no
+    # terminal the "decline" is just EOF and nothing was applied.
+    [[ -t 0 ]] && exit 0
+    exit 1
 fi
 
 # ============================================================
@@ -418,18 +435,24 @@ fi
 progress_step "Verifying Final Configuration"
 
 # The broker's health check can take a moment to converge after a
-# protection mode change - poll SHOW CONFIGURATION for SUCCESS.
+# protection mode change - poll SHOW CONFIGURATION for SUCCESS, mirroring
+# step 6: every 10s, up to ~120s.
 FINAL_STATUS=""
 FINAL_OK=0
 attempt=0
-while [[ $attempt -lt 6 ]]; do
+max_attempts=12
+while [[ $attempt -lt $max_attempts ]]; do
     FINAL_STATUS=$(run_dgmgrl "show_configuration.dgmgrl" 2>&1 || true)
-    if echo "$FINAL_STATUS" | grep -q "SUCCESS"; then
+    FINAL_VALUE=$(dgmgrl_status_value "$FINAL_STATUS") || FINAL_VALUE=""
+    if [[ "$FINAL_VALUE" == "SUCCESS" ]]; then
         FINAL_OK=1
         break
     fi
     attempt=$((attempt+1))
-    sleep 5
+    if [[ $attempt -lt $max_attempts ]]; then
+        log_info "Configuration not yet SUCCESS (status: ${FINAL_VALUE:-unknown}; attempt ${attempt}/${max_attempts}) - retrying in 10s..."
+        sleep 10
+    fi
 done
 
 echo ""

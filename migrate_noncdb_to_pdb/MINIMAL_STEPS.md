@@ -1,5 +1,10 @@
 # Minimal: Migrate `dgnonc` (non-CDB) into `dgcdb` as a PDB
 
+> **LAB-ONLY.** This is the hand-run / `run_minimal.sh` shortcut for the poug-dg1/poug-dg2 test lab:
+> hard-coded hosts and paths, none of the preflight, identity, lag or replication checks of
+> `01_preflight.sh` ... `05_verify_pdb_dataguard.sh`. Do not use it on anything that matters; use the
+> numbered scripts (see README.md).
+
 Tailored to the test environment in this repo:
 
 * `dgnonc` (non-CDB)  primary on **poug-dg1**, standby `dgnonc_s` on **poug-dg2**, files at `/u01/app/oracle/oradata/DGNONC/` and `/u01/app/oracle/oradata/DGNONC_S/`
@@ -61,10 +66,15 @@ SQL
 
 ## 3. Tell the CDB standby where its source files live
 
+`STANDBY_PDB_SOURCE_FILE_DIRECTORY` is read by the **standby's** recovery process and `ALTER SYSTEM`
+does not travel in redo, so it has to be set on the standby instance itself (not on the primary, and
+not through dgmgrl's `SQL` command, which runs on the primary side):
+
 ```bash
-ORACLE_SID=dgcdb dgmgrl -silent / <<'DG'
-SQL "ALTER SYSTEM SET STANDBY_PDB_SOURCE_FILE_DIRECTORY='/u01/app/oracle/oradata/DGNONC_S/' SCOPE=BOTH";
-DG
+ssh poug-dg2 "ORACLE_SID=dgcdb $ORACLE_HOME/bin/sqlplus -s / as sysdba" <<'SQL'
+ALTER SYSTEM SET STANDBY_PDB_SOURCE_FILE_DIRECTORY='/u01/app/oracle/oradata/DGNONC_S/' SCOPE=BOTH;
+SELECT value FROM v$parameter WHERE name='standby_pdb_source_file_directory';
+SQL
 ```
 
 ## 4. Plug it in as `DGNONC_PDB`

@@ -17,11 +17,15 @@
 #   1. -s / --sid flag
 #   2. $ORACLE_SID environment variable
 #   3. Auto-detect from running ora_pmon_ process on primary host
-#   The standby SID is always auto-detected from its pmon process.
+#   The standby SID is auto-detected from its pmon process unless
+#   --standby-sid is given; with several pmon processes on the standby host
+#   the one whose DB_NAME matches the primary's wins, else the first is used
+#   and a warning is raised.
 #
 # Usage:
 #   bash dg_status.sh                           # Use $ORACLE_SID or auto-detect
 #   bash dg_status.sh -s cdb1                   # Specify Oracle SID explicitly
+#   bash dg_status.sh --standby-sid cdb1_stby   # Specify the standby SID
 #   bash dg_status.sh -c /path/to/config.env    # Use custom SSH config file
 #
 #
@@ -47,10 +51,13 @@ source "${SCRIPT_DIR}/common/dg_render_common.sh"
 EXIT_USAGE=3
 
 usage() {
-    printf "Usage: bash dg_status.sh [-c config.env] [-s SID] [--no-color]\n"
+    printf "Usage: bash dg_status.sh [-c config.env] [-s SID] [--standby-sid SID] [--no-color]\n"
     printf "  -c, --config FILE   SSH connection config (default: tests/e2e/config.env)\n"
-    printf "  -s, --sid SID       Oracle SID (default: \$ORACLE_SID, then auto-detect)\n"
+    printf "  -s, --sid SID       Primary Oracle SID (default: \$ORACLE_SID, then auto-detect)\n"
+    printf "  --standby-sid SID   Standby Oracle SID (default: auto-detect from pmon)\n"
     printf "  --no-color          Disable colored output (also honors NO_COLOR)\n"
+    printf "\n"
+    printf "Env: DG_REMOTE_TIMEOUT=SECONDS (default 120) bounds the whole remote collection\n"
     printf "\n"
     printf "Exit codes: 0 healthy, 1 warnings, 2 errors, %s usage/pre-flight error\n" "$EXIT_USAGE"
 }
@@ -58,6 +65,7 @@ usage() {
 # -- Parse args ---------------------------------------------------------------
 CONFIG_FILE="${SCRIPT_DIR}/tests/e2e/config.env"
 ORACLE_SID_OVERRIDE=""
+STANDBY_SID_OVERRIDE=""
 NO_COLOR_FLAG=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -75,6 +83,13 @@ while [[ $# -gt 0 ]]; do
                 exit $EXIT_USAGE
             fi
             ORACLE_SID_OVERRIDE="$2"; shift 2 ;;
+        --standby-sid)
+            if [[ $# -lt 2 ]]; then
+                printf "ERROR: %s requires a SID argument\n" "$1" >&2
+                usage >&2
+                exit $EXIT_USAGE
+            fi
+            STANDBY_SID_OVERRIDE="$2"; shift 2 ;;
         --no-color)  NO_COLOR_FLAG=true; shift ;;
         -h|--help)
             usage
@@ -92,6 +107,18 @@ done
 # requirement, and confirmed by inspection: `bash dg_status.sh | cat` emits
 # no escape codes since stdout is not a tty in that pipeline either way.
 $NO_COLOR_FLAG && dg_render_init_colors 1
+
+# A malformed threshold ("80%") would make the checks error out or silently
+# always/never fire, so it is a usage error, not a finding.
+dg_validate_thresholds || exit $EXIT_USAGE
+
+# Upper bound for the whole parallel remote collection (M10).
+: "${DG_REMOTE_TIMEOUT:=120}"
+case "$DG_REMOTE_TIMEOUT" in
+    ''|*[!0-9]*|0)
+        printf 'ERROR: DG_REMOTE_TIMEOUT must be a positive integer number of seconds (got "%s")\n' "$DG_REMOTE_TIMEOUT" >&2
+        exit $EXIT_USAGE ;;
+esac
 
 if [[ ! -f "$CONFIG_FILE" ]]; then
     printf "ERROR: Config file not found: %s\n" "$CONFIG_FILE" >&2
@@ -131,21 +158,43 @@ unset _key _REQUIRED_CONFIG_KEYS _MISSING_CONFIG_KEYS
 JUMP_SSH_PORT="${JUMP_SSH_PORT:-22}"
 PRIMARY_SSH_PORT="${PRIMARY_SSH_PORT:-22}"
 STANDBY_SSH_PORT="${STANDBY_SSH_PORT:-22}"
-DB_SSH_KEY_OPT=""
-[[ -n "${SSH_KEY:-}" ]] && DB_SSH_KEY_OPT="-i ${SSH_KEY}"
 
-# Skip ProxyJump if we're already on the jump host
-_CURRENT_HOST=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
-_CURRENT_HOST=${_CURRENT_HOST%%.*}
-if [[ -z "${JUMP_HOST:-}" || "$_CURRENT_HOST" == "${JUMP_HOST}"* ]]; then
-    _JUMP_OPT=""
-else
-    _JUMP_OPT="-J ${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}"
+# The ssh options are an ARRAY so an SSH_KEY path (or ProxyJump target) with
+# spaces survives intact. SSH_OPTS from the config is deliberately word-split
+# once here (it is a flat string of "-o K=V" pairs).
+SSH_ARGS=()
+if [[ -n "${SSH_OPTS:-}" ]]; then
+    read -r -a SSH_ARGS <<< "$SSH_OPTS"
+fi
+[[ -n "${SSH_KEY:-}" ]] && SSH_ARGS+=(-i "$SSH_KEY")
+# Liveness defaults, appended AFTER the config's options: ssh keeps the first
+# value it sees for an option, so a config that sets these itself wins. They
+# make a dead connection fail in ~45s instead of hanging (M10).
+SSH_ARGS+=(-o ServerAliveInterval=15 -o ServerAliveCountMax=3 -o ConnectTimeout=15)
+
+# Skip ProxyJump if we're already on the jump host. Compared as whole names:
+# a prefix glob made JUMP_HOST=jump match a host called jump02. Short and
+# fully-qualified forms are both accepted; an IP address never matches (the
+# jump hop then simply goes through itself, which is harmless).
+_CURRENT_HOST_FULL=$(hostname 2>/dev/null || uname -n 2>/dev/null || printf 'unknown')
+_CURRENT_HOST=${_CURRENT_HOST_FULL%%.*}
+_JUMP_SHORT=${JUMP_HOST:-}
+_JUMP_SHORT=${_JUMP_SHORT%%.*}
+_ON_JUMP_HOST=false
+if [[ -z "${JUMP_HOST:-}" ]]; then
+    _ON_JUMP_HOST=true
+elif [[ "$_CURRENT_HOST_FULL" == "$JUMP_HOST" ]]; then
+    _ON_JUMP_HOST=true
+elif [[ "$_CURRENT_HOST" == "$_JUMP_SHORT" ]] && { [[ "$JUMP_HOST" != *.* ]] || [[ "$_CURRENT_HOST_FULL" != *.* ]]; }; then
+    _ON_JUMP_HOST=true
+fi
+if ! $_ON_JUMP_HOST; then
+    SSH_ARGS+=(-J "${JUMP_USER}@${JUMP_HOST}:${JUMP_SSH_PORT}")
 fi
 
 _ssh_raw() {
     local host="$1" port="$2" cmd="$3"
-    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${_JUMP_OPT} \
+    ssh "${SSH_ARGS[@]}" \
         -p "${port}" "${SSH_USER}@${host}" "${cmd}" 2>&1
 }
 
@@ -155,19 +204,38 @@ _ssh_raw() {
 # in data we run sed over.
 _ssh_raw_stdout() {
     local host="$1" port="$2" cmd="$3"
-    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${_JUMP_OPT} \
+    ssh "${SSH_ARGS[@]}" \
         -p "${port}" "${SSH_USER}@${host}" "${cmd}" 2>/dev/null
 }
 
+# Remote Oracle environment prefix (ksh-safe: runs under whatever login shell
+# the DB host gives oracle, incl. AIX ksh). A non-login ssh skips .profile, so
+# everything sqlplus/dgmgrl need is exported here. LIBPATH is the AIX
+# equivalent of LD_LIBRARY_PATH (A7); the ${LIBPATH:+:...} form avoids a
+# trailing ':' (= current directory) when it was empty.
+_ora_env() {
+    local sid="$1"
+    printf "export ORACLE_HOME='%s'; export ORACLE_BASE='%s'; export ORACLE_SID='%s'; export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; export LIBPATH=\"\${ORACLE_HOME}/lib\${LIBPATH:+:\${LIBPATH}}\"; " \
+        "${ORACLE_HOME}" "${ORACLE_BASE}" "$sid"
+}
+
+# stderr merged into stdout (SQL*Plus and everything else prints its errors
+# there; the sections that use this tolerate or want the noise).
 _ssh_ora() {
     local host="$1" port="$2" sid="$3" cmd="$4"
-    ssh ${SSH_OPTS} ${DB_SSH_KEY_OPT} ${_JUMP_OPT} \
+    ssh "${SSH_ARGS[@]}" \
         -p "${port}" "${SSH_USER}@${host}" \
-        "export ORACLE_HOME='${ORACLE_HOME}'; \
-         export ORACLE_BASE='${ORACLE_BASE}'; \
-         export ORACLE_SID='${sid}'; \
-         export PATH=\"\${ORACLE_HOME}/bin:\${PATH}\"; \
-         ${cmd}" 2>&1
+        "$(_ora_env "$sid")${cmd}" 2>&1
+}
+
+# For parsed, unmarked streams (dgmgrl output): ssh's own stderr (host-key
+# warning, banner) is dropped locally; the caller appends "2>&1" to the remote
+# command when the tool's own stderr should still be part of the output.
+_ssh_ora_stdout() {
+    local host="$1" port="$2" sid="$3" cmd="$4"
+    ssh "${SSH_ARGS[@]}" \
+        -p "${port}" "${SSH_USER}@${host}" \
+        "$(_ora_env "$sid")${cmd}" 2>/dev/null
 }
 
 # -- Helpers ------------------------------------------------------------------
@@ -232,36 +300,57 @@ fi
 
 # -- Resolve SID --------------------------------------------------------------
 # Priority: -s flag > $ORACLE_SID > auto-detect from pmon
-_detect_pmon_sid() {
-    local host="$1" port="$2"
-    local raw pmon_line sid
-    # `[o]ra_pmon_` keeps the grep's own process line from matching; the
-    # explicit `+ASM` exclusion prevents an ASM instance pmon from being
-    # picked up ahead of (or instead of) the real database instance.
-    #
-    # M23: the remote side tags every candidate line with a `DG_PMON|`
-    # marker and we filter on that marker LOCALLY before running sed.
-    # Without it, anything the login shell prints (a /etc/motd banner, a
-    # "Last login:" line, an sshd warning) lands in the same stream and the
-    # unanchored `sed 's/.*ora_pmon_//'` happily turns it into a "SID".
-    # _ssh_raw_stdout additionally keeps stderr out of the parsed stream.
-    raw=$(_ssh_raw_stdout "${host}" "${port}" \
-        "ps -ef 2>/dev/null | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'")
-    pmon_line=$(printf '%s\n' "$raw" | grep '^DG_PMON|' | grep 'ora_pmon_' | head -1)
-    [[ -z "$pmon_line" ]] && return 0
-    # Anchored extraction: in real `ps -ef` output `ora_pmon_<SID>` is the
-    # LAST token on the line, and a SID is [A-Za-z][A-Za-z0-9_$]*. Requiring
-    # both means a prose line that merely mentions ora_pmon_ yields nothing
-    # at all, instead of the old unanchored `s/.*ora_pmon_//` turning the
-    # rest of the sentence into a "SID".
-    sid=$(printf '%s' "$pmon_line" \
+
+# Pure: reads the raw ssh stdout stream on stdin and prints every SID found,
+# one per line, first-seen order, duplicates dropped.
+#
+# `[o]ra_pmon_` on the remote side keeps the grep's own process line from
+# matching; the explicit `+ASM` exclusion keeps an ASM instance pmon from being
+# picked up ahead of (or instead of) the real database instance.
+#
+# M23: the remote side tags every candidate line with a `DG_PMON|` marker and
+# we filter on that marker LOCALLY before running sed. Without it, anything the
+# login shell prints (a /etc/motd banner, a "Last login:" line, an sshd
+# warning) lands in the same stream and the unanchored
+# `sed 's/.*ora_pmon_//'` happily turns it into a "SID".
+# Anchored extraction: in real `ps -ef` output `ora_pmon_<SID>` is the LAST
+# token on the line, and a SID is [A-Za-z][A-Za-z0-9_$]*. Requiring both means
+# a prose line that merely mentions ora_pmon_ yields nothing at all.
+_pmon_sids_from_stream() {
+    grep '^DG_PMON|' | grep 'ora_pmon_' \
         | sed 's/[[:space:]]*$//' \
-        | sed -n 's/.*ora_pmon_\([A-Za-z][A-Za-z0-9_$]*\)$/\1/p')
-    printf '%s' "$sid"
+        | sed -n 's/.*ora_pmon_\([A-Za-z][A-Za-z0-9_$]*\)$/\1/p' \
+        | awk '!seen[$0]++'
+}
+
+# All candidate SIDs on a host, one per line. _ssh_raw_stdout keeps ssh's
+# stderr out of the parsed stream.
+_detect_pmon_sids() {
+    local host="$1" port="$2"
+    _ssh_raw_stdout "${host}" "${port}" \
+        "ps -ef 2>/dev/null | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'" \
+        | _pmon_sids_from_stream
 }
 
 _validate_sid() {
     [[ "$1" =~ ^[A-Za-z][A-Za-z0-9_$]*$ ]]
+}
+
+# Pure: stdin lines are "SID|DB_NAME"; prints the first SID whose DB_NAME equals
+# $1 (case-insensitive), nothing if none does.
+_select_sid_by_dbname() {
+    local wanted="$1"
+    awk -F'|' -v w="$wanted" 'BEGIN { w = tolower(w) } w != "" && tolower($2) == w { print $1; exit }'
+}
+
+# DB_NAME of the instance <sid> on a host ('' when it cannot be queried).
+_db_name_for_sid() {
+    local host="$1" port="$2" sid="$3"
+    _ssh_ora_stdout "${host}" "${port}" "${sid}" "sqlplus -s / as sysdba <<'SQL' 2>&1
+SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300
+SELECT 'DG_DBNAME|' || NAME FROM V\$DATABASE;
+EXIT;
+SQL" | grep '^DG_DBNAME|' | head -1 | sed 's/^DG_DBNAME|//' | dg_trim
 }
 
 if [[ -n "$ORACLE_SID_OVERRIDE" ]]; then
@@ -277,7 +366,8 @@ elif [[ -n "${ORACLE_SID:-}" ]]; then
         exit $EXIT_USAGE
     fi
 elif $PRIMARY_REACHABLE; then
-    DETECTED_SID=$(_detect_pmon_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}")
+    PRI_SID_CANDIDATES=( $(_detect_pmon_sids "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}") )
+    DETECTED_SID="${PRI_SID_CANDIDATES[0]:-}"
     if [[ -z "$DETECTED_SID" ]]; then
         # Reachable host, no pmon: the instance is down. That is a genuine
         # finding, not an operator mistake - report it with the "errors
@@ -290,6 +380,11 @@ elif $PRIMARY_REACHABLE; then
         printf "ERROR: Auto-detected primary SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID" >&2
         exit $EXIT_USAGE
     fi
+    # M11: more than one instance on the host - nothing to match against yet,
+    # so the first is used, but never silently.
+    if [[ ${#PRI_SID_CANDIDATES[@]} -gt 1 ]]; then
+        add_summary_warning "Several Oracle instances run on primary ${PRIMARY_HOST} (${PRI_SID_CANDIDATES[*]}); using '${DETECTED_SID}' - pass -s/--sid to choose"
+    fi
 else
     # Primary unreachable: also a genuine finding (already counted as a
     # summary error above), so exit 2 rather than the usage code.
@@ -299,14 +394,40 @@ else
 fi
 
 # Detect standby SID (may differ)
-if $STANDBY_REACHABLE; then
-    DETECTED_SID_STB=$(_detect_pmon_sid "${STANDBY_HOST}" "${STANDBY_SSH_PORT}")
+if [[ -n "$STANDBY_SID_OVERRIDE" ]]; then
+    DETECTED_SID_STB="$STANDBY_SID_OVERRIDE"
+    if ! _validate_sid "$DETECTED_SID_STB"; then
+        printf "ERROR: SID '%s' from --standby-sid looks invalid\n" "$DETECTED_SID_STB" >&2
+        exit $EXIT_USAGE
+    fi
+elif $STANDBY_REACHABLE; then
+    STB_SID_CANDIDATES=( $(_detect_pmon_sids "${STANDBY_HOST}" "${STANDBY_SSH_PORT}") )
+    DETECTED_SID_STB="${STB_SID_CANDIDATES[0]:-}"
     if [[ -z "$DETECTED_SID_STB" ]]; then
         DETECTED_SID_STB="$DETECTED_SID"
         add_summary_error "No Oracle instance detected on standby ${STANDBY_HOST}:${STANDBY_SSH_PORT} (no ora_pmon_ process)"
     elif ! _validate_sid "$DETECTED_SID_STB"; then
-        printf "ERROR: Auto-detected standby SID '%s' looks invalid; use -s/--sid to specify explicitly\n" "$DETECTED_SID_STB" >&2
+        printf "ERROR: Auto-detected standby SID '%s' looks invalid; use --standby-sid to specify explicitly\n" "$DETECTED_SID_STB" >&2
         exit $EXIT_USAGE
+    elif [[ ${#STB_SID_CANDIDATES[@]} -gt 1 ]]; then
+        # M11: a physical standby shares the primary's DB_NAME, so ask each
+        # candidate for its DB_NAME and prefer the one that matches. Only
+        # when that cannot decide is the first used - with a warning.
+        _stb_pick=""
+        if $PRIMARY_REACHABLE; then
+            _pri_dbname=$(_db_name_for_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}")
+            if [[ -n "$_pri_dbname" ]]; then
+                _stb_pick=$(for _c in "${STB_SID_CANDIDATES[@]}"; do
+                    printf '%s|%s\n' "$_c" "$(_db_name_for_sid "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$_c")"
+                done | _select_sid_by_dbname "$_pri_dbname")
+            fi
+        fi
+        if [[ -n "$_stb_pick" ]]; then
+            DETECTED_SID_STB="$_stb_pick"
+        else
+            add_summary_warning "Several Oracle instances run on standby ${STANDBY_HOST} (${STB_SID_CANDIDATES[*]}) and none could be matched to the primary's DB_NAME; using '${DETECTED_SID_STB}' - pass --standby-sid to choose"
+        fi
+        unset _stb_pick _pri_dbname _c
     fi
 else
     DETECTED_SID_STB="$DETECTED_SID"
@@ -318,7 +439,111 @@ printf " ${DIM}Primary: ${PRIMARY_ORACLE_HOSTNAME} (SID: ${DETECTED_SID})  |  St
 
 # -- Collect data in parallel -------------------------------------------------
 TMP=$(make_temp_dir)
-trap 'rm -rf "$TMP"' EXIT
+if [[ -z "$TMP" || ! -d "$TMP" ]]; then
+    printf "ERROR: cannot create a temporary directory (check TMPDIR / permissions)\n" >&2
+    exit $EXIT_USAGE
+fi
+
+# M10: every remote job is tracked (pid, host, label, output file) so the
+# collection can be bounded. A hung sqlplus/dgmgrl used to hang a bare `wait`
+# forever and cron never saw exit 2.
+JOB_PIDS=(); JOB_HOSTS=(); JOB_LABELS=(); JOB_FILES=()
+_track_job() {
+    JOB_PIDS+=("$1"); JOB_HOSTS+=("$2"); JOB_LABELS+=("$3"); JOB_FILES+=("$4")
+}
+
+# Kill a process and its descendants (the background job is a subshell whose
+# child is the ssh). `ps -eo pid,ppid` exists on Linux, macOS and AIX; there is
+# no pkill -P / timeout dependency.
+_kill_tree() {
+    local pid="$1" child
+    for child in $(ps -eo pid,ppid 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }'); do
+        _kill_tree "$child"
+    done
+    kill "$pid" 2>/dev/null
+}
+
+_jobs_alive() {
+    local i
+    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
+        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+_cleanup() {
+    local i
+    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
+        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && _kill_tree "${JOB_PIDS[i]}"
+    done
+    rm -rf "$TMP"
+}
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Wait for the tracked jobs for at most DG_REMOTE_TIMEOUT seconds. Whatever is
+# still running at the deadline is killed and its output file emptied (partial
+# SQL output must not be parsed as if complete). Portable: SECONDS + `kill -0`
+# polling with `sleep 1` - no `timeout`, no `wait -n` (bash 4.3).
+# Sets PRI_TIMED_OUT/STB_TIMED_OUT (labels of the jobs that were cut off).
+PRI_TIMED_OUT=""; STB_TIMED_OUT=""
+_wait_for_jobs() {
+    local start=$SECONDS i
+    while _jobs_alive; do
+        if (( SECONDS - start >= DG_REMOTE_TIMEOUT )); then
+            for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
+                if kill -0 "${JOB_PIDS[i]}" 2>/dev/null; then
+                    _kill_tree "${JOB_PIDS[i]}"
+                    : > "${JOB_FILES[i]}"
+                    if [[ "${JOB_HOSTS[i]}" == primary ]]; then
+                        PRI_TIMED_OUT="${PRI_TIMED_OUT:+${PRI_TIMED_OUT}, }${JOB_LABELS[i]}"
+                    else
+                        STB_TIMED_OUT="${STB_TIMED_OUT:+${STB_TIMED_OUT}, }${JOB_LABELS[i]}"
+                    fi
+                fi
+            done
+            break
+        fi
+        sleep 1
+    done
+    # Reap the finished/killed jobs; the shell's "Terminated" notice for a
+    # killed job goes to this group's stderr.
+    { wait; } 2>/dev/null
+    if [[ -n "$PRI_TIMED_OUT" ]]; then
+        add_summary_error "Remote collection on primary ${PRIMARY_HOST} timed out after ${DG_REMOTE_TIMEOUT}s (${PRI_TIMED_OUT}); data is incomplete - raise DG_REMOTE_TIMEOUT or check the host"
+    fi
+    if [[ -n "$STB_TIMED_OUT" ]]; then
+        add_summary_error "Remote collection on standby ${STANDBY_HOST} timed out after ${DG_REMOTE_TIMEOUT}s (${STB_TIMED_OUT}); data is incomplete - raise DG_REMOTE_TIMEOUT or check the host"
+    fi
+}
+
+# Remote shell snippet that locates a diagnostic log under 'Diag Trace' and
+# prints FILE|<path> + ENTRY|<line>..., MISSING|<path>, or - when V$DIAG_INFO
+# returned nothing - no marker at all (rendered as "path could not be
+# determined"). Args: file name, awk filter, lines to tail, entries to keep.
+# The trim is awk, not xargs: xargs strips quote characters from a path.
+_remote_log_script() {
+    local name="$1" filter="$2" tail_n="$3" show_n="$4"
+    cat <<EOF
+TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
+SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
+SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
+EXIT;
+SQLT
+)
+TRACE_DIR=\$(printf '%s\n' "\$TRACE_DIR" | awk 'NF { sub(/^[ \t]+/, ""); sub(/[ \t]+\$/, ""); print; exit }')
+if [ -n "\$TRACE_DIR" ]; then
+    LOG_FILE="\${TRACE_DIR}/${name}"
+    if [ -f "\$LOG_FILE" ]; then
+        printf 'FILE|%s\n' "\$LOG_FILE"
+        tail -${tail_n} "\$LOG_FILE" | awk '${filter}' | tail -${show_n} | sed 's/^/ENTRY|/'
+    else
+        printf 'MISSING|%s\n' "\$LOG_FILE"
+    fi
+fi
+EOF
+}
 
 # Primary: SQL data + DGMGRL
 if $PRIMARY_REACHABLE; then
@@ -336,19 +561,25 @@ ${DG_SQL_SELECT_FRA}
 ${DG_SQL_SELECT_SERVICE}
 EXIT;
 SQL" > "$TMP/primary_sql" &
+_track_job $! primary "SQL data" "$TMP/primary_sql"
 
-_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
-    "dgmgrl -silent / 'SHOW CONFIGURATION'" > "$TMP/dgmgrl_config" &
+# M13: dgmgrl output is parsed without markers, so ssh's own stderr (host-key
+# warnings, banners) is dropped; the tool's own stderr is merged remotely.
+_ssh_ora_stdout "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
+    "dgmgrl -silent / 'SHOW CONFIGURATION' 2>&1" > "$TMP/dgmgrl_config" &
+_track_job $! primary "DGMGRL configuration" "$TMP/dgmgrl_config"
 
-_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
-    "dgmgrl -silent / 'SHOW FAST_START FAILOVER'" > "$TMP/dgmgrl_fsfo" 2>/dev/null &
+_ssh_ora_stdout "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
+    "dgmgrl -silent / 'SHOW FAST_START FAILOVER' 2>&1" > "$TMP/dgmgrl_fsfo" &
+_track_job $! primary "DGMGRL FSFO" "$TMP/dgmgrl_fsfo"
 fi
 
 # Standby: SQL data
 if $STANDBY_REACHABLE; then
 _ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" "sqlplus -s / as sysdba <<'SQL'
 SET HEADING OFF FEEDBACK OFF LINESIZE 300 PAGESIZE 0 TRIMSPOOL ON
-SELECT 'DBSTATUS|' || DATABASE_ROLE || '|' || OPEN_MODE || '|' || PROTECTION_MODE || '|' || SWITCHOVER_STATUS || '|' || DB_UNIQUE_NAME FROM V\$DATABASE;
+${DG_SQL_SELECT_DBSTATUS_FULL}
+${DG_SQL_SELECT_DGPARAMS}
 ${DG_SQL_SELECT_MRP}
 ${DG_SQL_SELECT_DGSTATS}
 ${DG_SQL_SELECT_ARCHGAP}
@@ -360,172 +591,128 @@ ${DG_SQL_SELECT_FRA}
 ${DG_SQL_SELECT_SERVICE}
 EXIT;
 SQL" > "$TMP/standby_sql" &
+_track_job $! standby "SQL data" "$TMP/standby_sql"
 fi
 
-# Alert log: primary (get diag trace path, then extract DG-related entries with timestamps)
-# Oracle 19c alert log has ISO timestamps on their own line (e.g. 2024-01-15T10:30:45.123+00:00)
-# awk tracks the last timestamp and prepends it to matching DG lines
+# Alert log (Oracle 19c has ISO timestamps on their own line, e.g.
+# 2024-01-15T10:30:45.123+00:00; the awk filter tracks the last one and
+# prepends it to matching DG lines) and broker log (drc<SID>.log).
 if $PRIMARY_REACHABLE; then
-_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" "
-TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
-SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
-SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
-EXIT;
-SQLT
-)
-TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
-ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID}.log\"
-if [ -f \"\$ALERT_FILE\" ]; then
-    printf 'FILE|%s\n' \"\$ALERT_FILE\"
-    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15 | sed 's/^/ENTRY|/'
-else
-    printf 'MISSING|%s\n' \"\$ALERT_FILE\"
-fi
-" > "$TMP/primary_alert" 2>/dev/null &
+_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
+    "$(_remote_log_script "alert_${DETECTED_SID}.log" "$DG_ALERT_LOG_AWK_FILTER" 2000 15)" \
+    > "$TMP/primary_alert" 2>/dev/null &
+_track_job $! primary "alert log" "$TMP/primary_alert"
+
+_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" \
+    "$(_remote_log_script "drc${DETECTED_SID}.log" "$DG_BROKER_LOG_AWK_FILTER" 500 10)" \
+    > "$TMP/primary_drc" 2>/dev/null &
+_track_job $! primary "broker log" "$TMP/primary_drc"
 fi
 
-# Alert log: standby
 if $STANDBY_REACHABLE; then
-_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" "
-TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
-SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
-SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
-EXIT;
-SQLT
-)
-TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
-ALERT_FILE=\"\${TRACE_DIR}/alert_${DETECTED_SID_STB}.log\"
-if [ -f \"\$ALERT_FILE\" ]; then
-    printf 'FILE|%s\n' \"\$ALERT_FILE\"
-    tail -2000 \"\$ALERT_FILE\" | awk '${DG_ALERT_LOG_AWK_FILTER}' | tail -15 | sed 's/^/ENTRY|/'
-else
-    printf 'MISSING|%s\n' \"\$ALERT_FILE\"
-fi
-" > "$TMP/standby_alert" 2>/dev/null &
+_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" \
+    "$(_remote_log_script "alert_${DETECTED_SID_STB}.log" "$DG_ALERT_LOG_AWK_FILTER" 2000 15)" \
+    > "$TMP/standby_alert" 2>/dev/null &
+_track_job $! standby "alert log" "$TMP/standby_alert"
+
+_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" \
+    "$(_remote_log_script "drc${DETECTED_SID_STB}.log" "$DG_BROKER_LOG_AWK_FILTER" 500 10)" \
+    > "$TMP/standby_drc" 2>/dev/null &
+_track_job $! standby "broker log" "$TMP/standby_drc"
 fi
 
-# Broker log (drc<SID>.log): primary
-if $PRIMARY_REACHABLE; then
-_ssh_ora "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}" "
-TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
-SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
-SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
-EXIT;
-SQLT
-)
-TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
-DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID}.log\"
-if [ -f \"\$DRC_FILE\" ]; then
-    printf 'FILE|%s\n' \"\$DRC_FILE\"
-    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10 | sed 's/^/ENTRY|/'
-else
-    printf 'MISSING|%s\n' \"\$DRC_FILE\"
-fi
-" > "$TMP/primary_drc" 2>/dev/null &
-fi
-
-# Broker log (drc<SID>.log): standby
-if $STANDBY_REACHABLE; then
-_ssh_ora "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "${DETECTED_SID_STB}" "
-TRACE_DIR=\$(sqlplus -s / as sysdba <<'SQLT'
-SET HEADING OFF FEEDBACK OFF LINESIZE 500 PAGESIZE 0 TRIMSPOOL ON
-SELECT VALUE FROM V\$DIAG_INFO WHERE NAME = 'Diag Trace';
-EXIT;
-SQLT
-)
-TRACE_DIR=\$(printf '%s' \"\$TRACE_DIR\" | xargs)
-DRC_FILE=\"\${TRACE_DIR}/drc${DETECTED_SID_STB}.log\"
-if [ -f \"\$DRC_FILE\" ]; then
-    printf 'FILE|%s\n' \"\$DRC_FILE\"
-    tail -500 \"\$DRC_FILE\" | awk '${DG_BROKER_LOG_AWK_FILTER}' | tail -10 | sed 's/^/ENTRY|/'
-else
-    printf 'MISSING|%s\n' \"\$DRC_FILE\"
-fi
-" > "$TMP/standby_drc" 2>/dev/null &
-fi
-
-wait
+_wait_for_jobs
 
 # -- Parse primary SQL --------------------------------------------------------
 PRI_SQL=$(cat "$TMP/primary_sql" 2>/dev/null)
 
 PRI_DBSTATUS=$(printf '%s\n' "$PRI_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-PRI_ROLE=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
-PRI_OPEN=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
-PRI_PROTECT=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
-PRI_SWITCH=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
-PRI_FORCE=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
-PRI_FLASH=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $6}' | xargs)
-PRI_DBUNIQ=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $7}' | xargs)
+PRI_ROLE=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $1}' | dg_trim)
+PRI_OPEN=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $2}' | dg_trim)
+PRI_PROTECT=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $3}' | dg_trim)
+PRI_SWITCH=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $4}' | dg_trim)
+PRI_FORCE=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $5}' | dg_trim)
+PRI_FLASH=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $6}' | dg_trim)
+PRI_DBUNIQ=$(printf '%s' "$PRI_DBSTATUS" | awk -F'|' '{print $7}' | dg_trim)
 
-PRI_BROKER=$(printf '%s\n' "$PRI_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | xargs)
-PRI_ARCHGAP=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
-PRI_UNNAMED=$(printf '%s\n' "$PRI_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+PRI_BROKER=$(printf '%s\n' "$PRI_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | dg_trim)
+PRI_ARCHGAP=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | dg_trim)
+PRI_UNNAMED=$(printf '%s\n' "$PRI_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | dg_trim)
 case "$PRI_UNNAMED" in ''|*[!0-9]*) PRI_UNNAMED="" ;; esac
 PRI_REDO=$(printf '%s\n' "$PRI_SQL" | grep '^REDOLOG|' | sed 's/^REDOLOG|//')
-PRI_REDO_CNT=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $1}' | xargs)
-PRI_REDO_MB=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $2}' | xargs)
-PRI_SRL=$(printf '%s\n' "$PRI_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
-PRI_DEST2_STATUS=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | xargs)
-PRI_DEST2_ERROR=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | xargs)
+PRI_REDO_CNT=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $1}' | dg_trim)
+PRI_REDO_MB=$(printf '%s' "$PRI_REDO" | awk -F'|' '{print $2}' | dg_trim)
+PRI_SRL=$(printf '%s\n' "$PRI_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | dg_trim)
+PRI_DEST2_STATUS=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $3}' | dg_trim)
+PRI_DEST2_ERROR=$(printf '%s\n' "$PRI_SQL" | grep '^ARCHDEST|2|' | awk -F'|' '{print $4}' | dg_trim)
 
 # FRA
 PRI_FRA=$(printf '%s\n' "$PRI_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
-PRI_FRA_PATH=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $1}' | xargs)
-PRI_FRA_SIZE=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $2}' | xargs)
-PRI_FRA_USED=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $3}' | xargs)
-PRI_FRA_RECLAIM=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $4}' | xargs)
-PRI_FRA_FILES=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $5}' | xargs)
+PRI_FRA_PATH=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $1}' | dg_trim)
+PRI_FRA_SIZE=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $2}' | dg_trim)
+PRI_FRA_USED=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $3}' | dg_trim)
+PRI_FRA_RECLAIM=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $4}' | dg_trim)
+PRI_FRA_FILES=$(printf '%s' "$PRI_FRA" | awk -F'|' '{print $5}' | dg_trim)
 PRI_SERVICES=$(format_services "$(printf '%s\n' "$PRI_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
 # FSFO runtime state from V$DATABASE (M17). The FSFODB row was collected all
 # along but never parsed, so an FSFO configuration whose observer had died
 # still rendered a green "Enabled" and exited 0.
 PRI_FSFODB=$(printf '%s\n' "$PRI_SQL" | grep '^FSFODB|' | head -1 | sed 's/^FSFODB|//')
-PRI_FSFO_STATUS=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $1}' | xargs)
-PRI_FSFO_OBSERVER_PRESENT=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $2}' | xargs)
-PRI_FSFO_OBSERVER_HOST=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $3}' | xargs)
+PRI_FSFO_STATUS=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $1}' | dg_trim)
+PRI_FSFO_OBSERVER_PRESENT=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $2}' | dg_trim)
+PRI_FSFO_OBSERVER_HOST=$(printf '%s' "$PRI_FSFODB" | awk -F'|' '{print $3}' | dg_trim)
 
 # -- Parse standby SQL --------------------------------------------------------
 STB_SQL=$(cat "$TMP/standby_sql" 2>/dev/null)
 
 STB_DBSTATUS=$(printf '%s\n' "$STB_SQL" | grep '^DBSTATUS|' | head -1 | sed 's/^DBSTATUS|//')
-STB_ROLE=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $1}' | xargs)
-STB_OPEN=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $2}' | xargs)
-STB_PROTECT=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $3}' | xargs)
-STB_SWITCH=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $4}' | xargs)
-STB_DBUNIQ=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $5}' | xargs)
+STB_ROLE=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $1}' | dg_trim)
+STB_OPEN=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $2}' | dg_trim)
+STB_PROTECT=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $3}' | dg_trim)
+STB_SWITCH=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $4}' | dg_trim)
+STB_FLASH=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $6}' | dg_trim)
+STB_DBUNIQ=$(printf '%s' "$STB_DBSTATUS" | awk -F'|' '{print $7}' | dg_trim)
+STB_BROKER=$(printf '%s\n' "$STB_SQL" | grep 'dg_broker_start' | awk -F'|' '{print $3}' | dg_trim)
 
 STB_MRP=$(printf '%s\n' "$STB_SQL" | grep '^MRP|' | head -1 | sed 's/^MRP|//')
-STB_MRP_STATUS=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $2}' | xargs)
-STB_MRP_SEQ=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $3}' | xargs)
-STB_RECOVERY_MODE=$(printf '%s\n' "$STB_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | xargs)
+STB_MRP_STATUS=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $2}' | dg_trim)
+STB_MRP_SEQ=$(printf '%s' "$STB_MRP" | awk -F'|' '{print $3}' | dg_trim)
+STB_RECOVERY_MODE=$(printf '%s\n' "$STB_SQL" | grep '^RECMODE|' | head -1 | awk -F'|' '{print $2}' | dg_trim)
 
-STB_TRANSPORT_LAG=$(printf '%s\n' "$STB_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | xargs)
-STB_APPLY_LAG=$(printf '%s\n' "$STB_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | xargs)
+STB_TRANSPORT_LAG=$(printf '%s\n' "$STB_SQL" | grep 'transport lag' | awk -F'|' '{print $3}' | dg_trim)
+STB_APPLY_LAG=$(printf '%s\n' "$STB_SQL" | grep 'apply lag' | awk -F'|' '{print $3}' | dg_trim)
 
-STB_ARCHGAP=$(printf '%s\n' "$STB_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | xargs)
-STB_UNNAMED=$(printf '%s\n' "$STB_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | xargs)
+STB_ARCHGAP=$(printf '%s\n' "$STB_SQL" | grep '^ARCHGAP|' | awk -F'|' '{print $2}' | dg_trim)
+STB_UNNAMED=$(printf '%s\n' "$STB_SQL" | grep '^UNNAMEDDF|' | awk -F'|' '{print $2}' | dg_trim)
 case "$STB_UNNAMED" in ''|*[!0-9]*) STB_UNNAMED="" ;; esac
 STB_APPLYINFO=$(printf '%s\n' "$STB_SQL" | grep '^APPLYINFO|' | sed 's/^APPLYINFO|//')
-STB_LAST_APPLIED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $1}' | xargs)
-STB_LAST_RECEIVED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $2}' | xargs)
-STB_SRL=$(printf '%s\n' "$STB_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | xargs)
+STB_LAST_APPLIED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $1}' | dg_trim)
+STB_LAST_RECEIVED=$(printf '%s' "$STB_APPLYINFO" | awk -F'|' '{print $2}' | dg_trim)
+STB_SRL=$(printf '%s\n' "$STB_SQL" | grep '^SRLCOUNT|' | awk -F'|' '{print $2}' | dg_trim)
 
 # FRA
 STB_FRA=$(printf '%s\n' "$STB_SQL" | grep '^FRA|' | head -1 | sed 's/^FRA|//')
-STB_FRA_PATH=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $1}' | xargs)
-STB_FRA_SIZE=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $2}' | xargs)
-STB_FRA_USED=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $3}' | xargs)
-STB_FRA_RECLAIM=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $4}' | xargs)
-STB_FRA_FILES=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $5}' | xargs)
+STB_FRA_PATH=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $1}' | dg_trim)
+STB_FRA_SIZE=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $2}' | dg_trim)
+STB_FRA_USED=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $3}' | dg_trim)
+STB_FRA_RECLAIM=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $4}' | dg_trim)
+STB_FRA_FILES=$(printf '%s' "$STB_FRA" | awk -F'|' '{print $5}' | dg_trim)
 STB_SERVICES=$(format_services "$(printf '%s\n' "$STB_SQL" | grep '^SERVICE|' | sed 's/^SERVICE|//')")
 
 # -- Parse DGMGRL output -----------------------------------------------------
 DGMGRL_CONFIG=$(cat "$TMP/dgmgrl_config" 2>/dev/null)
 DGMGRL_FSFO=$(cat "$TMP/dgmgrl_fsfo" 2>/dev/null)
 
-BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | xargs)
+# M13: the real configuration listing starts at the "Configuration -" line.
+# Anything before it (a login banner, "Connected to ...", a stray warning)
+# must never be graded as a broker finding. Output without that line
+# (ORA-16532 / not configured) is kept whole for the NOT CONFIGURED test.
+if printf '%s\n' "$DGMGRL_CONFIG" | grep -q 'Configuration -'; then
+    DGMGRL_CONFIG=$(printf '%s\n' "$DGMGRL_CONFIG" | sed -n '/Configuration -/,$p')
+fi
+
+BROKER_CFG_NAME=$(printf '%s\n' "$DGMGRL_CONFIG" | grep 'Configuration -' | sed 's/.*Configuration - //' | dg_trim)
 BROKER_OVERALL=$(printf '%s\n' "$DGMGRL_CONFIG" | tail -5 | extract_first_status)
 
 # =============================================================================
@@ -743,8 +930,17 @@ row "Protection Mode" "$STB_PROTECT"
 icon=$(warn_icon "$STB_SWITCH" "NOT ALLOWED" "SWITCHOVER PENDING")
 row "Switchover Status" "$STB_SWITCH" "$icon"
 
+# M12: the standby's flashback and dg_broker_start were only ever graded by
+# the local triage/diag tools.
+icon=$(warn_icon "${STB_FLASH:-unknown}" "YES")
+[[ "$icon" == *"!!"* ]] && add_summary_warning "Flashback is '${STB_FLASH:-unknown}' on standby"
+row "Flashback" "${STB_FLASH:-unknown}" "$icon"
+
 subheader "Services"
 
+icon=$(status_icon "${STB_BROKER:-FALSE}" "TRUE")
+[[ "$icon" == *"XX"* ]] && add_summary_error "DG Broker is '${STB_BROKER:-FALSE}' on standby"
+row "DG Broker" "${STB_BROKER:-FALSE}" "$icon"
 row "Running Services" "${STB_SERVICES:-NONE}"
 
 subheader "Recovery / Apply"
@@ -904,13 +1100,13 @@ else
     done <<< "$DGMGRL_CONFIG"
 
     # FSFO status
-    FSFO_MODE=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Fast-Start Failover:' | head -1 | sed 's/.*: *//' | xargs)
+    FSFO_MODE=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Fast-Start Failover:' | head -1 | sed 's/.*: *//' | dg_trim)
     if [[ -n "${FSFO_MODE:-}" ]]; then
         if printf '%s' "$FSFO_MODE" | grep -qi "Enabled"; then
             row "Fast-Start Failover" "$FSFO_MODE" "$CHK"
-            FSFO_TARGET=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Target:' | sed 's/.*: *//' | xargs)
-            FSFO_OBS=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Observer:' | sed 's/.*: *//' | xargs)
-            FSFO_THRESHOLD=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Threshold:' | sed 's/.*: *//' | xargs)
+            FSFO_TARGET=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Target:' | sed 's/.*: *//' | dg_trim)
+            FSFO_OBS=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Observer:' | sed 's/.*: *//' | dg_trim)
+            FSFO_THRESHOLD=$(printf '%s\n' "$DGMGRL_FSFO" | grep -i 'Threshold:' | sed 's/.*: *//' | dg_trim)
             [[ -n "${FSFO_TARGET:-}" ]] && row "  Target" "$FSFO_TARGET"
             [[ -n "${FSFO_OBS:-}" ]] && row "  Observer" "$FSFO_OBS"
             [[ -n "${FSFO_THRESHOLD:-}" ]] && row "  Threshold" "$FSFO_THRESHOLD"
@@ -983,25 +1179,18 @@ else
     BROKER_STATE="${YELLOW}UNKNOWN${NC}"
 fi
 
-# M18: "IN SYNC" must be a conclusion, not a fall-through. With an
-# unreachable or down standby every lag/sequence field is empty, and the old
-# final `else` rendered that as a green IN SYNC.
+# M18: "IN SYNC" must be a conclusion, not a fall-through. The derivation is
+# the shared dg_repl_state (common/dg_render_common.sh), so this tool and the
+# local triage/diag tools can never grade the same data differently.
 if ! $STANDBY_REACHABLE; then
     # The unreachable host is already a summary error; don't double-count.
     REPL_STATE="${YELLOW}UNKNOWN${NC}"
-elif [[ -z "${STB_TRANSPORT_LAG:-}" && -z "${STB_APPLY_LAG:-}" && -z "${SEQ_LAG:-}" ]]; then
-    REPL_STATE="${YELLOW}UNKNOWN${NC}"
-    add_summary_warning "Replication state unknown: no transport lag, apply lag or sequence data returned by the standby"
-elif [[ -n "${STB_TRANSPORT_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_TRANSPORT_LAG") > DG_LAG_WARN_SECONDS )); then
-    REPL_STATE="${YELLOW}LAGGING${NC}"
-elif [[ -n "${STB_APPLY_LAG:-}" ]] && (( $(dg_parse_lag_seconds "$STB_APPLY_LAG") > DG_LAG_WARN_SECONDS )); then
-    REPL_STATE="${YELLOW}LAGGING${NC}"
-elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_CRIT" ]]; then
-    REPL_STATE="${RED}BEHIND${NC}"
-elif [[ -n "${SEQ_LAG:-}" && "$SEQ_LAG" -gt "$DG_SEQ_GAP_WARN" ]]; then
-    REPL_STATE="${YELLOW}BEHIND${NC}"
 else
-    REPL_STATE="${GREEN}IN SYNC${NC}"
+    REPL_STATE_TOKEN=$(dg_repl_state "${STB_TRANSPORT_LAG:-}" "${STB_APPLY_LAG:-}" "${SEQ_LAG:-}")
+    REPL_STATE=$(dg_repl_state_text "$REPL_STATE_TOKEN")
+    if [[ "$REPL_STATE_TOKEN" == "UNKNOWN" ]]; then
+        add_summary_warning "Replication state unknown: no transport lag, apply lag or sequence data returned by the standby"
+    fi
 fi
 
 printf "\n ${DIM}────────────────────────────────────────────────────────────${NC}\n"

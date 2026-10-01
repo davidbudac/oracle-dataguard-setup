@@ -66,19 +66,34 @@ falls back to its own defaults - use the override flags to fill them in.
 EOF
 }
 
+# Usage errors are exit 2 in this tool; a bare `shift 2` on a missing value
+# would instead die silently with rc 1 under set -e.
+usage_error() { echo "ERROR: $*" >&2; usage >&2; exit 2; }
+need_value() { [[ $1 -ge 2 ]] || usage_error "$2 requires a value"; }
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --primary-host)     PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
-        --standby-host)     STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
-        --observer-host)    OBSERVER_HOST_OVERRIDE="$2"; shift 2 ;;
-        --port)             PORT_OVERRIDE="$2"; shift 2 ;;
-        --service)          SERVICE_OVERRIDE="$2"; shift 2 ;;
-        --base-url)         DG_DOC_BASE_URL="$2"; export DG_DOC_BASE_URL; shift 2 ;;
+        --primary-host)     need_value $# "$1"; PRIMARY_HOST_OVERRIDE="$2"; shift 2 ;;
+        --standby-host)     need_value $# "$1"; STANDBY_HOST_OVERRIDE="$2"; shift 2 ;;
+        --observer-host)    need_value $# "$1"; OBSERVER_HOST_OVERRIDE="$2"; shift 2 ;;
+        --port)             need_value $# "$1"; PORT_OVERRIDE="$2"; shift 2 ;;
+        --service)          need_value $# "$1"; SERVICE_OVERRIDE="$2"; shift 2 ;;
+        --base-url)         need_value $# "$1"; DG_DOC_BASE_URL="$2"; export DG_DOC_BASE_URL; shift 2 ;;
         -q|--quiet)         QUIET="YES"; shift ;;
         -h|--help)          usage; exit 0 ;;
         *) echo "Unknown option: $1" >&2; usage >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "$PORT_OVERRIDE" ]]; then
+    case "$PORT_OVERRIDE" in
+        *[!0-9]*) usage_error "--port must be a number between 1 and 65535 (got '${PORT_OVERRIDE}')" ;;
+    esac
+    PORT_OVERRIDE=$((10#$PORT_OVERRIDE))
+    if [[ $PORT_OVERRIDE -lt 1 || $PORT_OVERRIDE -gt 65535 ]]; then
+        usage_error "--port must be a number between 1 and 65535 (got '${PORT_OVERRIDE}')"
+    fi
+fi
 
 # ============================================================
 # Pre-flight
@@ -112,7 +127,7 @@ EXIT;
 EOF
 }
 
-clean() { tr -d ' \r' | sed '/^$/d'; }
+clean() { tr -d ' \r\t' | sed '/^$/d'; }
 # Like clean(), but keeps embedded spaces - used for values that contain
 # them ("MAXIMUM AVAILABILITY", "PHYSICAL STANDBY") so the summary reads
 # correctly; the visualizer mapping matches on substrings either way.
@@ -269,19 +284,48 @@ LOCAL_LISTENER_RAW=$(run_sql "SELECT VALUE FROM V\$LISTENER_NETWORK WHERE TYPE='
 DISCOVERED_PORT=$(echo "$LOCAL_LISTENER_RAW" | sed -n 's/.*PORT *= *\([0-9][0-9]*\).*/\1/p' | head -1)
 PORT="${PORT_OVERRIDE:-${DISCOVERED_PORT:-1521}}"
 
-# First user-visible service (same exclusion list as the handoff reports)
+# First user-visible service. Same classification as dg_handoff.sh: a
+# container's default services (DB_NAME / DB_UNIQUE_NAME / instance name, with
+# and without the DB_DOMAIN suffix, and the PDB name) are registered wherever
+# the container is up, so they are never "the" service. CASE, not NOT IN: a
+# NULL db_domain would make NOT IN match nothing.
 SERVICE_OUTPUT=$(run_sql "
-SELECT NAME FROM V\$ACTIVE_SERVICES
-WHERE UPPER(NAME) NOT IN (
-    SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE
-    UNION ALL SELECT UPPER(NAME) FROM V\$DATABASE
-    UNION ALL SELECT UPPER(INSTANCE_NAME) FROM V\$INSTANCE
+SELECT NAME FROM (
+  SELECT s.CON_ID, s.NAME,
+         CASE WHEN UPPER(s.NAME) IN (
+             UPPER(c.NAME),
+             UPPER(c.NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain'),
+             (SELECT UPPER(DB_UNIQUE_NAME) FROM V\$DATABASE),
+             (SELECT UPPER(NAME) FROM V\$DATABASE),
+             (SELECT UPPER(NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain') FROM V\$DATABASE),
+             (SELECT UPPER(DB_UNIQUE_NAME) || '.' || (SELECT UPPER(VALUE) FROM V\$PARAMETER WHERE NAME = 'db_domain') FROM V\$DATABASE),
+             (SELECT UPPER(INSTANCE_NAME) FROM V\$INSTANCE)
+         ) THEN 'DEFAULT' ELSE 'USER' END AS CLS
+  FROM V\$ACTIVE_SERVICES s
+  JOIN V\$CONTAINERS c ON s.CON_ID = c.CON_ID
+  WHERE s.NAME NOT LIKE 'SYS\$%'
+    AND UPPER(s.NAME) NOT IN (
+        SELECT UPPER(n) FROM (
+            SELECT NAME || 'XDB' AS n FROM V\$DATABASE
+            UNION ALL SELECT DB_UNIQUE_NAME || 'XDB' FROM V\$DATABASE
+            UNION ALL SELECT INSTANCE_NAME || 'XDB' FROM V\$INSTANCE
+            UNION ALL SELECT c2.NAME || 'XDB' FROM V\$CONTAINERS c2
+            UNION ALL SELECT d.NAME || 'XDB.' || p.VALUE FROM V\$DATABASE d, V\$PARAMETER p
+                       WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+            UNION ALL SELECT d.DB_UNIQUE_NAME || 'XDB.' || p.VALUE FROM V\$DATABASE d, V\$PARAMETER p
+                       WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+            UNION ALL SELECT i.INSTANCE_NAME || 'XDB.' || p.VALUE FROM V\$INSTANCE i, V\$PARAMETER p
+                       WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+            UNION ALL SELECT c2.NAME || 'XDB.' || p.VALUE FROM V\$CONTAINERS c2, V\$PARAMETER p
+                       WHERE p.NAME = 'db_domain' AND p.VALUE IS NOT NULL
+        ) WHERE n IS NOT NULL
+    )
+    AND UPPER(s.NAME) NOT LIKE '%\_CFG' ESCAPE '\'
+    AND UPPER(s.NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
+    AND c.NAME <> 'PDB\$SEED'
 )
-AND NAME NOT LIKE 'SYS\$%'
-AND UPPER(NAME) NOT LIKE '%XDB%'
-AND UPPER(NAME) NOT LIKE '%\_CFG' ESCAPE '\'
-AND UPPER(NAME) NOT LIKE '%\_DGMGRL' ESCAPE '\'
-ORDER BY NAME;
+WHERE CLS = 'USER'
+ORDER BY CON_ID, NAME;
 " | clean) || { SERVICE_OUTPUT=""; failed "active services list"; }
 
 SERVICE_LIST=()
@@ -312,11 +356,12 @@ if [[ "$DG_BROKER_START" == "TRUE" ]]; then
         [[ -n "$STANDBY_LOGXPTMODE" ]] || STANDBY_LOGXPTMODE="unknown"
     fi
 
-    if [[ -n "$PRIMARY_DB_UNIQUE_NAME" ]]; then
-        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW DATABASE '${PRIMARY_DB_UNIQUE_NAME}' 'FastStartFailoverThreshold';" | parse_broker_property || true)
-    fi
+    # FastStartFailoverThreshold is a CONFIGURATION property, not a database
+    # property. SHOW FAST_START FAILOVER prints it as "Threshold:  30 seconds";
+    # the property query is the fallback.
+    FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
     if [[ -z "$FSFO_THRESHOLD" || "$FSFO_THRESHOLD" == "unknown" ]]; then
-        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW FAST_START FAILOVER;" | extract_fsfo_threshold || true)
+        FSFO_THRESHOLD=$(run_dgmgrl_cmd "SHOW CONFIGURATION FastStartFailoverThreshold;" | parse_broker_property || true)
     fi
     [[ -n "$FSFO_THRESHOLD" ]] || FSFO_THRESHOLD="unknown"
 else

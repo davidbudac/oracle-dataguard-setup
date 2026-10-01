@@ -15,6 +15,12 @@
 --     (7 days by default), so span_days reports the window actually seen.
 --   * No rows (fresh database) yields zeros with span_days=0.04 (1 hour),
 --     never a divide-by-zero.
+--   * The per-HOUR average divides by the observed span (floored at 1 hour).
+--     The per-DAY figures (avg_mb_day, avg_switches_day) divide by
+--     GREATEST(span, 1 day): with less than a day of history they are the
+--     observed totals, NOT total/span extrapolated up to 24 hours (one hour
+--     of history would otherwise be multiplied 24x). Step 1 flags this case
+--     from span_days < 1.
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 WHENEVER OSERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 400 PAGESIZE 0 TRIMSPOOL ON
@@ -50,7 +56,7 @@ span AS (
 SELECT TO_CHAR(ROUND(s.span_days, 2), 'FM99990.00') || '|' ||
        TO_CHAR(s.log_count, 'FM99999999990') || '|' ||
        TO_CHAR(ROUND(s.total_mb), 'FM99999999990') || '|' ||
-       TO_CHAR(ROUND(s.total_mb / s.span_days), 'FM99999999990') || '|' ||
+       TO_CHAR(ROUND(s.total_mb / GREATEST(s.span_days, 1)), 'FM99999999990') || '|' ||
        TO_CHAR(NVL((SELECT ROUND(MAX(mb)) FROM daily), 0), 'FM99999999990') || '|' ||
        NVL((SELECT TO_CHAR(MAX(dy) KEEP (DENSE_RANK LAST ORDER BY mb), 'YYYY-MM-DD')
             FROM daily), 'n/a') || '|' ||
@@ -58,7 +64,7 @@ SELECT TO_CHAR(ROUND(s.span_days, 2), 'FM99990.00') || '|' ||
        TO_CHAR(NVL((SELECT ROUND(MAX(mb)) FROM hourly), 0), 'FM99999999990') || '|' ||
        NVL((SELECT TO_CHAR(MAX(hr) KEEP (DENSE_RANK LAST ORDER BY mb), 'YYYY-MM-DD"_"HH24"h"')
             FROM hourly), 'n/a') || '|' ||
-       TO_CHAR(ROUND(s.log_count / s.span_days), 'FM99999999990') || '|' ||
+       TO_CHAR(ROUND(s.log_count / GREATEST(s.span_days, 1)), 'FM99999999990') || '|' ||
        TO_CHAR(NVL((SELECT MAX(switches) FROM hourly), 0), 'FM99999999990')
 FROM   span s;
 EXIT;

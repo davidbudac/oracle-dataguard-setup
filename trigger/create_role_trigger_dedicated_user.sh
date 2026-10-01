@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 # ============================================================
 # Oracle Data Guard Setup - Create Role-Aware Service Trigger
 #                           (Dedicated User - Non-SYS)
@@ -19,7 +19,8 @@
 # available, otherwise to the current directory.
 #
 # This script:
-# - Creates a dedicated user (DG_ADMIN or C##DG_ADMIN for CDB)
+# - Creates a dedicated user (DG_ADMIN by default; non-CDB only - a CDB is
+#   refused, use create_role_trigger_cdb.sh)
 # - Grants only the required privileges
 # - Discovers user-defined services running on the database
 # - Allows you to review/edit the service list
@@ -127,19 +128,35 @@ if [[ -z "$STANDBY_DB_UNIQUE_NAME" ]]; then
     # a setup-time standby_config_*.env file if one happens to exist on the
     # NFS share - purely for this label; nothing else in this script depends
     # on it. Quiet and non-interactive: this is a best-effort label only.
-    CONFIG_CANDIDATE=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null | head -1) || true
-    if [[ -n "$CONFIG_CANDIDATE" ]]; then
+    # Only a .env whose PRIMARY_DB_UNIQUE_NAME equals the discovered one is
+    # used (another build may be running concurrently on the same share), and
+    # it is sourced in a subshell so nothing else it defines leaks into this
+    # script - in particular it cannot overwrite PRIMARY_DB_UNIQUE_NAME.
+    DISCOVERED_PRIMARY="$PRIMARY_DB_UNIQUE_NAME"
+    CONFIG_CANDIDATES=$(ls -1t "${NFS_SHARE}"/standby_config_*.env 2>/dev/null) || true
+    while IFS= read -r CONFIG_CANDIDATE; do
+        [[ -n "$CONFIG_CANDIDATE" ]] || continue
         # shellcheck disable=SC1090
-        source "$CONFIG_CANDIDATE"
-        log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME:-UNKNOWN}"
-    fi
+        STANDBY_FROM_ENV=$( (
+            source "$CONFIG_CANDIDATE" >/dev/null 2>&1 || true
+            if [[ "${PRIMARY_DB_UNIQUE_NAME:-}" == "$DISCOVERED_PRIMARY" ]]; then
+                printf '%s' "${STANDBY_DB_UNIQUE_NAME:-}"
+            fi
+        ) ) || true
+        STANDBY_FROM_ENV=$(printf '%s' "$STANDBY_FROM_ENV" | tr -d ' \t\n\r')
+        if [[ -n "$STANDBY_FROM_ENV" ]]; then
+            STANDBY_DB_UNIQUE_NAME="$STANDBY_FROM_ENV"
+            log_info "Standby DB_UNIQUE_NAME (from ${CONFIG_CANDIDATE}): ${STANDBY_DB_UNIQUE_NAME}"
+            break
+        fi
+    done <<< "$CONFIG_CANDIDATES"
 fi
 
 log_info "Primary DB_UNIQUE_NAME: $PRIMARY_DB_UNIQUE_NAME"
 if [[ -n "$STANDBY_DB_UNIQUE_NAME" ]]; then
     log_info "Standby DB_UNIQUE_NAME: $STANDBY_DB_UNIQUE_NAME"
 else
-    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
+    log_warn "No peer found in V\$DATAGUARD_CONFIG (and no matching standby_config_*.env available) - standby will be labelled UNKNOWN in the generated SQL"
     STANDBY_DB_UNIQUE_NAME="UNKNOWN"
 fi
 
@@ -195,22 +212,12 @@ if [[ "$USER_SCHEMA" == "SYS" ]] || [[ "$USER_SCHEMA" == "SYSTEM" ]]; then
     exit 1
 fi
 
-# Validate CDB naming
-if [[ "$IS_CDB" == "YES" ]] && [[ "$USER_SCHEMA" != C##* ]]; then
-    log_error "CDB requires common user prefix C## (e.g., C##DG_ADMIN)"
-    exit 1
-fi
-
 # Validate schema name format: this value is interpolated directly into
 # CREATE USER / GRANT statements and package/trigger DDL below, so it must
-# be a well-formed Oracle identifier before it ever reaches sqlplus. Strip
-# an already-verified C## common-user prefix first, then apply the same
+# be a well-formed Oracle identifier before it ever reaches sqlplus. Same
 # leading-alpha identifier rule used for service/container names.
-SCHEMA_NAME_TO_CHECK="$USER_SCHEMA"
-if [[ "$IS_CDB" == "YES" ]]; then
-    SCHEMA_NAME_TO_CHECK="${USER_SCHEMA#C##}"
-fi
-if ! echo "$SCHEMA_NAME_TO_CHECK" | grep -q '^[A-Za-z][A-Za-z0-9_$]*$'; then
+# (No C## common-user handling: a CDB is refused above.)
+if ! echo "$USER_SCHEMA" | grep -q '^[A-Za-z][A-Za-z0-9_$]*$'; then
     log_error "Invalid schema name: $USER_SCHEMA"
     log_error "Schema names must start with a letter and contain only letters, numbers, underscore, and dollar sign"
     exit 1
@@ -218,13 +225,6 @@ fi
 if [[ ${#USER_SCHEMA} -gt 128 ]]; then
     log_error "Schema name too long (max 128 chars): $USER_SCHEMA"
     exit 1
-fi
-
-# Set CONTAINER=ALL clause for CDB common user operations
-if [[ "$IS_CDB" == "YES" ]]; then
-    CONTAINER_CLAUSE=" CONTAINER=ALL"
-else
-    CONTAINER_CLAUSE=""
 fi
 
 log_info "Schema: $USER_SCHEMA"
@@ -275,13 +275,16 @@ fi
 
 log_section "SYS Alert Log Helper Procedure"
 
-log_info "Creating/replacing SYS.DG_ALERT_LOG_MSG (idempotent)..."
-confirm_approval_action "Create/replace SYS.DG_ALERT_LOG_MSG helper procedure" "sqlplus -s / as sysdba <create SYS.DG_ALERT_LOG_MSG>" || exit 1
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: would create/replace SYS.DG_ALERT_LOG_MSG (idempotent)"
+else
+    log_info "Creating/replacing SYS.DG_ALERT_LOG_MSG (idempotent)..."
+    confirm_approval_action "Create/replace SYS.DG_ALERT_LOG_MSG helper procedure" "sqlplus -s / as sysdba <create SYS.DG_ALERT_LOG_MSG>" || exit 1
 
-# Capture status explicitly: under `set -e` a bare assignment followed by a
-# `$?` check would abort before the check ever ran.
-HELPER_RC=0
-HELPER_RESULT=$(sqlplus -s / as sysdba << 'EOSQL'
+    # Capture status explicitly: under `set -e` a bare assignment followed by a
+    # `$?` check would abort before the check ever ran.
+    HELPER_RC=0
+    HELPER_RESULT=$(sqlplus -s / as sysdba << 'EOSQL'
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 
@@ -295,22 +298,23 @@ SELECT 'HELPER_STATUS=' || STATUS FROM DBA_OBJECTS WHERE OBJECT_NAME = 'DG_ALERT
 
 EXIT;
 EOSQL
-) || HELPER_RC=$?
-echo "$HELPER_RESULT" | while IFS= read -r line; do
-    [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
-done
-if [[ $HELPER_RC -ne 0 ]] || echo "$HELPER_RESULT" | grep -q "^ORA-"; then
-    log_error "Failed to create SYS.DG_ALERT_LOG_MSG helper procedure"
-    echo "$HELPER_RESULT"
-    exit 1
-fi
+    ) || HELPER_RC=$?
+    echo "$HELPER_RESULT" | while IFS= read -r line; do
+        [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
+    done
+    if [[ $HELPER_RC -ne 0 ]] || echo "$HELPER_RESULT" | grep -q "^ORA-"; then
+        log_error "Failed to create SYS.DG_ALERT_LOG_MSG helper procedure"
+        echo "$HELPER_RESULT"
+        exit 1
+    fi
 
-HELPER_STATUS=$( { echo "$HELPER_RESULT" | grep "HELPER_STATUS=" || true; } | sed 's/.*HELPER_STATUS=//' | tr -d ' \t\n\r')
-if [[ "$HELPER_STATUS" == "VALID" ]]; then
-    log_info "SYS.DG_ALERT_LOG_MSG: VALID"
-else
-    log_error "SYS.DG_ALERT_LOG_MSG: ${HELPER_STATUS:-NOT FOUND}"
-    exit 1
+    HELPER_STATUS=$( { echo "$HELPER_RESULT" | grep "HELPER_STATUS=" || true; } | sed 's/.*HELPER_STATUS=//' | tr -d ' \t\n\r')
+    if [[ "$HELPER_STATUS" == "VALID" ]]; then
+        log_info "SYS.DG_ALERT_LOG_MSG: VALID"
+    else
+        log_error "SYS.DG_ALERT_LOG_MSG: ${HELPER_STATUS:-NOT FOUND}"
+        exit 1
+    fi
 fi
 
 # ============================================================
@@ -319,8 +323,17 @@ fi
 
 log_section "User and Privileges"
 
-if [[ "$CREATE_USER" == "true" ]]; then
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    if [[ "$CREATE_USER" == "true" ]]; then
+        log_info "Check mode: would create user $USER_SCHEMA (password prompted at run time) and grant CREATE SESSION, CREATE PROCEDURE, ADMINISTER DATABASE TRIGGER, EXECUTE ON DBMS_SERVICE, SELECT ON V_\$DATABASE and V_\$ACTIVE_SERVICES, EXECUTE ON SYS.DG_ALERT_LOG_MSG"
+    else
+        log_info "Check mode: would apply the grants to existing user $USER_SCHEMA"
+    fi
+elif [[ "$CREATE_USER" == "true" ]]; then
     log_info "Creating user $USER_SCHEMA..."
+    # Keep xtrace (-v) off for everything that holds the password: the prompt
+    # assignment, the validation, the heredoc and the redaction below.
+    pause_verbose_trace
     USER_PASSWORD=$(prompt_password "Enter password for $USER_SCHEMA")
     if [[ -z "$USER_PASSWORD" ]]; then
         log_error "Password cannot be empty"
@@ -347,26 +360,31 @@ if [[ "$CREATE_USER" == "true" ]]; then
     confirm_approval_action "Create user $USER_SCHEMA and grant privileges" "sqlplus -s / as sysdba <create user and grant privileges>" || exit 1
 
     CREATE_RC=0
+    # The user gets the database default temporary tablespace (no TEMPORARY
+    # TABLESPACE clause): a hard-coded TEMP fails with ORA-00959 where the
+    # default temp tablespace is named differently.
     CREATE_RESULT=$(sqlplus -s / as sysdba << EOSQL
+SET DEFINE OFF
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 
 CREATE USER ${USER_SCHEMA} IDENTIFIED BY "${USER_PASSWORD}"
     DEFAULT TABLESPACE SYSTEM
-    TEMPORARY TABLESPACE TEMP
-    QUOTA 0 ON SYSTEM${CONTAINER_CLAUSE};
+    QUOTA 0 ON SYSTEM;
 
-GRANT CREATE SESSION TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT CREATE SESSION TO ${USER_SCHEMA};
+GRANT CREATE PROCEDURE TO ${USER_SCHEMA};
+GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA};
+GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$ACTIVE_SERVICES TO ${USER_SCHEMA};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA};
 
 EXIT;
 EOSQL
     ) || CREATE_RC=$?
     [[ -n "$USER_PASSWORD" ]] && CREATE_RESULT=${CREATE_RESULT//"$USER_PASSWORD"/********}
+    resume_verbose_trace
     echo "$CREATE_RESULT" | while IFS= read -r line; do
         [ -n "$LOG_FILE" ] && echo "  $line" >> "$LOG_FILE" || :
     done
@@ -386,12 +404,13 @@ else
 SET HEADING OFF FEEDBACK ON VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON SERVEROUTPUT ON
 WHENEVER SQLERROR EXIT SQL.SQLCODE
 
-GRANT CREATE SESSION TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT CREATE SESSION TO ${USER_SCHEMA};
+GRANT CREATE PROCEDURE TO ${USER_SCHEMA};
+GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA};
+GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$ACTIVE_SERVICES TO ${USER_SCHEMA};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA};
 
 EXIT;
 EOSQL
@@ -447,9 +466,11 @@ resolve_service_name() {
     resolved=$(sqlplus -s / as sysdba << EOSQL
 SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
 SELECT 'SVCNAME=' || name FROM (
-    SELECT name FROM DBA_SERVICES WHERE UPPER(name) = UPPER('${input}')
-    UNION
-    SELECT name FROM V\$ACTIVE_SERVICES WHERE UPPER(name) = UPPER('${input}')
+    SELECT name FROM (
+        SELECT name FROM DBA_SERVICES WHERE UPPER(name) = UPPER('${input}')
+        UNION
+        SELECT name FROM V\$ACTIVE_SERVICES WHERE UPPER(name) = UPPER('${input}')
+    ) ORDER BY CASE WHEN name = '${input}' THEN 0 ELSE 1 END, name
 ) WHERE ROWNUM = 1;
 EXIT;
 EOSQL
@@ -682,9 +703,38 @@ if [[ "$PKG_EXISTS" != "0" ]]; then
     echo "Existing objects will be replaced with the new definition."
     echo "This is safe - the new package will contain the updated service list."
     echo ""
-    if ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_info "Check mode: the existing package and triggers would be replaced"
+    elif ! confirm_proceed "Replace existing DG_SERVICE_MGR package and triggers?"; then
         log_info "Deployment cancelled by user"
         exit 0
+    fi
+fi
+
+# Another variant (the SYS-owned create_role_trigger.sh, or this script under a
+# different schema) uses the same trigger names under another owner. Two
+# trigger sets would both fire on every role change and startup, possibly with
+# different service lists.
+OTHER_TRIGGERS=$(sqlplus -s / as sysdba << EOSQL
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT OWNER || '.' || TRIGGER_NAME FROM DBA_TRIGGERS
+WHERE TRIGGER_NAME IN ('TRG_MANAGE_SERVICES_ROLE_CHG', 'TRG_MANAGE_SERVICES_STARTUP')
+  AND OWNER <> '${USER_SCHEMA}'
+ORDER BY OWNER, TRIGGER_NAME;
+EXIT;
+EOSQL
+)
+OTHER_TRIGGERS=$(printf '%s\n' "$OTHER_TRIGGERS" | grep -E '^[A-Za-z0-9_$#.]+$' || true)
+if [[ -n "$OTHER_TRIGGERS" ]]; then
+    log_warn "Role-trigger objects from another variant already exist (different owner):"
+    printf '%s\n' "$OTHER_TRIGGERS" | sed 's/^/    /'
+    log_warn "Deploying here as well leaves two trigger sets that both manage services on every role change and startup."
+    log_warn "Drop the other set first (see the removal commands in its generated SQL file), or keep only one variant."
+    if [[ "$CHECK_ONLY" != "1" && -t 0 ]]; then
+        if ! confirm_proceed "Deploy alongside the existing trigger set anyway?"; then
+            log_info "Deployment cancelled by user"
+            exit 0
+        fi
     fi
 fi
 
@@ -701,12 +751,17 @@ echo "  Package : ${USER_SCHEMA}.DG_SERVICE_MGR"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_ROLE_CHG (AFTER DB_ROLE_CHANGE)"
 echo "  Trigger : ${USER_SCHEMA}.TRG_MANAGE_SERVICES_STARTUP  (AFTER STARTUP)"
 echo ""
-echo "  (SYS.DG_ALERT_LOG_MSG - a narrow alert-log helper procedure - was"
-echo "   created/replaced as SYS earlier in this run; see above.)"
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    echo "  (SYS.DG_ALERT_LOG_MSG - a narrow alert-log helper procedure - would be"
+    echo "   created/replaced as SYS first.)"
+else
+    echo "  (SYS.DG_ALERT_LOG_MSG - a narrow alert-log helper procedure - was"
+    echo "   created/replaced as SYS earlier in this run; see above.)"
+fi
 echo ""
 echo "  Privileges granted:"
 echo "    CREATE SESSION, CREATE PROCEDURE, ADMINISTER DATABASE TRIGGER,"
-echo "    EXECUTE ON DBMS_SERVICE, SELECT ON V_\$DATABASE,"
+echo "    EXECUTE ON DBMS_SERVICE, SELECT ON V_\$DATABASE and V_\$ACTIVE_SERVICES,"
 echo "    EXECUTE ON SYS.DG_ALERT_LOG_MSG (not DBMS_SYSTEM)"
 echo ""
 echo "Services managed (started on PRIMARY, stopped on STANDBY):"
@@ -717,6 +772,23 @@ done
 echo ""
 echo "Objects will replicate to standby via redo apply."
 echo ""
+
+# Write the generated SQL to the NFS share when one is mounted and writable
+# (keeps parity with the previous config-driven workflow); otherwise fall back
+# to the current directory with a clear notice, since this script no longer
+# requires NFS.
+if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
+    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
+else
+    SQL_OUTPUT_FILE="./dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
+    log_warn "NFS share (${NFS_SHARE}) not available/writable - generated SQL goes to the current directory instead"
+fi
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    log_info "Check mode: generated SQL would be written to: $SQL_OUTPUT_FILE"
+    log_info "Check mode: no changes made"
+    finish_check_mode "Role-trigger preflight complete. No users, helper procedures or database objects were created or replaced."
+fi
 
 if ! confirm_proceed "Deploy DG_SERVICE_MGR package and triggers?"; then
     log_info "Deployment cancelled by user"
@@ -806,6 +878,7 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
     PROCEDURE MANAGE_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
+        l_active   NUMBER;
     BEGIN
         SELECT DATABASE_ROLE INTO l_role FROM SYS.V_\$DATABASE;
         l_services := get_service_list();
@@ -814,7 +887,10 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
             -- Start services on PRIMARY
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    SYS.DBMS_SERVICE.START_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM SYS.V_\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active = 0 THEN
+                        SYS.DBMS_SERVICE.START_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('START', l_services(i), SQLERRM);
@@ -824,7 +900,10 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
             -- Stop services on STANDBY (any non-PRIMARY role)
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    SYS.DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM SYS.V_\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active > 0 THEN
+                        SYS.DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('STOP', l_services(i), SQLERRM);
@@ -910,6 +989,13 @@ fi
 
 if [[ "$DEPLOY_OK" != "true" ]]; then
     log_error "Deployment verification failed"
+    # Show what the database said: the ORA-/PLS- lines (and compilation
+    # warnings) are the only clue to why the objects are missing or invalid.
+    DEPLOY_ERRORS=$( { printf '%s\n' "$DEPLOY_RESULT" | grep -E '^(ORA-|PLS-|SP2-|Warning:)' || true; } )
+    [[ -n "$DEPLOY_ERRORS" ]] || DEPLOY_ERRORS="$DEPLOY_RESULT"
+    echo ""
+    echo "Database output:"
+    printf '%s\n' "$DEPLOY_ERRORS" | sed 's/^/  /'
     echo ""
     echo "Check for compilation errors:"
     echo "  SELECT * FROM DBA_ERRORS WHERE OWNER = '${USER_SCHEMA}' AND NAME = 'DG_SERVICE_MGR';"
@@ -922,16 +1008,6 @@ fi
 # ============================================================
 
 log_section "Saving Generated SQL"
-
-# Write to the NFS share when one is mounted and writable (keeps parity with
-# the previous config-driven workflow); otherwise fall back to the current
-# directory with a clear notice, since this script no longer requires NFS.
-if [[ -d "$NFS_SHARE" && -w "$NFS_SHARE" ]]; then
-    SQL_OUTPUT_FILE="${NFS_SHARE}/dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
-else
-    SQL_OUTPUT_FILE="./dg_service_mgr_dedicated_${PRIMARY_DB_UNIQUE_NAME}.sql"
-    log_warn "NFS share (${NFS_SHARE}) not available/writable - writing generated SQL to the current directory instead"
-fi
 
 cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
@@ -952,8 +1028,7 @@ cat > "$SQL_OUTPUT_FILE" << EOSQLFILE
 -- ============================================================
 -- CREATE USER ${USER_SCHEMA} IDENTIFIED BY "<password>"
 --     DEFAULT TABLESPACE SYSTEM
---     TEMPORARY TABLESPACE TEMP
---     QUOTA 0 ON SYSTEM${CONTAINER_CLAUSE};
+--     QUOTA 0 ON SYSTEM;
 
 -- SYS-owned, definer-rights alert-log helper (idempotent). Lets the
 -- dedicated user log to the alert log without EXECUTE on DBMS_SYSTEM.
@@ -963,12 +1038,13 @@ BEGIN
 END DG_ALERT_LOG_MSG;
 /
 
-GRANT CREATE SESSION TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT CREATE PROCEDURE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
-GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA}${CONTAINER_CLAUSE};
+GRANT CREATE SESSION TO ${USER_SCHEMA};
+GRANT CREATE PROCEDURE TO ${USER_SCHEMA};
+GRANT ADMINISTER DATABASE TRIGGER TO ${USER_SCHEMA};
+GRANT EXECUTE ON DBMS_SERVICE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$DATABASE TO ${USER_SCHEMA};
+GRANT SELECT ON V_\$ACTIVE_SERVICES TO ${USER_SCHEMA};
+GRANT EXECUTE ON SYS.DG_ALERT_LOG_MSG TO ${USER_SCHEMA};
 
 -- Package Specification
 CREATE OR REPLACE PACKAGE ${USER_SCHEMA}.DG_SERVICE_MGR AS
@@ -1005,6 +1081,7 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
     PROCEDURE MANAGE_SERVICES IS
         l_role     VARCHAR2(30);
         l_services service_list_t;
+        l_active   NUMBER;
     BEGIN
         SELECT DATABASE_ROLE INTO l_role FROM SYS.V_\$DATABASE;
         l_services := get_service_list();
@@ -1012,7 +1089,10 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
         IF l_role = 'PRIMARY' THEN
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    SYS.DBMS_SERVICE.START_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM SYS.V_\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active = 0 THEN
+                        SYS.DBMS_SERVICE.START_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('START', l_services(i), SQLERRM);
@@ -1021,7 +1101,10 @@ CREATE OR REPLACE PACKAGE BODY ${USER_SCHEMA}.DG_SERVICE_MGR AS
         ELSE
             FOR i IN 1..l_services.COUNT LOOP
                 BEGIN
-                    SYS.DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    SELECT COUNT(*) INTO l_active FROM SYS.V_\$ACTIVE_SERVICES WHERE name = l_services(i);
+                    IF l_active > 0 THEN
+                        SYS.DBMS_SERVICE.STOP_SERVICE(l_services(i));
+                    END IF;
                 EXCEPTION
                     WHEN OTHERS THEN
                         log_service_issue('STOP', l_services(i), SQLERRM);
@@ -1103,6 +1186,7 @@ echo "  CREATE PROCEDURE              - Package compilation"
 echo "  ADMINISTER DATABASE TRIGGER   - Database event triggers"
 echo "  EXECUTE ON DBMS_SERVICE       - Start/stop services"
 echo "  SELECT ON V_\$DATABASE         - Read database role"
+echo "  SELECT ON V_\$ACTIVE_SERVICES  - Skip start/stop of services already in the target state"
 echo "  EXECUTE ON SYS.DG_ALERT_LOG_MSG - Alert log writes (narrow wrapper,"
 echo "                                  NOT DBMS_SYSTEM itself)"
 echo ""

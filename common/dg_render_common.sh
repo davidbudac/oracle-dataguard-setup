@@ -81,6 +81,34 @@ HLINE=${HLINE// /─}
 : "${DG_SEQ_GAP_CRIT:=5}"
 : "${DG_LAG_WARN_SECONDS:=60}"
 
+# A threshold like "80%" or "abc" used to make `[ -ge ]` / `(( ))` checks error
+# out or silently always/never fire. Callers run this once after sourcing (and
+# after their own arg parsing) and exit with their usage code on failure:
+# dg_status.sh -> 3, dg_triage_sid.sh/dg_diag_sid.sh -> 64. Valid values are
+# also normalized to plain decimals ("08" would otherwise be an octal error
+# inside (( ))).
+dg_validate_thresholds() {
+    local name val bad=0
+    for name in DG_FRA_WARN_PCT DG_FRA_CRIT_PCT DG_SEQ_GAP_WARN DG_SEQ_GAP_CRIT DG_LAG_WARN_SECONDS; do
+        val="${!name}"
+        case "$val" in
+            ''|*[!0-9]*)
+                printf 'ERROR: %s must be a non-negative integer (got "%s")\n' "$name" "$val" >&2
+                bad=1
+                ;;
+            *)
+                if [[ ${#val} -gt 9 ]]; then
+                    printf 'ERROR: %s is too large (got "%s")\n' "$name" "$val" >&2
+                    bad=1
+                else
+                    printf -v "$name" '%d' "$((10#$val))"
+                fi
+                ;;
+        esac
+    done
+    return $bad
+}
+
 # -----------------------------------------------------------------------
 # Data Guard lag parsing (WS4.3)
 # -----------------------------------------------------------------------
@@ -176,8 +204,63 @@ dg_lag_icon() {
 }
 
 # -----------------------------------------------------------------------
+# Replication state (M12)
+# -----------------------------------------------------------------------
+# One derivation for both engines (dg_status.sh and the local triage/diag
+# tools). Arguments are the raw transport lag, raw apply lag and the numeric
+# archived-sequence lag; any of them may be empty. Prints a state token:
+#   UNKNOWN | LAGGING | BEHIND_CRIT | BEHIND_WARN | IN_SYNC
+# UNKNOWN means NO lag or sequence data at all - "IN SYNC" is a conclusion
+# drawn from data, never the fall-through for a standby that returned nothing.
+dg_repl_state() {
+    local tlag="${1:-}" alag="${2:-}" gap="${3:-}"
+    [[ "$gap" =~ ^-?[0-9]+$ ]] || gap=""
+    if [[ -z "$tlag" && -z "$alag" && -z "$gap" ]]; then
+        printf 'UNKNOWN'
+    elif [[ -n "$tlag" ]] && (( $(dg_parse_lag_seconds "$tlag") > DG_LAG_WARN_SECONDS )); then
+        printf 'LAGGING'
+    elif [[ -n "$alag" ]] && (( $(dg_parse_lag_seconds "$alag") > DG_LAG_WARN_SECONDS )); then
+        printf 'LAGGING'
+    elif [[ -n "$gap" ]] && (( gap > DG_SEQ_GAP_CRIT )); then
+        printf 'BEHIND_CRIT'
+    elif [[ -n "$gap" ]] && (( gap > DG_SEQ_GAP_WARN )); then
+        printf 'BEHIND_WARN'
+    else
+        printf 'IN_SYNC'
+    fi
+}
+
+# Colored display text for a dg_repl_state token (for use as a row() status).
+dg_repl_state_text() {
+    case "${1:-}" in
+        UNKNOWN)     printf '%s' "${YELLOW}UNKNOWN${NC}" ;;
+        LAGGING)     printf '%s' "${YELLOW}LAGGING${NC}" ;;
+        BEHIND_CRIT) printf '%s' "${RED}BEHIND${NC}" ;;
+        BEHIND_WARN) printf '%s' "${YELLOW}BEHIND${NC}" ;;
+        *)           printf '%s' "${GREEN}IN SYNC${NC}" ;;
+    esac
+}
+
+# Icon for the broker's overall status: SUCCESS ok, WARNING amber, anything
+# else (ERROR) red - the same grading in both engines.
+dg_broker_overall_icon() {
+    case "${1:-}" in
+        SUCCESS) printf '%b' "$CHK" ;;
+        WARNING) printf '%b' "$WARN" ;;
+        *)       printf '%b' "$FAIL" ;;
+    esac
+}
+
+# -----------------------------------------------------------------------
 # Generic text / rendering primitives (WS4.4)
 # -----------------------------------------------------------------------
+
+# Trim leading/trailing whitespace and collapse inner runs (joining lines).
+# Replaces `| xargs`, which also ate quote characters and aborted on an odd
+# apostrophe in ARCHIVE_DEST error text.
+dg_trim() {
+    tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/^ //; s/ $//'
+}
 repeat_char() {
     local char="$1" count="$2" out=""
     while (( count > 0 )); do
@@ -362,14 +445,33 @@ format_services() {
     fi
 }
 
+# FRA sizes arrive as text from SQL. They are passed to awk with -v (never
+# interpolated into the program text) after being checked: a comma-decimal
+# value ("0,4") used to be an awk SYNTAX error, the fraction/percent came out
+# empty and the FRA checks silently never fired. A comma is normalized to a
+# dot and anything still non-numeric counts as 0. LC_ALL=C pins awk's own
+# decimal point.
+dg_num() {
+    local v="${1:-}"
+    v="${v//,/.}"
+    case "$v" in
+        ''|.|*[!0-9.]*|*.*.*) printf '0' ;;
+        *) printf '%s' "$v" ;;
+    esac
+}
+
 compute_fra_pct() {
-    local size="$1" used="$2" reclaim="$3"
-    awk "BEGIN {if (${size:-0} > 0) {effective=${used:-0}-${reclaim:-0}; if (effective < 0) effective=0; printf \"%.0f\", (effective/${size})*100} else print 0}"
+    local size used reclaim
+    size=$(dg_num "${1:-0}"); used=$(dg_num "${2:-0}"); reclaim=$(dg_num "${3:-0}")
+    LC_ALL=C awk -v size="$size" -v used="$used" -v reclaim="$reclaim" \
+        'BEGIN {if (size + 0 > 0) {effective = used - reclaim; if (effective < 0) effective = 0; printf "%.0f", (effective / size) * 100} else print 0}'
 }
 
 compute_fra_effective() {
-    local used="$1" reclaim="$2"
-    awk "BEGIN {effective=${used:-0}-${reclaim:-0}; if (effective < 0) effective=0; printf \"%.1f\", effective}"
+    local used reclaim
+    used=$(dg_num "${1:-0}"); reclaim=$(dg_num "${2:-0}")
+    LC_ALL=C awk -v used="$used" -v reclaim="$reclaim" \
+        'BEGIN {effective = used - reclaim; if (effective < 0) effective = 0; printf "%.1f", effective}'
 }
 
 # -----------------------------------------------------------------------
@@ -396,7 +498,12 @@ compute_fra_effective() {
 DG_ALERT_LOG_AWK_FILTER=$(cat <<'AWKEOF'
 /^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T/ { ts = substr($0, 1, 19); gsub(/T/, " ", ts); next }
 { low = tolower($0) }
-low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover|data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change|arch.*gap|apply_lag|transport_lag|unsynchronized|synchronized|maximum availability|maximum performance|maximum protection|redo transport|log shipping|media recovery|recovery stopped|recovery paused|catching up|incomplete/ {
+low ~ /ora-16[0-9][0-9][0-9]|ora-01034|ora-03113|ora-12541|switchover|failover/ ||
+low ~ /data guard|mrp0|fal\[|rfs\[|lns[0-9]|broker|dgmgrl|role.change/ ||
+low ~ /arch.*gap|apply_lag|transport_lag|unsynchronized|synchronized/ ||
+low ~ /maximum availability|maximum performance|maximum protection/ ||
+low ~ /redo transport|log shipping|media recovery|recovery stopped/ ||
+low ~ /recovery paused|catching up|incomplete/ {
     if (ts != "") printf "%s  %s\n", ts, $0; else print $0
 }
 AWKEOF
@@ -424,10 +531,6 @@ AWKEOF
 #     DEST_ID|STATUS|ERROR (3 fields); dg_local_status_common.sh's
 #     collect_local_sql also selects DB_UNIQUE_NAME (4 fields) so it can
 #     flag a dest pointed at the wrong peer (PRI_DEST2_DBUNIQ check).
-#   - The 5-field standby DBSTATUS query in dg_status.sh's STANDBY block
-#     (DATABASE_ROLE|OPEN_MODE|PROTECTION_MODE|SWITCHOVER_STATUS|
-#     DB_UNIQUE_NAME, no FORCE_LOGGING/FLASHBACK_ON) is a distinct shape
-#     from DG_SQL_SELECT_DBSTATUS_FULL below and is left as literal text.
 #
 # DGSTATS (transport/apply lag + apply finish time) IS byte-identical
 # everywhere it's queried (dg_status.sh fetches 'apply finish time' too,
@@ -439,7 +542,10 @@ DG_SQL_SELECT_REDOLOG="SELECT 'REDOLOG|' || COUNT(*) || '|' || ROUND(SUM(BYTES)/
 DG_SQL_SELECT_SRLCOUNT="SELECT 'SRLCOUNT|' || COUNT(*) FROM V\$STANDBY_LOG;"
 DG_SQL_SELECT_ARCHGAP="SELECT 'ARCHGAP|' || COUNT(*) FROM V\$ARCHIVE_GAP;"
 DG_SQL_SELECT_FSFODB="SELECT 'FSFODB|' || FS_FAILOVER_STATUS || '|' || FS_FAILOVER_OBSERVER_PRESENT || '|' || FS_FAILOVER_OBSERVER_HOST FROM V\$DATABASE;"
-DG_SQL_SELECT_FRA="SELECT 'FRA|' || NAME || '|' || ROUND(SPACE_LIMIT/1024/1024/1024,1) || '|' || ROUND(SPACE_USED/1024/1024/1024,1) || '|' || ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1) || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;"
+# The GB figures go through TO_CHAR with an explicit NLS_NUMERIC_CHARACTERS so
+# the text is "0.4" under any session NLS_LANG (a bare ROUND(..) || '|' uses the
+# session decimal separator, i.e. "0,4" under a comma-decimal locale).
+DG_SQL_SELECT_FRA="SELECT 'FRA|' || NAME || '|' || TO_CHAR(ROUND(SPACE_LIMIT/1024/1024/1024,1),'FM9999999990.0','NLS_NUMERIC_CHARACTERS=''.,''') || '|' || TO_CHAR(ROUND(SPACE_USED/1024/1024/1024,1),'FM9999999990.0','NLS_NUMERIC_CHARACTERS=''.,''') || '|' || TO_CHAR(ROUND(SPACE_RECLAIMABLE/1024/1024/1024,1),'FM9999999990.0','NLS_NUMERIC_CHARACTERS=''.,''') || '|' || NUMBER_OF_FILES FROM V\$RECOVERY_FILE_DEST;"
 DG_SQL_SELECT_SERVICE="SELECT 'SERVICE|' || NAME
   FROM (
     SELECT NAME
