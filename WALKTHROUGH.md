@@ -329,7 +329,10 @@ before planned database maintenance.
 
 `observer.sh` validates a pidfile's PID against the process's actual command line (it
 must be a `dgmgrl` process) before trusting it, and cleans up stale or mismatched
-pidfiles automatically.
+pidfiles automatically. `start` checks with the broker (`FS_FAILOVER_OBSERVER_PRESENT`)
+that the observer registered, and `status` exits 0 only when the broker reports an
+observer present. A pidfile written by another host is ignored only if the broker
+reports no observer; otherwise remove it by hand (the script prints the `rm` command).
 
 **Adding an observer later, on a third host?** Steps 9-10 need this build's
 `standby_config_*.env` on the NFS share. To retrofit an observer onto a configuration
