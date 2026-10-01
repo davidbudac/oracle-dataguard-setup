@@ -692,11 +692,56 @@ if [[ "$STANDBY_STORAGE_MODE" == "TRADITIONAL" && -t 0 ]]; then
     fi
 fi
 
+# Primary file-placement parameters RMAN DUPLICATE ... SPFILE would hand to
+# the standby (gathered by step 1; older primary_info files lack the keys -
+# missing means unset). Initialized for both modes: the .env writer and the
+# pfile generator below read the STANDBY_ side only in OMF mode.
+_omf_pri_dests=("${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_1:-}" "${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_2:-}" \
+    "${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_3:-}" "${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_4:-}" \
+    "${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_5:-}")
+STANDBY_DB_CREATE_ONLINE_LOG_DEST_1=""
+STANDBY_DB_CREATE_ONLINE_LOG_DEST_2=""
+STANDBY_DB_CREATE_ONLINE_LOG_DEST_3=""
+STANDBY_DB_CREATE_ONLINE_LOG_DEST_4=""
+STANDBY_DB_CREATE_ONLINE_LOG_DEST_5=""
+
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    # Refuse BEFORE asking anything or writing any file: with these set on
+    # the primary the standby would silently take its (stale) convert pairs
+    # or an unusable online log destination through the spfile copy.
+    if [[ "${PRIMARY_LOG_FILE_NAME_CONVERT_SET:-NO}" == "YES" \
+       || "${PRIMARY_DB_FILE_NAME_CONVERT_SET:-NO}" == "YES" ]]; then
+        log_omf_inherited_convert_error "${PRIMARY_LOG_FILE_NAME_CONVERT_SET:-NO}" "${PRIMARY_DB_FILE_NAME_CONVERT_SET:-NO}"
+        exit 1
+    fi
+    if [[ "${PRIMARY_ONLINE_LOG_DEST_UNSAFE:-NO}" == "YES" ]]; then
+        log_error "The primary sets a db_create_online_log_dest_n value that step 1 could not store safely"
+        log_error "(only letters, digits and _ . / + - in an absolute path or +DISKGROUP are supported)."
+        log_error "The standby would inherit it through RMAN's SPFILE clause and place redo logs and"
+        log_error "control files there. Use Traditional storage mode, or change the primary's value and"
+        log_error "re-run step 1."
+        exit 1
+    fi
+
+    _omf_any_pri_dest="NO"
+    _n=0
+    while [[ $_n -lt 5 ]]; do
+        [[ -n "${_omf_pri_dests[$_n]}" ]] && _omf_any_pri_dest="YES"
+        _n=$((_n + 1))
+    done
+
     echo ""
-    echo "OMF mode: Oracle will place datafiles, redo logs, and control"
-    echo "files under db_create_file_dest. A FRA is required for archived"
-    echo "redo - choose its path and size below."
+    if [[ "$_omf_any_pri_dest" == "YES" ]]; then
+        echo "OMF mode: Oracle will place datafiles under db_create_file_dest. The"
+        echo "primary sets db_create_online_log_dest_n, which overrides it for redo"
+        echo "logs and control files, so you will also choose the standby directory"
+        echo "for each of those below. A FRA is required for archived redo - choose"
+        echo "its path and size below."
+    else
+        echo "OMF mode: Oracle will place datafiles, redo logs, and control"
+        echo "files under db_create_file_dest. A FRA is required for archived"
+        echo "redo - choose its path and size below."
+    fi
     echo ""
 
     prompt_with_default "Standby db_create_file_dest" "" STANDBY_DB_CREATE_FILE_DEST
@@ -802,6 +847,38 @@ case "$_archive_choice" in
 esac
 
 # ============================================================
+# OMF: standby value for each db_create_online_log_dest_n the primary sets
+# ============================================================
+# Placed after Q2 because the default for n=2 is the standby FRA, which is
+# only known now. Defaults mirror Oracle's own OMF redo multiplexing (see
+# omf_default_online_log_dest). The per-dest override prompt is TTY-gated
+# like Q1b: piped/E2E runs silently take the defaults and read no input.
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        _pri_dest="${_omf_pri_dests[$((_n - 1))]}"
+        if [[ -n "$_pri_dest" ]]; then
+            _stby_dest=$(omf_default_online_log_dest "$_n" "$STANDBY_DB_CREATE_FILE_DEST" "$STANDBY_DB_RECOVERY_FILE_DEST")
+            if [[ -t 0 ]]; then
+                while true; do
+                    prompt_with_default "Standby db_create_online_log_dest_${_n} (primary: ${_pri_dest})" "$_stby_dest" _stby_dest
+                    is_safe_omf_dest_path "$_stby_dest" && break
+                    log_warn "Not accepted: '${_stby_dest}' - enter an absolute path or +DISKGROUP (letters, digits and _ . / + - only)"
+                    _stby_dest=$(omf_default_online_log_dest "$_n" "$STANDBY_DB_CREATE_FILE_DEST" "$STANDBY_DB_RECOVERY_FILE_DEST")
+                done
+            elif ! is_safe_omf_dest_path "$_stby_dest"; then
+                log_error "Default standby db_create_online_log_dest_${_n} '${_stby_dest}' is not a safe absolute path"
+                log_error "  (derived from the standby db_create_file_dest / FRA); run interactively or fix those paths"
+                exit 1
+            fi
+            eval "STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}=\$_stby_dest"
+            log_info "db_create_online_log_dest_${_n}: primary ${_pri_dest} -> standby ${_stby_dest}"
+        fi
+        _n=$((_n + 1))
+    done
+fi
+
+# ============================================================
 # Generate Path Conversions
 # ============================================================
 
@@ -833,6 +910,12 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     log_info "OMF mode: Oracle will manage file placement"
     log_info "  db_create_file_dest:      $STANDBY_DB_CREATE_FILE_DEST"
     log_info "  db_recovery_file_dest:    $STANDBY_DB_RECOVERY_FILE_DEST"
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_stby_dest=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        [[ -n "$_stby_dest" ]] && log_info "  db_create_online_log_dest_${_n}: $_stby_dest"
+        _n=$((_n + 1))
+    done
 else
 # ============================================================
 # Per-path token remapping (case-aware, substring-safe)
@@ -1182,7 +1265,16 @@ COMPATIBLE="$COMPATIBLE"
 # OMF         = Oracle Managed Files (db_create_file_dest + db_recovery_file_dest)
 STANDBY_STORAGE_MODE="$STANDBY_STORAGE_MODE"
 # OMF only: base directory for data, redo, and control files (empty in Traditional mode)
-STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"
+STANDBY_DB_CREATE_FILE_DEST="$STANDBY_DB_CREATE_FILE_DEST"$(if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+printf '\n# OMF only: standby directory for each db_create_online_log_dest_n the PRIMARY sets\n'
+printf '# (it outranks db_create_file_dest for redo logs/control files and would otherwise be\n'
+printf '# inherited through RMAN SPFILE). Empty = the primary does not set that one.\n'
+printf 'STANDBY_DB_CREATE_ONLINE_LOG_DEST_1="%s"\n' "$STANDBY_DB_CREATE_ONLINE_LOG_DEST_1"
+printf 'STANDBY_DB_CREATE_ONLINE_LOG_DEST_2="%s"\n' "$STANDBY_DB_CREATE_ONLINE_LOG_DEST_2"
+printf 'STANDBY_DB_CREATE_ONLINE_LOG_DEST_3="%s"\n' "$STANDBY_DB_CREATE_ONLINE_LOG_DEST_3"
+printf 'STANDBY_DB_CREATE_ONLINE_LOG_DEST_4="%s"\n' "$STANDBY_DB_CREATE_ONLINE_LOG_DEST_4"
+printf 'STANDBY_DB_CREATE_ONLINE_LOG_DEST_5="%s"\n' "$STANDBY_DB_CREATE_ONLINE_LOG_DEST_5"
+fi)
 # Per-filesystem remap ("/primary_fs=/standby_fs" entries) applied to
 # the first path component of derived standby paths at generation time
 # (Q1b; record only - the path ARRAYS below are the truth; --regenerate
@@ -1414,6 +1506,8 @@ $(if [[ -n "$DB_DOMAIN" ]]; then echo "*.db_domain='${DB_DOMAIN}'"; fi)
 $(if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
 echo "# --- OMF File Placement ---"
 echo "*.db_create_file_dest='${STANDBY_DB_CREATE_FILE_DEST}'"
+_pf_olog=$(build_pfile_online_log_dest_lines "${STANDBY_DB_CREATE_ONLINE_LOG_DEST_1:-}" "${STANDBY_DB_CREATE_ONLINE_LOG_DEST_2:-}" "${STANDBY_DB_CREATE_ONLINE_LOG_DEST_3:-}" "${STANDBY_DB_CREATE_ONLINE_LOG_DEST_4:-}" "${STANDBY_DB_CREATE_ONLINE_LOG_DEST_5:-}") || true
+[[ -n "$_pf_olog" ]] && printf '%s\n' "$_pf_olog"
 echo ""
 echo "# --- Archive Log Destination ---"
 echo "*.log_archive_dest_1='LOCATION=USE_DB_RECOVERY_FILE_DEST VALID_FOR=(ALL_LOGFILES,ALL_ROLES) DB_UNIQUE_NAME=${STANDBY_DB_UNIQUE_NAME}'"
@@ -1624,6 +1718,17 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
         "db_create_file_dest" "$STANDBY_DB_CREATE_FILE_DEST" \
         "db_recovery_file_dest" "$STANDBY_DB_RECOVERY_FILE_DEST" \
         "db_recovery_file_dest_size" "$STANDBY_DB_RECOVERY_FILE_DEST_SIZE"
+
+    _omf_olog_rows=()
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_stby_dest=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        [[ -n "$_stby_dest" ]] && _omf_olog_rows+=("db_create_online_log_dest_${_n}" "$_stby_dest")
+        _n=$((_n + 1))
+    done
+    if [[ ${#_omf_olog_rows[@]} -gt 0 ]]; then
+        print_status_block "Online Log Destinations (inherited from primary, remapped)" "${_omf_olog_rows[@]}"
+    fi
 
     print_status_block "Key Settings" \
         "File Name Convert" "(not used - OMF mode)" \

@@ -637,6 +637,154 @@ get_db_property() {
 }
 
 # ============================================================
+# OMF File-Placement Helpers (inherited-parameter handling)
+# ============================================================
+# RMAN DUPLICATE ... SPFILE copies the PRIMARY's spfile to the standby and
+# overrides only the parameters named in its SET clauses, so file-placement
+# parameters the OMF branch does not SET are inherited silently:
+#   - DB_CREATE_ONLINE_LOG_DEST_1..5 outrank DB_CREATE_FILE_DEST for online
+#     and standby redo logs and OMF control files -> the standby would
+#     re-create them in the PRIMARY's directories (ORA-19504/ORA-27040 when
+#     those do not exist on the standby host).
+#   - LOG_FILE_NAME_CONVERT / DB_FILE_NAME_CONVERT outrank the OMF
+#     parameters in RMAN's file-naming precedence.
+# The functions below are pure (no DB access) so steps 1, 2, 3 and 5 share
+# one implementation and tests/test_omf_online_log_dest.sh can cover it.
+
+# True when $1 is safe to embed in a sourced .env, a pfile and an RMAN
+# SET clause: an absolute path or an ASM disk-group form (+DG, +DG/dir),
+# characters limited to letters, digits and _ . / + -
+# (the regex lives in variables - the portable bash 3.2 / AIX form)
+# Usage: is_safe_omf_dest_path <value>
+is_safe_omf_dest_path() {
+    local _v="$1"
+    local _re_abs='^/[A-Za-z0-9_./+-]*$'
+    local _re_asm='^\+[A-Za-z0-9_][A-Za-z0-9_./+-]*$'
+    [[ -n "$_v" ]] || return 1
+    [[ "$_v" =~ $_re_abs ]] && return 0
+    [[ "$_v" =~ $_re_asm ]] && return 0
+    return 1
+}
+
+# Default standby value for DB_CREATE_ONLINE_LOG_DEST_<n>. Mirrors Oracle's
+# own OMF redo multiplexing: member 1 in the file destination, member 2 in
+# the recovery destination, any further member back in the file destination.
+# An empty recovery destination degrades to the file destination.
+# Prints nothing and returns 1 for n outside 1..5.
+# Usage: omf_default_online_log_dest <n> <db_create_file_dest> <db_recovery_file_dest>
+omf_default_online_log_dest() {
+    local _n="$1" _file_dest="$2" _rec_dest="$3"
+    case "$_n" in
+        1|3|4|5) printf '%s\n' "$_file_dest" ;;
+        2)       printf '%s\n' "${_rec_dest:-$_file_dest}" ;;
+        *)       return 1 ;;
+    esac
+}
+
+# RMAN "SET DB_CREATE_ONLINE_LOG_DEST_<n>='<value>'" lines (4-space indent,
+# matching the DUPLICATE ... SPFILE body). Arguments are the values for
+# n = 1..5 in order; an empty or missing argument is skipped, so nothing is
+# printed when none is set. A value that fails is_safe_omf_dest_path prints
+# nothing at all and returns 1 (never emit it into an RMAN script).
+# Usage: build_rman_online_log_dest_set_lines <d1> <d2> <d3> <d4> <d5>
+build_rman_online_log_dest_set_lines() {
+    local _n=1 _v _out=""
+    while [[ $_n -le 5 ]]; do
+        _v="${1:-}"
+        [[ $# -gt 0 ]] && shift
+        if [[ -n "$_v" ]]; then
+            is_safe_omf_dest_path "$_v" || return 1
+            _out="${_out}    SET DB_CREATE_ONLINE_LOG_DEST_${_n}='${_v}'
+"
+        fi
+        _n=$((_n + 1))
+    done
+    printf '%s' "$_out"
+}
+
+# Same values as pfile lines: *.db_create_online_log_dest_<n>='<value>'
+# Usage: build_pfile_online_log_dest_lines <d1> <d2> <d3> <d4> <d5>
+build_pfile_online_log_dest_lines() {
+    local _n=1 _v _out=""
+    while [[ $_n -le 5 ]]; do
+        _v="${1:-}"
+        [[ $# -gt 0 ]] && shift
+        if [[ -n "$_v" ]]; then
+            is_safe_omf_dest_path "$_v" || return 1
+            _out="${_out}*.db_create_online_log_dest_${_n}='${_v}'
+"
+        fi
+        _n=$((_n + 1))
+    done
+    printf '%s' "$_out"
+}
+
+# Parse the output of sql/queries/get_omf_placement_params.sql
+# ("name|value" rows) into globals (the whole bash 3.2 / AIX toolbox has no
+# namerefs, so results are fixed names):
+#   OMF_PARAM_ONLINE_LOG_DEST_1..5     raw trimmed value, empty when unset
+#   OMF_PARAM_LOG_FILE_NAME_CONVERT_SET  YES|NO
+#   OMF_PARAM_DB_FILE_NAME_CONVERT_SET   YES|NO
+#   OMF_PARAM_UNSAFE                   YES when any online log dest value
+#                                      fails is_safe_omf_dest_path
+# Values are kept raw (only surrounding whitespace is trimmed) so a value
+# with an embedded space or quote is detected rather than silently mangled;
+# callers must not store an unsafe value anywhere that gets sourced.
+# Usage: parse_omf_placement_params "<raw query output>"
+parse_omf_placement_params() {
+    local _raw="$1" _pname _pval _n
+    OMF_PARAM_ONLINE_LOG_DEST_1=""
+    OMF_PARAM_ONLINE_LOG_DEST_2=""
+    OMF_PARAM_ONLINE_LOG_DEST_3=""
+    OMF_PARAM_ONLINE_LOG_DEST_4=""
+    OMF_PARAM_ONLINE_LOG_DEST_5=""
+    OMF_PARAM_LOG_FILE_NAME_CONVERT_SET="NO"
+    OMF_PARAM_DB_FILE_NAME_CONVERT_SET="NO"
+    OMF_PARAM_UNSAFE="NO"
+
+    while IFS='|' read -r _pname _pval; do
+        _pname=$(printf '%s' "$_pname" | tr -d '[:space:]')
+        _pval=$(printf '%s' "$_pval" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [[ -z "$_pname" || -z "$_pval" ]] && continue
+        case "$_pname" in
+            db_create_online_log_dest_[1-5])
+                _n="${_pname#db_create_online_log_dest_}"
+                eval "OMF_PARAM_ONLINE_LOG_DEST_${_n}=\$_pval"
+                is_safe_omf_dest_path "$_pval" || OMF_PARAM_UNSAFE="YES"
+                ;;
+            log_file_name_convert) OMF_PARAM_LOG_FILE_NAME_CONVERT_SET="YES" ;;
+            db_file_name_convert)  OMF_PARAM_DB_FILE_NAME_CONVERT_SET="YES" ;;
+        esac
+    done <<EOF
+$_raw
+EOF
+    return 0
+}
+
+# Operator-facing explanation shared by step 2 (OMF refused at generation
+# time) and step 5 (refused before anything destructive happens).
+# Usage: log_omf_inherited_convert_error <log_file_name_convert_set> <db_file_name_convert_set>
+log_omf_inherited_convert_error() {
+    local _lfnc="${1:-NO}" _dfnc="${2:-NO}"
+    local _set=""
+    [[ "$_lfnc" == "YES" ]] && _set="log_file_name_convert"
+    if [[ "$_dfnc" == "YES" ]]; then
+        _set="${_set}${_set:+ and }db_file_name_convert"
+    fi
+    log_error "The primary has ${_set} set. RMAN DUPLICATE copies the primary's spfile to the standby,"
+    log_error "so the standby would inherit it - and these parameters take precedence over the OMF"
+    log_error "parameters (db_create_file_dest / db_create_online_log_dest_n) when RMAN names files,"
+    log_error "placing them in paths derived from the stale convert pairs."
+    log_error "Ways forward:"
+    log_error "  1) Use Traditional storage mode (step 2, Q1) - it manages the convert pairs itself."
+    log_error "  2) If they are leftovers (e.g. the primary used to be a standby), reset them on the primary:"
+    log_error "       ALTER SYSTEM RESET log_file_name_convert SCOPE=SPFILE;"
+    log_error "       ALTER SYSTEM RESET db_file_name_convert SCOPE=SPFILE;"
+    log_error "     They are static parameters: the reset only shows up in V\$PARAMETER (what the"
+    log_error "     checks read) after the next primary restart. Then re-run step 1 and this step."
+}
+
+# ============================================================
 # RMAN Execution Functions
 # ============================================================
 

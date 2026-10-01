@@ -81,6 +81,34 @@ source "$STANDBY_CONFIG_FILE"
 # Reinitialize log with standby DB name
 init_log "05_clone_standby_${STANDBY_DB_UNIQUE_NAME}"
 
+# Verify one standby db_create_online_log_dest_<n> value: shell/RMAN-safe,
+# and (unless it is an ASM '+' value) an existing, writable directory on
+# THIS host. RMAN DUPLICATE is not restartable, so a missing directory has
+# to be caught here rather than as ORA-19504/ORA-27040 mid-duplicate.
+# Usage: check_standby_online_log_dest_dir <n> <dir>
+check_standby_online_log_dest_dir() {
+    local _n="$1" _dir="$2"
+    if ! is_safe_omf_dest_path "$_dir"; then
+        log_error "db_create_online_log_dest_${_n} value '${_dir}' is not a safe absolute path or +DISKGROUP"
+        log_error "  (letters, digits and _ . / + - only) - fix STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n} in ${STANDBY_CONFIG_FILE}"
+        return 1
+    fi
+    [[ "$_dir" == +* ]] && return 0
+    if [[ ! -d "$_dir" ]]; then
+        log_error "db_create_online_log_dest_${_n} directory does not exist on this host: ${_dir}"
+        log_error "  Create it (mkdir -p ${_dir}, owned by the Oracle user), or edit"
+        log_error "  STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n} in ${STANDBY_CONFIG_FILE} and re-run step 3"
+        return 1
+    fi
+    if [[ ! -w "$_dir" ]]; then
+        log_error "db_create_online_log_dest_${_n} directory is not writable by $(id -un 2>/dev/null || echo this user): ${_dir}"
+        log_error "  Fix the ownership/permissions, or edit STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}"
+        log_error "  in ${STANDBY_CONFIG_FILE} and re-run step 3"
+        return 1
+    fi
+    return 0
+}
+
 # Set Oracle environment. Prefer a locally-set ORACLE_HOME when it points
 # at a usable installation (bin/sqlplus present) - the standby host's
 # Oracle installation may live somewhere other than the path recorded in
@@ -172,6 +200,29 @@ print_list_block "Recovery If This Step Fails" \
 
 record_next_step "./primary/06_configure_broker.sh"
 
+# OMF: local-only check of the online log destinations the config already
+# names (no SYS password needed). The authoritative check against the live
+# primary runs after the password prompt below; this one lets -n report
+# the problems it can see without it.
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    _olog_local_bad=0
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_olog_dir=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        if [[ -n "$_olog_dir" ]]; then
+            if check_standby_online_log_dest_dir "$_n" "$_olog_dir"; then
+                log_info "db_create_online_log_dest_${_n}: ${_olog_dir} (OK)"
+            else
+                _olog_local_bad=1
+            fi
+        fi
+        _n=$((_n + 1))
+    done
+    if [[ $_olog_local_bad -ne 0 ]]; then
+        exit 1
+    fi
+fi
+
 if [[ "$CHECK_ONLY" == "1" ]]; then
     finish_check_mode "Standby clone preflight complete. No instance or RMAN changes were applied."
 fi
@@ -254,6 +305,97 @@ SQL
     exit 1
 fi
 log_info "Password verified successfully"
+
+# ============================================================
+# OMF: Inherited File-Placement Preflight (authoritative)
+# ============================================================
+# RMAN DUPLICATE ... SPFILE copies the primary's spfile and overrides only
+# what the SET clauses name. Ask the LIVE primary (it may have changed since
+# step 1) for the parameters that would otherwise steer file placement:
+#   - log_file_name_convert / db_file_name_convert set -> refuse (they
+#     outrank the OMF parameters in RMAN's naming precedence)
+#   - db_create_online_log_dest_1..5 set -> each needs a standby directory
+#     (from the config, else step 2's default) that exists and is writable
+#     here, and gets an explicit SET in the RMAN body below.
+# Runs BEFORE the SHUTDOWN ABORT / STARTUP NOMOUNT below: nothing has been
+# changed yet, so every failure here is free. A failed query also stops the
+# step - this run cannot be repeated, so it must not go in blind.
+RESOLVED_OLOG_DEST_1=""
+RESOLVED_OLOG_DEST_2=""
+RESOLVED_OLOG_DEST_3=""
+RESOLVED_OLOG_DEST_4=""
+RESOLVED_OLOG_DEST_5=""
+OMF_ONLINE_LOG_DEST_SETS=""
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
+    log_section "Checking Primary File-Placement Parameters (OMF)"
+
+    # CONNECT fed on stdin (never argv) with DEFINE OFF, as in
+    # verify_sys_password(); xtrace is paused so the password is not traced.
+    pause_verbose_trace
+    _omf_rc=0
+    OMF_PRIMARY_PARAMS_RAW=$(sqlplus -s /nolog <<SQL 2>&1
+SET DEFINE OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
+@${SQL_DIR}/queries/get_omf_placement_params.sql
+SQL
+) || _omf_rc=$?
+    resume_verbose_trace
+
+    if [[ $_omf_rc -ne 0 ]]; then
+        log_error "Could not read db_create_online_log_dest_n / *_file_name_convert from the primary (sqlplus exit ${_omf_rc})"
+        log_error "  $(_first_ora_line "$OMF_PRIMARY_PARAMS_RAW")"
+        log_error "Refusing to start the non-restartable RMAN duplicate without this check. Nothing has been changed."
+        exit 1
+    fi
+
+    parse_omf_placement_params "$OMF_PRIMARY_PARAMS_RAW"
+
+    if [[ "$OMF_PARAM_LOG_FILE_NAME_CONVERT_SET" == "YES" || "$OMF_PARAM_DB_FILE_NAME_CONVERT_SET" == "YES" ]]; then
+        log_omf_inherited_convert_error "$OMF_PARAM_LOG_FILE_NAME_CONVERT_SET" "$OMF_PARAM_DB_FILE_NAME_CONVERT_SET"
+        log_error "Nothing has been changed on this host."
+        exit 1
+    fi
+
+    _olog_bad=0
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_olog_pri=\$OMF_PARAM_ONLINE_LOG_DEST_${_n}"
+        eval "_olog_cfg=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        if [[ -n "$_olog_pri" ]]; then
+            _olog_stby="$_olog_cfg"
+            if [[ -z "$_olog_stby" ]]; then
+                _olog_stby=$(omf_default_online_log_dest "$_n" "$STANDBY_DB_CREATE_FILE_DEST" "$STANDBY_DB_RECOVERY_FILE_DEST")
+                log_warn "Primary sets db_create_online_log_dest_${_n} (${_olog_pri}) but the config has no STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}"
+                log_warn "  (older config, or the primary gained it after step 2) - using the default: ${_olog_stby}"
+            fi
+            if check_standby_online_log_dest_dir "$_n" "$_olog_stby"; then
+                eval "RESOLVED_OLOG_DEST_${_n}=\$_olog_stby"
+                log_info "db_create_online_log_dest_${_n}: primary ${_olog_pri} -> standby ${_olog_stby}"
+            else
+                _olog_bad=1
+            fi
+        elif [[ -n "$_olog_cfg" ]]; then
+            log_info "db_create_online_log_dest_${_n}: not set on the primary any more - config value ${_olog_cfg} ignored"
+        fi
+        _n=$((_n + 1))
+    done
+    if [[ $_olog_bad -ne 0 ]]; then
+        log_error "Fix the directory problem(s) above, then re-run this step. Nothing has been changed."
+        exit 1
+    fi
+
+    _omf_sets=$(build_rman_online_log_dest_set_lines "$RESOLVED_OLOG_DEST_1" "$RESOLVED_OLOG_DEST_2" "$RESOLVED_OLOG_DEST_3" "$RESOLVED_OLOG_DEST_4" "$RESOLVED_OLOG_DEST_5") || {
+        log_error "Internal error: could not build the db_create_online_log_dest_n SET clauses"
+        exit 1
+    }
+    if [[ -n "$_omf_sets" ]]; then
+        OMF_ONLINE_LOG_DEST_SETS="
+${_omf_sets}"
+    else
+        log_info "Primary sets no db_create_online_log_dest_n and no *_file_name_convert - nothing inherited to override"
+    fi
+fi
 
 # ============================================================
 # Start Instance in NOMOUNT
@@ -371,7 +513,7 @@ DUPLICATE TARGET DATABASE
   DORECOVER
   SPFILE
     SET DB_UNIQUE_NAME='${STANDBY_DB_UNIQUE_NAME}'
-    SET DB_CREATE_FILE_DEST='${STANDBY_DB_CREATE_FILE_DEST}'
+    SET DB_CREATE_FILE_DEST='${STANDBY_DB_CREATE_FILE_DEST}'${OMF_ONLINE_LOG_DEST_SETS}
     SET DB_RECOVERY_FILE_DEST='${STANDBY_DB_RECOVERY_FILE_DEST}'
     SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE}'
     SET LOG_ARCHIVE_DEST_1='${LOG_ARCHIVE_DEST_1_SETTING}'
@@ -486,6 +628,14 @@ if [[ $RMAN_EXIT_CODE -ne 0 ]]; then
     # screen (and in the log) right where the failure just happened.
     if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
         RESET_DATA_NOTE="Remove standby files under: ${STANDBY_DB_CREATE_FILE_DEST}, ${STANDBY_DB_RECOVERY_FILE_DEST}"
+        # db_create_online_log_dest_n directories also hold standby redo
+        # logs / control files (ASM '+' values are cleaned up in ASM)
+        _n=1
+        while [[ $_n -le 5 ]]; do
+            eval "_olog_dir=\$RESOLVED_OLOG_DEST_${_n}"
+            [[ -n "$_olog_dir" ]] && RESET_DATA_NOTE="${RESET_DATA_NOTE}, ${_olog_dir}"
+            _n=$((_n + 1))
+        done
     else
         RESET_DATA_PATHS=("$STANDBY_DATA_PATH")
         if [[ -n "${STANDBY_DATA_PATHS+x}" && ${#STANDBY_DATA_PATHS[@]} -gt 0 ]]; then

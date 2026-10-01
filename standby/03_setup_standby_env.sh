@@ -387,6 +387,20 @@ progress_step "Reviewing Planned Changes"
 
 if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     _dir_summary="Create any missing standby directories under ${STANDBY_DB_CREATE_FILE_DEST}, ${STANDBY_DB_RECOVERY_FILE_DEST}, and ${STANDBY_ADMIN_DIR}."
+    # db_create_online_log_dest_n directories (mapped from the primary's by
+    # step 2) - ASM '+' values are not filesystem paths and are skipped
+    _olog_dirs_summary=""
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_olog_dir=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        if [[ -n "$_olog_dir" && "$_olog_dir" != +* ]]; then
+            _olog_dirs_summary="${_olog_dirs_summary}${_olog_dirs_summary:+, }${_olog_dir}"
+        fi
+        _n=$((_n + 1))
+    done
+    if [[ -n "$_olog_dirs_summary" ]]; then
+        _dir_summary="${_dir_summary} Also create the online log destination(s): ${_olog_dirs_summary}."
+    fi
 else
     _dir_summary="Create any missing standby directories under ${STANDBY_DATA_PATH}, ${STANDBY_REDO_PATH}, and ${STANDBY_ADMIN_DIR}."
     if [[ -n "${STANDBY_SRL_PATH:-}" ]] && [[ "$STANDBY_SRL_PATH" != "$STANDBY_REDO_PATH" ]]; then
@@ -445,6 +459,22 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     log_info "OMF mode: creating base OMF directories"
     log_info "  db_create_file_dest:   ${STANDBY_DB_CREATE_FILE_DEST}"
     log_info "  db_recovery_file_dest: ${STANDBY_DB_RECOVERY_FILE_DEST}"
+    # db_create_online_log_dest_n overrides db_create_file_dest for redo
+    # logs and control files, so those directories must exist too (step 5
+    # preflight refuses to start RMAN otherwise).
+    _n=1
+    while [[ $_n -le 5 ]]; do
+        eval "_olog_dir=\${STANDBY_DB_CREATE_ONLINE_LOG_DEST_${_n}:-}"
+        if [[ -n "$_olog_dir" ]]; then
+            if [[ "$_olog_dir" == +* ]]; then
+                log_info "  db_create_online_log_dest_${_n}: ${_olog_dir} (ASM - not created here)"
+            else
+                DIRS_TO_CREATE+=("$_olog_dir")
+                log_info "  db_create_online_log_dest_${_n}: ${_olog_dir}"
+            fi
+        fi
+        _n=$((_n + 1))
+    done
 else
     # Traditional mode: create explicit data, redo, archive directories.
     # Cover EVERY distinct directory the convert params remap to - not

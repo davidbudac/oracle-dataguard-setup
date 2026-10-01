@@ -434,6 +434,73 @@ log_info "DB_RECOVERY_FILE_DEST: $DB_RECOVERY_FILE_DEST"
 log_info "DB_RECOVERY_FILE_DEST_SIZE: $DB_RECOVERY_FILE_DEST_SIZE"
 
 # ============================================================
+# Inherited File-Placement Parameters (matter for OMF mode)
+# ============================================================
+# RMAN DUPLICATE ... SPFILE (step 5) copies this database's spfile to the
+# standby and overrides only what its SET clauses name, so these
+# parameters would be inherited silently:
+#   db_create_online_log_dest_1..5 - outrank db_create_file_dest for
+#       online/standby redo logs and OMF control files
+#   log_file_name_convert / db_file_name_convert - outrank the OMF
+#       parameters in RMAN's file-naming precedence
+# Step 2 maps the former onto standby directories and refuses OMF mode
+# while the latter are set.
+#
+# Informational: a query that fails degrades to "unset" plus a warning,
+# never a failed step (step 5 re-checks against the live primary).
+# The .env is sourced by later steps, so a dest value is stored only when
+# it passes is_safe_omf_dest_path; otherwise it is stored empty and
+# PRIMARY_ONLINE_LOG_DEST_UNSAFE=YES makes step 2 refuse OMF mode.
+# ============================================================
+
+log_section "Gathering File-Placement Parameters"
+
+OMF_PARAMS_RAW=""
+if OMF_PARAMS_RAW=$(run_sql_query "get_omf_placement_params.sql" 2>/dev/null); then
+    parse_omf_placement_params "$OMF_PARAMS_RAW"
+else
+    log_warn "Could not read db_create_online_log_dest_n / *_file_name_convert from the primary"
+    log_warn "  Treating them as unset here; step 5 re-checks them against the live primary"
+    parse_omf_placement_params ""
+fi
+
+PRIMARY_ONLINE_LOG_DEST_UNSAFE="NO"
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_1=""
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_2=""
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_3=""
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_4=""
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_5=""
+_olog_n=1
+while [[ $_olog_n -le 5 ]]; do
+    eval "_olog_val=\$OMF_PARAM_ONLINE_LOG_DEST_${_olog_n}"
+    if [[ -n "$_olog_val" ]]; then
+        if is_safe_omf_dest_path "$_olog_val"; then
+            eval "PRIMARY_DB_CREATE_ONLINE_LOG_DEST_${_olog_n}=\$_olog_val"
+            log_info "DB_CREATE_ONLINE_LOG_DEST_${_olog_n}: $_olog_val"
+        else
+            PRIMARY_ONLINE_LOG_DEST_UNSAFE="YES"
+            log_warn "DB_CREATE_ONLINE_LOG_DEST_${_olog_n} has an unsupported value: '$_olog_val'"
+            log_warn "  Only letters, digits and _ . / + - in an absolute path or +DISKGROUP are accepted;"
+            log_warn "  it is NOT stored, and step 2 will refuse OMF storage mode for this primary"
+        fi
+    fi
+    _olog_n=$((_olog_n + 1))
+done
+if [[ -z "${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_1}${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_2}${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_3}${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_4}${PRIMARY_DB_CREATE_ONLINE_LOG_DEST_5}" \
+   && "$PRIMARY_ONLINE_LOG_DEST_UNSAFE" == "NO" ]]; then
+    log_info "DB_CREATE_ONLINE_LOG_DEST_n: (not set)"
+fi
+
+PRIMARY_LOG_FILE_NAME_CONVERT_SET="$OMF_PARAM_LOG_FILE_NAME_CONVERT_SET"
+PRIMARY_DB_FILE_NAME_CONVERT_SET="$OMF_PARAM_DB_FILE_NAME_CONVERT_SET"
+log_info "LOG_FILE_NAME_CONVERT set: $PRIMARY_LOG_FILE_NAME_CONVERT_SET"
+log_info "DB_FILE_NAME_CONVERT set:  $PRIMARY_DB_FILE_NAME_CONVERT_SET"
+if [[ "$PRIMARY_LOG_FILE_NAME_CONVERT_SET" == "YES" || "$PRIMARY_DB_FILE_NAME_CONVERT_SET" == "YES" ]]; then
+    log_info "  A standby in OMF storage mode would inherit these and they would override OMF placement;"
+    log_info "  step 2 refuses OMF mode while they are set (Traditional mode manages them itself)"
+fi
+
+# ============================================================
 # Archive Log and Redo Generation Statistics
 # ============================================================
 # Sizing input for the standby build: the redo generation rate
@@ -815,6 +882,20 @@ CONTROL_FILES="$CONTROL_FILES"
 DB_RECOVERY_FILE_DEST="$DB_RECOVERY_FILE_DEST"
 DB_RECOVERY_FILE_DEST_SIZE="$DB_RECOVERY_FILE_DEST_SIZE"
 USE_FRA_FOR_ARCHIVE="$USE_FRA_FOR_ARCHIVE"
+
+# --- Inherited File-Placement Parameters ---
+# RMAN DUPLICATE ... SPFILE hands these to the standby unless step 2/5
+# override them (relevant for OMF mode; see step 2). Online log dests are
+# empty when unset; a value that is not shell-safe is stored empty and
+# flagged in PRIMARY_ONLINE_LOG_DEST_UNSAFE (step 2 then refuses OMF mode).
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_1="$PRIMARY_DB_CREATE_ONLINE_LOG_DEST_1"
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_2="$PRIMARY_DB_CREATE_ONLINE_LOG_DEST_2"
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_3="$PRIMARY_DB_CREATE_ONLINE_LOG_DEST_3"
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_4="$PRIMARY_DB_CREATE_ONLINE_LOG_DEST_4"
+PRIMARY_DB_CREATE_ONLINE_LOG_DEST_5="$PRIMARY_DB_CREATE_ONLINE_LOG_DEST_5"
+PRIMARY_ONLINE_LOG_DEST_UNSAFE="$PRIMARY_ONLINE_LOG_DEST_UNSAFE"
+PRIMARY_LOG_FILE_NAME_CONVERT_SET="$PRIMARY_LOG_FILE_NAME_CONVERT_SET"
+PRIMARY_DB_FILE_NAME_CONVERT_SET="$PRIMARY_DB_FILE_NAME_CONVERT_SET"
 
 # --- Redo Log Configuration ---
 REDO_LOG_SIZE_MB="$(strip_whitespace "$REDO_LOG_SIZE_MB")"
