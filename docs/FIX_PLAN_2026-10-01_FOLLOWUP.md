@@ -87,6 +87,7 @@ tests with stubbed Oracle binaries, both `bash` and `/bin/bash` (3.2) must pass.
 | 12 | Medium | `dg_status.sh` timeout does not cover SID discovery | Fix: discovery runs under the same watchdog | H | FIXED |
 | 13 | Medium | Failed wallet authentication still ends in success | Fix: exit 1, no SUCCESS summary, restore hint | A, C | FIXED |
 | 14 | Medium | SRL size check rounds down | Fix: compare bytes; round DDL sizes up | G | FIXED |
+| 15 | High | **Found in the lab 2026-10-03, not in the review.** The observer user's `GRANT SYSDG` never reaches a mounted standby's password file (19.27), so the observer has no login on the standby; step 10's both-aliases check (finding 13) fails right after step 9 | Fix: set the same password again after the grant (`ALTER USER … IDENTIFIED BY`, which does propagate) in `primary/09_configure_fsfo.sh`, `add_observer/01_prepare_primary.sh` and `observer_sys_to_sysdg/01_create_sysdg_user.sh`; step 9 proves the `AS SYSDG` login on the other member (`prove_observer_standby_login`, bound `DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS`, default 30) before LogXptMode, protection mode or FSFO are touched and exits 1 otherwise; a refused re-set (ORA-28007 under a reuse-limited profile) is a warning and the login check decides; messages and docs no longer promise automatic propagation. New suite `tests/test_step9_observer_user.sh` | — | FIXED (unit-tested; lab row 12.12 open) |
 
 ## Remaining release gates
 
@@ -127,17 +128,35 @@ tests with stubbed Oracle binaries, both `bash` and `/bin/bash` (3.2) must pass.
 - **Step 5 read-back (6):** also applied when an FRA *was* chosen (Traditional or OMF), where
   the standby's value must equal the configured path.
 
+## Lab run 2026-10-03 (commit `23d6ec8`)
+
+Results are in the test plan's results log; the lab's state and the next steps are in
+[`HANDOFF_2026-10-03.md`](HANDOFF_2026-10-03.md).
+
+- **Passed:** Phase 0; E2E steps 1-9 and 13; spot checks 1.1-1.10; rows 12.1 (finding 1),
+  12.2 (finding 2), 12.4 (findings 4, 13), 12.5 (finding 7), 12.7 (finding 13). The Status
+  column above stays `FIXED` until the clean Phase 1 rerun has passed on the commit that
+  carries finding 15's fix; then findings 1, 2, 7 and 13 can move to `LAB-VERIFIED`
+  (finding 4 still has row 11.10 on AIX).
+- **Failed:** E2E step 10, on finding 15. It passed after the observer user's password was
+  re-set by hand, so there is no single clean end-to-end run yet.
+- **Not fixed yet (minor, seen during the run):** step 5 logs an empty standby FRA as
+  `'(path with unusual characters - not shown)'`; `setup_dg_wallet.sh` drops the ORA- line when
+  its first local query fails; `setup_dg_wallet.sh` leaks mkstore's "Credential does not
+  exists" and banner lines.
+- **Plan corrections:** deploy with `LOCAL_DEPLOY=true` (the hosts' tree has no `.git`);
+  snapshots only with the VMs off; row 12.4(b) needs a valid unrelated wallet, not an empty
+  directory (ORA-12578 on every connection otherwise).
+
 ## What is left
 
-Nothing in this pass ran a clone, a role change, an observer or a migration. In order of
-value:
+In order of value:
 
-1. Commit and push, then test plan Phases 0-1 (unit suites + the E2E run that drives every
-   changed numbered step with its fixed stdin sequence).
-2. Phase 12 rows 12.2 (identity guard; the lab has the two-primaries-on-one-host case), 12.3
-   (dead-observer restart; it settles the one assumption about the broker's answer) and 12.6
-   (observer restart with the original primary down).
-3. Row 12.8 together with Phase 10: both need a rebuild, and Phase 10 decides the open OMF
+1. Clean Phase 1 rerun on the commit with finding 15's fix, plus row 12.12.
+2. The three minor defects above.
+3. Rows 12.3 (dead-observer restart; it settles the one assumption about the broker's answer)
+   and 12.6 (observer restart with the original primary down), with Phases 5 and 6.
+4. Row 12.8 together with Phase 10: both need a rebuild, and Phase 10 decides the open OMF
    control-file gate.
-4. Phase 9 for the migration fixes (rows 9.2, 9.6, 9.8, 9.9).
-5. Phase 11 when an AIX 7.2 host exists.
+5. Phase 9 for the migration fixes (rows 9.2, 9.6, 9.8, 9.9).
+6. Phase 11 when an AIX 7.2 host exists.

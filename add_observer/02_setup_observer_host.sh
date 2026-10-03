@@ -450,10 +450,10 @@ fi
 
 if ! $STANDBY_OK; then
     log_error "The STANDBY connection failed while the primary works."
-    log_error "That is almost always ORA-01017: the primary's password file - which now"
-    log_error "carries ${OBSERVER_USER} - has not reached the standby. On 12.2+ it"
-    log_error "propagates automatically while the standby receives redo; a"
-    log_error "long-disconnected standby will not have it. Copy it manually:"
+    log_error "That is almost always ORA-01017: ${OBSERVER_USER} is not in the standby's password"
+    log_error "file. A GRANT of SYSDG does not reach a mounted standby by itself. Either set the"
+    log_error "user's password on the primary again (ALTER USER ${OBSERVER_USER} IDENTIFIED BY ...; the"
+    log_error "entry propagates within seconds while redo apply runs), or copy the primary's file:"
     log_error ""
     log_error "  primary\$ scp \$ORACLE_HOME/dbs/orapw<PRIMARY_SID> ${STANDBY_HOST:-<standby-host>}:\$ORACLE_HOME/dbs/orapw<STANDBY_SID>"
     log_error ""

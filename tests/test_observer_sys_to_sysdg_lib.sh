@@ -131,6 +131,25 @@ check "no sqlplus heredoc embeds a password outside run_sql" "0" \
     "$(grep -n 'sqlplus' "${KIT}"/0*.sh | grep -ci 'password')"
 
 echo ""
+echo "Test 7: 01 sets a new user's password again AFTER the grants (standby password file)"
+# Verified on 19.27 with a MOUNTED physical standby: create + grant do not reach
+# the standby's password file; a following ALTER USER ... IDENTIFIED BY does.
+# The prompts need a TTY, so the SQL order is asserted on the script text.
+order_ok() {
+    awk 'tolower($0) ~ /create user .*identified by/ && !c {c=NR}
+         c && tolower($0) ~ /^grant sysdg to/ && !g {g=NR}
+         g && tolower($0) ~ /alter user .*identified by/ && !a {a=NR}
+         END {exit !(c && g && a && c < g && g < a)}' "$1"
+}
+if order_ok "${KIT}/01_create_sysdg_user.sh"; then pass "01: create -> grant sysdg -> alter user identified by"; else fail "01: create -> grant sysdg -> alter user identified by"; fi
+check "01: a refused ALTER is a warning, not a die" "1" \
+    "$(grep -c 'Could not set the password again' "${KIT}/01_create_sysdg_user.sh")"
+check "01: no 'picks up ... AUTOMATICALLY' claim" "0" \
+    "$(grep -ci 'picks up' "${KIT}/01_create_sysdg_user.sh")"
+check "02: no 'propagates automatically' claim" "0" \
+    "$(grep -ci 'propagates automatically' "${KIT}/02_switch_observer_credentials.sh")"
+
+echo ""
 echo "============================================================"
 echo "Test Summary: $PASS passed, $FAIL failed"
 echo "============================================================"

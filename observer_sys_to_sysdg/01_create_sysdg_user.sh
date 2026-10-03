@@ -167,7 +167,17 @@ if [[ "$USER_EXISTS" == "0" ]]; then
     run_sql_or_die "create user ${OBSERVER_USER} identified by \"${OBSERVER_PASSWORD}\";
 grant create session to ${OBSERVER_USER};
 grant sysdg to ${OBSERVER_USER};" "Failed to create $OBSERVER_USER."
-    unset OBSERVER_PASSWORD
+    # Observed on 19.27 with a MOUNTED physical standby: create + grant do not
+    # reach the standby's password file, but a password change does. Set the same
+    # password again, after the grant; a failure is only a warning (step 02 proves
+    # the standby login).
+    if ! REPW_OUT=$(run_sql "alter user ${OBSERVER_USER} identified by \"${OBSERVER_PASSWORD}\";"); then
+        REPW_OUT=${REPW_OUT//"$OBSERVER_PASSWORD"/********}
+        log_warn "Could not set the password again: $(printf '%s\n' "$REPW_OUT" | grep -E '(ORA|SP2)-[0-9]+' | tail -1)"
+        log_warn "The standby's password file will not receive $OBSERVER_USER until the password is changed to a NEW value"
+        log_warn "or the primary's password file is copied to the standby."
+    fi
+    unset OBSERVER_PASSWORD REPW_OUT
     log_info "User created with CREATE SESSION + SYSDG."
 else
     log_info "User $OBSERVER_USER already exists."
@@ -176,9 +186,11 @@ else
     # V$PWFILE_USERS, never in DBA_ROLE_PRIVS / DBA_SYS_PRIVS.
     HAS_SYSDG=$(run_sql "select count(*) from v\$pwfile_users where username = '${OBSERVER_USER}' and sysdg = 'TRUE';" | tr -d ' \t\r')
 
+    SYSDG_GRANTED_NOW=0
     if [[ "$HAS_SYSDG" == "1" ]]; then
         log_info "User already has SYSDG."
     else
+        SYSDG_GRANTED_NOW=1
         log_info "Granting SYSDG + CREATE SESSION to $OBSERVER_USER..."
         run_sql_or_die "grant create session to ${OBSERVER_USER};
 grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to $OBSERVER_USER."
@@ -193,6 +205,12 @@ grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to $OBSERVER_USER."
         log_info "Password updated."
     else
         log_info "Keeping the existing password (you will need it for the wallet in step 02)."
+        if [[ "$SYSDG_GRANTED_NOW" == "1" ]]; then
+            # Observed on 19.27 with a MOUNTED physical standby.
+            log_warn "SYSDG was granted just now, and a GRANT alone does not reach a mounted standby's password file."
+            log_warn "$OBSERVER_USER cannot log in to the standby until its password is set again on the primary"
+            log_warn "(re-run this script and answer yes to the password reset) or the primary's password file is copied to the standby."
+        fi
     fi
 fi
 
@@ -270,13 +288,14 @@ SYSDG OBSERVER USER READY: ${OBSERVER_USER}
 
 The grant updated the PRIMARY's password file. The observer also
 connects to the STANDBY (that is how it survives a failover), so the
-standby's password file must contain this user too:
+standby's password file must contain this user too. A GRANT alone does
+not reach a mounted standby (verified on 19.27); setting the password
+does, so a newly created user's password was set a second time above.
 
-  - On 12.2+ a physical standby that is receiving redo picks up
-    primary password file changes AUTOMATICALLY - usually nothing
-    to do.
   - If the wallet connection test to the standby in step 02 fails
-    with ORA-01017, copy the file manually:
+    with ORA-01017, set the user's password on the primary again
+    (ALTER USER ${OBSERVER_USER} IDENTIFIED BY ...; re-run this script
+    and answer yes to the reset), or copy the file manually:
 
       primary>  scp \$ORACLE_HOME/dbs/orapw${ORACLE_SID} \\
                     standby:\$ORACLE_HOME/dbs/orapw<STANDBY_ORACLE_SID>

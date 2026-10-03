@@ -937,7 +937,11 @@ EXIT;
 
 1. Verifies Data Guard Broker configuration is healthy
 2. Prompts for observer username (default: dg_observer)
-3. Creates observer user with SYSDG privilege
+3. Creates observer user with SYSDG privilege, then sets its password a second
+   time so the user reaches the standby's password file, and proves the observer
+   user can log in `AS SYSDG` to the standby (waits up to
+   `DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS`, default 30) before anything else is
+   changed
 4. Sets LogXptMode to FASTSYNC for both databases
 5. Sets protection mode to MAXIMUM AVAILABILITY
 6. Configures FSFO properties (threshold, target)
@@ -966,6 +970,11 @@ sqlplus / as sysdba
 CREATE USER dg_observer IDENTIFIED BY <password>;
 GRANT SYSDG TO dg_observer;
 GRANT CREATE SESSION TO dg_observer;
+-- Set the SAME password again. Verified on 19.27 with a MOUNTED physical
+-- standby: CREATE USER + GRANT SYSDG alone do not reach the standby's password
+-- file (the observer then gets ORA-01017 there); the ALTER USER does, within
+-- seconds, while redo apply is running.
+ALTER USER dg_observer IDENTIFIED BY <password>;
 
 EXIT;
 ```
@@ -1834,8 +1843,11 @@ Design notes:
   the script says so rather than silently upgrading the mode.
 - **Both connections are proven before anything starts.** Script 02 aborts if the
   observer user cannot log in `AS SYSDG` to the *standby*, which is usually `ORA-01017`
-  from a password file that was never propagated. An observer the standby rejects can
-  watch a failure but cannot complete the failover.
+  because the user never reached the standby's password file. Verified on 19.27 with a
+  MOUNTED physical standby: `CREATE USER` + `GRANT SYSDG` do not reach it, a following
+  `ALTER USER ... IDENTIFIED BY "<same password>"` does within seconds (script 01 does
+  that for a new user). An observer the standby rejects can watch a failure but cannot
+  complete the failover.
 - **Named observers** (12.2+) are used when available, falling back to the unnamed form
   if `START OBSERVER <name>` fails, rather than leaving no observer running at all.
 - **Reboot survival is explicit.** A background observer is a detached `dgmgrl` process

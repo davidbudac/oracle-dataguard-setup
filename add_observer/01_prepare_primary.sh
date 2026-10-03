@@ -382,16 +382,28 @@ else
         run_sql_or_die "create user ${OBSERVER_USER} identified by \"${OBSERVER_PASSWORD}\";
 grant create session to ${OBSERVER_USER};
 grant sysdg to ${OBSERVER_USER};" "Failed to create ${OBSERVER_USER}."
-        unset OBSERVER_PASSWORD
+        # Observed on 19.27 with a MOUNTED physical standby: create + grant do not
+        # reach the standby's password file, but a password change does. So set the
+        # same password again, after the grant. A failure here is only a warning;
+        # script 02 proves the standby login.
+        if ! __repw_out=$(run_sql "alter user ${OBSERVER_USER} identified by \"${OBSERVER_PASSWORD}\";"); then
+            __repw_out=${__repw_out//"$OBSERVER_PASSWORD"/********}
+            log_warn "Could not set the password again: $(printf '%s\n' "$__repw_out" | grep -E '(ORA|SP2)-[0-9]+' | tail -1)"
+            log_warn "The standby's password file will not receive ${OBSERVER_USER} until the password is changed to a NEW value"
+            log_warn "or the primary's password file is copied to the standby."
+        fi
+        unset OBSERVER_PASSWORD __repw_out
         log_info "User created."
     else
         log_info "User ${OBSERVER_USER} already exists."
         # SYSDG is an administrative (password-file) privilege: it appears in
         # V$PWFILE_USERS, never in DBA_ROLE_PRIVS / DBA_SYS_PRIVS.
         HAS_SYSDG=$(run_sql "select count(*) from v\$pwfile_users where username = '${OBSERVER_USER}' and sysdg = 'TRUE';" | clean | head -1) || HAS_SYSDG="0"
+        SYSDG_GRANTED_NOW=0
         if [[ "$HAS_SYSDG" == "1" ]]; then
             log_info "It already holds SYSDG."
         else
+            SYSDG_GRANTED_NOW=1
             log_info "Granting CREATE SESSION + SYSDG..."
             run_sql_or_die "grant create session to ${OBSERVER_USER};
 grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to ${OBSERVER_USER}."
@@ -405,6 +417,12 @@ grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to ${OBSERVER_USER}."
             log_info "Password updated."
         else
             log_info "Keeping the existing password - you will need it on the observer host in step 02."
+            if [[ "$SYSDG_GRANTED_NOW" == "1" ]]; then
+                # Observed on 19.27 with a MOUNTED physical standby.
+                log_warn "SYSDG was granted just now, and a GRANT alone does not reach a mounted standby's password file."
+                log_warn "${OBSERVER_USER} cannot log in to the standby until its password is set again on the primary"
+                log_warn "(re-run this script and answer yes to the password reset) or the primary's password file is copied to the standby."
+            fi
         fi
     fi
 
@@ -416,8 +434,8 @@ grant sysdg to ${OBSERVER_USER};" "Failed to grant SYSDG to ${OBSERVER_USER}."
     # The observer must log in to the STANDBY too (that is how it completes a
     # failover), and on a mounted standby AS SYSDG is authenticated purely
     # against the password file.
-    log_info "Standby password file: on 12.2+ a standby that is receiving redo picks up"
-    log_info "this change automatically. Step 02's standby connection test proves it."
+    log_info "Standby password file: a GRANT alone does not reach a mounted standby (verified on 19.27); setting the"
+    log_info "password again does. Step 02's standby connection test proves the login."
 fi
 
 # ============================================================
@@ -628,8 +646,12 @@ dgmgrl  /@${PRIMARY_TNS_ALIAS} "show configuration"
 \`\`\`
 
 If the **standby** connection fails with \`ORA-01017\` while the primary works,
-the primary's password file has not reached the standby. Copy it (mind that the
-filename carries each side's own \`ORACLE_SID\`):
+the user has not reached the standby's password file (a \`GRANT SYSDG\` alone does
+not reach a mounted standby; verified on 19.27). On the primary, set the user's
+password again - \`ALTER USER ${OBSERVER_USER} IDENTIFIED BY ...\` - which carries
+the entry across within seconds while redo apply is running, or copy the
+primary's password file (mind that the filename carries each side's own
+\`ORACLE_SID\`):
 
 \`\`\`bash
 primary\$ scp \$ORACLE_HOME/dbs/orapw${ORACLE_SID} ${STANDBY_HOST}:\$ORACLE_HOME/dbs/orapw<STANDBY_SID>

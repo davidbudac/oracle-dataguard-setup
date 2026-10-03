@@ -21,6 +21,22 @@ verdict above stands until [TEST_PLAN_2026-10-01.md](TEST_PLAN_2026-10-01.md) Ph
 been run. The plan, the design decisions and the batch split are in
 [FIX_PLAN_2026-10-01_FOLLOWUP.md](FIX_PLAN_2026-10-01_FOLLOWUP.md).
 
+### Lab run 2026-10-03 (added the same evening)
+
+The E2E run and the first Phase 12 rows were run on `23d6ec8`. Steps 1-9 and 13, the ten
+Phase 1 spot checks and rows 12.1, 12.2, 12.4, 12.5 and 12.7 passed, which covers findings 1,
+2, 4 (Linux), 7 and 13 on a real system. Step 10 failed, on a defect this review did not
+contain:
+
+**Finding 15 (High, found in the lab).** On 19.27 with a MOUNTED physical standby,
+`CREATE USER` + `GRANT SYSDG` on the primary does not reach the standby's password file; a
+following `ALTER USER … IDENTIFIED BY` carries the entry over within a second. The observer
+user created by step 9 (and by `add_observer/01` and `observer_sys_to_sysdg/01`) therefore
+had no login on the standby. Finding 13's both-aliases check is what exposed it. It is fixed
+in code and unit-tested (fix plan, finding 15); the lab verification is test plan row 12.12,
+together with the clean end-to-end E2E run that is still owed. The verdict above stands until
+then. Current lab state and next steps: [HANDOFF_2026-10-03.md](HANDOFF_2026-10-03.md).
+
 ### How the fixes were verified
 
 - **Unit suites:** 25 pass under Bash 5.3 and under Bash 3.2.57 (driver and every inner

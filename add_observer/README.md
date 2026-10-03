@@ -153,9 +153,14 @@ password on disk and none in any start script**.
 
 **The standby test is not optional.** The observer connects to the standby to
 *complete* a failover; if the standby rejects it, the observer is decorative.
-A standby-only `ORA-01017` means the primary's password file has not reached the
-standby (12.2+ propagates it automatically only while the standby is receiving
-redo). Copy it — the filename carries each side's own `ORACLE_SID`:
+A standby-only `ORA-01017` means the user is not in the standby's password file.
+Verified on 19.27 with a MOUNTED physical standby: `CREATE USER` + `GRANT SYSDG` do
+**not** reach it, while a following `ALTER USER <user> IDENTIFIED BY "<same password>"`
+does, within seconds, as long as redo apply is running. Script 01 therefore sets a
+new user's password a second time after the grants (a failure there, e.g. `ORA-28007`
+from a profile that forbids reuse, is only a warning). To fix an existing user, set
+its password on the primary again (re-run script 01 and answer yes to the reset), or
+copy the primary's file — the filename carries each side's own `ORACLE_SID`:
 
 ```bash
 primary$ scp $ORACLE_HOME/dbs/orapw<PRIMARY_SID> standby:$ORACLE_HOME/dbs/orapw<STANDBY_SID>
@@ -299,7 +304,7 @@ Everything is reversible:
 | `ENABLE FAST_START FAILOVER` → `ORA-16627` | The standby is not synchronized / not a valid target. Fix transport and apply first (`VALIDATE DATABASE`). |
 | `02` reports missing `dgmgrl` / `mkstore` | Instant Client on the third host. Install an Administrator-type client (or a database home) at the databases' release. |
 | `tnsping` fails on the third host | Wrong `TNS_ADMIN`, or `sqlnet.ora` sets `NAMES.DEFAULT_DOMAIN` — which silently appends a domain to every unqualified alias. Script 02 warns about this; qualify the aliases or drop the setting. |
-| `ORA-01017` on the **standby** only | The primary's password file has not reached the standby. Copy `orapw<SID>` manually (see step 3) — the filename uses each side's own `ORACLE_SID`. |
+| `ORA-01017` on the **standby** only | The user is not in the standby's password file (a `GRANT SYSDG` alone does not reach a mounted standby). Set its password on the primary again (`ALTER USER <user> IDENTIFIED BY ...`, or re-run script 01 and reset it), or copy `orapw<SID>` manually (see step 3) — the filename uses each side's own `ORACLE_SID`. |
 | `ORA-01017` on **both** | Wrong password typed, or the user/grant never landed. Re-run `01_prepare_primary.sh` and check `V$PWFILE_USERS`. |
 | `ORA-65096` creating the user | A CDB needs a common user — accept the `C##` prefix script 01 offers. |
 | `START OBSERVER` fails on the name | Named observers need a 12.2+ broker configuration; the script already retries unnamed. |

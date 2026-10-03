@@ -923,8 +923,10 @@ report_wallet_test_failure() {
 ${WALLET_TEST_FAILURES}
 EOF
     log_error "Check: the TNS entry resolves on $(hostname), the database is up, the user exists"
-    log_error "with SYSDG, and the password is right on BOTH sides - a standby ORA-01017 usually"
-    log_error "means the primary's password file has not reached the standby."
+    log_error "with SYSDG, and the password is right on BOTH sides. A standby-only ORA-01017 usually means the user is not in"
+    log_error "the standby's password file (a GRANT of SYSDG does not reach a mounted standby by itself). Set the user's password"
+    log_error "on the primary again (re-run step 9 and answer yes to the password reset; ALTER USER ... IDENTIFIED BY ..."
+    log_error "propagates within seconds while redo apply runs), or copy the primary's password file to the standby as its own orapw<SID>."
     if [[ -n "${WALLET_SWAP_BACKUP:-}" ]]; then
         backup="$WALLET_SWAP_BACKUP"
     elif [[ -n "${WALLET_INPLACE_BACKUP:-}" ]]; then

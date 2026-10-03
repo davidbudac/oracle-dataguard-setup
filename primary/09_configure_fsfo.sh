@@ -6,7 +6,10 @@
 # Data Guard setup is complete (Step 7 verification passes).
 #
 # This script:
-# - Creates a user with SYSDG privilege for observer authentication
+# - Creates a user with SYSDG privilege for observer authentication,
+#   sets its password a second time so the entry reaches the standby's
+#   password file, and proves the user can log in AS SYSDG to the standby
+#   before anything else is changed
 # - Sets protection mode to MAXIMUM AVAILABILITY
 # - Sets LogXptMode to FASTSYNC
 # - Enables Fast-Start Failover
@@ -62,6 +65,61 @@ fail_observer_sql() {
     log_error "$msg (sqlplus exit code ${rc})"
     [[ -n "$out" ]] && printf '%s\n' "$out"
     exit 1
+}
+
+# Prove that the observer user can log in AS SYSDG to the OTHER broker member
+# (the standby; the original primary after a switchover). The observer needs
+# that login to complete a failover, and on a mounted standby it is
+# authenticated purely against the standby's password file. Observed on 19.27
+# with a MOUNTED physical standby: CREATE USER + GRANT SYSDG on the primary
+# does not reach that file; the user appears within seconds once the password
+# is set again with ALTER USER ... IDENTIFIED BY.
+# Uses OBSERVER_USER and OBSERVER_PASSWORD from the caller. Polls up to
+# DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS seconds (default 30, every 3 s; 0 = one
+# attempt). Returns 0 once a login succeeds, 1 after the bound (the last
+# ORA-/TNS- line is logged, with the password redacted).
+# Usage: prove_observer_standby_login <tns alias of the other member>
+prove_observer_standby_login() {
+    local alias="$1"
+    local wait_secs="${DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS:-30}" poll_secs=3
+    local attempts i=0 out="" last=""
+
+    case "$wait_secs" in
+        ''|*[!0-9]*)
+            log_warn "DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS='${wait_secs}' is not a non-negative integer - using 30"
+            wait_secs=30 ;;
+    esac
+    attempts=$(( wait_secs / poll_secs + 1 ))
+
+    pause_verbose_trace
+    log_info "Checking that ${OBSERVER_USER} can log in AS SYSDG to ${alias} (waiting up to ${wait_secs}s for its password file)..."
+    while [[ $i -lt $attempts ]]; do
+        i=$((i + 1))
+        # The password stays on stdin; the sentinel is split so an echoed
+        # statement cannot match it.
+        out=$(sqlplus -s -L /nolog 2>&1 << EOSQL
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
+WHENEVER SQLERROR EXIT FAILURE
+CONNECT ${OBSERVER_USER}/"${OBSERVER_PASSWORD}"@${alias} AS SYSDG
+SELECT 'OBSERVER_LOGIN_' || 'OK|' || SYS_CONTEXT('USERENV','AUTHENTICATED_IDENTITY') FROM DUAL;
+EXIT;
+EOSQL
+) || true
+        if printf '%s\n' "$out" | grep -q '^OBSERVER_LOGIN_OK|'; then
+            resume_verbose_trace
+            log_info "${OBSERVER_USER} logs in AS SYSDG to ${alias} (after ${i} attempt(s))"
+            return 0
+        fi
+        [[ $i -lt $attempts ]] && sleep "$poll_secs"
+    done
+
+    [[ -n "${OBSERVER_PASSWORD:-}" ]] && out=${out//"$OBSERVER_PASSWORD"/********}
+    # ORA-/TNS- first: a failed CONNECT is followed by "SP2-0640: Not connected".
+    last=$(printf '%s\n' "$out" | grep -E '(ORA|TNS)-[0-9]+' | tail -1)
+    [[ -n "$last" ]] || last=$(printf '%s\n' "$out" | grep -E 'SP2-[0-9]+' | tail -1)
+    resume_verbose_trace
+    log_error "${OBSERVER_USER} cannot log in AS SYSDG to ${alias} after ${wait_secs}s: ${last:-no ORA- error in the output}"
+    return 1
 }
 
 # ============================================================
@@ -325,6 +383,9 @@ fi
 
 progress_step "Creating Observer User"
 
+# Set to 1 when this run knows the observer's password (new user or reset)
+OBSERVER_PW_HELD=0
+
 # Check if user already exists
 USER_EXISTS=$(sqlplus -s / as sysdba << EOF
 SET HEADING OFF FEEDBACK OFF VERIFY OFF
@@ -350,9 +411,11 @@ EOF
 )
     HAS_SYSDG=$(echo "$HAS_SYSDG" | tr -d ' \t\n\r')
 
+    SYSDG_GRANTED_NOW=0
     if [[ "$HAS_SYSDG" == "1" ]]; then
         log_info "User $OBSERVER_USER already has SYSDG privilege"
     else
+        SYSDG_GRANTED_NOW=1
         log_info "Granting SYSDG privilege to $OBSERVER_USER..."
         confirm_approval_action "Grant SYSDG and CREATE SESSION to observer user" "GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
         GRANT_RC=0
@@ -379,6 +442,17 @@ EOF
 
     if ! confirm_proceed "Do you want to reset the password for $OBSERVER_USER?"; then
         log_info "Keeping existing password for $OBSERVER_USER"
+        if [[ "$SYSDG_GRANTED_NOW" == "1" ]]; then
+            # Observed on 19.27 with a MOUNTED physical standby: the grant alone
+            # does not reach the standby's password file; a password change does.
+            log_warn "SYSDG was granted just now, and a GRANT alone does not reach a mounted standby's password file"
+            log_warn "${OBSERVER_USER} cannot log in to the standby until one of these is done:"
+            log_warn "  - re-run this step and answer yes to the password reset (the new password carries the entry to the standby), or"
+            log_warn "  - copy the primary's password file to the standby as \$ORACLE_HOME/dbs/orapw${STANDBY_ORACLE_SID:-<standby SID>}"
+        else
+            log_info "The observer's login to the standby is proven by step 10 (fsfo/observer.sh setup); on a standby-only ORA-01017,"
+            log_info "re-run this step and reset the password, or copy the primary's password file to the standby"
+        fi
     else
         pause_verbose_trace
         OBSERVER_PASSWORD=$(prompt_password "Enter new password for $OBSERVER_USER")
@@ -412,6 +486,7 @@ EOF
 
         resume_verbose_trace
         log_info "Password updated for $OBSERVER_USER"
+        OBSERVER_PW_HELD=1
     fi
 else
     # Prompt for password
@@ -438,7 +513,7 @@ else
 
     log_info "Creating user $OBSERVER_USER with SYSDG privilege..."
     log_cmd "sqlplus / as sysdba:" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***"
-    confirm_approval_action "Create observer user with SYSDG privilege" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***; GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER};" || exit 1
+    confirm_approval_action "Create observer user with SYSDG privilege" "CREATE USER ${OBSERVER_USER} IDENTIFIED BY ***; GRANT SYSDG TO ${OBSERVER_USER}; GRANT CREATE SESSION TO ${OBSERVER_USER}; ALTER USER ${OBSERVER_USER} IDENTIFIED BY *** (same password again, so the entry reaches the standby's password file);" || exit 1
     CREATE_RC=0
     RESULT=$(sqlplus -s / as sysdba << EOF
 WHENEVER SQLERROR EXIT SQL.SQLCODE
@@ -457,6 +532,31 @@ EOF
         fail_observer_sql "Failed to create user $OBSERVER_USER with SYSDG" "$RESULT" "$CREATE_RC"
     fi
 
+    # Observed on 19.27 with a MOUNTED physical standby: CREATE USER + GRANT
+    # SYSDG leave the standby's password file untouched, while a following
+    # ALTER USER ... IDENTIFIED BY (same password) writes the user there within
+    # seconds. (Working explanation, not from Oracle docs: a mounted standby
+    # cannot read the dictionary, so a grant marker alone gives it no password
+    # verifiers to build the entry from.) A failed ALTER is not fatal: the
+    # standby login check below decides.
+    log_info "Setting the password again so the user reaches the standby's password file..."
+    log_cmd "sqlplus / as sysdba:" "ALTER USER ${OBSERVER_USER} IDENTIFIED BY ***"
+    REPW_RC=0
+    RESULT=$(sqlplus -s / as sysdba << EOF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+SET DEFINE OFF HEADING OFF FEEDBACK OFF VERIFY OFF
+ALTER USER ${OBSERVER_USER} IDENTIFIED BY "${OBSERVER_PASSWORD}";
+SELECT 'SUCCESS' FROM DUAL;
+EXIT;
+EOF
+) || REPW_RC=$?
+    if [[ $REPW_RC -ne 0 ]] || ! echo "$RESULT" | grep -q "SUCCESS" || echo "$RESULT" | grep -Eq '(ORA|SP2)-[0-9]'; then
+        RESULT=${RESULT//"$OBSERVER_PASSWORD"/********}
+        log_warn "Could not set the password again (sqlplus exit code ${REPW_RC}): $(printf '%s\n' "$RESULT" | grep -E '(ORA|SP2)-[0-9]+' | tail -1)"
+        log_warn "The standby's password file will not receive ${OBSERVER_USER} until the password is changed to a NEW value"
+        log_warn "or the primary's password file is copied to the standby"
+    fi
+
     resume_verbose_trace
     HAS_SYSDG=$(observer_sysdg_count) || HAS_SYSDG=""
     if [[ "$HAS_SYSDG" != "1" ]]; then
@@ -466,7 +566,27 @@ EOF
     fi
 
     log_info "User $OBSERVER_USER created successfully with SYSDG"
-    log_info "Note: User will be replicated to standby via redo transport"
+    OBSERVER_PW_HELD=1
+fi
+
+# The observer completes a failover by logging in to the standby, so prove that
+# login now - before LogXptMode, the protection mode or FSFO are touched. Only
+# possible when this run holds the password (new user or password reset).
+if [[ "$OBSERVER_PW_HELD" == "1" ]]; then
+    if [[ "${DG_CONFIG_ROLES_SWAPPED:-0}" == "1" ]]; then
+        OBSERVER_PEER_ALIAS="$PRIMARY_TNS_ALIAS"
+    else
+        OBSERVER_PEER_ALIAS="$STANDBY_TNS_ALIAS"
+    fi
+    if ! prove_observer_standby_login "$OBSERVER_PEER_ALIAS"; then
+        log_error "Fast-Start Failover was NOT enabled: the observer would be rejected by ${OBSERVER_PEER_ALIAS}. Nothing after the user setup was changed."
+        log_error "A GRANT of SYSDG does not reach a mounted standby's password file by itself. Fix one of:"
+        log_error "  - set the observer user's password on the primary again, to a NEW value if the profile forbids reuse (re-run this step and answer"
+        log_error "    yes to the password reset; ALTER USER ${OBSERVER_USER} IDENTIFIED BY ... propagates the entry within seconds while redo apply runs), or"
+        log_error "  - copy the primary's password file to the standby as \$ORACLE_HOME/dbs/orapw${STANDBY_ORACLE_SID:-<standby SID>}"
+        log_error "Then re-run this step. Wait time: DG_OBSERVER_STANDBY_LOGIN_WAIT_SECS (default 30)."
+        exit 1
+    fi
 fi
 
 # Clear password from memory

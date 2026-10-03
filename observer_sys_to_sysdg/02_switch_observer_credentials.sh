@@ -510,11 +510,12 @@ if ! $PRIMARY_OK; then
     die_wallet_changed "Primary connection test failed - the wallet has already been changed."
 fi
 if ! $STANDBY_OK; then
-    log_error "STANDBY connection failed. Most likely the primary's password file"
-    log_error "change has not reached the standby (ORA-01017). Fix:"
+    log_error "STANDBY connection failed. Most likely the user is not in the standby's"
+    log_error "password file (ORA-01017): a GRANT of SYSDG does not reach a mounted standby"
+    log_error "by itself. Fix, then re-run this script - either set the user's password on the"
+    log_error "primary again (ALTER USER <user> IDENTIFIED BY ...; propagates within seconds"
+    log_error "while redo apply runs), or copy the primary's password file:"
     log_error "  primary>  scp \$ORACLE_HOME/dbs/orapw<PRIMARY_SID> standby:\$ORACLE_HOME/dbs/orapw<STANDBY_SID>"
-    log_error "then re-run this script. (On 12.2+ it propagates automatically while"
-    log_error "the standby is receiving redo - a long-disconnected standby will not have it.)"
     die_wallet_changed "Standby connection test failed - the wallet has already been changed; not restarting the observer with credentials the standby rejects (it could not follow a failover)."
 fi
 

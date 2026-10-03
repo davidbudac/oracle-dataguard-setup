@@ -84,10 +84,15 @@ keep the stock profile, schedule a password rotation *and* a wallet update.
 
 **Standby password file.** The observer must also log into the *standby* (that
 is how it completes a failover), and `AS SYSDG` logins on a mounted standby are
-authenticated purely against its password file. On 12.2+ a physical standby
-that is receiving redo picks up primary password-file changes automatically.
-Script 02's standby connection test proves whether it worked; if it didn't
-(long-disconnected standby, older version):
+authenticated purely against its password file. Verified on 19.27 with a
+MOUNTED physical standby: `CREATE USER` + `GRANT SYSDG` do **not** reach that
+file, while a following `ALTER USER <user> IDENTIFIED BY "<same password>"` does,
+within seconds, while redo apply is running. Script 01 therefore sets a new
+user's password a second time after the grants (a failure there is only a
+warning), and warns when it grants SYSDG to an existing user whose password you
+keep. Script 02's standby connection test proves the login; if it fails, set
+the user's password on the primary again (re-run script 01 and reset it) or copy
+the file:
 
 ```bash
 # names use each side's ORACLE_SID, which may differ
@@ -222,7 +227,7 @@ Everything the kit changes is reversible and backed up:
 
 | Symptom | Cause / fix |
 |---|---|
-| `ORA-01017` connecting to the **standby** only | Primary password-file change hasn't reached the standby. Copy `orapw<SID>` manually (see step 1) — mind the differing `ORACLE_SID`s in the filename. |
+| `ORA-01017` connecting to the **standby** only | The user is not in the standby's password file (a `GRANT SYSDG` alone does not reach a mounted standby). Set its password on the primary again (`ALTER USER <user> IDENTIFIED BY ...`, or re-run 01 and reset it), or copy `orapw<SID>` manually (see step 1) — mind the differing `ORACLE_SID`s in the filename. |
 | `ORA-01017` on **both** | Wrong password in the wallet, or the grant didn't land — re-run 01 and check `V$PWFILE_USERS`. |
 | `ORA-65096` creating the user | CDB needs a common user; accept the `C##` prefix that script 01 offers. |
 | `mkstore` rejects the wallet password | The old wallet's password is lost (common for wallets built by someone long gone). Script 02 offers a backup-and-rebuild. |

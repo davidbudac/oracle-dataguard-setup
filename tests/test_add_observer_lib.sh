@@ -667,6 +667,27 @@ show_obs obs_prim obs1.example.com "742 seconds ago" "1 second ago" > "$ST/show_
 OUT=$(run04 --tns stby); RC=$?
 assert_eq   "04 via a standby: judged on the target ping" "0" "$RC"
 
+# ------------------------------------------------------------
+echo "Test 11: 01 sets a new user's password again AFTER the grants (standby password file)"
+# ------------------------------------------------------------
+# Verified on 19.27 with a MOUNTED physical standby: create + grant do not
+# reach the standby's password file; a following ALTER USER ... IDENTIFIED BY
+# does. The password prompts need a TTY, so the SQL order is asserted on the
+# script text: create user -> grant sysdg -> alter user ... identified by.
+order_ok() {   # order_ok FILE: create < grant sysdg < alter user identified by
+    awk 'tolower($0) ~ /create user .*identified by/ && !c {c=NR}
+         c && tolower($0) ~ /^grant sysdg to/ && !g {g=NR}
+         g && tolower($0) ~ /alter user .*identified by/ && !a {a=NR}
+         END {exit !(c && g && a && c < g && g < a)}' "$1"
+}
+assert_true  "01_prepare_primary: create -> grant sysdg -> alter user identified by" order_ok "${KIT}/01_prepare_primary.sh"
+assert_true  "01_prepare_primary: a refused ALTER is a warning, not a die" \
+    grep -q 'Could not set the password again' "${KIT}/01_prepare_primary.sh"
+assert_false "01_prepare_primary: no 12.2+ 'picks up automatically' claim" \
+    grep -qi 'picks up' "${KIT}/01_prepare_primary.sh"
+assert_false "02_setup_observer_host: no 'propagates automatically' claim" \
+    grep -qi 'propagates automatically' "${KIT}/02_setup_observer_host.sh"
+
 echo
 echo "============================================================"
 echo "Results: ${PASS} passed, ${FAIL} failed"
