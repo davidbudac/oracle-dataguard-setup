@@ -38,7 +38,6 @@ trap_err
 log_step "03 DESCRIBE + STAGE non-CDB ${SOURCE_DB_NAME}"
 
 require_state noncdb_quiesced 02_quiesce_noncdb.sh
-clear_state describe_done stage_datafile_count stage_total_bytes create_pdb_done plug_done verify_done verify_failures
 
 # ---- 0. Sanity: the non-CDB must be OPEN READ ONLY -------------------------
 SRC_OPEN_MODE="$(sql_scalar "$SOURCE_ORACLE_SID" "SELECT open_mode FROM v\$database;")"
@@ -46,6 +45,11 @@ if [[ "$SRC_OPEN_MODE" != "READONLY" ]]; then
     log_error "Source non-CDB must be OPEN READ ONLY (got '${SRC_OPEN_MODE}'). Run 02_quiesce_noncdb.sh first."
     exit 1
 fi
+
+# Start of a new attempt (after the refusal above, which changes nothing):
+# the manifest and the stage are rebuilt from here on, so this step's and every
+# later step's flags are stale.
+clear_state describe_done stage_datafile_count stage_total_bytes create_pdb_done plug_done verify_done verify_failures
 
 # ---- 1. Generate the unplug manifest ---------------------------------------
 log_info "Calling DBMS_PDB.DESCRIBE -> ${MIGRATE_MANIFEST}"

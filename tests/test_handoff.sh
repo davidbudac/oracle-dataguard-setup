@@ -16,7 +16,8 @@
 #   DGSTUB_APPLY_INFO  "applied|received" (default 412|412)
 #   DGSTUB_GAPS        V$ARCHIVE_GAP count (default 0)
 #   DGSTUB_FSFO        "off" -> FSFO disabled
-#   DGSTUB_TRIGGER     role-trigger status row (default 1|2|2|SYS)
+#   DGSTUB_TRIGGER     role-trigger status row: ready-count|ready-owners|all-owners|detail
+#                      (default 1|SYS|SYS|SYS spec=VALID,body=VALID,chg=OK,startup=OK)
 #   DGSTUB_EXTRA_SVC   name of a second USER service to report
 #   DGSTUB_APPLY_LAG   broker Apply Lag text (default "3 seconds")
 #   DGSTUB_CFG         "error" -> SHOW CONFIGURATION reports ERROR + ORA-16810;
@@ -157,7 +158,7 @@ fsfo_status)
         echo "TARGET UNDER LAG LIMIT|YES|obs1.example.com"
     fi
     ;;
-role_trigger_status)  echo "${DGSTUB_TRIGGER:-1|2|2|SYS}" ;;
+role_trigger_status)  echo "${DGSTUB_TRIGGER:-1|SYS|SYS|SYS spec=VALID,body=VALID,chg=OK,startup=OK}" ;;
 local_listener)       echo "(ADDRESS=(PROTOCOL=TCP)(HOST=pri.example.com)(PORT=1521))" ;;
 is_cdb)               echo "YES" ;;
 db_version_full)      echo "19.23.0.0.0" ;;
@@ -399,10 +400,64 @@ assert_eq "broker config error rc" "2" "$RC"
 assert_contains "broker config verdict" "$MDC" "**Verdict:** ERROR"
 assert_contains "broker config note" "$MDC" "Broker Configuration Status is ERROR"
 
-DGSTUB_TRIGGER="0|0|0|NONE" run_handoff v_trg
+DGSTUB_TRIGGER="0|NONE|NONE|NONE" run_handoff v_trg
 assert_eq "role trigger rc" "1" "$RC"
-assert_contains "role trigger note" "$MDC" "Role-aware service trigger is not deployed/enabled"
+assert_contains "role trigger note" "$MDC" "Role-aware service trigger is not deployed and valid: the DG_SERVICE_MGR package and both triggers are not deployed"
+assert_contains "role trigger note carries an action" "$MDC" "— run trigger/create_role_trigger.sh"
 assert_contains "role trigger status row" "$MDC" "| Role trigger ready | NO (NONE) |"
+assert_contains "role trigger problem row" "$MDC" "| Role trigger problem | the DG_SERVICE_MGR package and both triggers are not deployed |"
+
+# Finding 9: readiness needs ONE owner with a VALID package spec AND body and
+# both triggers ENABLED and VALID. Each case below is a stub answer in the
+# "ready-count|ready-owners|all-owners|detail" layout.
+echo "Test: role-trigger readiness predicates"
+trigger_case() {
+    # $1 label, $2 stub row, $3 expected READY (YES/NO), $4 fragment expected in the problem text ('' = none)
+    DGSTUB_TRIGGER="$2" run_handoff "v_trg_$1"
+    assert_contains "trigger case $1: status row" "$MDC" "| Role trigger ready | $3 ("
+    if [[ "$3" == "YES" ]]; then
+        assert_eq "trigger case $1: healthy rc" "0" "$RC"
+        assert_not_contains "trigger case $1: no trigger verdict note" "$MDC" "Role-aware service trigger is not deployed and valid"
+        assert_not_contains "trigger case $1: no trigger warning" "$MDC" "role-aware service objects are not deployed and valid"
+        assert_contains "trigger case $1: deployed-and-valid wording" "$MDC" "deployed and valid under"
+    else
+        assert_eq "trigger case $1: rc is WARNING" "1" "$RC"
+        assert_contains "trigger case $1: verdict note" "$MDC" "Role-aware service trigger is not deployed and valid: "
+        assert_contains "trigger case $1: problem text" "$MDC" "$4"
+        assert_contains "trigger case $1: action attached" "$MDC" "trigger/create_role_trigger.sh"
+    fi
+}
+trigger_case invalid_body "0|NONE|SYS|SYS spec=VALID,body=INVALID,chg=OK,startup=OK" NO "package body not VALID (INVALID)"
+trigger_case invalid_trg  "0|NONE|SYS|SYS spec=VALID,body=VALID,chg=OK,startup=INVALID" NO "trigger TRG_MANAGE_SERVICES_STARTUP invalid"
+trigger_case disabled_trg "0|NONE|SYS|SYS spec=VALID,body=VALID,chg=DISABLED,startup=OK" NO "trigger TRG_MANAGE_SERVICES_ROLE_CHG disabled"
+trigger_case missing_trg  "0|NONE|SYS|SYS spec=VALID,body=VALID,chg=OK,startup=MISSING" NO "trigger TRG_MANAGE_SERVICES_STARTUP missing"
+trigger_case missing_body "0|NONE|SYS|SYS spec=VALID,body=MISSING,chg=OK,startup=OK" NO "package body missing"
+trigger_case split_owners "0|NONE|DG_ADMIN,SYS|DG_ADMIN spec=MISSING,body=MISSING,chg=OK,startup=OK;SYS spec=VALID,body=VALID,chg=MISSING,startup=MISSING" NO "objects are split across owners"
+assert_contains "trigger split case names each owner" "$MDC" "DG_ADMIN (package spec missing, package body missing)"
+trigger_case both_variants "2|DG_ADMIN,SYS|DG_ADMIN,SYS|DG_ADMIN spec=VALID,body=VALID,chg=OK,startup=OK;SYS spec=VALID,body=VALID,chg=OK,startup=OK" NO "more than one owner (DG_ADMIN,SYS)"
+trigger_case sys_ok       "1|SYS|SYS|SYS spec=VALID,body=VALID,chg=OK,startup=OK" YES ""
+assert_contains "trigger sys case: owner shown" "$MDC" "| Role trigger ready | YES (SYS) |"
+trigger_case dedicated_ok "1|DG_ADMIN|DG_ADMIN|DG_ADMIN spec=VALID,body=VALID,chg=OK,startup=OK" YES ""
+assert_contains "trigger dedicated case: owner shown" "$MDC" "| Role trigger ready | YES (DG_ADMIN) |"
+trigger_case ok_plus_leftover "1|SYS|DG_ADMIN,SYS|DG_ADMIN spec=MISSING,body=MISSING,chg=INVALID,startup=MISSING;SYS spec=VALID,body=VALID,chg=OK,startup=OK" YES ""
+assert_contains "trigger leftover case: leftover note" "$MDC" "other owners also hold incomplete role-trigger objects (DG_ADMIN ("
+
+# A failed status query degrades to a discovery warning and is never "ready".
+DGSTUB_FAIL_TAGS="role_trigger_status" run_handoff v_trg_fail
+assert_eq "trigger query failure rc" "1" "$RC"
+assert_contains "trigger query failure: discovery warning" "$MDC" "role-aware service trigger status"
+assert_contains "trigger query failure: not ready" "$MDC" "| Role trigger ready | NO (unknown) |"
+assert_contains "trigger query failure: problem" "$MDC" "the object status could not be read"
+
+# The JSON sidecar keeps its key names, and a healthy unchanged installation
+# produces no "Role trigger ready" entry in Changes Since Last Report.
+run_handoff v_trg_json
+run_handoff v_trg_json
+assert_contains "trigger json: key kept" "$JSONC" '"role_trigger_ready": true'
+assert_contains "trigger json: owners key kept" "$JSONC" '"trigger_owners": "SYS"'
+assert_not_contains "trigger json: no spurious diff" "$MDC" "| Role trigger ready | true"
+DGSTUB_TRIGGER="0|NONE|SYS|SYS spec=VALID,body=INVALID,chg=OK,startup=OK" run_handoff v_trg_json
+assert_contains "trigger json: a real regression is diffed" "$MDC" "| Role trigger ready | true | false |"
 
 DGSTUB_ROLE=standby run_handoff v_stb
 assert_eq "standby role rc" "1" "$RC"

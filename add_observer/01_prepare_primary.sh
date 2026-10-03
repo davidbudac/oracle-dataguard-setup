@@ -680,7 +680,7 @@ you. Install one of the starters it prints:
 ## Day-to-day
 
 \`\`\`bash
-./03_observer_ctl.sh status        # broker's view + local process
+./03_observer_ctl.sh status        # registered? pinging? process alive? (exit 0 = live)
 ./03_observer_ctl.sh log           # tail the observer log
 ./03_observer_ctl.sh restart
 ./03_observer_ctl.sh stop

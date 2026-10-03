@@ -39,7 +39,7 @@ it must reach **both** listeners.
 | `01_prepare_primary.sh` | **PRIMARY** | Discovers the topology, reports FSFO readiness, creates the dedicated `SYSDG` observer user, optionally enables FSFO, and writes the bundle for the third host. |
 | `02_setup_observer_host.sh` | **THIRD host** | Installs the TNS entries, builds the auto-login wallet, configures `sqlnet.ora`, and proves connectivity to **both** databases. |
 | `03_observer_ctl.sh` | **THIRD host** | `start` / `stop` / `restart` / `status` / `log` / `boot` (prints a systemd unit and a cron `@reboot` line for Linux, an `inittab`/`rc2.d` entry for AIX, and a watchdog cron line). |
-| `04_verify_observer.sh` | anywhere | End-state verification, including a check that the observer is *not* on a database host. Exit 0 = verified. |
+| `04_verify_observer.sh` | anywhere | End-state verification, including a check that the observer is *not* on a database host and that *this* observer (not just any) is live. Exit 0 = verified. |
 | `_lib.sh` | — | Shared helpers sourced by the numbered scripts. |
 
 All passwords are prompted at runtime — never accepted via argv, env, or files.
@@ -184,11 +184,33 @@ opens its own connection instead of inheriting the `dgmgrl` session's. Named
 observers need a 12.2+ broker configuration; on an older one the script retries
 without the name rather than leaving you with nothing.
 
-Then it polls `V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT` until the *primary*
-confirms the observer — a local process is not evidence.
+Then it polls until this observer is **live**, which is more than being
+listed: the broker keeps a crashed observer registered. Live means all of
 
-Verification passes when `FS_FAILOVER_OBSERVER_PRESENT = YES` **and**
-`FS_FAILOVER_STATUS` is `SYNCHRONIZED` (or `TARGET UNDER LAG LIMIT` in
+* `SHOW OBSERVER` lists it (by name, else by host);
+* *its own* block's `Last Ping to Primary` is at most `DG_OBS_MAX_PING_AGE`
+  seconds old (default 60; `(unknown)` counts as not live). Another observer's
+  healthy ping never counts. When the primary alias does not answer and the
+  session goes through the standby alias, the fresher of the block's primary and
+  target pings is used — after a failover that alias *is* the primary;
+* the `dgmgrl` process recorded in `<dir>/fsfo_<PRIMARY>.pid` (written by
+  `start`) is still running. Without a pidfile (observer started by hand) or
+  without `ps`, this part is not checked and the ping decides.
+
+Only when `SHOW OBSERVER` cannot be read at all does it fall back to the
+primary's `FS_FAILOVER_OBSERVER_PRESENT`, and it says so: that flag is weaker
+evidence, because it reports *an* observer, not which one.
+
+If this observer is registered but not live (crashed, killed, hung), `start`
+restarts it in place: it kills the leftover process — only a pidfile PID that is
+verified to be this configuration's `dgmgrl` observer — and issues the same
+`START OBSERVER` with the same `FILE IS` (the existing `.dat` state file is
+reused, never deleted). If the broker refuses because the stale registration
+still holds the name, it runs `STOP OBSERVER <that name>` and retries once.
+
+Verification passes when this observer is live (same rule, judged on the ping
+to whichever database `04` is connected to), `FS_FAILOVER_OBSERVER_PRESENT = YES`
+**and** `FS_FAILOVER_STATUS` is `SYNCHRONIZED` (or `TARGET UNDER LAG LIMIT` in
 `MAXIMUM PERFORMANCE` mode). Anything else — `UNSYNCHRONIZED`,
 `TARGET OVER LAG LIMIT`, `STALLED` — means no automatic failover would happen
 right now, and `04_verify_observer.sh` exits 1.
@@ -208,10 +230,15 @@ systemd unit and a cron `@reboot` line (Linux), an `mkitab` entry and an
 and a five-minute watchdog that restarts a dead observer. The watchdog spells
 the minutes out (`0,5,10,...,55`) so it is valid on AIX too, and the generated
 lines export `ORACLE_HOME`, `TNS_ADMIN`, `LIBPATH` and `LD_LIBRARY_PATH` because
-cron and init skip `.profile`. `03_observer_ctl.sh status` exits 0 only when the
-broker lists *this* observer (by name, else by host), so it is safe to drive a
-restart from; it falls back to the standby alias when the primary does not
-answer, so the watchdog keeps working after a failover.
+cron and init skip `.profile` (plus `DG_OBS_MAX_PING_AGE` when you run `boot`
+with a non-default value). `03_observer_ctl.sh status` exits 0 only when *this*
+observer is live as defined in step 4 — registered, pinging within
+`DG_OBS_MAX_PING_AGE` seconds, process alive — and prints the three separately
+(e.g. `registered: yes`, `last ping to primary: 742 s ago (stale, limit 60 s)`,
+`local process: not running`), so a crashed observer that the broker still lists
+makes the watchdog run `start`, which restarts it with its existing state file.
+It falls back to the standby alias when the primary does not answer, so the
+watchdog keeps working after a failover.
 
 Alert on it as well:
 
@@ -222,7 +249,7 @@ select fs_failover_observer_present from v$database;   -- expect YES
 ## Day-to-day
 
 ```bash
-./03_observer_ctl.sh status     # broker's view + this host's process
+./03_observer_ctl.sh status     # broker's view + registration / ping / process
 ./03_observer_ctl.sh log -f     # follow the observer's own log
 ./03_observer_ctl.sh restart
 ./03_observer_ctl.sh stop
@@ -279,6 +306,7 @@ Everything is reversible:
 | Observer starts, then `04` says `FS_FAILOVER_STATUS = UNSYNCHRONIZED` | The observer is fine; the *configuration* is not ready to fail over. Fix the redo gap / apply lag. |
 | `SHOW OBSERVER` names a host you did not expect | Another observer is registered (an old one on the standby host, or something in cron). Stop it there, then start yours. |
 | Observer vanished after a reboot | Nothing restarts it by default. Run `./03_observer_ctl.sh boot`. |
+| `status`: `registered: yes` but `last ping ... (stale ...)` | The observer crashed or hangs; the broker keeps it listed. `./03_observer_ctl.sh start` restarts it with its existing state file (and deregisters the stale entry if needed). A slow network can legitimately age pings: raise `DG_OBS_MAX_PING_AGE`. |
 
 ## FAQ
 
@@ -296,7 +324,8 @@ Yes, on 12.2+: up to three can be registered per configuration, one of them the
 master (`SET MASTEROBSERVER TO <name>`). Run script 02 on each additional host
 and give each a distinct `--observer-name`. `03_observer_ctl.sh start` checks
 for *this* observer (by name, else by host) in `SHOW OBSERVER`, so an observer
-already running elsewhere does not stop another host from adding its own;
+already running elsewhere does not stop another host from adding its own — and
+its healthy ping never stands in for a dead one here;
 `restart` waits for the broker to drop this observer before starting again. The observer *user* and wallet
 approach are identical.
 

@@ -6,8 +6,13 @@
 # queries (dispatching on the SQL text) and a stub `dgmgrl` under
 # $ORACLE_HOME/bin answers the DGConnectIdentifier lookup. Steered by env:
 #   STUB_ORL         largest online redo log in MB (default 200; empty/0 =
-#                    unreadable)
+#                    unreadable; the stub answers in exact bytes)
+#   STUB_ORL_BYTES   same, in exact bytes (wins over STUB_ORL)
 #   STUB_SRL_MB      size of every existing SRL in MB (default 200)
+#   STUB_SRL_BYTES   same, in exact bytes (wins over STUB_SRL_MB)
+#   STUB_UNASSIGNED  "count:min_bytes" of the THREAD#=0 SRL pool (default 0:0)
+#   STUB_SRL_COUNT   number of existing SRL groups on thread 1 (default 4 =
+#                    the N+1 the stub's 3 ORL groups require)
 #   STUB_PEERS       comma-separated peer DB_UNIQUE_NAMEs the local database
 #                    reports from V$DATAGUARD_CONFIG (default CDB1_STBY)
 #   STUB_GOOD_ALIAS  space-separated aliases a peer CONNECT succeeds for
@@ -86,6 +91,14 @@ if [[ "$local_side" == "NO" ]]; then
     for a in ${STUB_GOOD_ALIAS-CDB1_STBY}; do [[ "$a" == "$alias_used" ]] && ok="YES"; done
     if [[ "$ok" == "NO" ]]; then echo "ORA-12154: TNS:could not resolve" >&2; exit 1; fi
 fi
+# mb_to_bytes VALUE -> VALUE * 1048576 when numeric, else VALUE untouched
+# (an unreadable size must stay unreadable).
+mb_to_bytes() {
+    case "$1" in
+        ''|*[!0-9]*) printf '%s' "$1" ;;
+        *) printf '%s' $(( $1 * 1048576 )) ;;
+    esac
+}
 case "$IN" in
 *"SELECT 'OK' FROM DUAL"*)
     echo "OK" ;;
@@ -94,11 +107,11 @@ case "$IN" in
 *"MAX(GROUP#)"*)
     echo "20" ;;
 *"FROM V\$THREAD"*)
-    printf '\t1:3:4:%s\n' "${STUB_SRL_MB-200}" ;;
+    printf '\t1:3:%s:%s\n' "${STUB_SRL_COUNT-4}" "${STUB_SRL_BYTES:-$(mb_to_bytes "${STUB_SRL_MB-200}")}" ;;
 *"NVL(THREAD#,0)=0"*)
-    echo "0:0" ;;
+    echo "${STUB_UNASSIGNED-0:0}" ;;
 *"MAX(BYTES)"*)
-    printf '\t%s\n' "${STUB_ORL-200}" ;;
+    printf '\t%s\n' "${STUB_ORL_BYTES:-$(mb_to_bytes "${STUB_ORL-200}")}" ;;
 *"db_create_file_dest"*)
     echo "NO" ;;
 *"TYPE='STANDBY'"*)
@@ -192,7 +205,61 @@ run_script -L
 unset STUB_SRL_MB
 assert_eq "smaller SRL rc" "1" "$RC"
 assert_contains "smaller SRL finding" "$OUT" "smaller than 200 MB"
-assert_contains "smaller SRL query" "$OUT" "WHERE BYTES/1024/1024 < 200;"
+assert_contains "smaller SRL query" "$OUT" "WHERE BYTES < 209715200;"
+
+# ==== Test 6b: exact byte comparison (finding 14) ====
+echo "Test 6b: SRL size is compared in exact bytes, never truncated to MiB"
+ORL_100_5=105381888      # 100.5 MiB
+MIB_100=104857600        # 100 MiB
+MIB_101=105906176        # 101 MiB
+# the review's reproduction: 100.5 MiB ORLs, 100 MiB SRLs (used to print OK)
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$MIB_100 run_script -L
+assert_eq "100.5 MiB ORL vs 100 MiB SRL rc" "1" "$RC"
+assert_contains "fractional case is ACTION REQUIRED" "$OUT" "Result: ACTION REQUIRED"
+assert_contains "fractional case flags undersized SRL" "$OUT" "smaller than $ORL_100_5 bytes"
+assert_contains "fractional case: ORL shown exactly" "$OUT" "Max online redo log size : $ORL_100_5 bytes"
+assert_contains "fractional case: DDL size is rounded up" "$OUT" "New SRL size (DDL)       : 101 MB"
+assert_contains "fractional case: recreate DDL uses the rounded-up size" "$OUT" "SIZE 101M;"
+assert_not_contains "fractional case: no truncated 100M DDL" "$OUT" "SIZE 100M"
+assert_contains "fractional case: size query is in bytes" "$OUT" "WHERE BYTES < $ORL_100_5;"
+# an SRL deficit with a fractional ORL emits DDL at least as large as the ORL
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$MIB_101 run_script -L
+assert_eq "101 MiB SRL vs 100.5 MiB ORL rc" "0" "$RC"
+assert_contains "larger SRL passes (fractional ORL)" "$OUT" "Result: OK"
+# exact equal passes, 1 byte smaller fails, larger passes
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$ORL_100_5 run_script -L
+assert_eq "exactly equal bytes rc" "0" "$RC"
+assert_contains "exactly equal bytes is OK" "$OUT" "Result: OK"
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$((ORL_100_5 - 1)) run_script -L
+assert_eq "1 byte smaller rc" "1" "$RC"
+assert_contains "1 byte smaller is a finding" "$OUT" "Result: ACTION REQUIRED"
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$((ORL_100_5 + 1)) run_script -L
+assert_eq "1 byte larger rc" "0" "$RC"
+# whole-MiB sizes keep the plain "N MB" wording and DDL
+STUB_ORL_BYTES=$MIB_100 STUB_SRL_BYTES=$((MIB_100 - 1)) run_script -L
+assert_eq "whole-MiB ORL, SRL 1 byte smaller rc" "1" "$RC"
+assert_contains "whole-MiB ORL label" "$OUT" "Max online redo log size : 100 MB"
+assert_contains "whole-MiB ORL DDL" "$OUT" "SIZE 100M;"
+assert_not_contains "whole-MiB ORL needs no rounding note" "$OUT" "New SRL size (DDL)"
+# a missing-SRL deficit: the generated ADD STANDBY LOGFILE is >= the ORL
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_BYTES=$ORL_100_5 STUB_SRL_COUNT=1 run_script -L
+assert_eq "SRL deficit rc" "1" "$RC"
+DDL_MB=$(printf '%s\n' "$OUT" | sed -n 's/.*ADD STANDBY LOGFILE THREAD 1 GROUP [0-9]* (.*) SIZE \([0-9][0-9]*\)M;.*/\1/p' | head -1)
+assert_eq "deficit DDL emitted at the rounded-up size" "101" "$DDL_MB"
+if [[ -n "$DDL_MB" && $((DDL_MB * 1048576)) -ge $ORL_100_5 ]]; then
+    echo "  PASS: deficit DDL size ($DDL_MB MiB) >= ORL bytes"; PASS=$((PASS + 1))
+else
+    echo "  FAIL: deficit DDL size ($DDL_MB MiB) < ORL bytes"; FAIL=$((FAIL + 1))
+fi
+# the THREAD#=0 pool is graded on exact bytes too
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_COUNT=0 STUB_UNASSIGNED="4:$ORL_100_5" run_script -L
+assert_eq "THREAD#=0 pool of equal size rc" "0" "$RC"
+STUB_ORL_BYTES=$ORL_100_5 STUB_SRL_COUNT=0 STUB_UNASSIGNED="4:$((ORL_100_5 - 1))" run_script -L
+assert_eq "THREAD#=0 pool 1 byte smaller rc" "1" "$RC"
+# sizes beyond NUMWIDTH digits are carried as plain digit strings
+STUB_ORL_BYTES=21474836480 STUB_SRL_BYTES=21474836480 run_script -L
+assert_eq "20 GiB logs rc" "0" "$RC"
+assert_contains "20 GiB label" "$OUT" "at least 20480 MB."
 
 # ==== Test 7: peer alias resolution (M24) ====
 echo "Test 7: the peer is reached through its DGConnectIdentifier"

@@ -32,8 +32,18 @@ trap_err
 log_step "02 QUIESCE non-CDB ${SOURCE_DB_UNIQUE_NAME}"
 
 require_state preflight_ok 01_preflight.sh
-clear_state noncdb_quiesced quiesce_scn describe_done create_pdb_done plug_done verify_done verify_failures
 assert_source_identity "READWRITE|READONLY" || exit 1
+
+# begin_attempt  -  clear this step's and every later step's flags. Called just
+# before the first change, never before a refusal that leaves the system as it
+# was (identity check above, operator decline, lag re-check on a source that is
+# already READ ONLY): a refused re-run must not wipe a later step's state.
+ATTEMPT_STARTED=false
+begin_attempt() {
+    [[ "$ATTEMPT_STARTED" == "true" ]] && return 0
+    clear_state noncdb_quiesced quiesce_scn describe_done create_pdb_done plug_done verify_done verify_failures
+    ATTEMPT_STARTED=true
+}
 
 # wait_standby_drained <max attempts>  -  0 once apply AND transport lag of the
 # non-CDB standby read 0 seconds, 1 on timeout. The attempt loop is a poll, so a
@@ -63,6 +73,8 @@ ALREADY_RO=false
 if [[ "$ALREADY_RO" == "true" ]]; then
     log_info "Source non-CDB is already OPEN READ ONLY - skipping the log switch and restart."
 else
+    # The source is READ WRITE, so whatever a later step recorded is stale.
+    begin_attempt
     # ---- 1. Force a log switch and wait for standby to catch up ----------------
     log_info "Forcing log switches on the non-CDB primary ..."
     run_sql "$SOURCE_ORACLE_SID" "
@@ -97,9 +109,9 @@ fi
 log_success "non-CDB ${SOURCE_DB_NAME} is now OPEN READ ONLY"
 
 # Final SCN baseline (after RO open, no further changes)
-SRC_SCN="$(sql_scalar "$SOURCE_ORACLE_SID" "SELECT current_scn FROM v\$database;")"
+# (TO_CHAR: a bare NUMBER wider than NUMWIDTH prints in scientific notation.)
+SRC_SCN="$(sql_scalar "$SOURCE_ORACLE_SID" "SELECT TO_CHAR(current_scn) FROM v\$database;")"
 log_info "Source SCN at quiesce: ${SRC_SCN}"
-record_state "quiesce_scn" "$SRC_SCN"
 
 # ---- 3. Drain & stop apply on the non-CDB standby --------------------------
 # The shutdown/reopen above generated redo; stopping apply before the standby
@@ -113,6 +125,8 @@ if ! wait_standby_drained 36; then
     log_error "and re-run this step (it resumes here when the source is already READ ONLY)."
     exit 1
 fi
+begin_attempt
+record_state "quiesce_scn" "$SRC_SCN"
 log_info "Stopping redo apply on the non-CDB standby ..."
 run_dgmgrl "$SOURCE_ORACLE_SID" "EDIT DATABASE '${SOURCE_STANDBY_UNIQUE_NAME}' SET STATE='APPLY-OFF';" | tee_into_log
 

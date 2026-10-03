@@ -5,8 +5,14 @@
 #     (DG_SCRIPT_FLAGS / DG_SCRIPT_POSITIONAL), value flags
 #   - pause_verbose_trace / resume_verbose_trace nesting, prompt_password
 #   - dgmgrl_status_value / dgmgrl_has_error_lines (19c SHOW CONFIGURATION)
-#   - hostnames_match (IPv4 handling), create_temp_dir, get_db_parameter,
-#     dg_net_admin_dir, dg_sqlplus_bin
+#   - hostnames_match (IPv4 handling), get_db_parameter, dg_net_admin_dir,
+#     dg_sqlplus_bin
+#   - create_temp_dir: no-mktemp and failing-mktemp fallback, two live
+#     allocations, pre-existing dirs/symlinks skipped, nested use by
+#     add_sid_to_listener (finding 7)
+#   - compare_db_identity / assert_db_matches_config, dgmgrl_config_members /
+#     dgmgrl_foreign_members, and steps 4/6 end to end with stubbed
+#     sqlplus/dgmgrl: a mismatched database makes no mutating call (finding 2)
 # Usage: ./tests/test_shared_helpers.sh
 # ============================================================
 
@@ -398,28 +404,145 @@ check "create_temp_dir returns a directory" t_temp_dir_basic
 
 # A PATH without mktemp but with the few tools the fallback needs
 mkdir -p "$TEST_DIR/nomktemp_bin" "$TEST_DIR/tmpbase"
-for _tool in mkdir ls; do
+for _tool in mkdir ls rmdir; do
     ln -s "$(command -v $_tool)" "$TEST_DIR/nomktemp_bin/$_tool"
 done
+# The same tools plus an installed-but-broken mktemp that writes junk to
+# stdout and exits 1
+mkdir -p "$TEST_DIR/badmktemp_bin"
+for _tool in mkdir ls rmdir; do
+    ln -s "$(command -v $_tool)" "$TEST_DIR/badmktemp_bin/$_tool"
+done
+printf '#!/bin/sh\necho /junk/from/mktemp\nexit 1\n' > "$TEST_DIR/badmktemp_bin/mktemp"
+chmod 755 "$TEST_DIR/badmktemp_bin/mktemp"
+
+mode_is_700() { [[ "$(ls -ld "$1" | cut -c1-10)" == "drwx------" ]]; }
 
 t_fallback_creates_700() {
     local d
     d=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$TEST_DIR/tmpbase" create_temp_dir) || return 1
-    [[ -d "$d" ]] && [[ "$(ls -ld "$d" | cut -c1-10)" == "drwx------" ]]
+    [[ -d "$d" && "$d" == "$TEST_DIR/tmpbase/"* ]] && mode_is_700 "$d"
 }
 check "fallback creates a mode-700 directory" t_fallback_creates_700
 
-t_fallback_refuses_existing() {
-    # the fallback name is dg_tmp_<pid of this shell>; pre-create it (wrong mode)
-    mkdir -p "$TEST_DIR/tmpbase2/dg_tmp_$$"
-    chmod 755 "$TEST_DIR/tmpbase2/dg_tmp_$$"
-    local d
-    if d=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$TEST_DIR/tmpbase2" create_temp_dir); then
-        return 1
-    fi
-    [[ -z "$d" ]]
+t_fallback_two_live() {
+    # Finding 7: two allocations alive at once in ONE shell ($$ identical
+    # in both command substitutions) must get two distinct directories
+    local d1 d2
+    d1=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$TEST_DIR/tmpbase" create_temp_dir) || return 1
+    d2=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$TEST_DIR/tmpbase" create_temp_dir) || return 1
+    [[ -n "$d1" && -n "$d2" && "$d1" != "$d2" && -d "$d1" && -d "$d2" ]] || return 1
+    mode_is_700 "$d1" && mode_is_700 "$d2" || return 1
+    # cleanup removes both, contents included
+    touch "$d1/f" "$d2/f"
+    rm -rf "$d1" "$d2"
+    [[ ! -e "$d1" && ! -e "$d2" ]]
 }
-check "fallback refuses a pre-existing directory" t_fallback_refuses_existing
+check "fallback (no mktemp): two live allocations are distinct, both 700, cleanable" t_fallback_two_live
+
+t_failing_mktemp_two_live() {
+    local d1 d2
+    d1=$(PATH="$TEST_DIR/badmktemp_bin" TMPDIR="$TEST_DIR/tmpbase" create_temp_dir) || return 1
+    d2=$(PATH="$TEST_DIR/badmktemp_bin" TMPDIR="$TEST_DIR/tmpbase" create_temp_dir) || return 1
+    [[ "$d1" != *junk* && "$d2" != *junk* ]] || return 1
+    [[ "$d1" == "$TEST_DIR/tmpbase/dg_tmp_"* && "$d2" == "$TEST_DIR/tmpbase/dg_tmp_"* && "$d1" != "$d2" ]] || return 1
+    mode_is_700 "$d1" && mode_is_700 "$d2" || return 1
+    rm -rf "$d1" "$d2"
+}
+check "installed-but-failing mktemp falls through to the fallback, no stdout leak" t_failing_mktemp_two_live
+
+t_fallback_skips_existing() {
+    # Predictable candidates: 1 = an existing directory (ours, even mode
+    # 700), 2 = a symlink to a directory, 3 = a dangling symlink, 4 = free.
+    # None of the existing paths may be reused or written through.
+    local base="$TEST_DIR/tmpbase3" d
+    mkdir -p "$base/target"
+    mkdir -m 700 "$base/cand_1"
+    ln -s "$base/target" "$base/cand_2"
+    ln -s "$base/nowhere" "$base/cand_3"
+    d=$(
+        _dg_temp_dir_candidate() { printf '%s/cand_%s\n' "$1" "$2"; }
+        PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$base" create_temp_dir
+    ) || return 1
+    [[ "$d" == "$base/cand_4" && -d "$d" && ! -L "$d" ]] || return 1
+    mode_is_700 "$d" || return 1
+    # the pre-existing entries are untouched
+    [[ -L "$base/cand_2" && -L "$base/cand_3" && ! -e "$base/nowhere" ]] || return 1
+    [[ -z "$(ls -A "$base/target")" && -z "$(ls -A "$base/cand_1")" ]]
+}
+check "fallback skips a pre-existing directory and symlinks, never reuses them" t_fallback_skips_existing
+
+t_fallback_bounded() {
+    # every candidate collides: give up (non-zero, nothing on stdout)
+    local base="$TEST_DIR/tmpbase4" d rc=0
+    mkdir -p "$base/taken"
+    d=$(
+        _dg_temp_dir_candidate() { printf '%s/taken\n' "$1"; }
+        PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$base" create_temp_dir
+    ) || rc=$?
+    [[ $rc -ne 0 && -z "$d" ]]
+}
+check "fallback gives up after a bounded number of collisions" t_fallback_bounded
+
+t_fallback_unwritable_base() {
+    # a base that cannot be written fails at once rather than retrying
+    local d rc=0
+    d=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$TEST_DIR/no_such_base" create_temp_dir) || rc=$?
+    [[ $rc -ne 0 && -z "$d" ]]
+}
+check "fallback fails (nothing on stdout) when the base directory is unusable" t_fallback_unwritable_base
+
+t_fallback_listener_nested() {
+    # Finding 7 acceptance: the caller (step 4) holds one fallback temp dir
+    # while add_sid_to_listener allocates its own; the insert must succeed
+    local base="$TEST_DIR/tmpbase5" outer lf sd
+    mkdir -p "$base"
+    outer=$(PATH="$TEST_DIR/nomktemp_bin" TMPDIR="$base" create_temp_dir) || return 1
+    lf="$TEST_DIR/listener_nested.ora"
+    sd="$outer/sid_desc"
+    cat > "$lf" <<'LEOF'
+LISTENER =
+  (DESCRIPTION_LIST =
+    (DESCRIPTION =
+      (ADDRESS = (PROTOCOL = TCP)(HOST = pri)(PORT = 1521))
+    )
+  )
+
+SID_LIST_LISTENER =
+  (SID_LIST =
+    (SID_DESC =
+      (GLOBAL_DBNAME = other)
+      (ORACLE_HOME = /u01/oh)
+      (SID_NAME = other)
+    )
+  )
+LEOF
+    write_sid_desc_entries "$sd" "cdb1" "/u01/oh" "cdb1" "cdb1_DGMGRL"
+    (
+        # Only the tools add_sid_to_listener needs - no mktemp - and count
+        # the fallback candidates so the test proves the fallback ran
+        PATH="$TEST_DIR/listener_bin"
+        command -v mktemp >/dev/null 2>&1 && exit 99
+        _dg_temp_dir_candidate() {
+            printf 'x\n' >> "$TEST_DIR/inner_candidates"
+            printf '%s/dg_tmp_%s_%s_%s%s\n' "$1" "$$" "$2" "$RANDOM" "$RANDOM"
+        }
+        TMPDIR="$base" add_sid_to_listener "$lf" "$sd"
+    ) || return 1
+    [[ -s "$TEST_DIR/inner_candidates" ]] || return 1
+    listener_has_global_dbname "$lf" "cdb1" && listener_has_global_dbname "$lf" "cdb1_DGMGRL" \
+        && listener_has_global_dbname "$lf" "other" || return 1
+    # inserted inside the existing SID_LIST (before its closing paren)
+    awk '/GLOBAL_DBNAME = cdb1_DGMGRL/{a=NR} /^  \)$/{c=NR} END{exit !(a && c && a < c)}' "$lf" || return 1
+    # the inner allocation was cleaned up; only the caller's dir is left
+    [[ -d "$outer" && "$(ls -A "$base")" == "$(basename "$outer")" ]] || return 1
+    rm -rf "$outer"
+}
+mkdir -p "$TEST_DIR/listener_bin"
+for _tool in mkdir ls rmdir rm grep awk head tail cat; do
+    ln -s "$(command -v $_tool)" "$TEST_DIR/listener_bin/$_tool"
+done
+check "add_sid_to_listener works while the caller holds a fallback temp dir" t_fallback_listener_nested
 
 # ============================================================
 # get_db_parameter, dg_net_admin_dir, dg_sqlplus_bin
@@ -481,6 +604,351 @@ t_sqlplus_path() {
         && [[ "$(unset ORACLE_HOME; dg_sqlplus_bin)" == "sqlplus" ]]
 }
 check "dg_sqlplus_bin falls back to PATH sqlplus" t_sqlplus_path
+
+# ============================================================
+# compare_db_identity (pure) - finding 2
+# ============================================================
+
+# ident <mode> <name> <role> <dbid> <exp_pri> <exp_stb> <exp_dbid>: sets
+# IDENT_OUT and IDENT_RC
+ident() {
+    IDENT_RC=0
+    IDENT_OUT=$(compare_db_identity "$@") || IDENT_RC=$?
+}
+
+t_id_primary_match() {
+    ident primary cdb1 PRIMARY 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -eq 0 && -z "$IDENT_OUT" ]]
+}
+check "identity primary: exact match passes silently" t_id_primary_match
+
+t_id_case() {
+    ident primary CDB1 primary 1234567890 cdb1 CDB1_STBY 1234567890
+    [[ $IDENT_RC -eq 0 && -z "$IDENT_OUT" ]]
+}
+check "identity: names and role compare case-insensitively" t_id_case
+
+t_id_two_primaries() {
+    # two primaries on one host: a role-only check would pass - must not
+    ident primary orcl PRIMARY 999 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"FAIL: DB_UNIQUE_NAME orcl is not the configuration primary cdb1"* \
+       && "$IDENT_OUT" == *"FAIL: DBID 999"* ]]
+}
+check "identity primary: another PRIMARY database on the host is refused" t_id_two_primaries
+
+t_id_two_primaries_member() {
+    ident member orcl PRIMARY 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"FAIL: DB_UNIQUE_NAME orcl is neither"* ]]
+}
+check "identity member: a foreign PRIMARY is refused even with the same DBID" t_id_two_primaries_member
+
+t_id_wrong_dbid() {
+    ident primary cdb1 PRIMARY 111 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == "FAIL: DBID 111 does not match the configuration DBID 1234567890" ]]
+}
+check "identity: right name, wrong DBID is refused" t_id_wrong_dbid
+
+t_id_standby_role() {
+    ident primary cdb1 "PHYSICAL STANDBY" 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"role is PHYSICAL STANDBY, not PRIMARY"* ]]
+}
+check "identity primary: the config primary in a standby role is refused" t_id_standby_role
+
+t_id_standby_role_member() {
+    ident member cdb1_stby "PHYSICAL STANDBY" 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"not PRIMARY"* ]]
+}
+check "identity member: the config standby still in the standby role is refused" t_id_standby_role_member
+
+t_id_swapped_primary_mode() {
+    ident primary cdb1_stby PRIMARY 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"is not the configuration primary"* ]]
+}
+check "identity primary: swapped roles are refused (initial-build steps)" t_id_swapped_primary_mode
+
+t_id_swapped_member_mode() {
+    ident member cdb1_stby PRIMARY 1234567890 cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -eq 0 && "$IDENT_OUT" == "NOTE: ROLES_SWAPPED" ]]
+}
+check "identity member: swapped roles are accepted with a note" t_id_swapped_member_mode
+
+t_id_no_config_dbid() {
+    ident primary cdb1 PRIMARY 1234567890 cdb1 cdb1_stby ""
+    [[ $IDENT_RC -eq 0 && "$IDENT_OUT" == "WARN: "* && "$IDENT_OUT" != *FAIL* ]]
+}
+check "identity: config without DBID passes on the name, with a warning" t_id_no_config_dbid
+
+t_id_no_config_dbid_wrong_name() {
+    ident primary orcl PRIMARY 1 cdb1 cdb1_stby ""
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"FAIL: DB_UNIQUE_NAME orcl"* ]]
+}
+check "identity: config without DBID still refuses the wrong name" t_id_no_config_dbid_wrong_name
+
+t_id_empty_query() {
+    ident primary "" "" "" cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == "FAIL: could not read"* ]]
+}
+check "identity: empty query result is a refusal" t_id_empty_query
+
+t_id_empty_dbid() {
+    ident primary cdb1 PRIMARY "" cdb1 cdb1_stby 1234567890
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"FAIL: DBID <empty>"* ]]
+}
+check "identity: an empty connected DBID against a recorded one is refused" t_id_empty_dbid
+
+t_id_no_expected_primary() {
+    ident member cdb1 PRIMARY 1 "" "" ""
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"no PRIMARY_DB_UNIQUE_NAME"* ]]
+}
+check "identity: a config without PRIMARY_DB_UNIQUE_NAME is refused" t_id_no_expected_primary
+
+t_id_bad_mode() {
+    ident whatever cdb1 PRIMARY 1 cdb1 cdb1_stby 1
+    [[ $IDENT_RC -ne 0 && "$IDENT_OUT" == *"unknown identity check mode"* ]]
+}
+check "identity: unknown mode is refused" t_id_bad_mode
+
+# ============================================================
+# assert_db_matches_config (run_sql_query stubbed above)
+# ============================================================
+
+# assert_cfg <mode> : runs the wrapper in a subshell with the config values
+# below; sets AC_RC and AC_OUT (stdout+stderr), AC_SWAPPED
+assert_cfg() {
+    AC_RC=0
+    AC_OUT=$( (
+        PRIMARY_DB_UNIQUE_NAME=cdb1 STANDBY_DB_UNIQUE_NAME=cdb1_stby DBID="$CFG_DBID"
+        STANDBY_CONFIG_FILE=/nfs/standby_config_cdb1_stby.env ORACLE_SID=orcl
+        assert_db_matches_config "$1"
+        rc=$?
+        echo "SWAPPED=${DG_CONFIG_ROLES_SWAPPED}"
+        exit $rc
+    ) 2>&1 ) || AC_RC=$?
+}
+CFG_DBID=1234567890
+
+t_ac_match() {
+    STUB_SQL_OUTPUT="cdb1|PRIMARY|1234567890"
+    assert_cfg primary
+    [[ $AC_RC -eq 0 && "$AC_OUT" == *"SWAPPED=0"* ]]
+}
+check "assert_db_matches_config: matching database passes" t_ac_match
+
+t_ac_mismatch() {
+    STUB_SQL_OUTPUT="orcl|PRIMARY|42"
+    assert_cfg primary
+    [[ $AC_RC -ne 0 && "$AC_OUT" == *"DB_UNIQUE_NAME=orcl ROLE=PRIMARY DBID=42 (ORACLE_SID=orcl)"* \
+       && "$AC_OUT" == *"cdb1 in the PRIMARY role, DBID=1234567890"* && "$AC_OUT" == *"ORACLE_SID"* \
+       && "$AC_OUT" == *"standby_config_cdb1_stby.env"* ]]
+}
+check "assert_db_matches_config: mismatch names both sides and the ORACLE_SID hint" t_ac_mismatch
+
+t_ac_swapped() {
+    STUB_SQL_OUTPUT="  cdb1_stby|PRIMARY|1234567890  "
+    assert_cfg member
+    [[ $AC_RC -eq 0 && "$AC_OUT" == *"SWAPPED=1"* && "$AC_OUT" == *"roles are swapped"* ]]
+}
+check "assert_db_matches_config member: swapped roles pass and set DG_CONFIG_ROLES_SWAPPED" t_ac_swapped
+
+t_ac_empty() {
+    STUB_SQL_OUTPUT=""
+    assert_cfg member
+    [[ $AC_RC -ne 0 && "$AC_OUT" == *"Could not read"* ]]
+}
+check "assert_db_matches_config: empty query output refuses" t_ac_empty
+
+t_ac_query_fails() {
+    AC_RC=0
+    AC_OUT=$( (
+        run_sql_query() { echo "ORA-01034: ORACLE not available"; return 1; }
+        PRIMARY_DB_UNIQUE_NAME=cdb1 STANDBY_DB_UNIQUE_NAME=cdb1_stby DBID=1
+        assert_db_matches_config primary
+    ) 2>&1 ) || AC_RC=$?
+    [[ $AC_RC -ne 0 && "$AC_OUT" == *"Could not read"* ]]
+}
+check "assert_db_matches_config: a failed query refuses" t_ac_query_fails
+
+t_ac_no_dbid() {
+    STUB_SQL_OUTPUT="cdb1|PRIMARY|1234567890"
+    CFG_DBID="" assert_cfg primary
+    local rc=$AC_RC
+    [[ $rc -eq 0 && "$AC_OUT" == *"DBID not cross-checked"* ]]
+}
+check "assert_db_matches_config: config without DBID passes with a warning" t_ac_no_dbid
+
+t_query_file() {
+    local f="${SQL_DIR}/queries/get_db_identity_pipe.sql"
+    [[ -f "$f" ]] && grep -qi '^SET DEFINE OFF' "$f" && grep -q 'WHENEVER SQLERROR EXIT' "$f" \
+        && grep -q 'DB_UNIQUE_NAME' "$f" && grep -q 'DATABASE_ROLE' "$f" && grep -q 'DBID' "$f"
+}
+check "get_db_identity_pipe.sql exists with SET DEFINE OFF and WHENEVER SQLERROR" t_query_file
+
+# ============================================================
+# dgmgrl_config_members / dgmgrl_foreign_members - finding 2
+# ============================================================
+
+SHOW_CFG_FOREIGN='
+Configuration - dg_cdb1
+
+  Protection Mode: MaxAvailability
+  Members:
+  cdb1      - Primary database
+    Error: ORA-16810: multiple errors or warnings detected for the member
+
+    cdb1_stby - (*) Physical standby database
+      Warning: ORA-16809: multiple warnings detected for the member
+
+    orcl_far  - Far sync instance
+
+  Members Not Receiving Redo:
+  orcl_stby - Physical standby database (disabled)
+    ORA-16795: the standby database needs to be re-created
+
+Fast-Start Failover: Enabled in Zero Data Loss Mode
+  Target:          cdb1_stby
+  Observer:        dg3 - (*) Master
+
+Configuration Status:
+ERROR   (status updated 3 seconds ago)
+'
+
+members_are() { [[ "$(dgmgrl_config_members "$1" | tr '\n' ' ')" == "$2" ]]; }
+
+check "members: 19c SUCCESS sample" members_are "$SHOW_CFG_SUCCESS" "cdb1 cdb1_stby "
+check "members: real lab output with the FSFO (*) marker" members_are "$SHOW_CFG_LAB" "cdb1 cdb1_stby "
+check "members: Warning: lines under members are not members" members_are "$SHOW_CFG_WARNING" "cdb1 cdb1_stby "
+check "members: Error:/ORA- lines under members are not members" members_are "$SHOW_CFG_ERROR" "cdb1 cdb1_stby "
+check "members: far sync and Members Not Receiving Redo; observer line excluded" \
+    members_are "$SHOW_CFG_FOREIGN" "cdb1 cdb1_stby orcl_far orcl_stby "
+check "members: CRLF output" members_are "$(printf 'Configuration - x\r\n  Members:\r\n  cdb1 - Primary database\r\n\r\nConfiguration Status:\r\nSUCCESS\r\n')" "cdb1 "
+check "members: no configuration -> nothing" members_are "$ERR_NO_CONFIG" ""
+
+foreign_are() { local o="$1" want="$2"; shift 2; [[ "$(dgmgrl_foreign_members "$o" "$@" | tr '\n' ' ')" == "$want" ]]; }
+
+check "foreign: none when every member belongs to the config" foreign_are "$SHOW_CFG_LAB" "" cdb1 cdb1_stby
+check "foreign: config names compare case-insensitively" foreign_are "$SHOW_CFG_LAB" "" CDB1 CDB1_STBY
+check "foreign: other members are named" foreign_are "$SHOW_CFG_FOREIGN" "orcl_far orcl_stby " cdb1 cdb1_stby
+check "foreign: a config for different databases names every member" foreign_are "$SHOW_CFG_SUCCESS" "cdb1 cdb1_stby " orcl orcl_stby
+
+# ============================================================
+# Steps 4 and 6 end to end with stubbed Oracle binaries - finding 2
+# ============================================================
+# A mismatched database must stop the step with ZERO mutating invocations:
+# the only sqlplus calls allowed are check_connection.sql and the identity
+# query, no dgmgrl/lsnrctl call at all, and no file under TNS_ADMIN.
+
+REPO_DIR="$(dirname "$SCRIPT_DIR")"
+E2E="$TEST_DIR/e2e"
+mkdir -p "$E2E/oh/bin" "$E2E/nfs" "$E2E/tns"
+cat > "$E2E/oh/bin/sqlplus" <<'SQLEOF'
+#!/bin/bash
+script=""
+for a in "$@"; do case "$a" in @*) script="${a#@}" ;; esac; done
+printf 'sqlplus %s\n' "$(basename "$script")" >> "$STUB_LOG"
+case "$(basename "$script")" in
+    check_connection.sql) echo CONNECTED ;;
+    get_db_identity_pipe.sql) printf '%s\n' "$STUB_IDENTITY" ;;
+    get_db_parameter.sql) echo TRUE ;;
+    get_dmon_count.sql) echo 1 ;;
+    *) echo "" ;;
+esac
+exit 0
+SQLEOF
+cat > "$E2E/oh/bin/dgmgrl" <<'DGEOF'
+#!/bin/bash
+cmd=$(cat)
+printf 'dgmgrl %s\n' "$(printf '%s' "$cmd" | tr '\n' ' ')" >> "$STUB_LOG"
+case "$cmd" in
+    *"SHOW CONFIGURATION"*) printf '%s\n' "$STUB_SHOW_CONFIG" ;;
+    *) echo "Succeeded." ;;
+esac
+DGEOF
+for _b in lsnrctl tnsping; do
+    printf '#!/bin/bash\necho "%s $*" >> "$STUB_LOG"\nexit 0\n' "$_b" > "$E2E/oh/bin/$_b"
+done
+chmod 755 "$E2E/oh/bin/"*
+cat > "$E2E/nfs/standby_config_cdb1_stby.env" <<'ENVEOF'
+PRIMARY_DB_NAME="cdb1"
+PRIMARY_DB_UNIQUE_NAME="cdb1"
+PRIMARY_ORACLE_SID="cdb1"
+PRIMARY_HOSTNAME="pri.example.com"
+PRIMARY_TNS_ALIAS="cdb1"
+STANDBY_DB_UNIQUE_NAME="cdb1_stby"
+STANDBY_HOSTNAME="stb.example.com"
+STANDBY_TNS_ALIAS="cdb1_stby"
+DBID="1234567890"
+STANDBY_REDO_GROUPS="4"
+ENVEOF
+
+# run_step <script> <identity> <stdin> [args...] : sets STEP_RC, STEP_OUT;
+# the invocation log is $E2E/calls.log
+run_step() {
+    local script="$1" identity="$2" input="$3"
+    shift 3
+    : > "$E2E/calls.log"
+    STEP_RC=0
+    STEP_OUT=$(printf "$input" | env ORACLE_HOME="$E2E/oh" ORACLE_SID=orcl NFS_SHARE="$E2E/nfs" \
+        TNS_ADMIN="$E2E/tns" STUB_LOG="$E2E/calls.log" STUB_IDENTITY="$identity" \
+        STUB_SHOW_CONFIG="${STUB_SHOW_CONFIG:-}" PATH="$E2E/oh/bin:$PATH" \
+        bash "$REPO_DIR/primary/$script" "$@" 2>&1) || STEP_RC=$?
+}
+# only the two read-only identity calls were made
+only_identity_calls() {
+    [[ "$(grep -v -e '^sqlplus check_connection.sql' -e '^sqlplus get_db_identity_pipe.sql' "$E2E/calls.log")" == "" ]] \
+        && grep -q '^sqlplus get_db_identity_pipe.sql' "$E2E/calls.log" \
+        && [[ -z "$(ls -A "$E2E/tns")" ]]
+}
+
+t_e2e_step4_mismatch() {
+    run_step 04_prepare_primary_dg.sh "orcl|PRIMARY|42" ""
+    [[ $STEP_RC -eq 1 && "$STEP_OUT" == *"does not match the selected configuration"* ]] && only_identity_calls
+}
+check "step 4: another PRIMARY on the host exits 1 with zero mutating calls" t_e2e_step4_mismatch
+
+t_e2e_step4_mismatch_check() {
+    run_step 04_prepare_primary_dg.sh "orcl|PRIMARY|42" "" -n
+    [[ $STEP_RC -eq 1 && "$STEP_OUT" == *"does not match"* && "$STEP_OUT" != *"preflight complete"* ]] && only_identity_calls
+}
+check "step 4 -n: the mismatch is reported and exits 1" t_e2e_step4_mismatch_check
+
+t_e2e_step4_match_check() {
+    # positive control: the matching database gets past the guard to the -n stop
+    run_step 04_prepare_primary_dg.sh "cdb1|PRIMARY|1234567890" "" -n
+    [[ $STEP_RC -eq 0 && "$STEP_OUT" == *"matches the selected configuration"* ]] && only_identity_calls
+}
+check "step 4 -n: the matching database passes the guard (control)" t_e2e_step4_match_check
+
+t_e2e_step6_mismatch() {
+    run_step 06_configure_broker.sh "cdb1|PRIMARY|42" "y\n"
+    [[ $STEP_RC -eq 1 && "$STEP_OUT" == *"DBID 42 does not match"* ]] && only_identity_calls
+}
+check "step 6: wrong DBID exits 1 before any dgmgrl call" t_e2e_step6_mismatch
+
+t_e2e_step6_standby() {
+    run_step 06_configure_broker.sh "cdb1_stby|PHYSICAL STANDBY|1234567890" "y\n"
+    [[ $STEP_RC -eq 1 ]] && only_identity_calls
+}
+check "step 6: connected to the standby exits 1 before any dgmgrl call" t_e2e_step6_standby
+
+t_e2e_step6_foreign_member() {
+    # right database, but the existing broker configuration also manages
+    # orcl_far/orcl_stby: piped stdin -> refuse, no DISABLE/REMOVE issued
+    STUB_SHOW_CONFIG="$SHOW_CFG_FOREIGN" run_step 06_configure_broker.sh "cdb1|PRIMARY|1234567890" "y\n"
+    [[ $STEP_RC -eq 1 && "$STEP_OUT" == *"orcl_far"* && "$STEP_OUT" == *"orcl_stby"* \
+       && "$STEP_OUT" == *"Refusing to remove"* ]] || return 1
+    ! grep -qi -e 'REMOVE CONFIGURATION' -e 'DISABLE FAST_START' "$E2E/calls.log"
+}
+check "step 6: foreign broker members refuse non-interactively, nothing removed" t_e2e_step6_foreign_member
+
+t_e2e_step6_own_members() {
+    # control: own members only -> the existing prompt is reached and the
+    # piped 'n' keeps the configuration (exit 0), no second prompt consumed
+    STUB_SHOW_CONFIG="$SHOW_CFG_SUCCESS" run_step 06_configure_broker.sh "cdb1|PRIMARY|1234567890" "n\n"
+    [[ $STEP_RC -eq 0 && "$STEP_OUT" == *"Keeping existing configuration"* && "$STEP_OUT" != *"Refusing"* \
+       && "$STEP_OUT" != *"NOT part of the selected"* ]] || return 1
+    ! grep -qi 'REMOVE CONFIGURATION' "$E2E/calls.log"
+}
+check "step 6: own members only keep today's single prompt (control)" t_e2e_step6_own_members
 
 # ============================================================
 # Summary

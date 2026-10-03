@@ -255,7 +255,12 @@ bash dg_check_srl.sh -d /u02/oradata/srl   # override the dir used in generated 
 
 Rules: each thread needs at least `online_redo_groups + 1` SRL groups, all
 at least as large as the largest online redo log (larger is fine; only a
-smaller SRL is flagged).
+smaller SRL is flagged). Sizes are compared in exact bytes: an SRL one byte
+smaller than the largest online redo log is a finding, so 100 MB SRLs under
+100.5 MB online logs are reported, where a whole-MiB comparison would have
+called them equal. Sizes that are not a whole number of MiB are shown in bytes,
+and the generated DDL rounds the size **up** to whole MiB (`New SRL size (DDL)`
+in the output), so the logs it creates are never smaller than the online logs.
 
 Every peer in `V$DATAGUARD_CONFIG` is checked, each reached via its broker
 `DGConnectIdentifier`. If an online redo log size cannot be read, the tool

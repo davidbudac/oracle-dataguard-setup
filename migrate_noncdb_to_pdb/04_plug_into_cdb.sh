@@ -10,7 +10,10 @@
 # Requires steps 01-03 to have completed (state preflight_ok, noncdb_quiesced,
 # describe_done) and the standby prerequisites from step 01 (standby_prereq_ok).
 # NOT restartable once the PDB exists (ORA-65012): a leftover PDB is detected up
-# front and the exit message says how to proceed.
+# front and the exit message says how to proceed. Every refusal (existing PDB,
+# missing manifest, incomplete stage, unreachable standby) happens BEFORE the
+# plug/verify flags are cleared, so an accidental re-run after a successful
+# plug-in leaves state.env untouched and step 05 still runs.
 #
 # Effects:
 #   * Sets STANDBY_PDB_SOURCE_FILE_DIRECTORY ON THE CDB STANDBY (direct
@@ -52,10 +55,20 @@ require_state noncdb_quiesced    02_quiesce_noncdb.sh
 require_state describe_done      03_describe_and_stage.sh
 require_state standby_prereq_ok  01_preflight.sh
 require_state standby_dirs_ok    01_preflight.sh
-clear_state create_pdb_done plug_done new_pdb_state noncdb_to_pdb_log verify_done verify_failures
 
-# Not restartable: the PDB name must be free in the CDB.
-EXISTING_PDB="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT name FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAME}');")"
+# Every refusal below leaves the system unchanged, so it must leave state.env
+# unchanged too: an accidental re-run after a successful plug-in is refused by
+# the "PDB already exists" check and must not take plug_done with it (step 05
+# requires it). The progress flags are cleared only once a new attempt really
+# begins, just before the first change (see "Start of a new attempt" below).
+
+# Not restartable: the PDB name must be free in the CDB. The query carries a
+# marker, so a failed query cannot be mistaken for an existing PDB's name.
+PDB_CHECK="$(run_sql "$TARGET_CDB_ORACLE_SID" "SELECT 'PDB=' || name FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAME}');")" || {
+    log_error "Cannot query v\$pdbs on the target CDB (TARGET_CDB_ORACLE_SID=${TARGET_CDB_ORACLE_SID}): ${PDB_CHECK}"
+    exit 1
+}
+EXISTING_PDB="$(kv_get PDB "$PDB_CHECK")"
 if [[ -n "$EXISTING_PDB" ]]; then
     log_error "PDB ${EXISTING_PDB} already exists in ${TARGET_CDB_NAME} (a previous run of this step, or a name clash)."
     log_error "This step cannot be resumed (CREATE PLUGGABLE DATABASE would fail with ORA-65012). To go on:"
@@ -79,6 +92,15 @@ if [[ ! "$EXPECTED_STAGED" =~ ^[0-9]+$ || "$EXPECTED_STAGED" -eq 0 || "$ACTUAL_S
     log_error "Staged datafile count in ${MIGRATE_DATAFILE_STAGE} is ${ACTUAL_STAGED}; step 03 recorded '${EXPECTED_STAGED}'. Re-run 03_describe_and_stage.sh."
     exit 1
 fi
+if ! standby_connect_init; then
+    log_error "Cannot connect to the CDB standby '${STANDBY_TNS_ALIAS}' (wallet or SYS password). Without STANDBY_PDB_SOURCE_FILE_DIRECTORY on the standby the plug-in redo cannot be applied there. Refusing to plug."
+    exit 1
+fi
+
+# Start of a new attempt: every refusal that leaves the system unchanged is
+# behind us, and no PDB of this name exists, so any plug/verify flag left by an
+# earlier run is stale. Clear them before the first change.
+clear_state create_pdb_done plug_done new_pdb_state noncdb_to_pdb_log verify_done verify_failures
 TARGET_DIR="${TARGET_PDB_DATAFILE_DIR}/${NEW_PDB_NAME}"
 mkdir -p "$TARGET_DIR"
 
@@ -91,10 +113,6 @@ mkdir -p "$TARGET_DIR"
 # staged files (STANDBY_STAGE_DIR; the primary's staging path by default,
 # since the share is mounted identically on both hosts).
 log_info "Setting STANDBY_PDB_SOURCE_FILE_DIRECTORY='${STANDBY_STAGE_DIR}/' on the CDB standby (${STANDBY_TNS_ALIAS}) ..."
-if ! standby_connect_init; then
-    log_error "Cannot connect to the CDB standby '${STANDBY_TNS_ALIAS}' (wallet or SYS password). Without the parameter on the standby the plug-in redo cannot be applied there. Refusing to plug."
-    exit 1
-fi
 run_sql_standby "
 ALTER SYSTEM SET STANDBY_PDB_SOURCE_FILE_DIRECTORY='${STANDBY_STAGE_DIR}/' SCOPE=BOTH;
 " | tee_into_log
@@ -226,7 +244,7 @@ log_info "Running noncdb_to_pdb.sql inside ${NEW_PDB_NAME} (this can take 10-30 
 NONCDB_LOG="${MIGRATE_LOG_DIR}/noncdb_to_pdb_$(date '+%Y%m%d_%H%M%S').log"
 ORACLE_SID="$TARGET_CDB_ORACLE_SID" sqlplus -L / as sysdba <<EOF | tee -a "$NONCDB_LOG" | tee_into_log
 SET ECHO ON TIMING ON
-WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER SQLERROR EXIT FAILURE
 ALTER SESSION SET CONTAINER=${NEW_PDB_NAME};
 @${NONCDB_SQL}
 EXIT;

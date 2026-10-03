@@ -68,6 +68,30 @@ source "$STANDBY_CONFIG_FILE"
 
 init_log "10_generate_handoff_report_${PRIMARY_DB_UNIQUE_NAME}"
 
+# The selected config must describe the database ORACLE_SID points at
+# (either member, as long as it holds the PRIMARY role - the report is
+# re-run after switchovers). A mismatch is an ERROR (exit 1), the same
+# class as a failed dg_handoff.sh run. Checked before the -n stop.
+if ! assert_db_matches_config member; then
+    print_summary "ERROR" "Connected database does not match the selected configuration"
+    exit 1
+fi
+
+# The host/port/alias flags below are the CURRENT topology. After a
+# switchover the config's standby is the primary, so swap them; the report
+# file name stays keyed to the config's primary so reruns diff against the
+# same JSON sidecar.
+HANDOFF_PRIMARY_HOST="$PRIMARY_HOSTNAME"
+HANDOFF_STANDBY_HOST="$STANDBY_HOSTNAME"
+HANDOFF_PORT="${PRIMARY_LISTENER_PORT:-${STANDBY_LISTENER_PORT:-1521}}"
+HANDOFF_STANDBY_ALIAS="$STANDBY_TNS_ALIAS"
+if [[ "${DG_CONFIG_ROLES_SWAPPED:-0}" == "1" ]]; then
+    HANDOFF_PRIMARY_HOST="$STANDBY_HOSTNAME"
+    HANDOFF_STANDBY_HOST="$PRIMARY_HOSTNAME"
+    HANDOFF_PORT="${STANDBY_LISTENER_PORT:-${PRIMARY_LISTENER_PORT:-1521}}"
+    HANDOFF_STANDBY_ALIAS="$PRIMARY_TNS_ALIAS"
+fi
+
 REPORT_FILE="${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.md"
 HTML_REPORT_FILE="${NFS_SHARE}/dg_handoff_${PRIMARY_DB_UNIQUE_NAME}.html"
 # Companion files dg_handoff.sh writes next to the Markdown: the JSON
@@ -107,13 +131,13 @@ progress_step "Generating Handoff Report"
 # setup-time three-flavor output (primary-only / standby-only / role-aware).
 HANDOFF_ARGS=(
     -o "$REPORT_FILE"
-    --primary-host "$PRIMARY_HOSTNAME"
-    --standby-host "$STANDBY_HOSTNAME"
-    --port "${PRIMARY_LISTENER_PORT:-${STANDBY_LISTENER_PORT:-1521}}"
+    --primary-host "$HANDOFF_PRIMARY_HOST"
+    --standby-host "$HANDOFF_STANDBY_HOST"
+    --port "$HANDOFF_PORT"
     --all-flavors
 )
-if [[ -n "$STANDBY_TNS_ALIAS" ]]; then
-    HANDOFF_ARGS+=(--standby-tns-alias "$STANDBY_TNS_ALIAS")
+if [[ -n "$HANDOFF_STANDBY_ALIAS" ]]; then
+    HANDOFF_ARGS+=(--standby-tns-alias "$HANDOFF_STANDBY_ALIAS")
 fi
 if [[ "$IMPACT_COPIED" == "YES" ]]; then
     HANDOFF_ARGS+=(--impact-reference "$IMPACT_TARGET")

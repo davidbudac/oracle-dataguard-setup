@@ -583,42 +583,120 @@ case "$FSFO_STATUS_UPPER" in
     *) FSFO_ENABLED="YES" ;;
 esac
 
+# Role-trigger readiness. READY means: under ONE owner there is a VALID
+# PACKAGE and a VALID PACKAGE BODY named DG_SERVICE_MGR AND both triggers
+# exist, are ENABLED (DBA_TRIGGERS) and are VALID objects (DBA_OBJECTS - the
+# trigger view has no validity column). The SYS variant installs everything
+# under SYS, the dedicated-user variant under its user (default DG_ADMIN), so
+# counts are never added up across owners. One row, '|'-separated:
+#   1 number of owners with a complete valid installation
+#   2 those owners (comma list, NONE)
+#   3 every owner holding any of the objects (comma list, NONE)
+#   4 per-owner detail: "OWNER spec=S,body=S,chg=T,startup=T" joined by ';'
+#     (S = DBA_OBJECTS status or MISSING; T = OK, DISABLED, INVALID,
+#     DISABLED+INVALID or MISSING)
+# The report states object state only; it does not claim runtime behaviour.
 if ! TRIGGER_STATUS=$(run_sql "-- QTAG:role_trigger_status
-WITH pkg AS (
-    SELECT owner
+WITH o AS (
+    SELECT owner, object_type, object_name, status
     FROM DBA_OBJECTS
-    WHERE OBJECT_NAME = 'DG_SERVICE_MGR'
-      AND OBJECT_TYPE IN ('PACKAGE', 'PACKAGE BODY')
-      AND STATUS = 'VALID'
+    WHERE (object_name = 'DG_SERVICE_MGR' AND object_type IN ('PACKAGE', 'PACKAGE BODY'))
+       OR (object_name IN ('TRG_MANAGE_SERVICES_ROLE_CHG', 'TRG_MANAGE_SERVICES_STARTUP')
+           AND object_type = 'TRIGGER')
 ),
-trg AS (
-    SELECT owner, trigger_name, status
-    FROM DBA_TRIGGERS
-    WHERE trigger_name IN ('TRG_MANAGE_SERVICES_ROLE_CHG', 'TRG_MANAGE_SERVICES_STARTUP')
+t AS (
+    SELECT o.owner, o.object_name,
+           CASE WHEN tr.status = 'ENABLED' AND o.status = 'VALID' THEN 'OK'
+                WHEN tr.status <> 'ENABLED' AND o.status <> 'VALID' THEN 'DISABLED+INVALID'
+                WHEN tr.status <> 'ENABLED' THEN 'DISABLED'
+                ELSE 'INVALID' END AS state
+    FROM o JOIN DBA_TRIGGERS tr ON tr.owner = o.owner AND tr.trigger_name = o.object_name
+    WHERE o.object_type = 'TRIGGER'
+),
+st AS (
+    SELECT d.owner,
+           NVL((SELECT MAX(x.status) FROM o x WHERE x.owner = d.owner AND x.object_type = 'PACKAGE'), 'MISSING') AS pkg_spec,
+           NVL((SELECT MAX(x.status) FROM o x WHERE x.owner = d.owner AND x.object_type = 'PACKAGE BODY'), 'MISSING') AS pkg_body,
+           NVL((SELECT MAX(x.state) FROM t x WHERE x.owner = d.owner AND x.object_name = 'TRG_MANAGE_SERVICES_ROLE_CHG'), 'MISSING') AS trg_chg,
+           NVL((SELECT MAX(x.state) FROM t x WHERE x.owner = d.owner AND x.object_name = 'TRG_MANAGE_SERVICES_STARTUP'), 'MISSING') AS trg_start
+    FROM (SELECT DISTINCT owner FROM o) d
 )
 SELECT
-    (SELECT COUNT(DISTINCT owner) FROM pkg) || '|' ||
-    (SELECT COUNT(*) FROM trg WHERE status = 'ENABLED') || '|' ||
-    (SELECT COUNT(*) FROM trg) || '|' ||
-    NVL((SELECT LISTAGG(owner, ',') WITHIN GROUP (ORDER BY owner)
-         FROM (SELECT DISTINCT owner FROM pkg
-               UNION
-               SELECT DISTINCT owner FROM trg)), 'NONE')
+    (SELECT COUNT(*) FROM st
+      WHERE pkg_spec = 'VALID' AND pkg_body = 'VALID' AND trg_chg = 'OK' AND trg_start = 'OK') || '|' ||
+    NVL((SELECT LISTAGG(owner, ',') WITHIN GROUP (ORDER BY owner) FROM st
+          WHERE pkg_spec = 'VALID' AND pkg_body = 'VALID' AND trg_chg = 'OK' AND trg_start = 'OK'), 'NONE') || '|' ||
+    NVL((SELECT LISTAGG(owner, ',') WITHIN GROUP (ORDER BY owner) FROM st), 'NONE') || '|' ||
+    NVL((SELECT LISTAGG(owner || ' spec=' || pkg_spec || ',body=' || pkg_body ||
+                        ',chg=' || trg_chg || ',startup=' || trg_start, ';')
+                WITHIN GROUP (ORDER BY owner) FROM st), 'NONE')
 FROM DUAL;
 " | clean | head -1); then
     TRIGGER_STATUS=""
     note_discovery_failure "role-aware service trigger status"
 fi
-TRIGGER_PACKAGE_COUNT=$(field "$TRIGGER_STATUS" 1)
-TRIGGER_ENABLED_COUNT=$(field "$TRIGGER_STATUS" 2)
-TRIGGER_TOTAL_COUNT=$(field "$TRIGGER_STATUS" 3)
-TRIGGER_OWNERS=$(field "$TRIGGER_STATUS" 4)
+TRIGGER_READY_COUNT=$(field  "$TRIGGER_STATUS" 1)
+TRIGGER_READY_OWNERS=$(field "$TRIGGER_STATUS" 2)
+TRIGGER_ALL_OWNERS=$(field   "$TRIGGER_STATUS" 3)
+TRIGGER_DETAIL=$(field       "$TRIGGER_STATUS" 4)
+case "$TRIGGER_READY_COUNT" in ''|*[!0-9]*) TRIGGER_READY_COUNT=-1 ;; esac
+
+# "OWNER (problem, problem); OWNER2 (...)" for every owner whose installation
+# is not complete and valid. Plain awk: no function-local arrays.
+trigger_problem_text() {
+    printf '%s\n' "$1" | awk -F';' '
+    BEGIN { out = "" }
+    {
+        n = split($0, ent, ";")
+        for (i = 1; i <= n; i++) {
+            if (ent[i] == "" || ent[i] == "NONE") continue
+            split(ent[i], a, " ")
+            m = split(a[2], kv, ",")
+            probs = ""
+            for (j = 1; j <= m; j++) {
+                split(kv[j], p, "=")
+                txt = ""
+                if (p[1] == "spec" && p[2] != "VALID")
+                    txt = "package spec " (p[2] == "MISSING" ? "missing" : "not VALID (" p[2] ")")
+                else if (p[1] == "body" && p[2] != "VALID")
+                    txt = "package body " (p[2] == "MISSING" ? "missing" : "not VALID (" p[2] ")")
+                else if (p[1] == "chg" && p[2] != "OK")
+                    txt = "trigger TRG_MANAGE_SERVICES_ROLE_CHG " (p[2] == "MISSING" ? "missing" : (p[2] == "DISABLED" ? "disabled" : (p[2] == "INVALID" ? "invalid" : "disabled and invalid")))
+                else if (p[1] == "startup" && p[2] != "OK")
+                    txt = "trigger TRG_MANAGE_SERVICES_STARTUP " (p[2] == "MISSING" ? "missing" : (p[2] == "DISABLED" ? "disabled" : (p[2] == "INVALID" ? "invalid" : "disabled and invalid")))
+                if (txt != "") probs = probs (probs == "" ? "" : ", ") txt
+            }
+            if (probs != "") out = out (out == "" ? "" : "; ") a[1] " (" probs ")"
+        }
+    }
+    END { print out }'
+}
+
 ROLE_TRIGGER_READY="NO"
-case "$TRIGGER_PACKAGE_COUNT" in ''|*[!0-9]*) TRIGGER_PACKAGE_COUNT=0 ;; esac
-case "$TRIGGER_ENABLED_COUNT" in ''|*[!0-9]*) TRIGGER_ENABLED_COUNT=0 ;; esac
-case "$TRIGGER_TOTAL_COUNT" in ''|*[!0-9]*) TRIGGER_TOTAL_COUNT=0 ;; esac
-if [[ "$TRIGGER_PACKAGE_COUNT" -gt 0 && "$TRIGGER_ENABLED_COUNT" -ge 2 ]]; then
+TRIGGER_PROBLEM=""
+TRIGGER_ACTION=""
+TRIGGER_LEFTOVER=""
+TRIGGER_INCOMPLETE=$(trigger_problem_text "$TRIGGER_DETAIL")
+TRIGGER_OWNERS="$TRIGGER_ALL_OWNERS"
+if [[ -z "$TRIGGER_STATUS" || "$TRIGGER_READY_COUNT" -lt 0 ]]; then
+    TRIGGER_PROBLEM="the object status could not be read (see Discovery Warnings)"
+    TRIGGER_ACTION="fix the failed query (DBA_OBJECTS / DBA_TRIGGERS access) and regenerate this report before handing role-aware descriptors to applications"
+elif [[ "$TRIGGER_READY_COUNT" -eq 1 ]]; then
     ROLE_TRIGGER_READY="YES"
+    TRIGGER_OWNERS="$TRIGGER_READY_OWNERS"
+    TRIGGER_LEFTOVER="$TRIGGER_INCOMPLETE"
+elif [[ "$TRIGGER_READY_COUNT" -ge 2 ]]; then
+    TRIGGER_PROBLEM="complete valid installations exist under more than one owner (${TRIGGER_READY_OWNERS}) - both the SYS and the dedicated-user variants are deployed, so the services are managed twice"
+    TRIGGER_ACTION="keep one variant and drop the other (DROP TRIGGER <owner>.TRG_MANAGE_SERVICES_ROLE_CHG; DROP TRIGGER <owner>.TRG_MANAGE_SERVICES_STARTUP; DROP PACKAGE <owner>.DG_SERVICE_MGR)"
+elif [[ "$TRIGGER_ALL_OWNERS" == "NONE" || -z "$TRIGGER_ALL_OWNERS" ]]; then
+    TRIGGER_PROBLEM="the DG_SERVICE_MGR package and both triggers are not deployed"
+    TRIGGER_ACTION="run trigger/create_role_trigger.sh (CDB: create_role_trigger_cdb.sh; dedicated user: create_role_trigger_dedicated_user.sh) on the primary before handing role-aware descriptors to applications"
+else
+    case "$TRIGGER_ALL_OWNERS" in
+        *,*) TRIGGER_PROBLEM="no single owner holds a complete valid installation - objects are split across owners or half-installed: ${TRIGGER_INCOMPLETE}" ;;
+        *)   TRIGGER_PROBLEM="the installation under ${TRIGGER_ALL_OWNERS} is not complete and valid: ${TRIGGER_INCOMPLETE}" ;;
+    esac
+    TRIGGER_ACTION="drop any leftovers under the unintended owner, then re-run trigger/create_role_trigger.sh (CDB: create_role_trigger_cdb.sh; dedicated user: create_role_trigger_dedicated_user.sh) on the primary - it replaces its owner's objects - and check DBA_ERRORS if the package body stays INVALID"
 fi
 
 # Listener port from V$LISTENER_NETWORK / local_listener. An empty result can
@@ -2433,7 +2511,7 @@ fi
 # Role-aware descriptors are only safe once the trigger is deployed.
 if [[ "$ROLE_TRIGGER_READY" != "YES" ]]; then
     escalate_verdict "WARNING"
-    VERDICT_NOTES+=("Role-aware service trigger is not deployed/enabled — run trigger/create_role_trigger.sh (CDB: create_role_trigger_cdb.sh) on the primary before handing role-aware descriptors to applications")
+    VERDICT_NOTES+=("Role-aware service trigger is not deployed and valid: ${TRIGGER_PROBLEM} — ${TRIGGER_ACTION}")
 fi
 
 # Default services can never be role-aware; with no user-created service there
@@ -2872,9 +2950,13 @@ fi
     echo "**Role-aware (failover)** descriptors: both hosts in one ADDRESS_LIST. The service runs only on the current primary (stopped on the standby by the role trigger), so clients follow the primary across switchover/failover with no config change. Use this for the application tier."
     echo ""
     if [[ "$ROLE_TRIGGER_READY" == "YES" ]]; then
-        echo "**Role-aware trigger status:** deployed and enabled. Role-aware descriptors are safe to hand to applications **for the services the trigger manages** - each service section below states whether it is one of them."
+        echo "**Role-aware trigger status:** deployed and valid under \`${TRIGGER_OWNERS}\` (\`DG_SERVICE_MGR\` specification and body VALID, both triggers ENABLED and VALID). That is object state only - the switchover drill in section 4 proves the behaviour. Role-aware descriptors are intended for **the services the trigger manages** - each service section below states whether it is one of them."
+        if [[ -n "$TRIGGER_LEFTOVER" ]]; then
+            echo ""
+            echo "**Note:** other owners also hold incomplete role-trigger objects (${TRIGGER_LEFTOVER}) - drop the leftovers."
+        fi
     else
-        echo "**WARNING:** The \`DG_SERVICE_MGR\` package and both role-aware triggers are not confirmed enabled. Role-aware descriptors may connect applications to a read-only standby until \`trigger/create_role_trigger.sh\` is deployed."
+        echo "**WARNING:** The role-aware service objects are not deployed and valid: ${TRIGGER_PROBLEM}. Role-aware descriptors may connect applications to a read-only standby. Action: ${TRIGGER_ACTION}."
     fi
     echo ""
     echo "### Descriptor Parameters"
@@ -3154,6 +3236,9 @@ fi
         echo "| FSFO threshold | ${FSFO_THRESHOLD:-unknown} |"
     fi
     echo "| Role trigger ready | ${ROLE_TRIGGER_READY} (${TRIGGER_OWNERS:-unknown}) |"
+    if [[ "$ROLE_TRIGGER_READY" != "YES" ]]; then
+        echo "| Role trigger problem | ${TRIGGER_PROBLEM} |"
+    fi
     echo "| SQLNET.EXPIRE_TIME | ${SQLNET_EXPIRE_TIME} |"
     echo ""
 

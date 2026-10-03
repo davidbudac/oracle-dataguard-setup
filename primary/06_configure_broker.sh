@@ -49,6 +49,11 @@ source "$STANDBY_CONFIG_FILE"
 # Reinitialize log with standby DB name
 init_log "06_configure_broker_${STANDBY_DB_UNIQUE_NAME}"
 
+# The selected config must describe the database ORACLE_SID points at:
+# on a multi-database host a stale ORACLE_SID would otherwise aim this
+# step's changes at another database. Checked before the -n stop.
+assert_db_matches_config primary || exit 1
+
 # ============================================================
 # Review Planned Changes
 # ============================================================
@@ -153,9 +158,44 @@ elif echo "$EXISTING_CONFIG" | grep -q "Configuration -"; then
     echo ""
     echo "$EXISTING_CONFIG"
     echo ""
+
+    # REMOVE CONFIGURATION drops EVERY member from broker management, not
+    # just the two this config describes. Name any other member (or say the
+    # membership could not be read) before asking, refuse outright when no
+    # one is at a terminal to read it, and ask a second, typed question on a
+    # TTY. When every member belongs to this config nothing changes here -
+    # the E2E suite pipes a fixed answer sequence through the prompt below.
+    EXISTING_MEMBERS=$(dgmgrl_config_members "$EXISTING_CONFIG")
+    FOREIGN_MEMBERS=$(dgmgrl_foreign_members "$EXISTING_CONFIG" "$PRIMARY_DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME")
+    REMOVE_NEEDS_SECOND_CONFIRM=0
+    if [[ -z "$EXISTING_MEMBERS" ]]; then
+        REMOVE_NEEDS_SECOND_CONFIRM=1
+        log_warn "Could not read the member list of the existing configuration - it may contain"
+        log_warn "databases other than ${PRIMARY_DB_UNIQUE_NAME} and ${STANDBY_DB_UNIQUE_NAME}."
+    elif [[ -n "$FOREIGN_MEMBERS" ]]; then
+        REMOVE_NEEDS_SECOND_CONFIRM=1
+        log_warn "The existing configuration contains member(s) that are NOT part of the selected"
+        log_warn "configuration (${PRIMARY_DB_UNIQUE_NAME} / ${STANDBY_DB_UNIQUE_NAME}):"
+        printf '%s\n' "$FOREIGN_MEMBERS" | while IFS= read -r _member; do
+            log_warn "  ${_member}"
+        done
+        log_warn "Removing the configuration also drops them from broker management."
+    fi
+    if [[ "$REMOVE_NEEDS_SECOND_CONFIRM" -eq 1 && ! -t 0 ]]; then
+        log_error "Refusing to remove a broker configuration that is not limited to this build without an interactive confirmation"
+        log_error "Inspect it with 'dgmgrl / \"show configuration\"' and remove or edit it by hand if that is really intended"
+        exit 1
+    fi
+
     if ! confirm_proceed "Do you want to remove the existing configuration and create a new one?"; then
         log_info "Keeping existing configuration"
         exit 0
+    fi
+    if [[ "$REMOVE_NEEDS_SECOND_CONFIRM" -eq 1 ]]; then
+        if ! confirm_typed_value "This removes the WHOLE broker configuration, including the member(s) listed above." "REMOVE CONFIGURATION"; then
+            log_info "Keeping existing configuration"
+            exit 1
+        fi
     fi
 
     # REMOVE CONFIGURATION fails with ORA-16654 while fast-start

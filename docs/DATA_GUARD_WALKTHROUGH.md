@@ -216,6 +216,21 @@ When `-a` / `--approval-mode` is used, every mutating action displays a prompt s
 
 You must type `y` or `yes` to approve each action. Declining skips that action with a warning.
 
+`fsfo/observer.sh` (Step 10) honours both flags as well: `-n` with `setup`, `start`, `stop`
+or `restart` runs read-only broker queries, prints the plan and changes nothing (no wallet
+write, no `START`/`STOP OBSERVER`, no signal; a stale pidfile is reported and left in place),
+while `status` runs normally. In approval mode a declined action ends the command with exit 1.
+
+### Identity Check
+
+Steps 4, 6, 9, 10 and 13 compare the database `ORACLE_SID` points at with the selected
+`standby_config_*.env` before they change anything, and under `-n` too: `DB_UNIQUE_NAME`,
+`DATABASE_ROLE` and `DBID` must match. On a host that runs several databases, a stale
+`ORACLE_SID` therefore ends the step with exit 1 instead of aiming it at another database.
+Steps 4 and 6 must be connected to the configuration's primary. Steps 9, 10 and 13 accept
+either member as long as it currently holds the PRIMARY role, so they still work after a
+switchover.
+
 ---
 
 ## Step 1: Gather Primary Information
@@ -567,7 +582,10 @@ lsnrctl status
 ### What the Script Does
 
 1. Configures TNS names on primary (adds entries for both databases)
-2. Configures listener on primary with static registration
+2. Configures listener on primary with static registration. If the entries cannot be
+   inserted automatically (for example a one-line `SID_LIST_LISTENER`), the rest of the
+   step still runs, but it ends in ERROR (exit 1) and prints the entries to add by hand;
+   re-run the step afterwards
 3. Enables FORCE_LOGGING if not already enabled
 4. Creates standby redo logs (required for switchover), one group more than the
    number of online redo log groups, sized to the largest online redo log, with
@@ -653,8 +671,16 @@ tnsping TESTDB_STBY
 3. Prompts for SYS password (verified against primary)
 4. Shuts down any existing instance
 5. Starts standby instance in NOMOUNT mode
-6. Executes RMAN DUPLICATE FROM ACTIVE DATABASE
-7. Creates SPFILE from PFILE if needed
+6. Executes RMAN DUPLICATE FROM ACTIVE DATABASE. In Traditional mode with no FRA chosen
+   for the standby, the live primary is asked first whether it has
+   `db_recovery_file_dest` set; if so, the `SPFILE` clause carries
+   `RESET DB_RECOVERY_FILE_DEST` and `RESET DB_RECOVERY_FILE_DEST_SIZE`, because the
+   duplicate copies the primary's spfile and the standby would otherwise inherit an FRA
+   path that may not exist on its host
+7. Verifies the SPFILE and reads back the standby's effective FRA settings. If they
+   contradict the choice made in Step 2, the remaining post-clone actions still run and
+   the step then exits 1 with the manual fix printed (the clone itself is complete - do
+   not re-run it)
 8. Starts Managed Recovery Process (MRP)
 9. Configures RMAN archivelog deletion policy on standby
 10. Verifies MRP is running and applying redo
@@ -738,7 +764,9 @@ EXIT;
 
 1. Verifies DG Broker is running (DMON process)
 2. Tests TNS connectivity to both databases
-3. Checks for existing broker configuration
+3. Checks for existing broker configuration. Before removing one, it names any member
+   that is not part of the selected configuration, refuses when run non-interactively,
+   and asks for a typed `REMOVE CONFIGURATION` at a terminal
 4. Creates new broker configuration
 5. Adds standby database to configuration
 6. Enables the configuration
@@ -987,11 +1015,16 @@ instead of this step).
 2. Creates auto-login wallet
 3. Adds observer user credentials for primary and standby TNS aliases
 4. Configures sqlnet.ora with wallet location
-5. Tests wallet connectivity
+5. Tests wallet connectivity for **both** aliases and checks that the login is the
+   observer user. A failure on either ends setup with `FAILED` and exit 1, and prints
+   where the previous wallet's backup is and the command that restores it
 
 **Start command (`./observer.sh start`):**
 1. Verifies wallet exists
-2. Verifies FSFO is enabled
+2. Picks a reachable broker member (the primary alias, then the standby alias; each
+   attempt bounded by `DG_OBSERVER_CONNECT_TIMEOUT`, default 20 s) and uses it for the
+   whole run, so the observer can be restarted after a failover while the original
+   primary is still down. Verifies FSFO is enabled
 3. Starts observer in background using wallet authentication
 4. Saves PID for lifecycle management
 
@@ -1414,7 +1447,8 @@ keeps the primary-only / standby-only / role-aware connect strings.
 5. Computes a **Verdict** with each reason named *and an action attached to every
    finding*: ERROR on broker-config errors/ORA- diagnostics, failure-state
    switchover status, or apply lag beyond `DG_SEQ_GAP_CRIT` sequences; WARNING on
-   lesser findings (broker warnings, role trigger not deployed, standby readability
+   lesser findings (broker warnings, role trigger not deployed and valid - one owner must
+   hold a VALID package spec and body plus both triggers ENABLED and VALID - standby readability
    unknown, no user-created service, apply lag in time beyond `DG_LAG_WARN_SECONDS`,
    default 60); HEALTHY only when nothing fired
 6. Writes the Markdown report, a styled self-contained HTML twin, a JSON sidecar and a
@@ -1574,8 +1608,10 @@ bash common/setup_dg_wallet.sh -A           # generate the wallet password autom
 ```
 
 The script auto-detects the local role, discovers the peer TNS alias from the broker,
-creates the wallet, configures `sqlnet.ora`, and tests the connection. It is idempotent
-- re-running adds or updates credentials in an existing wallet.
+creates the wallet, configures `sqlnet.ora`, and tests the connection. A failed wallet
+login is a failed setup: the script exits 1, leaves the new wallet in place and prints the
+command that restores the previous one. It is idempotent - re-running adds or updates
+credentials in an existing wallet.
 
 Re-running with `-A` against a wallet that already holds credentials (or whose
 auto-generated password can no longer be supplied) lists the existing credentials and
@@ -1746,8 +1782,8 @@ protection mode alone.
 |--------|---------|------|
 | `01_prepare_primary.sh` | PRIMARY | Discovers the topology, reports FSFO readiness, creates/verifies the dedicated `SYSDG` observer user (CDB-aware), optionally enables FSFO (`--enable-fsfo`), writes the bundle for the third host |
 | `02_setup_observer_host.sh` | THIRD HOST | TNS entries + auto-login wallet, then proves the observer user can log in `AS SYSDG` to **both** databases |
-| `03_observer_ctl.sh` | THIRD HOST | `start` / `stop` / `restart` / `status` / `log` / `boot` |
-| `04_verify_observer.sh` | THIRD HOST (or anywhere) | End-state verification + placement check. Exit `0` = observer present and FSFO ready |
+| `03_observer_ctl.sh` | THIRD HOST | `start` / `stop` / `restart` / `status` / `log` / `boot`. `status` exits `0` only when THIS observer is live: listed by the broker, its own last ping at most `DG_OBS_MAX_PING_AGE` seconds old (default 60), and its process not known dead. `start` restarts a registered-but-dead observer with its existing state file |
+| `04_verify_observer.sh` | THIRD HOST (or anywhere) | End-state verification + placement check. Exit `0` = this observer live (same rule) and FSFO ready |
 
 ```bash
 # 1. on the PRIMARY

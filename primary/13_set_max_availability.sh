@@ -87,6 +87,11 @@ source "$STANDBY_CONFIG_FILE"
 # Re-initialize log with DB name
 init_log "13_set_max_availability_${STANDBY_DB_UNIQUE_NAME}"
 
+# The selected config must describe the database ORACLE_SID points at
+# (either member, as long as it holds the PRIMARY role - this step also
+# runs after a switchover). Checked before the -n stop.
+assert_db_matches_config member || exit 1
+
 # ============================================================
 # Verify Database Role
 # ============================================================

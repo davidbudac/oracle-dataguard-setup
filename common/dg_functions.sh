@@ -489,32 +489,71 @@ strip_whitespace() {
 
 # Create a private temp directory for scratch files, preferring `mktemp -d`
 # (unpredictable name, created atomically, mode 700). Falls back to a
-# manually created mode-700 directory named with $$ when `mktemp` is not on
-# PATH (e.g. a minimal AIX image) - a fixed `/tmp/foo_$$` filename is
-# predictable and can be pre-created/symlinked by another user, so any
-# fallback still needs its own private, non-world-writable directory rather
-# than a bare file directly under /tmp.
-# Prints the directory path to stdout. Callers should immediately register
-# `trap 'rm -rf "$dir"' EXIT` (merging with any existing EXIT trap) so the
-# directory and everything placed inside it are cleaned up on every exit
-# path, not just the happy path.
+# manually created mode-700 directory when `mktemp` is not on PATH (e.g. a
+# minimal AIX image) or is installed but fails - a fixed `/tmp/foo_$$`
+# filename is predictable and can be pre-created/symlinked by another user,
+# so any fallback still needs its own private, non-world-writable directory
+# rather than a bare file directly under /tmp.
+# Prints the directory path (and nothing else) to stdout; returns non-zero
+# with nothing on stdout when no private directory could be established.
+# Callers should immediately register `trap 'rm -rf "$dir"' EXIT` (merging
+# with any existing EXIT trap) so the directory and everything placed inside
+# it are cleaned up on every exit path, not just the happy path.
 # Usage: MY_TMP_DIR=$(create_temp_dir) && trap 'rm -rf "$MY_TMP_DIR"' EXIT
 #        MY_TMP_FILE="${MY_TMP_DIR}/dg_sid_desc_primary.$$"
 create_temp_dir() {
+    local dir
     if command -v mktemp >/dev/null 2>&1; then
-        mktemp -d 2>/dev/null && return
+        # Captured rather than passed through, so a failing mktemp that
+        # still writes to stdout cannot leak text into the caller's path.
+        dir=$(mktemp -d 2>/dev/null) && [[ -n "$dir" && -d "$dir" ]] && {
+            printf '%s\n' "$dir"
+            return 0
+        }
     fi
-    # No -p: an existing directory (pre-created by someone else under this
-    # guessable name) must fail rather than be reused, and an existing one
-    # that is not ours/700 is refused even if mkdir somehow succeeded.
-    local dir="${TMPDIR:-/tmp}/dg_tmp_$$"
-    mkdir -m 700 "$dir" 2>/dev/null || return 1
-    [[ -O "$dir" ]] || return 1
-    case "$(ls -ld "$dir" 2>/dev/null)" in
-        drwx------*) ;;
-        *) return 1 ;;
-    esac
-    printf '%s\n' "$dir"
+    # Fallback. $$ is the SAME in every command substitution of one script,
+    # so a name built from $$ alone collides as soon as two directories are
+    # live at once (step 4 holds one while add_sid_to_listener allocates
+    # another). Each candidate therefore also carries $RANDOM (bash reseeds
+    # it per subshell) and the attempt number, and a candidate that already
+    # exists is skipped, a bounded number of times.
+    # No -p: an existing path (directory, file or symlink - pre-created by
+    # someone else, or by an earlier allocation) must fail rather than be
+    # reused, and a new one that is not ours/700 is refused even if mkdir
+    # somehow succeeded.
+    local base="${TMPDIR:-/tmp}" attempt=0
+    base="${base%/}"
+    while [[ $attempt -lt 20 ]]; do
+        attempt=$((attempt + 1))
+        dir=$(_dg_temp_dir_candidate "$base" "$attempt")
+        if mkdir -m 700 "$dir" 2>/dev/null; then
+            if [[ -O "$dir" && ! -L "$dir" ]]; then
+                case "$(ls -ld "$dir" 2>/dev/null)" in
+                    drwx------*)
+                        printf '%s\n' "$dir"
+                        return 0
+                        ;;
+                esac
+            fi
+            # Created by us but not private: remove the (empty) directory
+            # and give up - retrying would not change the filesystem's
+            # ownership or permission semantics.
+            rmdir "$dir" 2>/dev/null
+            return 1
+        fi
+        # Only a name collision is worth another candidate; anything else
+        # (unwritable or missing base directory) fails the same way again.
+        if [[ ! -e "$dir" && ! -L "$dir" ]]; then
+            return 1
+        fi
+    done
+    return 1
+}
+
+# Candidate path for create_temp_dir's fallback: <base>/dg_tmp_<pid>_<n>_<random>.
+# Separate so the unit tests can substitute predictable names.
+_dg_temp_dir_candidate() {
+    printf '%s/dg_tmp_%s_%s_%s%s\n' "$1" "$$" "$2" "$RANDOM" "$RANDOM"
 }
 
 # ============================================================
@@ -667,6 +706,140 @@ check_db_connection() {
         log_error "Output: $result"
         return 1
     fi
+}
+
+# Pure comparison behind assert_db_matches_config (no sqlplus, unit-tested).
+# Usage: compare_db_identity <mode> <db_unique_name> <database_role> <dbid> \
+#            <expected_primary> <expected_standby> <expected_dbid>
+#   mode primary - the connected database must be <expected_primary> and
+#                  hold the PRIMARY role (steps 4 and 6: the initial build)
+#   mode member  - the connected database must hold the PRIMARY role and be
+#                  <expected_primary> or <expected_standby> (steps 9, 10, 13,
+#                  which also run after a switchover)
+# The DBID must equal <expected_dbid>; an empty <expected_dbid> (a config
+# written before step 2 recorded DBID) is a warning, not a failure. Names
+# compare case-insensitively. Empty connected values - a failed or empty
+# V$DATABASE query - are failures, never a pass.
+# Prints one finding per line tagged "FAIL: ", "WARN: " or "NOTE: "; a
+# "NOTE: ROLES_SWAPPED" line means the connected database is the config's
+# standby (now primary). Returns 0 when no FAIL line was printed, else 1.
+compare_db_identity() {
+    local mode="$1" name="$2" role="$3" dbid="$4"
+    local exp_pri="$5" exp_stb="$6" exp_dbid="$7"
+    local lname lpri lstb failed=0
+
+    lname=$(printf '%s' "$name" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    lpri=$(printf '%s' "$exp_pri" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    lstb=$(printf '%s' "$exp_stb" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')
+    role=$(printf '%s' "$role" | tr '[:lower:]' '[:upper:]' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+    dbid=$(printf '%s' "$dbid" | tr -d '[:space:]')
+    exp_dbid=$(printf '%s' "$exp_dbid" | tr -d '[:space:]')
+
+    case "$mode" in
+        primary|member) ;;
+        *)
+            printf 'FAIL: unknown identity check mode "%s"\n' "$mode"
+            return 1
+            ;;
+    esac
+    if [[ -z "$lname" || -z "$role" ]]; then
+        printf 'FAIL: could not read the connected database identity from V$DATABASE\n'
+        return 1
+    fi
+    if [[ -z "$lpri" ]]; then
+        printf 'FAIL: the configuration has no PRIMARY_DB_UNIQUE_NAME\n'
+        return 1
+    fi
+
+    if [[ "$role" != "PRIMARY" ]]; then
+        printf 'FAIL: the connected database role is %s, not PRIMARY\n' "$role"
+        failed=1
+    fi
+
+    if [[ "$lname" == "$lpri" ]]; then
+        :
+    elif [[ "$mode" == "member" && -n "$lstb" && "$lname" == "$lstb" ]]; then
+        printf 'NOTE: ROLES_SWAPPED\n'
+    elif [[ "$mode" == "member" ]]; then
+        printf 'FAIL: DB_UNIQUE_NAME %s is neither the configuration primary (%s) nor its standby (%s)\n' \
+            "$name" "$exp_pri" "${exp_stb:-<unset>}"
+        failed=1
+    else
+        printf 'FAIL: DB_UNIQUE_NAME %s is not the configuration primary %s\n' "$name" "$exp_pri"
+        failed=1
+    fi
+
+    if [[ -z "$exp_dbid" ]]; then
+        printf 'WARN: the configuration records no DBID - the database could only be matched by name\n'
+    elif [[ "$dbid" != "$exp_dbid" ]]; then
+        printf 'FAIL: DBID %s does not match the configuration DBID %s\n' "${dbid:-<empty>}" "$exp_dbid"
+        failed=1
+    fi
+
+    return $failed
+}
+
+# Refuse to continue unless the database this session is connected to (the
+# ambient ORACLE_SID, "/ as sysdba") is the one the sourced
+# standby_config_*.env describes. Reads PRIMARY_DB_UNIQUE_NAME,
+# STANDBY_DB_UNIQUE_NAME, DBID (and STANDBY_CONFIG_FILE for messages) from
+# the caller's environment; see compare_db_identity for the two modes.
+# Run it right after sourcing the config and before the first mutating SQL,
+# broker command or file write (and before the CHECK_ONLY stop).
+# Sets DG_CONFIG_ROLES_SWAPPED=1 when (member mode) the connected primary is
+# the config's standby - a switchover happened since the build - else 0.
+# Returns 0 on a match; logs the mismatch and returns 1 otherwise.
+# Usage: assert_db_matches_config primary|member || exit 1
+assert_db_matches_config() {
+    local mode="$1"
+    local out line name="" role="" dbid="" findings rc=0 finding
+
+    DG_CONFIG_ROLES_SWAPPED=0
+    log_info "Checking that the connected database matches the selected configuration..."
+
+    out=$(run_sql_query "get_db_identity_pipe.sql") || rc=$?
+    line=$(printf '%s\n' "$out" | tr -d '\r' | grep '|' | head -1)
+    if [[ $rc -ne 0 || -z "$line" ]]; then
+        log_error "Could not read DB_UNIQUE_NAME/DATABASE_ROLE/DBID of the connected database (ORACLE_SID=${ORACLE_SID:-<unset>})"
+        log_error "Refusing to continue: the selected configuration cannot be matched to this database"
+        return 1
+    fi
+    IFS='|' read -r name role dbid <<< "$line"
+    name=$(printf '%s' "$name" | tr -d '[:space:]')
+    dbid=$(printf '%s' "$dbid" | tr -d '[:space:]')
+    role=$(printf '%s' "$role" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+    rc=0
+    findings=$(compare_db_identity "$mode" "$name" "$role" "$dbid" \
+        "${PRIMARY_DB_UNIQUE_NAME:-}" "${STANDBY_DB_UNIQUE_NAME:-}" "${DBID:-}") || rc=$?
+
+    if [[ $rc -ne 0 ]]; then
+        log_error "The connected database does not match the selected configuration"
+        log_error "  Connected : DB_UNIQUE_NAME=${name:-<empty>} ROLE=${role:-<empty>} DBID=${dbid:-<empty>} (ORACLE_SID=${ORACLE_SID:-<unset>})"
+        if [[ "$mode" == "member" ]]; then
+            log_error "  Expected  : the PRIMARY role on ${PRIMARY_DB_UNIQUE_NAME:-<unset>} or ${STANDBY_DB_UNIQUE_NAME:-<unset>}, DBID=${DBID:-<not recorded>}"
+        else
+            log_error "  Expected  : ${PRIMARY_DB_UNIQUE_NAME:-<unset>} in the PRIMARY role, DBID=${DBID:-<not recorded>}"
+        fi
+        log_error "  Config    : ${STANDBY_CONFIG_FILE:-<unknown>}"
+    fi
+    while IFS= read -r finding; do
+        case "$finding" in
+            "FAIL: "*) log_error "  ${finding#FAIL: }" ;;
+            "WARN: "*) log_warn "${finding#WARN: } (DBID not cross-checked)" ;;
+            "NOTE: ROLES_SWAPPED")
+                DG_CONFIG_ROLES_SWAPPED=1
+                log_info "Connected to ${name}, the configuration's standby, which now holds the PRIMARY role (roles are swapped relative to the configuration - a switchover/failover happened since the build)"
+                ;;
+        esac
+    done <<< "$findings"
+
+    if [[ $rc -ne 0 ]]; then
+        log_error "Check that ORACLE_SID (and ORACLE_HOME) point at the database this configuration describes, or select the matching standby_config_*.env"
+        return 1
+    fi
+    log_info "Connected database ${name} (${role}, DBID ${dbid}) matches the selected configuration"
+    return 0
 }
 
 # ============================================================
@@ -1098,6 +1271,41 @@ dgmgrl_has_error_lines() {
         }
     }
     END { exit(found ? 0 : 1) }
+    '
+}
+
+# Member names, one per line as the broker prints them, from captured 19c
+# SHOW CONFIGURATION output: the "<name> - <description>" lines after a
+# "Members:" (or "Members Not Receiving Redo:") header, up to
+# "Fast-Start Failover:" / "Configuration Status:".
+#     Members:
+#     cdb1      - Primary database
+#       cdb1_stby - (*) Physical standby database
+#         Warning: ORA-16809: multiple warnings detected for the member
+# Indented Warning:/Error:/ORA- lines under a member are not members.
+# Prints nothing when no member line is found.
+# Usage: dgmgrl_config_members <output>
+dgmgrl_config_members() {
+    printf '%s\n' "$1" | tr -d '\r' | awk '
+    tolower($0) ~ /^[ \t]*members[^:]*:[ \t]*$/ { inm = 1; next }
+    tolower($0) ~ /^[ \t]*(fast-start failover|configuration status)/ { inm = 0; next }
+    inm && NF >= 3 && $2 == "-" { print $1 }
+    '
+}
+
+# Members of captured SHOW CONFIGURATION output that are none of the given
+# DB_UNIQUE_NAMEs (case-insensitive), one per line; nothing when all belong.
+# Usage: dgmgrl_foreign_members <output> <db_unique_name>...
+dgmgrl_foreign_members() {
+    local output="$1"
+    shift
+    local known
+    # Space-joined (DB_UNIQUE_NAMEs contain no blanks): a newline inside an
+    # awk -v value is rejected by some awks ("newline in string").
+    known=$(printf '%s ' "$@" | tr '[:upper:]' '[:lower:]')
+    dgmgrl_config_members "$output" | awk -v known="$known" '
+    BEGIN { n = split(known, k, " "); for (i = 1; i <= n; i++) if (k[i] != "") ok[k[i]] = 1 }
+    !(tolower($0) in ok) { print }
     '
 }
 

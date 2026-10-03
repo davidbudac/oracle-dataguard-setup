@@ -10,7 +10,10 @@ by pointing it at a staging copy of the non-CDB datafiles via
 file copy on the standby host. That parameter is set **on the CDB standby
 instance** (it is not carried in redo), so the scripts need a direct connection
 to the standby (wallet `/@<alias>`, or a prompted SYS password) and the share
-must be visible from the standby host (`STANDBY_STAGE_DIR`).
+must be visible from the standby host (`STANDBY_STAGE_DIR`). The prompted
+password goes to sqlplus on stdin with substitution off (`&` is safe); a
+password containing a double quote cannot be passed through a CONNECT string
+and is refused at the prompt - use the wallet then.
 
 The scripts are conservative: where a precondition cannot be proven (standby
 unreachable, wrong database behind `SOURCE_ORACLE_SID`, PDB not replicated) they
@@ -68,9 +71,12 @@ cd migrate_noncdb_to_pdb
 
 Each step requires its predecessor (`state.env` flags `preflight_ok`,
 `noncdb_quiesced`, `describe_done`, `plug_done`, `verify_done`) and clears its own
-and later flags when it starts, and `01_preflight.sh` resets all of them - a stale
-flag from an earlier run cannot gate step 06. Step 04 cannot be resumed once the
-PDB exists (it says how to proceed).
+and later flags when a new attempt really begins - after its refusal checks, just
+before its first change - and `01_preflight.sh` resets all of them, so a stale
+flag from an earlier run cannot gate step 06. A refused re-run leaves `state.env`
+untouched: re-running step 04 after a successful plug-in is refused ("PDB already
+exists") and step 05 still runs. Step 04 cannot be resumed once the PDB exists
+(it says how to proceed).
 
 **Unattended runs** set `MIGRATE_NONINTERACTIVE=1`, which auto-answers the YES
 prompts. It does **not** authorise `DROP DATABASE`: that also needs
@@ -91,8 +97,12 @@ accepted via `STANDBY_SSH_TARGET` (checked over ssh) or
   `TARGET_PDB_DATAFILE_DIR/<PDB>/`.
 * **05** passes only if the standby (direct connection) has the PDB with
   `RECOVERY_STATUS=ENABLED`, no `UNNAMED` datafiles, the same datafile count as
-  the primary, and its applied SCN has reached an SCN taken after a write inside
-  the PDB. An unreachable standby is a failure.
+  the primary, and its applied SCN - the standby's own `V$DATABASE.CURRENT_SCN`,
+  read with its role in the same query - has reached an SCN taken after a write
+  inside the PDB. An unreachable standby, an alias that does not answer as the
+  configured `PHYSICAL STANDBY`, and a query error are failures; a query error
+  is reported with its ORA- text, never as apply lag (wait/poll:
+  `MIGRATE_SCN_WAIT_SECS`/`MIGRATE_SCN_POLL_SECS`, default 120/5).
 * **06** proves, before touching anything, that `SOURCE_ORACLE_SID` is the
   non-CDB `SOURCE_DB_NAME` (not a CDB, PRIMARY, OPEN READ ONLY, same DBID as
   preflight recorded) and that the new PDB is OPEN READ WRITE in the CDB.

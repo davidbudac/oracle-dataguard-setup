@@ -48,6 +48,11 @@ source "$STANDBY_CONFIG_FILE"
 # Reinitialize log with standby DB name
 init_log "04_prepare_primary_dg_${STANDBY_DB_UNIQUE_NAME}"
 
+# The selected config must describe the database ORACLE_SID points at:
+# on a multi-database host a stale ORACLE_SID would otherwise aim this
+# step's changes at another database. Checked before the -n stop.
+assert_db_matches_config primary || exit 1
+
 # ============================================================
 # Review Planned Changes
 # ============================================================
@@ -194,10 +199,16 @@ if [[ -f "$LISTENER_ORA" ]]; then
             log_info "Missing SID_DESC entries added to existing SID_LIST_LISTENER"
             LISTENER_CONFIG_CHANGED=1
         else
-            log_warn "Could not auto-insert SID_DESC entry"
-            log_warn "Please manually add the following entry to SID_LIST_LISTENER:"
+            # Not a warning: without these static entries DGMGRL switchover
+            # (and step 13's VALIDATE DATABASE) fail with ORA-12514. The rest
+            # of the step still runs (it is independent and idempotent), but
+            # the step ends in ERROR and exits 1 so the gap cannot be missed.
+            STATIC_REG_INCOMPLETE=1
+            STATIC_REG_PENDING_ENTRY=$(cat "$TEMP_SID_DESC")
+            log_error "Could not insert the static SID_DESC entries into ${LISTENER_ORA} (see the error above)"
+            log_error "Add the following entries to SID_LIST_LISTENER by hand, run 'lsnrctl reload', then re-run this step:"
             echo ""
-            cat "$TEMP_SID_DESC"
+            printf '%s\n' "$STATIC_REG_PENDING_ENTRY"
             echo ""
         fi
     else
@@ -317,6 +328,47 @@ fi
 log_info "Current standby redo groups: $CURRENT_STBY_GROUPS"
 log_info "Required standby redo groups: $REQUIRED_STBY_GROUPS"
 
+# ---- begin srl size helpers ----
+# srl_size_label BYTES -> "100 MB" for a whole number of MiB, otherwise the
+# exact byte count ("105381888 bytes"): never a truncated figure that makes
+# two different sizes look equal (mirrors dg_check_srl.sh's size_label).
+srl_size_label() {
+    if [[ $(( 10#$1 % 1048576 )) -eq 0 ]]; then
+        printf '%s MB' "$(( 10#$1 / 1048576 ))"
+    else
+        printf '%s bytes' "$(( 10#$1 ))"
+    fi
+}
+
+# srl_size_verdict MIN_SRL_BYTES MAX_ORL_BYTES -> prints one word:
+#   UNDERSIZED  smallest standby redo log is smaller than the largest online
+#               redo log, by even one byte
+#   ADEQUATE    smallest SRL is equal to or larger than the largest ORL
+#   UNKNOWN     either value is empty, non-numeric, zero or too wide for
+#               shell arithmetic - never reported as adequate
+# Exact bytes, not whole MiB: two figures both rounded UP to MiB can read equal
+# while the SRL is still smaller than the ORL (100.4 vs 100.5 MiB -> 101/101).
+srl_size_verdict() {
+    local srl="$1" orl="$2"
+    if [[ ! "$srl" =~ ^[0-9]+$ || ! "$orl" =~ ^[0-9]+$ ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    # 18 digits stay inside a signed 64-bit; strip leading zeros (no octal).
+    srl=$(printf '%s' "$srl" | sed 's/^0*//')
+    orl=$(printf '%s' "$orl" | sed 's/^0*//')
+    if [[ -z "$srl" || -z "$orl" || ${#srl} -gt 18 || ${#orl} -gt 18 ]]; then
+        printf 'UNKNOWN'
+        return 0
+    fi
+    if [[ "$srl" -lt "$orl" ]]; then
+        printf 'UNDERSIZED'
+    else
+        printf 'ADEQUATE'
+    fi
+}
+# ---- end srl size helpers ----
+
 check_existing_srl_sizes() {
     # M6: count alone doesn't catch UNDERSIZED pre-existing SRLs. Oracle
     # rejects a standby redo log smaller than the largest online redo
@@ -325,22 +377,44 @@ check_existing_srl_sizes() {
     # can pass this count check while defeating step 1's own advice to
     # resize the ORLs before the standby exists. Compare, warn, and give
     # the fix DDL - do not auto-drop existing standby redo log groups.
-    STBY_MIN_SIZE_MB=$(run_sql_query "get_standby_redo_min_size.sql")
-    STBY_MIN_SIZE_MB=$(echo "$STBY_MIN_SIZE_MB" | tr -d '[:space:]')
-    if is_numeric "$STBY_MIN_SIZE_MB" && is_numeric "${REDO_LOG_SIZE_MB:-}"; then
-        if [[ "$STBY_MIN_SIZE_MB" -lt "$REDO_LOG_SIZE_MB" ]]; then
-            log_warn "Existing standby redo logs are UNDERSIZED: smallest is ${STBY_MIN_SIZE_MB}MB, online redo logs are ${REDO_LOG_SIZE_MB}MB"
+    #
+    # The comparison is on exact bytes from the LIVE primary (smallest
+    # V$STANDBY_LOG vs largest V$LOG, one query: "min_srl|max_orl"), the
+    # same rule dg_check_srl.sh applies. A failed query must not abort the
+    # step under set -e, hence the || fallback to an empty result.
+    local raw srl_bytes orl_bytes verdict ddl_mb live_mb
+    raw=$(run_sql_query "get_standby_redo_min_size.sql") || raw=""
+    raw=$(printf '%s' "$raw" | tr -d '[:space:]')
+    srl_bytes="${raw%%|*}"
+    orl_bytes=""
+    case "$raw" in
+        *\|*) orl_bytes="${raw#*|}" ;;
+    esac
+    verdict=$(srl_size_verdict "$srl_bytes" "$orl_bytes")
+    case "$verdict" in
+        UNDERSIZED)
+            # SIZE must make the new SRLs at least as large as the ORLs:
+            # the config's whole-MiB figure (rounded up), unless it is
+            # missing/stale and smaller than the live ORL rounded up.
+            live_mb=$(( (10#$orl_bytes + 1048575) / 1048576 ))
+            ddl_mb="${REDO_LOG_SIZE_MB:-}"
+            if ! is_numeric "$ddl_mb" || [[ "$ddl_mb" -lt "$live_mb" ]]; then
+                ddl_mb="$live_mb"
+            fi
+            log_warn "Existing standby redo logs are UNDERSIZED: smallest is $(srl_size_label "$srl_bytes"), largest online redo log is $(srl_size_label "$orl_bytes")"
             log_warn "  Oracle rejects standby redo logs smaller than the largest online redo log for"
             log_warn "  real-time apply - transport silently falls back to archiver mode instead."
             log_warn "  Fix (run manually - not applied automatically), for each undersized group:"
             log_warn "    ALTER DATABASE DROP STANDBY LOGFILE GROUP <n>;"
-            log_warn "    ALTER DATABASE ADD STANDBY LOGFILE GROUP <n> ('<path>') SIZE ${REDO_LOG_SIZE_MB}M;"
-        else
-            log_info "Existing standby redo logs are sized adequately (>= ${REDO_LOG_SIZE_MB}MB)"
-        fi
-    else
-        log_warn "Could not verify existing standby redo log sizes (non-numeric query result) - check manually"
-    fi
+            log_warn "    ALTER DATABASE ADD STANDBY LOGFILE GROUP <n> ('<path>') SIZE ${ddl_mb}M;"
+            ;;
+        ADEQUATE)
+            log_info "Existing standby redo logs are sized adequately (smallest $(srl_size_label "$srl_bytes") >= largest online redo log $(srl_size_label "$orl_bytes"))"
+            ;;
+        *)
+            log_warn "Could not verify existing standby redo log sizes (empty or non-numeric query result) - check manually"
+            ;;
+    esac
 }
 
 if [[ "$CURRENT_STBY_GROUPS" -lt "$REQUIRED_STBY_GROUPS" ]]; then
@@ -629,6 +703,16 @@ echo "      configured automatically when the broker is enabled."
 FORCE_LOGGING=$(run_sql_query "get_force_logging.sql")
 FORCE_LOGGING=$(echo "$FORCE_LOGGING" | tr -d '[:space:]')
 DG_BROKER_START=$(get_db_parameter "dg_broker_start")
+
+if [[ "${STATIC_REG_INCOMPLETE:-0}" -eq 1 ]]; then
+    log_error "Static listener registration is INCOMPLETE on the primary - add these entries to"
+    log_error "SID_LIST_LISTENER in ${LISTENER_ORA}, run 'lsnrctl reload', then re-run this step:"
+    echo ""
+    printf '%s\n' "$STATIC_REG_PENDING_ENTRY"
+    echo ""
+    print_summary "ERROR" "Primary prepared, but static listener registration is incomplete"
+    exit 1
+fi
 
 print_summary "SUCCESS" "Primary configured for Data Guard"
 print_status_block "Primary Data Guard Readiness" \

@@ -27,13 +27,32 @@ The setup script:
 
 1. Detects the local database role (primary or standby) from `V$DATABASE`
 2. Discovers the peer database and TNS aliases from the DG Broker
-3. Prompts for the SYS password and verifies it against the peer
+3. Prompts for the SYS password and verifies it against the peer (and the local alias)
 4. Creates an auto-login wallet with `mkstore`
-5. Stores SYS credentials for both local and peer TNS aliases
-6. Adds `WALLET_LOCATION` and `SQLNET.WALLET_OVERRIDE` to `sqlnet.ora`
-7. Tests the wallet connection to the peer
+5. Stores SYS credentials for the peer TNS alias, and for the local alias when the password login over it worked in step 3
+6. Adds `WALLET_LOCATION` and `SQLNET.WALLET_OVERRIDE` to `sqlnet.ora` (after a timestamped `sqlnet.ora.bak.*` copy)
+7. Logs in through the wallet (`sqlplus /@<alias> as sysdba`) to every alias it stored
 
 After setup, any tool that connects using `/@<tns_alias> as sysdba` will authenticate via the wallet automatically.
+
+### Staging directory
+
+A new or recreated wallet is built in a private staging directory and moved into place only once it is complete. The directory comes from `mktemp -d` under `$TMPDIR` (default `/tmp`); where `mktemp` is missing, fails, or returns something that is not a private directory, the script falls back to an exclusive `mkdir -m 700` on unpredictable names, never reusing an existing path. Before any `mkstore` call the directory is verified to be a real directory (not a symlink), owned by the invoking user, mode `drwx------`. If no such directory can be made, the script exits 1 with nothing changed - point `TMPDIR` at a directory you own and re-run.
+
+### Exit status and a failed wallet login
+
+| Exit | Meaning |
+|---|---|
+| `0` | Wallet in place, `sqlnet.ora` configured, and the wallet login succeeded for every stored alias |
+| `1` | Any failure |
+
+The final wallet login is the proof the wallet works: `sqlplus` reads `sqlnet.ora` at every start, so a failure there is real - a stored password the database rejects (`ORA-01017`, e.g. a password file out of sync), an alias that does not resolve (`ORA-12154`), or a `WALLET_LOCATION`/`SQLNET.WALLET_OVERRIDE` that is not in effect. Output carrying an `ORA-`/`SP2-`/`TNS-`/`ERROR` line counts as a failure even when `sqlplus` exits 0. On a failed login the script names the alias, shows the Oracle error, prints no success summary and exits 1. The new wallet is left in place; the timestamped backup of the previous wallet (`<wallet_dir>.bak.<timestamp>_<pid>`, when there was one) is named together with the restore command:
+
+```bash
+rm -rf <wallet_dir> && mv <wallet_dir>.bak.<timestamp>_<pid> <wallet_dir>
+```
+
+along with the `sqlnet.ora` backup when this run edited that file.
 
 ## Command-Line Options
 
@@ -86,7 +105,7 @@ The script stores SYS credentials for two TNS aliases (discovered from the broke
 | TNS Alias | Purpose |
 |---|---|
 | Peer alias (e.g. `cdb1_stby`) | Connect to the other database |
-| Local alias (e.g. `cdb1`) | Connect to self via TNS (used by some tools) |
+| Local alias (e.g. `cdb1`) | Connect to self via TNS (used by some tools); stored only when the SYS password login over it works, otherwise the script warns and skips it - fix the alias and re-run |
 
 After running on both hosts, each database can reach the other with:
 

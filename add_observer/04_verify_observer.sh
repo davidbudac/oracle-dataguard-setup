@@ -6,6 +6,11 @@
 #   - broker configuration health (SHOW CONFIGURATION)
 #   - FSFO state, target and threshold/lag limit
 #   - SHOW OBSERVER and the V$DATABASE observer columns
+#   - that THIS observer (OBSERVER_NAME / OBSERVER_HOST from
+#     observer_env.sh) is live, not merely registered: its own block in
+#     SHOW OBSERVER must show a last ping no older than DG_OBS_MAX_PING_AGE
+#     seconds (default 60). FS_FAILOVER_OBSERVER_PRESENT alone cannot tell a
+#     different observer from this one
 #   - that the observer host is NOT one of the two database hosts,
 #     which is the entire point of a third host
 #   - which users hold SYSDG in the password file
@@ -17,8 +22,9 @@
 #   --local    -> OS auth 'dgmgrl /' (run it on a database host with
 #                 ORACLE_SID set)
 #
-# Exit codes: 0 observer present, 1 observer missing / cannot verify,
-#             2 bad arguments
+# Exit codes: 0 this observer live and FSFO ready, 1 observer missing /
+#             not live / cannot verify, 2 bad arguments (including an
+#             invalid DG_OBS_MAX_PING_AGE)
 # ============================================================
 
 set -e
@@ -42,6 +48,10 @@ Usage: $(basename "$0") [--tns ALIAS | --local]
                 (default: PRIMARY_TNS_ALIAS from observer_env.sh)
   --local       Connect locally as 'dgmgrl /' (on a database host)
   -h, --help    Show this help
+
+Environment:
+  DG_OBS_MAX_PING_AGE  Ping age limit in seconds for "this observer is live"
+                       (default 60)
 EOF
 }
 
@@ -54,6 +64,12 @@ while [[ $# -gt 0 ]]; do
         *) log_error "Unknown option: $1"; usage >&2; exit 2 ;;
     esac
 done
+
+DG_OBS_MAX_PING_AGE="${DG_OBS_MAX_PING_AGE:-60}"
+if ! valid_ping_age "$DG_OBS_MAX_PING_AGE"; then
+    log_error "DG_OBS_MAX_PING_AGE must be a positive whole number of seconds (got '${DG_OBS_MAX_PING_AGE}')."
+    exit 2
+fi
 
 check_oracle_env
 DGMGRL="$ORACLE_HOME/bin/dgmgrl"
@@ -120,6 +136,7 @@ PRESENT=$(printf '%s\n' "$VDB_OUT"     | sed -n 's/^FS_FAILOVER_OBSERVER_PRESENT
 OBS_HOST=$(printf '%s\n' "$VDB_OUT"    | sed -n 's/^FS_FAILOVER_OBSERVER_HOST=//p'    | trim       | head -1)
 FS_STATUS=$(printf '%s\n' "$VDB_OUT"   | sed -n 's/^FS_FAILOVER_STATUS=//p'           | trim       | head -1)
 FS_TARGET=$(printf '%s\n' "$VDB_OUT"   | sed -n 's/^FS_FAILOVER_CURRENT_TARGET=//p'   | trim       | head -1)
+DB_ROLE=$(printf '%s\n' "$VDB_OUT"     | sed -n 's/^DATABASE_ROLE=//p'                | trim       | head -1)
 
 log_section "Observer Placement"
 
@@ -158,7 +175,7 @@ fi
 
 case "$PRESENT" in
     YES)
-        log_info "FS_FAILOVER_OBSERVER_PRESENT = YES"
+        log_info "FS_FAILOVER_OBSERVER_PRESENT = YES (an observer is connected - which one is checked below)"
         ;;
     NO)
         log_error "FS_FAILOVER_OBSERVER_PRESENT = NO - the observer is not connected."
@@ -193,6 +210,43 @@ case "$(upper "$FS_STATUS")" in
 esac
 
 [[ -n "$FS_TARGET" ]] && log_info "Failover target: ${FS_TARGET}"
+
+# THIS observer, not "an" observer: the broker keeps a crashed observer
+# registered, and with several observers FS_FAILOVER_OBSERVER_PRESENT can be
+# YES because of a different one. The ping that counts is the one to the
+# database this session is connected to (its broker saw it first hand); if
+# that role is unknown, the fresher of the block's two pings.
+OBS_BLK=$(observer_block "$OBSERVER_OUT" "${OBSERVER_NAME:-}" "${OBSERVER_HOST:-}")
+case "$(upper "$DB_ROLE")" in
+    PRIMARY)    PING_MODE=primary ;;
+    *STANDBY*)  PING_MODE=target ;;
+    *)          PING_MODE=either ;;
+esac
+IFS='|' read -r OBS_PING OBS_PING_LABEL OBS_PING_TEXT <<< "$(observer_ping "$OBS_BLK" "$PING_MODE")"
+OBS_ID="'${OBSERVER_NAME:-?}'${OBSERVER_HOST:+ / host ${OBSERVER_HOST}}"
+if [[ -z "${OBSERVER_NAME:-}" && -z "${OBSERVER_HOST:-}" ]]; then
+    log_warn "No OBSERVER_NAME / OBSERVER_HOST (observer_env.sh) - cannot check THIS observer specifically;"
+    log_warn "  FS_FAILOVER_OBSERVER_PRESENT above is weaker evidence: it does not say which observer."
+elif [[ "$(obs_field "$OBS_BLK" BLOCKS)" == "0" ]]; then
+    log_warn "SHOW OBSERVER could not be read - cannot check observer ${OBS_ID} specifically;"
+    log_warn "  FS_FAILOVER_OBSERVER_PRESENT above is weaker evidence: it does not say which observer."
+elif [[ "$(obs_field "$OBS_BLK" MATCH)" == "none" ]]; then
+    log_error "SHOW OBSERVER does not list observer ${OBS_ID}."
+    [[ "$PRESENT" == "YES" ]] && log_error "  FS_FAILOVER_OBSERVER_PRESENT = YES refers to a different observer."
+    log_error "  On the observer host: ./03_observer_ctl.sh start"
+    RC=1
+elif [[ -z "$OBS_PING" ]]; then
+    log_error "Observer \"$(obs_field "$OBS_BLK" NAME)\" is registered, but its ${OBS_PING_LABEL} is '${OBS_PING_TEXT}' - not live."
+    log_error "  On the observer host: ./03_observer_ctl.sh status, then 'start' to restart it."
+    RC=1
+elif ! ping_is_fresh "$OBS_PING" "$DG_OBS_MAX_PING_AGE"; then
+    log_error "Observer \"$(obs_field "$OBS_BLK" NAME)\" is registered, but its ${OBS_PING_LABEL} was ${OBS_PING} s ago"
+    log_error "  (limit ${DG_OBS_MAX_PING_AGE} s) - a crashed or hung observer stays registered."
+    log_error "  On the observer host: ./03_observer_ctl.sh status, then 'start' to restart it."
+    RC=1
+else
+    log_info "Observer \"$(obs_field "$OBS_BLK" NAME)\" ($(obs_field "$OBS_BLK" ROLE), host $(obs_field "$OBS_BLK" HOST)) is live: ${OBS_PING_LABEL} ${OBS_PING} s ago."
+fi
 
 if [[ "$RC" == "0" ]]; then
     log_info "Observer verified."

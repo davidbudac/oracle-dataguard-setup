@@ -182,12 +182,17 @@ read_state() {
 # ------------------------------------------------------------
 
 # run_sql <sid> <sql ...>     (single connection, OS auth, returns stdout)
+# SET DEFINE OFF first: the SQL carries config values (paths, PDB names) that
+# must reach the database literally, never as '&' substitution variables.
+# EXIT FAILURE, not SQL.SQLCODE: the exit status is the code modulo 256, so
+# e.g. ORA-01536 would exit 0 and look like success.
 run_sql() {
     local sid="$1"; shift
     local sql="$*"
     ORACLE_SID="$sid" sqlplus -s -L / as sysdba <<EOF 2>&1
+SET DEFINE OFF
 SET PAGESIZE 0 LINESIZE 32767 FEEDBACK OFF HEADING OFF VERIFY OFF TRIMSPOOL ON
-WHENEVER SQLERROR EXIT SQL.SQLCODE
+WHENEVER SQLERROR EXIT FAILURE
 ${sql}
 EXIT;
 EOF
@@ -439,29 +444,84 @@ SELECT 'PDB_MODE=' || open_mode     FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAM
 # datafile names) is set and read through a direct connection to it.
 # Wallet first (/@alias; project convention alias == DB_UNIQUE_NAME, see
 # common/setup_dg_wallet.sh); on failure with a TTY, the standby SYS password
-# is prompted once and handed to sqlplus on stdin (never argv).
+# is prompted once and handed to sqlplus on stdin (never argv, never the
+# environment, never xtrace - see _trace_pause).
 STANDBY_SYS_PW=""
 
+# _trace_pause / _trace_resume  -  nestable: switch bash xtrace off around
+# anything that expands the standby password (a `bash -x` run would otherwise
+# print it in every [[ ]] test), and back on at the outermost resume.
+_MIG_TRACE_DEPTH=0
+_MIG_TRACE_WAS_ON=0
+_trace_pause() {
+    if [[ "$_MIG_TRACE_DEPTH" == "0" ]]; then
+        case "$-" in
+            *x*) _MIG_TRACE_WAS_ON=1; set +x ;;
+            *)   _MIG_TRACE_WAS_ON=0 ;;
+        esac
+    fi
+    _MIG_TRACE_DEPTH=$((_MIG_TRACE_DEPTH+1))
+}
+_trace_resume() {
+    if [[ "$_MIG_TRACE_DEPTH" != "0" ]]; then
+        _MIG_TRACE_DEPTH=$((_MIG_TRACE_DEPTH-1))
+    fi
+    if [[ "$_MIG_TRACE_DEPTH" == "0" && "$_MIG_TRACE_WAS_ON" == "1" ]]; then
+        _MIG_TRACE_WAS_ON=0
+        set -x
+    fi
+    return 0
+}
+
+# standby_pw_problem <password>  -  prints why the password cannot be used for
+# the in-script CONNECT (empty = usable). It goes inside double quotes in the
+# CONNECT string, which a double quote in it would close early; SQL*Plus has
+# no escape for that.
+standby_pw_problem() {
+    case "$1" in
+        "")    printf '%s' "is empty" ;;
+        *\"*)  printf '%s' "contains a double quote (\"), which cannot be passed through a SQL*Plus CONNECT string" ;;
+    esac
+    return 0
+}
+
+# Both branches turn substitution off and install the error handling BEFORE
+# the connection: an '&' in the password (or in any config value in the SQL)
+# must reach sqlplus literally, not start a substitution prompt that would eat
+# the following heredoc lines. A failed login is bounded either way: the
+# wallet branch has -L (no re-prompt), and in the /nolog branch the CONNECT
+# carries user and password, so nothing prompts - sqlplus either exits on
+# WHENEVER SQLERROR or answers each later statement "SP2-0640: Not
+# connected" and reaches EXIT. Neither prints the STBY_CONNECTED marker, which
+# run_sql_standby requires, so an unauthenticated run can never look like
+# success.
 _standby_sqlplus() {
-    local sql="$1"
+    local sql="$1" rc=0
+    _trace_pause
     if [[ -n "$STANDBY_SYS_PW" ]]; then
-        sqlplus -s /nolog <<EOF 2>&1
+        sqlplus -s /nolog <<EOF 2>&1 || rc=$?
+SET DEFINE OFF
+WHENEVER OSERROR EXIT FAILURE
+WHENEVER SQLERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON VERIFY OFF
 CONNECT sys/"${STANDBY_SYS_PW}"@${STANDBY_TNS_ALIAS} AS SYSDBA
-WHENEVER SQLERROR EXIT SQL.SQLCODE
 SELECT 'STBY_CONNECTED' FROM dual;
 ${sql}
 EXIT;
 EOF
     else
-        sqlplus -s -L "/@${STANDBY_TNS_ALIAS}" as sysdba <<EOF 2>&1
+        sqlplus -s -L "/@${STANDBY_TNS_ALIAS}" as sysdba <<EOF 2>&1 || rc=$?
+SET DEFINE OFF
+WHENEVER OSERROR EXIT FAILURE
+WHENEVER SQLERROR EXIT FAILURE
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 32767 TRIMSPOOL ON VERIFY OFF
-WHENEVER SQLERROR EXIT SQL.SQLCODE
 SELECT 'STBY_CONNECTED' FROM dual;
 ${sql}
 EXIT;
 EOF
     fi
+    _trace_resume
+    return "$rc"
 }
 
 # run_sql_standby <sql>  -  returns 0 only when the connection succeeded AND the
@@ -486,19 +546,160 @@ standby_connect_init() {
         STANDBY_CONNECTED=1; return 0
     fi
     if [[ -t 0 && "${MIGRATE_NONINTERACTIVE:-0}" != "1" ]]; then
+        local why=""
         log_warn "Wallet connect to the standby (/@${STANDBY_TNS_ALIAS}) failed."
+        _trace_pause
         printf "SYS password for %s (not echoed, not stored): " "$STANDBY_TNS_ALIAS"
+        # Ctrl-C at the prompt must not leave the terminal without echo.
+        trap 'stty echo 2>/dev/null; printf "\n"; exit 130' INT TERM HUP
         stty -echo 2>/dev/null || true
         read -r STANDBY_SYS_PW || STANDBY_SYS_PW=""
         stty echo 2>/dev/null || true
+        trap - INT TERM HUP
         printf '\n'
-        if [[ -n "$STANDBY_SYS_PW" && "$STANDBY_SYS_PW" != *'"'* ]] && \
-           run_sql_standby "SELECT 1 FROM dual;" >/dev/null 2>&1; then
+        why="$(standby_pw_problem "$STANDBY_SYS_PW")"
+        if [[ -n "$why" ]]; then
+            STANDBY_SYS_PW=""
+            _trace_resume
+            log_error "The standby SYS password ${why}. Use the wallet (common/setup_dg_wallet.sh) instead."
+            return 1
+        fi
+        if run_sql_standby "SELECT 1 FROM dual;" >/dev/null 2>&1; then
+            _trace_resume
             STANDBY_CONNECTED=1; return 0
         fi
         STANDBY_SYS_PW=""
+        _trace_resume
+        log_error "SYS password login to ${STANDBY_TNS_ALIAS} AS SYSDBA failed (wrong password, or the alias does not resolve)."
     fi
     return 1
+}
+
+# standby_identity_problem  -  prints why the direct standby connection is NOT
+# the configured CDB standby (empty output = it is): role and DB_UNIQUE_NAME
+# from one query, the name compared case-insensitively (V$ views return it as
+# it was set, e.g. cdb1_stby). A query error is printed as such.
+standby_identity_problem() {
+    local out rc=0 row role uniq
+    out="$(run_sql_standby "SELECT 'STBY_ID|' || database_role || '|' || db_unique_name FROM v\$database;")" || rc=$?
+    row="$(printf '%s\n' "$out" | grep '^STBY_ID|' | head -1)" || row=""
+    if [[ "$rc" != "0" || -z "$row" ]]; then
+        printf "Querying v\$database on '%s' failed (exit %s): %s" "$STANDBY_TNS_ALIAS" "$rc" \
+            "$(printf '%s\n' "$out" | grep -E '(ORA|SP2|TNS)-[0-9]' | head -3 | tr '\n' ' ' | sed 's/ *$//')"
+        return 0
+    fi
+    role="$(printf '%s' "$row" | awk -F'|' '{print $2}')"
+    uniq="$(printf '%s' "$row" | awk -F'|' '{gsub(/[[:space:]]/,"",$3); print $3}')"
+    if [[ "$role" != "PHYSICAL STANDBY" ]]; then
+        printf "'%s' is %s with role '%s', not a PHYSICAL STANDBY" "$STANDBY_TNS_ALIAS" "${uniq:-?}" "${role:-?}"
+    elif [[ "$(upper "$uniq")" != "$(upper "$TARGET_CDB_STANDBY_UNIQUE_NAME")" ]]; then
+        printf "'%s' is DB_UNIQUE_NAME '%s', not the configured CDB standby '%s'" "$STANDBY_TNS_ALIAS" "${uniq:-?}" "$TARGET_CDB_STANDBY_UNIQUE_NAME"
+    fi
+    return 0
+}
+
+# ------------------------------------------------------------
+# Applied-SCN gate on the CDB standby
+# ------------------------------------------------------------
+# wait_standby_scn <gate scn>
+#
+# Polls the CDB standby's own V$DATABASE, through the direct connection
+# (run_sql_standby), until CURRENT_SCN reaches <gate>. On a physical standby
+# (MOUNTED or open read-only) V$DATABASE.CURRENT_SCN is the SCN recovery has
+# applied through. It is an SCN-to-SCN comparison, so thread, sequence and
+# incarnation numbering do not enter into it. Not used, deliberately:
+#   * V$ARCHIVE_DEST_STATUS - has no APPLIED_SCN column in 19c (only
+#     APPLIED_THREAD#/APPLIED_SEQ#); the query fails with ORA-00904.
+#   * V$ARCHIVE_DEST.APPLIED_SCN on the primary - refreshed lazily; on the
+#     19c lab it trailed the standby's own CURRENT_SCN (20030439 vs 20030716
+#     at the same instant).
+# The role, DB_UNIQUE_NAME and SCN come from ONE query: if the alias reached
+# the primary (or another database) CURRENT_SCN would pass trivially, so that
+# is an error, not a pass.
+#
+# Return codes (STBY_SCN = last SCN read, STBY_SCN_ERR = reason for rc 2):
+#   0  reached: STBY_SCN >= gate
+#   1  apply lag: connected, readable, PHYSICAL STANDBY, still behind after
+#      MIGRATE_SCN_WAIT_SECS (default 120), polled every MIGRATE_SCN_POLL_SECS
+#      (default 5)
+#   2  error: query/connection error (ORA-/SP2-/TNS- text in STBY_SCN_ERR,
+#      after MIGRATE_SCN_ERR_RETRIES consecutive retries, default 2), wrong
+#      role or database, unparsable answer, or a non-numeric gate. Never
+#      waited on as if it were lag.
+STBY_SCN=""
+STBY_SCN_ERR=""
+wait_standby_scn() {
+    local gate="$1"
+    local wait_s="${MIGRATE_SCN_WAIT_SECS:-120}" poll_s="${MIGRATE_SCN_POLL_SECS:-5}"
+    local retries="${MIGRATE_SCN_ERR_RETRIES:-2}"
+    local waited=0 errs=0 out rc row role uniq scn
+    STBY_SCN=""; STBY_SCN_ERR=""
+    [[ "$wait_s"  =~ ^[0-9]+$ ]] || wait_s=120
+    [[ "$poll_s"  =~ ^[0-9]+$ ]] || poll_s=5
+    [[ "$retries" =~ ^[0-9]+$ ]] || retries=2
+    if [[ ! "$gate" =~ ^[0-9]+$ ]]; then
+        STBY_SCN_ERR="gate SCN '${gate}' read from the primary is not a number"
+        return 2
+    fi
+    while :; do
+        rc=0
+        out="$(run_sql_standby "SELECT 'STBY_SCN|' || database_role || '|' || db_unique_name || '|' || TO_CHAR(current_scn) FROM v\$database;")" || rc=$?
+        row="$(printf '%s\n' "$out" | grep '^STBY_SCN|' | head -1)" || row=""
+        if [[ "$rc" != "0" || -z "$row" ]] || printf '%s\n' "$out" | grep -Eq '(ORA|SP2|TNS)-[0-9]'; then
+            STBY_SCN_ERR="$(printf '%s\n' "$out" | grep -E '(ORA|SP2|TNS)-[0-9]' | head -3 | tr '\n' ' ' | sed 's/ *$//')"
+            if [[ -z "$STBY_SCN_ERR" ]]; then
+                STBY_SCN_ERR="no answer from V\$DATABASE (sqlplus exit ${rc}): $(printf '%s\n' "$out" | grep -v '^[[:space:]]*$' | head -3 | tr '\n' ' ' | sed 's/ *$//')"
+            fi
+            errs=$((errs+1))
+            if (( errs > retries )); then
+                return 2
+            fi
+            log_warn "  standby SCN query failed (${errs}/$((retries+1))): ${STBY_SCN_ERR} - retrying"
+            sleep "$poll_s"
+            continue
+        fi
+        errs=0
+        role="$(printf '%s' "$row" | awk -F'|' '{print $2}')"
+        uniq="$(printf '%s' "$row" | awk -F'|' '{gsub(/[[:space:]]/,"",$3); print $3}')"
+        scn="$(printf '%s' "$row"  | awk -F'|' '{gsub(/[[:space:]]/,"",$4); print $4}')"
+        if [[ "$role" != "PHYSICAL STANDBY" ]]; then
+            STBY_SCN_ERR="'${STANDBY_TNS_ALIAS}' answered as ${uniq:-?} with role '${role:-?}', not PHYSICAL STANDBY - its CURRENT_SCN proves nothing about apply on the standby"
+            return 2
+        fi
+        if [[ "$(upper "$uniq")" != "$(upper "${TARGET_CDB_STANDBY_UNIQUE_NAME}")" ]]; then
+            STBY_SCN_ERR="'${STANDBY_TNS_ALIAS}' is DB_UNIQUE_NAME '${uniq:-?}', not the configured CDB standby '${TARGET_CDB_STANDBY_UNIQUE_NAME}'"
+            return 2
+        fi
+        if [[ ! "$scn" =~ ^[0-9]+$ ]]; then
+            STBY_SCN_ERR="unparsable CURRENT_SCN '${scn}' from the standby"
+            return 2
+        fi
+        STBY_SCN="$scn"
+        if (( scn >= gate )); then
+            return 0
+        fi
+        if (( waited >= wait_s )); then
+            return 1
+        fi
+        log_info "  standby SCN ${scn} < gate ${gate} (waited ${waited}s of ${wait_s}s)"
+        sleep "$poll_s"
+        # A zero poll interval still has to use up the wait (tests set it to 0).
+        waited=$((waited + (poll_s > 0 ? poll_s : 1)))
+    done
+}
+
+# standby_scn_gate_message <wait_standby_scn rc> <gate scn>  -  one line
+# naming the outcome (reached / apply lag / error), for the log.
+standby_scn_gate_message() {
+    case "$1" in
+        0) printf 'Standby applied SCN %s >= gate SCN %s (everything up to and including the PDB round-trip write is applied)' \
+               "$STBY_SCN" "$2" ;;
+        1) printf 'Apply lag: the CDB standby %s is at SCN %s, still behind the gate SCN %s after %ss - the plug-in redo is not confirmed applied (check MRP and the standby alert log)' \
+               "$TARGET_CDB_STANDBY_UNIQUE_NAME" "${STBY_SCN:-?}" "$2" "${MIGRATE_SCN_WAIT_SECS:-120}" ;;
+        *) printf 'Error reading the applied SCN on the CDB standby %s (not a lag measurement): %s - the plug-in redo is not confirmed applied' \
+               "$STANDBY_TNS_ALIAS" "${STBY_SCN_ERR:-unknown error}" ;;
+    esac
+    return 0
 }
 
 # standby_param_prereqs  -  parameters on the CDB standby the plug-in depends
@@ -507,7 +708,7 @@ standby_connect_init() {
 # the standby cannot be queried at all.
 STBY_PDB_DIR=""
 standby_param_prereqs() {
-    local out role dbn cdb sfm dbfnc dest sample conv
+    local out role dbn cdb uniq sfm dbfnc dest sample conv
     if ! standby_connect_init; then
         fail "Cannot connect to the CDB standby '${STANDBY_TNS_ALIAS}' (wallet /@${STANDBY_TNS_ALIAS} or SYS password). Its parameters and the PDB's replication cannot be verified, so the migration is refused."
         return 1
@@ -516,12 +717,13 @@ standby_param_prereqs() {
 SELECT 'ROLE='   || database_role FROM v\$database;
 SELECT 'DBNAME=' || name          FROM v\$database;
 SELECT 'CDB='    || cdb           FROM v\$database;
+SELECT 'UNIQ='   || db_unique_name FROM v\$database;
 SELECT 'SFM='    || value FROM v\$parameter WHERE name='standby_file_management';
 SELECT 'DBFNC='  || value FROM v\$parameter WHERE name='db_file_name_convert';
 SELECT 'DEST='   || value FROM v\$parameter WHERE name='db_create_file_dest';
 ")" || { fail "Querying the CDB standby failed: ${out}"; return 1; }
     role="$(kv_get ROLE "$out")"; dbn="$(kv_get DBNAME "$out")"; cdb="$(kv_get CDB "$out")"
-    sfm="$(kv_get SFM "$out")"
+    uniq="$(kv_get UNIQ "$out")"; sfm="$(kv_get SFM "$out")"
     dbfnc="$(printf '%s\n' "$out" | sed -n 's/^DBFNC=//p' | head -1)"
     dest="$(kv_get DEST "$out")"
     if [[ "$role" != "PHYSICALSTANDBY" ]]; then
@@ -529,6 +731,10 @@ SELECT 'DEST='   || value FROM v\$parameter WHERE name='db_create_file_dest';
     fi
     if [[ "$(upper "$dbn")" != "$(upper "$TARGET_CDB_NAME")" || "$cdb" != "YES" ]]; then
         fail "'${STANDBY_TNS_ALIAS}' is database '${dbn:-?}' (CDB=${cdb:-?}), expected the standby of CDB ${TARGET_CDB_NAME}."
+    fi
+    # Case-insensitive: V$DATABASE returns DB_UNIQUE_NAME as it was set.
+    if [[ "$(upper "$uniq")" != "$(upper "$TARGET_CDB_STANDBY_UNIQUE_NAME")" ]]; then
+        fail "'${STANDBY_TNS_ALIAS}' is DB_UNIQUE_NAME '${uniq:-?}', expected the configured CDB standby '${TARGET_CDB_STANDBY_UNIQUE_NAME}'."
     fi
     if [[ "$(upper "$sfm")" != "AUTO" ]]; then
         fail "CDB standby standby_file_management='${sfm:-?}', must be AUTO (else the new PDB's datafiles are not created on the standby)."

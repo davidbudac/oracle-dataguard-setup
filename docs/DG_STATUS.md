@@ -173,7 +173,7 @@ Monitoring-friendly, matching `dg_triage_sid.sh` / `dg_diag_sid.sh`:
 
 - `0` -- healthy (no errors, no warnings)
 - `1` -- warnings only
-- `2` -- one or more errors (including an unreachable host, a primary with no running instance, or a remote collection that timed out)
+- `2` -- one or more errors (including an unreachable host, a primary with no running instance, or a remote collection or discovery call that timed out)
 - `3` -- **usage / pre-flight error**: unknown flag, an option missing its
   argument, config file not found, config file missing a required setting, a
   SID that fails validation, a malformed threshold or `DG_REMOTE_TIMEOUT`
@@ -203,13 +203,31 @@ line must not be reported as a Data Guard finding.
 - **SSH noise is not a finding.** DGMGRL output is read without ssh's stderr
   (`Warning: Permanently added ...`, login banners) and only from the
   `Configuration -` line on, so it can no longer count as a broker warning.
-- **Remote collection is time-bounded.** All remote jobs run in parallel under
-  a watchdog: after `DG_REMOTE_TIMEOUT` seconds (default `120`) whatever is
-  still running is killed (including the ssh child), its partial output is
-  discarded, and an **error** naming the host and the cut-off jobs is recorded
-  - the run ends with exit `2`, never a silent pass. ssh itself also gets
-  `ServerAliveInterval=15` / `ServerAliveCountMax=3` / `ConnectTimeout=15` as
-  defaults (appended after `SSH_OPTS`, so values set there win).
+- **Remote execution is time-bounded, discovery included.** All collection
+  jobs run in parallel under a watchdog: after `DG_REMOTE_TIMEOUT` seconds
+  (default `120`) whatever is still running is killed (including the ssh
+  child), its partial output is discarded, and an **error** naming the host and
+  the cut-off jobs is recorded - the run ends with exit `2`, never a silent
+  pass. The calls that run *before* the collection - the ssh reachability probe
+  on each host, the `ora_pmon_` scan, and (with several instances on the
+  standby) the remote `sqlplus` `DB_NAME` query per candidate SID - run under
+  the same kind of tree-killing watchdog, each bounded by `DG_REMOTE_TIMEOUT`
+  (a hung `sqlplus` on a healthy ssh connection is not caught by ssh
+  keepalives). Discovery as a whole has an overall budget of
+  `2 x DG_REMOTE_TIMEOUT`, and no further call is sent to a host after its
+  first timeout, so a typical hang costs one bound per host. Worst case for a
+  whole run: about `3 x DG_REMOTE_TIMEOUT` (discovery budget plus collection).
+  A discovery timeout is an **error** (exit `2`, message `Discovery on <side>
+  <host> timed out after Ns (<what>)`): a timed-out probe or standby pmon scan
+  leaves that side uncollected (`UNREACHABLE (SSH probe timed out)` /
+  `UNREACHABLE (discovery timed out)`), a timed-out primary pmon scan stops the
+  run with exit `2`, and a timed-out `DB_NAME` query falls back to the first
+  standby SID with the usual "pass `--standby-sid`" warning. ssh itself also
+  gets `ServerAliveInterval=15` / `ServerAliveCountMax=3` /
+  `ConnectTimeout=15` as defaults (appended after `SSH_OPTS`, so values set
+  there win). Killing the local ssh does not guarantee the remote `sqlplus`
+  dies at once: with no tty it ends when it next writes or when the session is
+  reaped on the host.
 - **Same grading as the local tools.** The `Redo Apply` state, broker colours
   and the primary/standby switchover, flashback and `dg_broker_start` checks
   are shared with / matched to `dg_triage_sid.sh` and `dg_diag_sid.sh`.
@@ -233,7 +251,7 @@ Each value must be a non-negative integer. `80%` or `abc` is rejected up front
 checks silently always or never fire.
 
 Other environment variable: `DG_REMOTE_TIMEOUT` (default `120`) -- seconds
-before a hung remote job is killed and reported (see above).
+before a hung remote job or discovery call is killed and reported (see above).
 
 FRA sizes are produced with an explicit `NLS_NUMERIC_CHARACTERS` in the SQL, so
 a comma-decimal session `NLS_LANG` cannot turn `0.4` into `0,4`; the values are

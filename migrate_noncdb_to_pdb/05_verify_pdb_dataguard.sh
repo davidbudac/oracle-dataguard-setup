@@ -19,8 +19,11 @@
 #       - V$DATAFILE rows for the PDB exist, none is an UNNAMEDnnnnn
 #         placeholder, and the count equals the primary's.
 #   * Plug-in violations on the new PDB (any ERROR rows fail the step).
-#   * Round-trip write on the primary, then the standby's applied SCN must
-#     reach an SCN taken AFTER that write (which is after the plug-in).
+#   * Round-trip write on the primary, then the standby's applied SCN (its own
+#     V$DATABASE.CURRENT_SCN, read directly, role PHYSICAL STANDBY) must reach
+#     an SCN taken AFTER that write (which is after the plug-in). A query error
+#     is reported as an error, not as lag. Wait/poll overridable with
+#     MIGRATE_SCN_WAIT_SECS / MIGRATE_SCN_POLL_SECS (defaults 120 / 5).
 # =============================================================================
 
 set -e
@@ -80,13 +83,21 @@ echo "$DG_CFG" | grep -qi "SUCCESS" || fail "DGMGRL Configuration Status not SUC
 # the drop of the only other complete copy.
 log_info "Connecting directly to the CDB standby (${STANDBY_TNS_ALIAS}) to verify ${NEW_PDB_NAME} ..."
 PDB_CON_ID=""
+STBY_ID_PROBLEM=""
 if ! standby_connect_init; then
     fail "Could not connect to the CDB standby ${STANDBY_TNS_ALIAS}: ${NEW_PDB_NAME} on the standby is UNVERIFIED (set up the wallet with common/setup_dg_wallet.sh or run interactively to enter the SYS password)."
+elif STBY_ID_PROBLEM="$(standby_identity_problem)" && [[ -n "$STBY_ID_PROBLEM" ]]; then
+    # An alias that reaches the primary would pass every check below trivially.
+    fail "${STBY_ID_PROBLEM}: ${NEW_PDB_NAME} on the standby is UNVERIFIED."
 else
-    PDB_ON_STBY="$(run_sql_standby "SELECT 'PDB|'||name||'|'||open_mode||'|'||con_id||'|'||recovery_status FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAME}');")" || true
+    # A failed query is reported as such - not as "PDB not found".
+    PDB_RC=0
+    PDB_ON_STBY="$(run_sql_standby "SELECT 'PDB|'||name||'|'||open_mode||'|'||con_id||'|'||recovery_status FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAME}');")" || PDB_RC=$?
     echo "$PDB_ON_STBY" | tee_into_log
     PDB_ROW="$(printf '%s\n' "$PDB_ON_STBY" | grep '^PDB|' | head -1)" || true
-    if [[ -z "$PDB_ROW" ]]; then
+    if [[ "$PDB_RC" != "0" ]]; then
+        fail "Querying v\$pdbs on the CDB standby failed (exit ${PDB_RC}): $(printf '%s\n' "$PDB_ON_STBY" | grep -E '(ORA|SP2|TNS)-[0-9]' | head -3 | tr '\n' ' ')"
+    elif [[ -z "$PDB_ROW" ]]; then
         fail "New PDB ${NEW_PDB_NAME} NOT found on the CDB standby ${TARGET_CDB_STANDBY_UNIQUE_NAME}"
     else
         PDB_CON_ID="$(printf '%s' "$PDB_ROW" | awk -F'|' '{gsub(/[[:space:]]/,"",$4); print $4}')"
@@ -101,13 +112,16 @@ else
 
     if [[ "$PDB_CON_ID" =~ ^[0-9]+$ ]]; then
         log_info "Querying datafiles for ${NEW_PDB_NAME} on standby ..."
-        DF_ON_STBY="$(run_sql_standby "SELECT 'STBY|'||file#||'|'||name FROM v\$datafile WHERE con_id=${PDB_CON_ID};")" || true
+        DF_RC=0
+        DF_ON_STBY="$(run_sql_standby "SELECT 'STBY|'||file#||'|'||name FROM v\$datafile WHERE con_id=${PDB_CON_ID};")" || DF_RC=$?
         echo "$DF_ON_STBY" | tee_into_log
         STBY_DF_ROWS="$(printf '%s\n' "$DF_ON_STBY" | grep '^STBY|' || true)"
         STBY_DF_COUNT=0
         [[ -z "$STBY_DF_ROWS" ]] || STBY_DF_COUNT="$(printf '%s\n' "$STBY_DF_ROWS" | wc -l | tr -d '[:space:]')"
         PRI_DF_COUNT="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT COUNT(*) FROM v\$datafile WHERE con_id=(SELECT con_id FROM v\$pdbs WHERE name=UPPER('${NEW_PDB_NAME}'));")"
-        if (( STBY_DF_COUNT == 0 )); then
+        if [[ "$DF_RC" != "0" ]]; then
+            fail "Querying v\$datafile on the CDB standby failed (exit ${DF_RC}): $(printf '%s\n' "$DF_ON_STBY" | grep -E '(ORA|SP2|TNS)-[0-9]' | head -3 | tr '\n' ' ')"
+        elif (( STBY_DF_COUNT == 0 )); then
             fail "No datafiles found for ${NEW_PDB_NAME} on the CDB standby ${TARGET_CDB_STANDBY_UNIQUE_NAME}"
         elif printf '%s\n' "$STBY_DF_ROWS" | grep -qi 'UNNAMED'; then
             fail "Standby has UNNAMED placeholder datafile(s) for ${NEW_PDB_NAME} (ORA-01274: files were not created on the standby, apply is or will be stuck)"
@@ -135,7 +149,9 @@ fi
 
 # ---- 6. Round-trip write test -----------------------------------------------
 log_info "Round-trip test: create + drop a small table inside ${NEW_PDB_NAME} on primary, verify redo flows."
-SCN_BEFORE="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT current_scn FROM v\$database;")"
+# TO_CHAR: a bare NUMBER wider than SQL*Plus's NUMWIDTH (10) prints in
+# scientific notation (1.2346E+13), which no longer parses as an SCN.
+SCN_BEFORE="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT TO_CHAR(current_scn) FROM v\$database;")"
 run_sql "$TARGET_CDB_ORACLE_SID" "
 ALTER SESSION SET CONTAINER=${NEW_PDB_NAME};
 CREATE TABLE migrate_smoke_test (n NUMBER, ts TIMESTAMP);
@@ -153,36 +169,31 @@ ALTER SYSTEM ARCHIVE LOG CURRENT;
 # reaches it, the plug-in has been applied there. A bare "current SCN a few
 # seconds later" would be the wrong gate - the SCN advances without redo on an
 # idle system, so the applied SCN could never catch up with it.
-SCN_GATE="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT current_scn FROM v\$database;")"
+SCN_GATE="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT TO_CHAR(current_scn) FROM v\$database;")"
 run_sql "$TARGET_CDB_ORACLE_SID" "
 ALTER SYSTEM SWITCH LOGFILE;
 ALTER SYSTEM ARCHIVE LOG CURRENT;
 " | tee_into_log
 
-# V$ARCHIVED_LOG has no APPLIED_SCN column - that query always failed with
-# ORA-00904, swallowed by the 2>&1 capture into a "?" in the log line below.
-# V$ARCHIVE_DEST_STATUS, queried on the PRIMARY, reports the last SCN
-# applied at each redo transport destination and is the correct source.
-APPLIED_SCN=""
-ATTEMPTS=0
-while (( ATTEMPTS < 24 )); do
-    APPLIED_SCN="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "
-SELECT applied_scn FROM v\$archive_dest_status
- WHERE db_unique_name = '${TARGET_CDB_STANDBY_UNIQUE_NAME}'
-   AND dest_id = (SELECT MIN(dest_id) FROM v\$archive_dest_status WHERE db_unique_name = '${TARGET_CDB_STANDBY_UNIQUE_NAME}');
-")" || APPLIED_SCN=""
-    if [[ "$APPLIED_SCN" =~ ^[0-9]+$ && "$SCN_GATE" =~ ^[0-9]+$ ]] && (( APPLIED_SCN >= SCN_GATE )); then
-        break
-    fi
-    sleep 5
-    ATTEMPTS=$((ATTEMPTS+1))
-done
-SCN_AFTER_PRI="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT current_scn FROM v\$database;")"
-log_info "Primary SCN before smoke test / gate / now: ${SCN_BEFORE} / ${SCN_GATE} / ${SCN_AFTER_PRI}; standby applied SCN: ${APPLIED_SCN:-?}"
-if [[ "$APPLIED_SCN" =~ ^[0-9]+$ && "$SCN_GATE" =~ ^[0-9]+$ ]] && (( APPLIED_SCN >= SCN_GATE )); then
-    log_success "Standby applied SCN ${APPLIED_SCN} >= ${SCN_GATE} (everything up to and including the PDB round-trip write is applied)"
+# The gate is read ON THE CDB STANDBY: its own V$DATABASE.CURRENT_SCN (the SCN
+# recovery has applied through on a physical standby), together with its role
+# and DB_UNIQUE_NAME, through the direct connection this step already requires
+# (wait_standby_scn in _lib.sh). Three outcomes, reported as what they are:
+# reached; still behind after the wait (apply lag, both SCNs shown); query or
+# connection error (the ORA-/SP2- text, after a couple of retries - never
+# waited out as if it were lag). Neither V$ARCHIVE_DEST_STATUS (no APPLIED_SCN
+# column in 19c) nor the primary's lazily refreshed V$ARCHIVE_DEST.APPLIED_SCN
+# is used.
+log_info "Waiting for the CDB standby (${STANDBY_TNS_ALIAS}) to apply through SCN ${SCN_GATE} ..."
+GATE_RC=0
+wait_standby_scn "$SCN_GATE" || GATE_RC=$?
+SCN_AFTER_PRI="$(sql_scalar "$TARGET_CDB_ORACLE_SID" "SELECT TO_CHAR(current_scn) FROM v\$database;")" || SCN_AFTER_PRI="?"
+log_info "Primary SCN before smoke test / gate / now: ${SCN_BEFORE} / ${SCN_GATE} / ${SCN_AFTER_PRI}; standby applied SCN: ${STBY_SCN:-?}"
+GATE_MSG="$(standby_scn_gate_message "$GATE_RC" "$SCN_GATE")"
+if [[ "$GATE_RC" == "0" ]]; then
+    log_success "$GATE_MSG"
 else
-    fail "Standby applied SCN '${APPLIED_SCN:-?}' did not reach ${SCN_GATE:-?} within 2 minutes - the plug-in redo is not confirmed applied"
+    fail "$GATE_MSG"
 fi
 
 # ---- 7. Summary ------------------------------------------------------------

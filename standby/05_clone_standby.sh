@@ -12,6 +12,19 @@
 #                        K/M/G suffix (e.g. 200M, 1G). Default: unlimited
 #
 # Example: bash ./standby/05_clone_standby.sh -c 4 -r 200M
+#
+# Inherited FRA (Traditional mode): DUPLICATE ... SPFILE copies the primary's
+# spfile and overrides only the SET list. With USE_FRA_FOR_STANDBY=NO the
+# standby must have NO Fast Recovery Area, so when the LIVE primary has
+# db_recovery_file_dest set, the RMAN body adds
+#   RESET DB_RECOVERY_FILE_DEST / RESET DB_RECOVERY_FILE_DEST_SIZE
+# (otherwise the primary's FRA path and size would be handed to the standby,
+# and a directory missing on this host can fail the auxiliary restart inside
+# the non-restartable DUPLICATE). The live primary is queried before anything
+# is changed (a failed query refuses the step); after the DUPLICATE the
+# standby's effective values are read back and compared with the choice.
+# -n/--check reports from the config's recorded primary FRA and stops before
+# any write (the live query needs the SYS password, which -n never asks for).
 # ============================================================
 
 set -e
@@ -146,6 +159,147 @@ check_standby_online_log_dest_dir() {
     return 0
 }
 
+# ---- begin fra reset helpers ----
+# Pure helpers (no database, no logging) for the inherited-FRA handling:
+# RMAN DUPLICATE ... SPFILE copies the primary's spfile, so a primary with
+# db_recovery_file_dest set hands it (and its size) to a standby that was
+# configured WITHOUT an FRA unless the SPFILE clause RESETs both. Kept between
+# the markers, function headers and closing braces at column 0, so
+# tests/test_step5_fra_reset.sh can extract and source them without running
+# this script.
+
+# Trim whitespace and trailing slashes ("/" itself is kept) for comparing paths.
+# Usage: fra_normalize_path <path>
+fra_normalize_path() {
+    local _p="$1"
+    _p=$(printf '%s' "$_p" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    while [[ "$_p" == */ && "$_p" != "/" ]]; do
+        _p="${_p%/}"
+    done
+    printf '%s' "$_p"
+}
+
+# A path as it may be echoed into logs: verbatim when it passes
+# is_safe_omf_dest_path, otherwise a placeholder (never an unvalidated value).
+# Usage: fra_display_path <path>
+fra_display_path() {
+    if is_safe_omf_dest_path "$1"; then
+        printf '%s' "$1"
+    else
+        printf '%s' "(path with unusual characters - not shown)"
+    fi
+}
+
+# Parse the live-primary FRA query output ("name|value" rows plus the
+# trailing "fra_query_ok|1" sentinel that proves the query really ran - an
+# empty result alone is a valid "no FRA"). Sets:
+#   PRIMARY_FRA_QUERY_OK       YES when the sentinel row was seen, else NO
+#   PRIMARY_FRA_DEST           db_recovery_file_dest ("" when unset)
+#   PRIMARY_FRA_SIZE           db_recovery_file_dest_size ("" when unset)
+#   PRIMARY_FRA_ARCHIVE_DESTS  space-separated log_archive_dest_<n> names
+#                              (n>1) whose value uses USE_DB_RECOVERY_FILE_DEST
+# Usage: parse_primary_fra_params "<raw query output>"
+parse_primary_fra_params() {
+    local _raw="$1" _pname _pval
+    PRIMARY_FRA_QUERY_OK="NO"
+    PRIMARY_FRA_DEST=""
+    PRIMARY_FRA_SIZE=""
+    PRIMARY_FRA_ARCHIVE_DESTS=""
+    while IFS='|' read -r _pname _pval; do
+        _pname=$(printf '%s' "$_pname" | tr -d '\r[:space:]')
+        _pval=$(printf '%s' "$_pval" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        case "$_pname" in
+            fra_query_ok) PRIMARY_FRA_QUERY_OK="YES" ;;
+            db_recovery_file_dest) PRIMARY_FRA_DEST="$_pval" ;;
+            db_recovery_file_dest_size) PRIMARY_FRA_SIZE="$_pval" ;;
+            log_archive_dest_1) ;;
+            log_archive_dest_[0-9]|log_archive_dest_[0-9][0-9])
+                PRIMARY_FRA_ARCHIVE_DESTS="${PRIMARY_FRA_ARCHIVE_DESTS}${PRIMARY_FRA_ARCHIVE_DESTS:+ }${_pname}"
+                ;;
+        esac
+    done <<EOF
+$_raw
+EOF
+    return 0
+}
+
+# The FRA-related lines of the SPFILE clause (one per line, 4-space indent,
+# no trailing newline), Traditional mode only (OMF prints nothing: its RMAN
+# body carries its own FRA SET lines):
+#   USE_FRA_FOR_STANDBY=YES                  -> the two SET lines
+#   no FRA for the standby, primary has one  -> RESET both (no value text)
+#   no FRA for the standby, primary has none -> nothing (nothing to inherit;
+#                                               RESET of an absent parameter
+#                                               is deliberately not emitted)
+# Usage: build_rman_fra_lines <STORAGE_MODE> <USE_FRA_FOR_STANDBY> <standby_fra> <standby_fra_size> <primary_fra_dest>
+build_rman_fra_lines() {
+    local _mode="$1" _use_fra="$2" _sfra="$3" _ssize="$4" _pfra="$5"
+    [[ "$_mode" == "OMF" ]] && return 0
+    if [[ "$_use_fra" == "YES" ]]; then
+        printf "    SET DB_RECOVERY_FILE_DEST='%s'\n    SET DB_RECOVERY_FILE_DEST_SIZE='%s'" "$_sfra" "$_ssize"
+    elif [[ -n "$_pfra" ]]; then
+        printf '    RESET DB_RECOVERY_FILE_DEST\n    RESET DB_RECOVERY_FILE_DEST_SIZE'
+    fi
+    return 0
+}
+
+# Without an FRA the explicit LOG_ARCHIVE_DEST_1 SET must be a real directory:
+# an empty STANDBY_ARCHIVE_DEST would produce "LOCATION= ..." and one that
+# resolves to USE_DB_RECOVERY_FILE_DEST would need the FRA that was just reset.
+# Prints the reason and returns 1 on a problem; always 0 for OMF / FRA=YES.
+# Usage: check_archive_dest_1_without_fra <STORAGE_MODE> <USE_FRA_FOR_STANDBY> <standby_archive_dest>
+check_archive_dest_1_without_fra() {
+    local _mode="$1" _use_fra="$2" _dest="$3" _up
+    [[ "$_mode" == "OMF" || "$_use_fra" == "YES" ]] && return 0
+    if [[ -z "$(printf '%s' "$_dest" | tr -d '[:space:]')" ]]; then
+        printf '%s' "USE_FRA_FOR_STANDBY is not YES but STANDBY_ARCHIVE_DEST is empty - log_archive_dest_1 would have no location"
+        return 1
+    fi
+    _up=$(printf '%s' "$_dest" | tr '[:lower:]' '[:upper:]')
+    case "$_up" in
+        *USE_DB_RECOVERY_FILE_DEST*)
+            printf '%s' "STANDBY_ARCHIVE_DEST resolves to USE_DB_RECOVERY_FILE_DEST but the standby is configured without an FRA"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+# Compare the standby's effective FRA parameters (read back after the
+# DUPLICATE) with the choice. Prints one message; return 0 = as chosen,
+# 1 = contradicts the choice (fail the step), 2 = acceptable but worth a
+# warning (FRA disabled, dest empty, but a non-zero size was left behind -
+# V$PARAMETER reports an unset size as 0).
+#   expect_fra=NO  -> dest must be empty
+#   expect_fra=YES -> dest must equal the configured path (whitespace and
+#                     trailing slashes ignored)
+# Usage: fra_readback_verdict <YES|NO> <expected_path> <actual_dest> <actual_size>
+fra_readback_verdict() {
+    local _expect="$1" _want _got _size
+    _want=$(fra_normalize_path "$2")
+    _got=$(fra_normalize_path "$3")
+    _size=$(printf '%s' "$4" | tr -d '[:space:]')
+    if [[ "$_expect" == "YES" ]]; then
+        if [[ -n "$_want" && "$_got" == "$_want" ]]; then
+            printf '%s' "db_recovery_file_dest is ${_got} as configured (size ${_size:-unset})"
+            return 0
+        fi
+        printf '%s' "db_recovery_file_dest is '${_got}' but the configuration says '${_want}'"
+        return 1
+    fi
+    if [[ -n "$_got" ]]; then
+        printf '%s' "the standby still has db_recovery_file_dest='${_got}' although it is configured without an FRA"
+        return 1
+    fi
+    if [[ -n "$_size" && "$_size" != "0" ]]; then
+        printf '%s' "db_recovery_file_dest is empty as chosen, but db_recovery_file_dest_size=${_size} was left behind (harmless without a destination)"
+        return 2
+    fi
+    printf '%s' "db_recovery_file_dest is empty as chosen (no FRA on the standby)"
+    return 0
+}
+# ---- end fra reset helpers ----
+
 # Set Oracle environment. Prefer a locally-set ORACLE_HOME when it points
 # at a usable installation (bin/sqlplus present) - the standby host's
 # Oracle installation may live somewhere other than the path recorded in
@@ -260,6 +414,24 @@ if [[ "$STANDBY_STORAGE_MODE" == "OMF" ]]; then
     done
     if [[ $_olog_local_bad -ne 0 ]]; then
         exit 1
+    fi
+fi
+
+# Traditional mode without a standby FRA: the standby must not inherit the
+# primary's. Local checks only here (no SYS password in -n); the live primary
+# query that decides the RESET lines runs after the password prompt below.
+if [[ "$STANDBY_STORAGE_MODE" != "OMF" && "$USE_FRA_FOR_STANDBY" != "YES" ]]; then
+    if ! _ad1_msg=$(check_archive_dest_1_without_fra "$STANDBY_STORAGE_MODE" "$USE_FRA_FOR_STANDBY" "${STANDBY_ARCHIVE_DEST:-}"); then
+        log_error "$_ad1_msg"
+        log_error "Fix STANDBY_ARCHIVE_DEST in ${STANDBY_CONFIG_FILE} and run 02_generate_standby_config.sh --regenerate"
+        exit 1
+    fi
+    if [[ -n "${DB_RECOVERY_FILE_DEST:-}" ]]; then
+        log_info "Config records a primary FRA ($(fra_display_path "$DB_RECOVERY_FILE_DEST")) and USE_FRA_FOR_STANDBY=NO:"
+        log_info "  the RMAN SPFILE clause will RESET DB_RECOVERY_FILE_DEST and DB_RECOVERY_FILE_DEST_SIZE so the standby has no FRA"
+        log_info "  (confirmed against the live primary after the SYS password prompt; the live value decides)"
+    else
+        log_info "Config records no primary FRA and USE_FRA_FOR_STANDBY=NO: no FRA reset expected (re-checked against the live primary)"
     fi
 fi
 
@@ -428,6 +600,89 @@ SQL
 ${_omf_sets}"
     else
         log_info "Primary sets no db_create_online_log_dest_n and no *_file_name_convert - nothing inherited to override"
+    fi
+fi
+
+# ============================================================
+# Traditional Mode Without a Standby FRA: Inherited FRA Preflight
+# ============================================================
+# Same inheritance problem as the OMF placement parameters above: DUPLICATE
+# copies the primary's spfile, so a primary with db_recovery_file_dest set
+# would hand that path and size to a standby configured WITHOUT an FRA - and a
+# directory missing here can fail the auxiliary restart inside the
+# non-restartable DUPLICATE. Ask the LIVE primary (it may have changed since
+# step 1; the config's recorded value is only a cross-check) and let the RMAN
+# body RESET both parameters when it has an FRA. Emitting RESET for a
+# parameter the source spfile does not contain is not lab-verified, so the
+# lines are produced only when the primary really has one. Runs BEFORE the
+# SHUTDOWN ABORT / STARTUP NOMOUNT: nothing has been changed, so a failed
+# query is a refusal, not a pass.
+LIVE_PRIMARY_FRA_DEST=""
+if [[ "$STANDBY_STORAGE_MODE" != "OMF" && "$USE_FRA_FOR_STANDBY" != "YES" ]]; then
+    log_section "Checking Primary Fast Recovery Area (standby has none)"
+
+    # Same connection mechanism as the OMF preflight: CONNECT on stdin (never
+    # argv), DEFINE OFF, xtrace paused. The inline SQL stays here (not in
+    # sql/queries) so this fix touches one file; V\$ is escaped for the
+    # unquoted here-document. The trailing fra_query_ok row proves the query
+    # ran: an empty result alone just means "no FRA".
+    pause_verbose_trace
+    _fra_rc=0
+    FRA_PRIMARY_PARAMS_RAW=$(sqlplus -s /nolog <<SQL 2>&1
+SET DEFINE OFF
+WHENEVER SQLERROR EXIT SQL.SQLCODE
+CONNECT sys/"${SYS_PASSWORD}"@${PRIMARY_TNS_ALIAS} AS SYSDBA
+SET HEADING OFF FEEDBACK OFF VERIFY OFF LINESIZE 1000 PAGESIZE 0 TRIMSPOOL ON
+SELECT name || '|' || value FROM V\$PARAMETER
+WHERE name IN ('db_recovery_file_dest', 'db_recovery_file_dest_size')
+AND value IS NOT NULL
+UNION ALL
+SELECT name || '|' || value FROM V\$PARAMETER
+WHERE REGEXP_LIKE(name, '^log_archive_dest_[0-9]+\$')
+AND UPPER(value) LIKE '%USE_DB_RECOVERY_FILE_DEST%'
+UNION ALL
+SELECT 'fra_query_ok|1' FROM dual;
+EXIT;
+SQL
+) || _fra_rc=$?
+    resume_verbose_trace
+
+    if [[ $_fra_rc -ne 0 ]]; then
+        log_error "Could not read db_recovery_file_dest from the primary (sqlplus exit ${_fra_rc})"
+        log_error "  $(_first_ora_line "$FRA_PRIMARY_PARAMS_RAW")"
+        log_error "Refusing to start the non-restartable RMAN duplicate without this check. Nothing has been changed."
+        exit 1
+    fi
+
+    parse_primary_fra_params "$FRA_PRIMARY_PARAMS_RAW"
+    if [[ "$PRIMARY_FRA_QUERY_OK" != "YES" ]]; then
+        log_error "The primary's db_recovery_file_dest query returned no completion row - cannot tell whether it has an FRA"
+        log_error "  $(_first_ora_line "$FRA_PRIMARY_PARAMS_RAW")"
+        log_error "Refusing to start the non-restartable RMAN duplicate without this check. Nothing has been changed."
+        exit 1
+    fi
+
+    # Cross-check against what step 1 recorded; the live value decides.
+    if [[ "$(fra_normalize_path "$PRIMARY_FRA_DEST")" != "$(fra_normalize_path "${DB_RECOVERY_FILE_DEST:-}")" ]]; then
+        log_warn "Primary db_recovery_file_dest differs from the config's record (live: '$(fra_display_path "${PRIMARY_FRA_DEST:-}")', recorded: '$(fra_display_path "${DB_RECOVERY_FILE_DEST:-}")') - using the live value"
+    fi
+
+    if [[ -n "$PRIMARY_FRA_DEST" ]]; then
+        LIVE_PRIMARY_FRA_DEST="$PRIMARY_FRA_DEST"
+        log_info "Primary has an FRA: $(fra_display_path "$PRIMARY_FRA_DEST") (size ${PRIMARY_FRA_SIZE:-unset})"
+        log_info "Clearing the primary's FRA $(fra_display_path "$PRIMARY_FRA_DEST") on the standby because USE_FRA_FOR_STANDBY=NO"
+        log_info "  (RMAN SPFILE clause: RESET DB_RECOVERY_FILE_DEST, RESET DB_RECOVERY_FILE_DEST_SIZE)"
+        log_warn "Without an FRA the standby cannot enable Flashback Database (needed to reinstate the old primary after an FSFO failover)"
+    else
+        log_info "Primary has no db_recovery_file_dest - nothing inherited to clear"
+    fi
+
+    # Other primary destinations that resolve into the FRA would be invalid
+    # on a standby without one. Warn, never rewrite them silently.
+    if [[ -n "$PRIMARY_FRA_ARCHIVE_DESTS" ]]; then
+        log_warn "Primary uses LOCATION=USE_DB_RECOVERY_FILE_DEST in: ${PRIMARY_FRA_ARCHIVE_DESTS}"
+        log_warn "  The standby inherits these but has no FRA, so they will be invalid there (log_archive_dest_1 is set explicitly below)."
+        log_warn "  Review them after the clone (broker manages the DG destinations; local ones need an explicit LOCATION=<dir>)."
     fi
 fi
 
@@ -661,12 +916,11 @@ EOF
 )
 else
     # Traditional mode: use FILE_NAME_CONVERT (existing behavior)
-    if [[ "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
-        FRA_SETTINGS="    SET DB_RECOVERY_FILE_DEST='${STANDBY_FRA}'
-    SET DB_RECOVERY_FILE_DEST_SIZE='${STANDBY_DB_RECOVERY_FILE_DEST_SIZE:-${DB_RECOVERY_FILE_DEST_SIZE}}'"
-    else
-        FRA_SETTINGS=""
-    fi
+    # FRA lines: USE_FRA_FOR_STANDBY=YES -> SET both; otherwise, when the live
+    # primary has an FRA, RESET both (the SPFILE is the primary's copy, so
+    # they would be inherited); a primary without one -> no line at all.
+    # See build_rman_fra_lines above.
+    FRA_SETTINGS=$(build_rman_fra_lines "$STANDBY_STORAGE_MODE" "$USE_FRA_FOR_STANDBY" "${STANDBY_FRA:-}" "${STANDBY_DB_RECOVERY_FILE_DEST_SIZE:-${DB_RECOVERY_FILE_DEST_SIZE}}" "$LIVE_PRIMARY_FRA_DEST")
 
     RMAN_BODY=$(cat <<EOF
 # RMAN Duplicate for Standby (Data Guard Broker Managed)
@@ -836,6 +1090,74 @@ else
 fi
 record_artifact "spfile:${SPFILE}"
 
+# Read back the standby's effective FRA parameters and compare them with the
+# choice made in step 2: the SPFILE is the primary's copy plus the SET/RESET
+# list, so this is where an inherited FRA (or a lost one) would show. A
+# value that cannot be read only warns - the clone itself succeeded. A
+# CONTRADICTION is recorded (FRA_CHECK_FAILED) and logged here, but does NOT
+# exit: the DUPLICATE is done and this step is not restartable, so the
+# remaining post-clone actions (broker start, MRP, deletion policy) must still
+# run; the script then ends non-zero with the error block repeated.
+FRA_CHECK_FAILED=0
+FRA_CHECK_MSG=""
+FRA_CHECK_FIX_1=""
+FRA_CHECK_FIX_2=""
+FRA_CHECK_WHY=""
+# Print the recorded FRA contradiction (used where it happens and again at the end).
+print_fra_check_failure() {
+    log_error "FRA check failed: ${FRA_CHECK_MSG}"
+    log_error "${FRA_CHECK_WHY}"
+    log_error "The clone itself is complete - do not re-run this step. Manual fix on the standby (sqlplus / as sysdba):"
+    log_error "  ${FRA_CHECK_FIX_1}"
+    log_error "  ${FRA_CHECK_FIX_2}"
+}
+if [[ "$STANDBY_STORAGE_MODE" == "OMF" || "$USE_FRA_FOR_STANDBY" == "YES" ]]; then
+    _fra_expect="YES"
+    _fra_expected_path="${STANDBY_FRA:-${STANDBY_DB_RECOVERY_FILE_DEST:-}}"
+    [[ "$STANDBY_STORAGE_MODE" == "OMF" ]] && _fra_expected_path="${STANDBY_DB_RECOVERY_FILE_DEST:-}"
+else
+    _fra_expect="NO"
+    _fra_expected_path=""
+fi
+# run_sql_query (not get_db_parameter) so a failed read is seen as one: the
+# latter always returns 0 and would hand ORA- text to the comparison.
+_read_standby_param() {
+    local _o
+    _o=$(run_sql_query "get_db_parameter.sql" "$1" 2>/dev/null) || return 1
+    printf '%s' "$_o" | tr -d '\r' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' | tr -d '\n'
+}
+_fra_have_values=1
+STANDBY_FRA_DEST_ACTUAL=$(_read_standby_param "db_recovery_file_dest") || _fra_have_values=0
+STANDBY_FRA_SIZE_ACTUAL=$(_read_standby_param "db_recovery_file_dest_size") || _fra_have_values=0
+if [[ $_fra_have_values -eq 0 ]]; then
+    log_warn "Could not read the standby's db_recovery_file_dest / db_recovery_file_dest_size - FRA configuration not verified"
+else
+    log_info "Standby effective db_recovery_file_dest: '$(fra_display_path "${STANDBY_FRA_DEST_ACTUAL:-}")' (size: ${STANDBY_FRA_SIZE_ACTUAL:-unset})"
+    _fra_rc=0
+    _fra_msg=$(fra_readback_verdict "$_fra_expect" "$_fra_expected_path" "$STANDBY_FRA_DEST_ACTUAL" "$STANDBY_FRA_SIZE_ACTUAL") || _fra_rc=$?
+    case $_fra_rc in
+        0) log_info "FRA check: ${_fra_msg}" ;;
+        2) log_warn "FRA check: ${_fra_msg}" ;;
+        *)
+            FRA_CHECK_FAILED=1
+            FRA_CHECK_MSG="$_fra_msg"
+            if [[ "$_fra_expect" == "NO" ]]; then
+                FRA_CHECK_WHY="The primary's FRA setting was inherited despite USE_FRA_FOR_STANDBY=NO (RMAN RESET did not take effect)."
+                FRA_CHECK_FIX_1="ALTER SYSTEM SET db_recovery_file_dest='' SCOPE=BOTH;"
+                FRA_CHECK_FIX_2="ALTER SYSTEM RESET db_recovery_file_dest_size SCOPE=SPFILE;"
+            else
+                # the size must be set before the destination
+                FRA_CHECK_WHY="The standby's FRA does not match the configuration."
+                FRA_CHECK_FIX_1="ALTER SYSTEM SET db_recovery_file_dest_size=${STANDBY_DB_RECOVERY_FILE_DEST_SIZE:-${DB_RECOVERY_FILE_DEST_SIZE:-<size>}} SCOPE=BOTH;"
+                FRA_CHECK_FIX_2="ALTER SYSTEM SET db_recovery_file_dest='${_fra_expected_path}' SCOPE=BOTH;"
+            fi
+            print_fra_check_failure
+            log_error "RMAN log: $RMAN_LOG"
+            log_error "Continuing with the remaining post-clone actions (broker start, MRP, deletion policy); this step will exit non-zero at the end."
+            ;;
+    esac
+fi
+
 # ============================================================
 # Start Managed Recovery
 # ============================================================
@@ -936,19 +1258,35 @@ log_success "RMAN archivelog deletion policy configured"
 # Summary
 # ============================================================
 
-print_summary "SUCCESS" "Standby database created successfully"
+if [[ "$FRA_CHECK_FAILED" == "1" ]]; then
+    _final_status="ERROR"
+    _final_msg="Standby cloned, but its FRA setting contradicts the configuration - fix it before step 6"
+else
+    _final_status="SUCCESS"
+    _final_msg="Standby database created successfully"
+fi
+print_summary "$_final_status" "$_final_msg"
 print_status_block "Standby Clone Result" \
     "DB_UNIQUE_NAME" "$STANDBY_DB_UNIQUE_NAME" \
     "Instance Status" "$INSTANCE_STATUS" \
     "MRP Verification" "${MRP_STATUS:-Unavailable}" \
+    "FRA Check" "$([[ "$FRA_CHECK_FAILED" == "1" ]] && printf 'FAILED - %s' "$FRA_CHECK_MSG" || printf 'OK / not applicable')" \
     "RMAN Log" "$RMAN_LOG"
 
 print_list_block "Completed Actions" \
     "Started the standby instance in NOMOUNT." \
     "Ran RMAN DUPLICATE FROM ACTIVE DATABASE." \
-    "Verified the SPFILE." \
+    "Verified the SPFILE and read back the standby's effective FRA settings." \
     "Started Managed Recovery Process (MRP)." \
     "Configured RMAN archivelog deletion policy."
+
+if [[ "$FRA_CHECK_FAILED" == "1" ]]; then
+    echo ""
+    print_fra_check_failure
+    log_error "The remaining post-clone actions (broker start, MRP, archivelog deletion policy) WERE carried out."
+    log_error "Do NOT run ./primary/06_configure_broker.sh until the FRA setting above is fixed."
+    exit 1
+fi
 
 print_list_block "Next Steps" \
     "On PRIMARY, run ./primary/06_configure_broker.sh to enable broker-managed log shipping." \

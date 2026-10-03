@@ -12,6 +12,93 @@ Scope: implementation correctness, logical errors, operational failure handling,
 
 This is a follow-up to [the earlier review](REVIEW_2026-10-01.md). It describes the implementation at the commit above, after the earlier fixes. It does not claim those fixes were never made. No implementation files were changed during this review; this document records findings for a subsequent agent to fix.
 
+## Fix status (added 2026-10-03, after the fix pass)
+
+All 14 findings are fixed in code and covered by DB-free tests. The three release gates are
+answered below: one is fixed, two stay open because they need systems this pass did not run
+on. Nothing here has been through a real clone, switchover, failover or migration yet, so the
+verdict above stands until [TEST_PLAN_2026-10-01.md](TEST_PLAN_2026-10-01.md) Phase 12 has
+been run. The plan, the design decisions and the batch split are in
+[FIX_PLAN_2026-10-01_FOLLOWUP.md](FIX_PLAN_2026-10-01_FOLLOWUP.md).
+
+### How the fixes were verified
+
+- **Unit suites:** 25 pass under Bash 5.3 and under Bash 3.2.57 (driver and every inner
+  `bash`), with `ps` available so no check is skipped. Five suites are new:
+  `test_fsfo_observer`, `test_setup_dg_wallet`, `test_migrate_lib`, `test_step5_fra_reset`
+  and `test_step4_srl_size`.
+- **Read-only on the 19c lab** (`cdb1` / `cdb1_stby`, 2026-10-03), no file written there:
+  - `V$ARCHIVE_DEST_STATUS` has no `APPLIED_SCN`; `V$ARCHIVE_DEST` has one, but it trailed
+    the standby's own `V$DATABASE.CURRENT_SCN`.
+  - The new standby gate query returns `PHYSICAL STANDBY|cdb1_stby|<scn>` on the MOUNTED
+    standby.
+  - `rman checksyntax` accepts `RESET DB_RECOVERY_FILE_DEST` /
+    `RESET DB_RECOVERY_FILE_DEST_SIZE` inside `DUPLICATE … SPFILE`.
+  - Step 5's live-primary FRA query, the identity query (`cdb1|PRIMARY|<dbid>`) and the new
+    role-trigger query all parse and return rows. The role-trigger query answered
+    `0|NONE|NONE|NONE`, because `cdb1` has no trigger deployed, so the "healthy
+    installation" answer is still unseen.
+  - `dg_check_srl.sh -L` with the byte-exact queries: OK on both sides. Step 4's query
+    returns `52428800|52428800` (smallest SRL, largest ORL).
+  - The `SHOW OBSERVER` parser, fed the lab's real output, finds the observer by name and by
+    short host name and reads both ping ages, including the singular `1 second ago`.
+
+### Status by finding
+
+| # | Status | What was done | Still needs a real system |
+|---|---|---|---|
+| 1 | FIXED | `fsfo/observer.sh -n` on setup/start/stop/restart runs read-only queries, prints the plan and changes nothing (stale pidfiles included). `-a` asks before every mutating action; a decline exits 1 | Test plan 12.1 |
+| 2 | FIXED | `assert_db_matches_config` compares `DB_UNIQUE_NAME`, role and DBID with the selected config in steps 4 and 6 (must be the config's primary) and 9, 10, 13 (either member holding the PRIMARY role), before the `-n` stop. Step 6 names foreign broker members before `REMOVE CONFIGURATION`, refuses non-interactively and asks for a typed confirmation on a TTY | 12.2 (the lab has two primaries on one host) |
+| 3 | FIXED | `add_observer/03` and `04`: up = listed by the broker and this observer's own ping within `DG_OBS_MAX_PING_AGE` (60 s) and the pidfile process not known dead. A registered-but-dead observer is restarted with its existing `.dat` file; the stale entry is deregistered by name only if the broker refuses the start | 12.3. What the broker answers to a `START OBSERVER <name>` over its own stale registration is an assumption |
+| 4 | FIXED | `setup_dg_wallet.sh` stages in `mktemp -d` or an exclusive, verified private `mkdir`, else exits 1 before any `mkstore` call. `fsfo/observer.sh` uses the shared `create_temp_dir` with the same abort | 12.4, 11.10 |
+| 5 | FIXED | Step 05 gates on the CDB standby's own `V$DATABASE.CURRENT_SCN` (direct connection, role and unique name checked in the same query). Reached, apply lag and query error are three separate outcomes; a query error is no longer waited out as lag | 9.2, 9.8 |
+| 6 | FIXED | Step 5 asks the live primary; when it has an FRA and the standby is configured without one, the SPFILE clause carries the two `RESET` lines. The standby's effective values are read back; a contradiction fails the step at the end, after the remaining post-clone actions | 12.8. RESET semantics inside DUPLICATE are confirmed for syntax only |
+| 7 | FIXED | `create_temp_dir` fallback uses a distinct `dg_tmp_<pid>_<n>_<random>` candidate per allocation, with bounded retries; an existing path is never reused. Step 4 now ends in ERROR when the static listener entries could not be inserted, instead of warning | 12.5 |
+| 8 | FIXED | `fsfo/observer.sh` picks one reachable member per run (primary alias, then standby alias; each attempt bounded by `DG_OBSERVER_CONNECT_TIMEOUT`, 20 s, by a shell watchdog) and uses it for preflight, launch, presence poll and stop | 12.6 |
+| 9 | FIXED | Ready only when one owner holds a VALID package spec and body and both triggers ENABLED and VALID. Each other state is named with an action. JSON keys unchanged | 12.9 |
+| 10 | FIXED | Steps 02, 03 and 04 clear state only when a new attempt begins; a refused re-run leaves `state.env` byte-identical | 9.6 |
+| 11 | FIXED | `SET DEFINE OFF` and error handling before `CONNECT` in both standby branches; a password containing `"` is refused at the prompt; xtrace paused around the password | 9.9 |
+| 12 | FIXED | Reachability probes, pmon detection and the standby `DB_NAME` queries run under the collection watchdog: `DG_REMOTE_TIMEOUT` per call, twice that for all of discovery, exit 2 on a timeout | 12.10 |
+| 13 | FIXED | Both wallet scripts exit 1 on a failed login, print no success summary, and name the backup with the restore command. `fsfo/observer.sh` proves both aliases | 12.4, 12.7 |
+| 14 | FIXED | Sizes compared in exact bytes; DDL sizes rounded up to whole MiB. Step 4's own check of pre-existing SRLs had the same gap in another form (two rounded-up MiB figures) and now compares bytes too | 12.11 |
+
+### Fixed along the way, not in the review
+
+- **Migration, large SCNs:** `SELECT current_scn` without `TO_CHAR` prints in scientific
+  notation once the SCN is wider than 10 digits, which no gate comparison would match.
+  All SCN reads use `TO_CHAR` now.
+- **Migration, exit codes:** `WHENEVER SQLERROR EXIT SQL.SQLCODE` wraps modulo 256, so some
+  errors exited 0. The toolkit uses `EXIT FAILURE`.
+- **Migration, standby identity:** step 05 and the step 01/04 prerequisite check now refuse
+  an alias that answers as the primary or as another database.
+- **`04_verify_observer.sh`:** another observer's `FS_FAILOVER_OBSERVER_PRESENT=YES` used to
+  pass verification for this one.
+- **`tests/test_grep_portability.sh`:** same `mapfile` bug as the counter test, with the same
+  false PASS under Bash 3.2.
+- **Step 10 after a switchover:** the wrapper passes the current primary and standby hosts
+  to `dg_handoff.sh`.
+
+### Remaining release gates
+
+| Gate | Status | Comment |
+|---|---|---|
+| OMF control-file placement | OPEN | Not changed. Whether the standby inherits the primary's explicit `control_files` in OMF mode is still unobserved, and a guessed fix in a non-restartable step is worse than none. Test plan Phase 10 decides: files under `db_create_file_dest` closes it, anything else means an explicit `CONTROL_FILES` handling in step 5's OMF branch |
+| Test-runtime compatibility | FIXED | Supported shell declared as Bash 3.2 or later. `test_counter_increment.sh` runs its demonstrations with the shell under test, asserts what that version really does, and fails when its sweep cannot run. All 25 suites pass with Bash 3.2 as both driver and inner shell, and with `ps` available |
+| AIX 7.2 lifecycle validation | OPEN | Cannot be closed from this repository. Test plan Phase 11 now carries the lifecycle items the review lists (rows 11.10-11.16) |
+
+### Known and left as is
+
+- After a switchover, step 9 still names the staged password-file copy
+  `orapw<PRIMARY_ORACLE_SID>` from the config, which may not be the SID of the host it now
+  runs on.
+- A complete trigger installation plus leftovers under a second owner stays "ready"; the
+  report adds a note to drop the leftovers. Two complete installations are not ready.
+- Killing the local ssh in `dg_status.sh` does not necessarily end the remote `sqlplus`; it
+  ends when it next writes or when sshd reaps the session. The collection watchdog has always
+  had this property.
+- The wallet scripts do not roll back automatically after a failed login. The cause may be a
+  database that is down, so the operator gets the backup and the restore command.
+
 ## Evidence and limits
 
 - All 48 shipped shell scripts passed Bash 3.2 syntax checks.

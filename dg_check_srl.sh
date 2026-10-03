@@ -155,8 +155,8 @@ fi
 # Fields:
 #   1  DB_UNIQUE_NAME
 #   2  DATABASE_ROLE
-#   3  MAX_ORL_MB                (largest online redo log in MB)
-#   4  THREAD_DATA               (csv of "tid:orl_cnt:srl_cnt:min_srl_mb",
+#   3  MAX_ORL_BYTES             (largest online redo log, exact BYTES)
+#   4  THREAD_DATA               (csv of "tid:orl_cnt:srl_cnt:min_srl_bytes",
 #                                 counting only SRLs already bound to that
 #                                 thread)
 #   5  MAX_GROUP                 (max(group#) across V$LOG and V$STANDBY_LOG)
@@ -165,7 +165,12 @@ fi
 #   8  PEER_DB_UNIQUE_NAMES      (every other member of V$DATAGUARD_CONFIG,
 #                                 comma-separated; may be empty)
 #   9  UNASSIGNED_SRL_CNT        (H11: SRL groups still at THREAD#=0)
-#  10  UNASSIGNED_SRL_MIN_MB     (smallest of those, 0 when none)
+#  10  UNASSIGNED_SRL_MIN_BYTES  (smallest of those, exact bytes, 0 when none)
+#
+# Sizes travel as exact byte counts (TO_CHAR keeps sqlplus from rendering a
+# value wider than NUMWIDTH in scientific notation) and are compared in
+# integer shell arithmetic: truncating to whole MiB made a 100.5 MiB ORL
+# grade a 100 MiB SRL as compliant.
 # ============================================================
 
 gather_side() {
@@ -179,7 +184,7 @@ gather_side() {
     role="${dbinfo#*~}"
     [[ "$role" == "$du" ]] && role=""
 
-    max_orl=$(run_sql "$cs" "SELECT NVL(MAX(BYTES)/1024/1024,0) FROM V\$LOG;" | clean | head -1)
+    max_orl=$(run_sql "$cs" "SELECT TO_CHAR(NVL(MAX(BYTES),0)) FROM V\$LOG;" | clean | head -1)
     max_grp=$(run_sql "$cs" "SELECT NVL(MAX(GROUP#),0) FROM (SELECT GROUP# FROM V\$LOG UNION ALL SELECT GROUP# FROM V\$STANDBY_LOG);" | clean | head -1)
 
     # Per-thread counts deliberately match only SRLs already bound to the
@@ -189,7 +194,7 @@ gather_side() {
 SELECT t.thread#||':'||
        (SELECT COUNT(DISTINCT GROUP#) FROM V\$LOG WHERE THREAD#=t.thread#)||':'||
        NVL((SELECT COUNT(DISTINCT GROUP#) FROM V\$STANDBY_LOG WHERE THREAD#=t.thread#),0)||':'||
-       NVL((SELECT MIN(BYTES)/1024/1024 FROM V\$STANDBY_LOG WHERE THREAD#=t.thread#),0)
+       NVL((SELECT TO_CHAR(MIN(BYTES)) FROM V\$STANDBY_LOG WHERE THREAD#=t.thread#),'0')
 FROM V\$THREAD t
 WHERE t.ENABLED IN ('PUBLIC','PRIVATE')
 ORDER BY t.thread#;
@@ -200,11 +205,11 @@ ORDER BY t.thread#;
     # and produced "ACTION REQUIRED" plus duplicate-SRL DDL on a database
     # that was in fact compliant.
     unassigned=$(run_sql "$cs" "
-SELECT COUNT(DISTINCT GROUP#)||':'||NVL(MIN(BYTES)/1024/1024,0)
+SELECT COUNT(DISTINCT GROUP#)||':'||NVL(TO_CHAR(MIN(BYTES)),'0')
 FROM V\$STANDBY_LOG
 WHERE NVL(THREAD#,0)=0;
 " | clean | head -1)
-    case "$unassigned" in ''|*[!0-9:.]*) unassigned="0:0" ;; esac
+    case "$unassigned" in ''|*[!0-9:]*) unassigned="0:0" ;; esac
 
     omf=$(run_sql "$cs" "SELECT CASE WHEN VALUE IS NULL OR VALUE='' THEN 'NO' ELSE 'YES' END FROM V\$PARAMETER WHERE NAME='db_create_file_dest';" | clean | head -1)
     omf="${omf:-NO}"
@@ -230,11 +235,45 @@ WHERE TYPE='ONLINE' AND ROWNUM=1;
 }
 
 # ============================================================
+# Byte-exact size helpers (integer arithmetic only).
+# ============================================================
+
+# size_uint VALUE -> VALUE when it is a plain digit string that fits 64-bit
+# shell arithmetic (<= 18 digits, no leading zeros kept), else 0.
+size_uint() {
+    case "$1" in
+        ''|*[!0-9]*) printf '0'; return 0 ;;
+    esac
+    if [[ "${#1}" -gt 18 ]]; then printf '0'; return 0; fi
+    printf '%s' "$((10#$1))"
+}
+
+# size_ceil_mb BYTES -> whole MiB, rounded UP (an SRL at this size is never
+# smaller than a log of BYTES).
+size_ceil_mb() { printf '%s' "$(( ($1 + 1048575) / 1048576 ))"; }
+
+# size_label BYTES -> "100 MB" for a whole number of MiB, otherwise the exact
+# byte count ("105381888 bytes"): never a truncated figure that looks equal to
+# a different size.
+size_label() {
+    if [[ $(( $1 % 1048576 )) -eq 0 ]]; then
+        printf '%s MB' "$(( $1 / 1048576 ))"
+    else
+        printf '%s bytes' "$1"
+    fi
+}
+
+# ============================================================
 # emit_side: print summary + DDL for one side.
 # Returns 0 = compliant, 1 = DDL emitted (missing or undersized),
 #         2 = the side could not be evaluated at all (M22).
 #
-# Args: du role max_orl threads max_grp path omf unassigned_cnt unassigned_min_mb
+# Args: du role max_orl_bytes threads max_grp path omf unassigned_cnt unassigned_min_bytes
+#
+# A new SRL is created at the largest ORL size rounded UP to whole MiB (the
+# same rule step 1 uses for REDO_LOG_SIZE_MB), so it is never smaller than
+# the ORL; an SRL smaller by even one byte is a finding, equal or larger is
+# compliant.
 # ============================================================
 
 emit_side() {
@@ -245,10 +284,14 @@ emit_side() {
     case "$max_grp" in ''|*[!0-9]*) max_grp=0 ;; esac
     local next_grp=$((max_grp + 1))
 
-    unassigned_cnt="${unassigned_cnt%.*}"
-    case "$unassigned_cnt" in ''|*[!0-9]*) unassigned_cnt=0 ;; esac
-    local unassigned_min_int="${unassigned_min%.*}"
-    case "$unassigned_min_int" in ''|*[!0-9]*) unassigned_min_int=0 ;; esac
+    unassigned_cnt=$(size_uint "$unassigned_cnt")
+    local unassigned_min_bytes
+    unassigned_min_bytes=$(size_uint "$unassigned_min")
+    local max_orl_bytes
+    max_orl_bytes=$(size_uint "$max_orl")
+    local ddl_mb orl_label
+    ddl_mb=$(size_ceil_mb "$max_orl_bytes")
+    orl_label=$(size_label "$max_orl_bytes")
 
     local target_path="$path"
     [[ -n "$SRL_PATH_OVERRIDE" ]] && target_path="$SRL_PATH_OVERRIDE"
@@ -258,19 +301,19 @@ emit_side() {
     echo "============================================================"
     echo " ${du} (${role:-unknown role})"
     echo "============================================================"
-    echo "  Max online redo log size : ${max_orl} MB"
+    echo "  Max online redo log size : ${orl_label}"
+    if [[ "$max_orl_bytes" -gt 0 && $(( max_orl_bytes % 1048576 )) -ne 0 ]]; then
+        echo "  New SRL size (DDL)       : ${ddl_mb} MB (rounded up from the exact size)"
+    fi
     echo "  OMF (db_create_file_dest): ${omf}"
     echo "  SRL/ORL member directory : ${path:-<none>}"
     if [[ -n "$SRL_PATH_OVERRIDE" ]]; then
         echo "  Target dir for new SRLs  : ${target_path} (overridden)"
     fi
 
-    local max_orl_int="${max_orl%.*}"
-    case "$max_orl_int" in ''|*[!0-9]*) max_orl_int=0 ;; esac
-
     # An unreadable (or zero) ORL size would turn into "SIZE 0M" DDL and a
     # bogus "not 0 MB" size finding - refuse to grade the side instead.
-    if [[ "$max_orl_int" -le 0 ]]; then
+    if [[ "$max_orl_bytes" -le 0 ]]; then
         echo ""
         echo "  Result: ERROR - could not read the online redo log size."
         echo "  V\$LOG returned no usable size for ${du} (raw value: '${max_orl}'), so no"
@@ -300,19 +343,18 @@ emit_side() {
     fi
 
     echo ""
-    printf "  %-8s %-11s %-11s %-11s %-13s %-11s\n" \
-        "Thread" "ORL_grps" "SRL_grps" "Unassign" "Required_SRL" "Min_SRL_MB"
-    printf "  %-8s %-11s %-11s %-11s %-13s %-11s\n" \
-        "------" "--------" "--------" "--------" "------------" "----------"
+    printf "  %-8s %-11s %-11s %-11s %-13s %-18s\n" \
+        "Thread" "ORL_grps" "SRL_grps" "Unassign" "Required_SRL" "Min_SRL_size"
+    printf "  %-8s %-11s %-11s %-11s %-13s %-18s\n" \
+        "------" "--------" "--------" "--------" "------------" "------------"
 
     # -- Pass 2: grade each thread ----------------------------------------
-    while IFS=':' read -r tid orl_cnt srl_cnt min_mb; do
+    while IFS=':' read -r tid orl_cnt srl_cnt min_bytes; do
         [[ -z "$tid" ]] && continue
         case "$tid" in ''|*[!0-9]*) continue ;; esac
         case "$orl_cnt" in ''|*[!0-9]*) orl_cnt=0 ;; esac
         case "$srl_cnt" in ''|*[!0-9]*) srl_cnt=0 ;; esac
-        local min_mb_int="${min_mb%.*}"
-        case "$min_mb_int" in ''|*[!0-9]*) min_mb_int=0 ;; esac
+        min_bytes=$(size_uint "$min_bytes")
 
         # H11: the unassigned (THREAD#=0) pool counts toward this thread.
         # With one thread that is exact; with several it is a shared pool
@@ -324,24 +366,27 @@ emit_side() {
         # the deficit rule, not the size rule.
         local effective_min=0
         if [[ "$srl_cnt" -gt 0 && "$unassigned_cnt" -gt 0 ]]; then
-            if [[ "$min_mb_int" -le "$unassigned_min_int" ]]; then
-                effective_min="$min_mb_int"
+            if [[ "$min_bytes" -le "$unassigned_min_bytes" ]]; then
+                effective_min="$min_bytes"
             else
-                effective_min="$unassigned_min_int"
+                effective_min="$unassigned_min_bytes"
             fi
         elif [[ "$srl_cnt" -gt 0 ]]; then
-            effective_min="$min_mb_int"
+            effective_min="$min_bytes"
         elif [[ "$unassigned_cnt" -gt 0 ]]; then
-            effective_min="$unassigned_min_int"
+            effective_min="$unassigned_min_bytes"
         fi
 
         local required=$((orl_cnt + 1))
         local deficit=$((required - effective_srl))
-        printf "  %-8s %-11s %-11s %-11s %-13s %-11s\n" \
-            "$tid" "$orl_cnt" "$srl_cnt" "$unassigned_cnt" "$required" "$effective_min"
+        local min_label="-"
+        [[ "$effective_srl" -gt 0 ]] && min_label=$(size_label "$effective_min")
+        printf "  %-8s %-11s %-11s %-11s %-13s %-18s\n" \
+            "$tid" "$orl_cnt" "$srl_cnt" "$unassigned_cnt" "$required" "$min_label"
 
-        # Larger than the biggest ORL is fine; only a smaller SRL is skipped.
-        if [[ "$effective_srl" -gt 0 ]] && [[ "$effective_min" -lt "$max_orl_int" ]]; then
+        # Larger than the biggest ORL is fine; an SRL smaller by even one
+        # byte is skipped by transport.
+        if [[ "$effective_srl" -gt 0 ]] && [[ "$effective_min" -lt "$max_orl_bytes" ]]; then
             any_size_mismatch="yes"
             needs_fix="yes"
         fi
@@ -351,9 +396,9 @@ emit_side() {
             local i=0
             while [[ $i -lt $deficit ]]; do
                 if [[ "$omf" == "YES" ]]; then
-                    ddl_lines+=$'\n'"ALTER DATABASE ADD STANDBY LOGFILE THREAD ${tid} GROUP ${next_grp} SIZE ${max_orl_int}M;"
+                    ddl_lines+=$'\n'"ALTER DATABASE ADD STANDBY LOGFILE THREAD ${tid} GROUP ${next_grp} SIZE ${ddl_mb}M;"
                 else
-                    ddl_lines+=$'\n'"ALTER DATABASE ADD STANDBY LOGFILE THREAD ${tid} GROUP ${next_grp} ('${target_path}standby_redo${next_grp}.log') SIZE ${max_orl_int}M;"
+                    ddl_lines+=$'\n'"ALTER DATABASE ADD STANDBY LOGFILE THREAD ${tid} GROUP ${next_grp} ('${target_path}standby_redo${next_grp}.log') SIZE ${ddl_mb}M;"
                 fi
                 next_grp=$((next_grp + 1))
                 i=$((i + 1))
@@ -379,7 +424,7 @@ emit_side() {
 
     echo ""
     if [[ "$needs_fix" == "no" ]]; then
-        echo "  Result: OK - all ${thread_count} thread(s) have at least N+1 SRLs of at least ${max_orl_int} MB."
+        echo "  Result: OK - all ${thread_count} thread(s) have at least N+1 SRLs of at least ${orl_label}."
         return 0
     fi
 
@@ -387,20 +432,20 @@ emit_side() {
 
     if [[ "$any_size_mismatch" == "yes" ]]; then
         echo ""
-        echo "  WARNING: At least one existing SRL group is smaller than ${max_orl_int} MB."
+        echo "  WARNING: At least one existing SRL group is smaller than ${orl_label}."
         echo "  Undersized SRLs are skipped by transport. List them with:"
         echo ""
-        echo "    SELECT GROUP#, THREAD#, BYTES/1024/1024 MB, STATUS"
-        echo "      FROM V\$STANDBY_LOG WHERE BYTES/1024/1024 < ${max_orl_int};"
+        echo "    SELECT GROUP#, THREAD#, BYTES, STATUS"
+        echo "      FROM V\$STANDBY_LOG WHERE BYTES < ${max_orl_bytes};"
         echo ""
         echo "  Then drop and recreate each at the correct size (the group must"
         echo "  not be CURRENT or ACTIVE; on a standby, stop apply first):"
         echo ""
         echo "    ALTER DATABASE DROP STANDBY LOGFILE GROUP <n>;"
         if [[ "$omf" == "YES" ]]; then
-            echo "    ALTER DATABASE ADD STANDBY LOGFILE THREAD <t> GROUP <n> SIZE ${max_orl_int}M;"
+            echo "    ALTER DATABASE ADD STANDBY LOGFILE THREAD <t> GROUP <n> SIZE ${ddl_mb}M;"
         else
-            echo "    ALTER DATABASE ADD STANDBY LOGFILE THREAD <t> GROUP <n> ('${target_path}standby_redo<n>.log') SIZE ${max_orl_int}M;"
+            echo "    ALTER DATABASE ADD STANDBY LOGFILE THREAD <t> GROUP <n> ('${target_path}standby_redo<n>.log') SIZE ${ddl_mb}M;"
         fi
     fi
 
@@ -429,17 +474,17 @@ info "Checking local side (ORACLE_SID=${ORACLE_SID})..."
 # M21: every field is defaulted before use, and the '|' delimiter keeps an
 # empty field from shifting all the later ones.
 LOCAL_DU=""; LOCAL_ROLE=""; LOCAL_MAX_ORL=0; LOCAL_THREADS=""; LOCAL_MAX_GRP=0
-LOCAL_PATH=""; LOCAL_OMF="NO"; LOCAL_PEER=""; LOCAL_UNASSIGNED=0; LOCAL_UNASSIGNED_MB=0
+LOCAL_PATH=""; LOCAL_OMF="NO"; LOCAL_PEER=""; LOCAL_UNASSIGNED=0; LOCAL_UNASSIGNED_BYTES=0
 
 LOCAL_REC=$(gather_side "$LOCAL_CS")
 IFS='|' read -r LOCAL_DU LOCAL_ROLE LOCAL_MAX_ORL LOCAL_THREADS LOCAL_MAX_GRP \
-    LOCAL_PATH LOCAL_OMF LOCAL_PEER LOCAL_UNASSIGNED LOCAL_UNASSIGNED_MB <<<"$LOCAL_REC"
+    LOCAL_PATH LOCAL_OMF LOCAL_PEER LOCAL_UNASSIGNED LOCAL_UNASSIGNED_BYTES <<<"$LOCAL_REC"
 
 LOCAL_MAX_ORL="${LOCAL_MAX_ORL:-0}"
 LOCAL_MAX_GRP="${LOCAL_MAX_GRP:-0}"
 LOCAL_OMF="${LOCAL_OMF:-NO}"
 LOCAL_UNASSIGNED="${LOCAL_UNASSIGNED:-0}"
-LOCAL_UNASSIGNED_MB="${LOCAL_UNASSIGNED_MB:-0}"
+LOCAL_UNASSIGNED_BYTES="${LOCAL_UNASSIGNED_BYTES:-0}"
 
 [[ -n "$LOCAL_DU" ]] || die "Could not read local DB_UNIQUE_NAME."
 
@@ -554,26 +599,26 @@ fi
 
 LOCAL_FIX_RC=0
 emit_side "$LOCAL_DU" "$LOCAL_ROLE" "$LOCAL_MAX_ORL" "$LOCAL_THREADS" "$LOCAL_MAX_GRP" \
-    "$LOCAL_PATH" "$LOCAL_OMF" "$LOCAL_UNASSIGNED" "$LOCAL_UNASSIGNED_MB" || LOCAL_FIX_RC=$?
+    "$LOCAL_PATH" "$LOCAL_OMF" "$LOCAL_UNASSIGNED" "$LOCAL_UNASSIGNED_BYTES" || LOCAL_FIX_RC=$?
 
 i=0
 while [[ $i -lt $P_N ]]; do
     if [[ "${P_REACHED[$i]}" == "yes" ]]; then
         # M21: every field is defaulted before use, as for the local side.
         PEER_DU=""; PEER_ROLE=""; PEER_MAX_ORL=0; PEER_THREADS=""; PEER_MAX_GRP=0
-        PEER_PATH=""; PEER_OMF="NO"; PEER_PEER=""; PEER_UNASSIGNED=0; PEER_UNASSIGNED_MB=0
+        PEER_PATH=""; PEER_OMF="NO"; PEER_PEER=""; PEER_UNASSIGNED=0; PEER_UNASSIGNED_BYTES=0
         IFS='|' read -r PEER_DU PEER_ROLE PEER_MAX_ORL PEER_THREADS PEER_MAX_GRP \
-            PEER_PATH PEER_OMF PEER_PEER PEER_UNASSIGNED PEER_UNASSIGNED_MB <<<"${P_REC[$i]}"
+            PEER_PATH PEER_OMF PEER_PEER PEER_UNASSIGNED PEER_UNASSIGNED_BYTES <<<"${P_REC[$i]}"
         PEER_MAX_ORL="${PEER_MAX_ORL:-0}"
         PEER_MAX_GRP="${PEER_MAX_GRP:-0}"
         PEER_OMF="${PEER_OMF:-NO}"
         PEER_UNASSIGNED="${PEER_UNASSIGNED:-0}"
-        PEER_UNASSIGNED_MB="${PEER_UNASSIGNED_MB:-0}"
+        PEER_UNASSIGNED_BYTES="${PEER_UNASSIGNED_BYTES:-0}"
         P_DU[$i]="$PEER_DU"
         P_ROLE[$i]="$PEER_ROLE"
         PEER_FIX_RC=0
         emit_side "$PEER_DU" "$PEER_ROLE" "$PEER_MAX_ORL" "$PEER_THREADS" "$PEER_MAX_GRP" \
-            "$PEER_PATH" "$PEER_OMF" "$PEER_UNASSIGNED" "$PEER_UNASSIGNED_MB" || PEER_FIX_RC=$?
+            "$PEER_PATH" "$PEER_OMF" "$PEER_UNASSIGNED" "$PEER_UNASSIGNED_BYTES" || PEER_FIX_RC=$?
         P_RC[$i]=$PEER_FIX_RC
     fi
     i=$((i + 1))

@@ -22,6 +22,18 @@
 # stdin (secret, secret again, wallet password). `setup` feeds them with
 # printf (a shell builtin), so neither the observer password nor the wallet
 # password ever appears on a process argv.
+#
+# -n/--check: setup/start/stop/restart run discovery, validation and the
+# read-only broker queries, print what they would do and exit 0 - no wallet
+# or sqlnet.ora write, no START/STOP OBSERVER, no process launched or
+# signalled, no pidfile created or removed (stale ones are reported, not
+# cleaned), no password prompt. status is read-only and runs as usual.
+# -a/--approval-mode: every mutating action asks first; a declined action is
+# not run and the command exits 1.
+#
+# Broker connections ('/@alias') are bounded by DG_OBSERVER_CONNECT_TIMEOUT
+# seconds (default 20) with a shell watchdog - AIX has no timeout binary, and
+# the alias text must stay as typed for the wallet lookup to match.
 # ============================================================
 
 set -e
@@ -41,7 +53,7 @@ enable_verbose_mode "$@"
 # ============================================================
 
 usage() {
-    echo "Usage: $0 {setup|start|stop|status|restart}"
+    echo "Usage: $0 [-n] [-a] [-v] {setup|start|stop|status|restart}"
     echo ""
     echo "Commands:"
     echo "  setup   - Set up Oracle Wallet for secure authentication"
@@ -50,9 +62,15 @@ usage() {
     echo "  status  - Show observer status"
     echo "  restart - Restart the observer"
     echo ""
+    echo "Options:"
+    echo "  -n, --check  - Discovery, validation and read-only broker queries only; print the plan, change nothing"
+    echo "  -a           - Approval mode: ask before every mutating action"
+    echo "  -v           - Verbose (shell trace; passwords are never traced)"
+    echo ""
     echo "Environment Variables:"
     echo "  WALLET_DIR  - Override wallet directory (default: \$ORACLE_HOME/network/admin/wallet)"
     echo "  OBSERVER_DIR - Host-local directory for the observer's .dat/log files (default: \$HOME/fsfo_observer)"
+    echo "  DG_OBSERVER_CONNECT_TIMEOUT - Seconds to wait for one broker/database connection (default: 20)"
     exit 1
 }
 
@@ -78,6 +96,10 @@ get_config() {
     PID_FILE="${NFS_SHARE}/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.pid"
     OBSERVER_LOG_FILE="${NFS_SHARE}/logs/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}.log"
     LOG_FILE="${NFS_SHARE}/logs/fsfo_observer_${STANDBY_DB_UNIQUE_NAME}_script.log"
+    # Check mode creates no file at all, so its messages go to the terminal only.
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        LOG_FILE=""
+    fi
 
     # Host-local state. Without FILE IS the observer drops fsfo.dat into
     # whatever directory `start` happened to run from, and a restart from a
@@ -86,6 +108,113 @@ get_config() {
     OBSERVER_DIR="${OBSERVER_DIR:-${HOME}/fsfo_observer}"
     OBSERVER_DAT="${OBSERVER_DIR}/fsfo_${STANDBY_DB_UNIQUE_NAME}.dat"
     OBSERVER_DGMGRL_LOG="${OBSERVER_DIR}/fsfo_${STANDBY_DB_UNIQUE_NAME}_observer.log"
+
+    # Upper bound, in seconds, for any one '/@alias' connection (see
+    # _run_bounded). A blackholed host otherwise hangs dgmgrl/sqlplus for
+    # the whole TCP connect timeout - minutes - per attempt.
+    OBSERVER_CONNECT_TIMEOUT="${DG_OBSERVER_CONNECT_TIMEOUT:-20}"
+    case "$OBSERVER_CONNECT_TIMEOUT" in
+        ''|*[!0-9]*)
+            log_error "DG_OBSERVER_CONNECT_TIMEOUT must be a whole number of seconds (got: $OBSERVER_CONNECT_TIMEOUT)"
+            exit 2
+            ;;
+    esac
+    OBSERVER_CONNECT_TIMEOUT=$((10#$OBSERVER_CONNECT_TIMEOUT))
+    if [[ $OBSERVER_CONNECT_TIMEOUT -lt 1 ]]; then
+        log_error "DG_OBSERVER_CONNECT_TIMEOUT must be at least 1 second"
+        exit 2
+    fi
+}
+
+# _run_bounded <seconds> <command> [args...]: run the command with stdout and
+# stderr merged, kill it once <seconds> have passed, and print its output.
+# Stdin is passed through (0<&0: a background job would otherwise get
+# /dev/null), so a here-doc on the call works. A killed run ends with the
+# line DG_BOUNDED_TIMEOUT (see _bounded_timed_out). Always returns 0: it is
+# called inside $(...), where a non-zero return would fire the ERR trap in
+# the subshell and its message would land in the captured output.
+# The watchdog's own output goes to /dev/null so its orphaned `sleep` (once
+# the watchdog is killed) does not hold the command substitution's pipe open.
+_run_bounded() {
+    local secs="$1" pid wd rc=0
+    shift
+    "$@" 0<&0 2>&1 &
+    pid=$!
+    ( sleep "$secs"; kill -TERM "$pid" 2>/dev/null || true; sleep 2; kill -KILL "$pid" 2>/dev/null || true ) >/dev/null 2>&1 &
+    wd=$!
+    wait "$pid" 2>/dev/null || rc=$?
+    kill "$wd" 2>/dev/null || true
+    # 143/137: ended by the watchdog's TERM/KILL
+    if [[ $rc -eq 143 || $rc -eq 137 ]]; then
+        printf '\nDG_BOUNDED_TIMEOUT\n'
+    fi
+    return 0
+}
+
+_bounded_timed_out() {
+    printf '%s\n' "$1" | grep -q '^DG_BOUNDED_TIMEOUT$'
+}
+
+# First Oracle/tool error line in $1 (ORA-, TNS-, DGM-, SP2-, or a line
+# starting with ERROR), or nothing. For messages, and for the strict check on
+# the identity query, whose healthy output never contains one.
+_first_error_line() {
+    printf '%s\n' "$1" | tr -d '\r' \
+        | grep -E 'ORA-[0-9]|TNS-[0-9]|DGM-[0-9]|SP2-[0-9]|^[[:space:]]*ERROR' \
+        | head -1 | sed 's/^[[:space:]]*//' || true
+}
+
+# select_broker_member: set DG_MEMBER_ALIAS to the first broker member that
+# answers SHOW CONFIGURATION through the wallet - PRIMARY_TNS_ALIAS, then
+# STANDBY_TNS_ALIAS - each attempt bounded by OBSERVER_CONNECT_TIMEOUT. After
+# a failover with the original primary down, the old standby alias is the
+# one that answers, and the observer must be startable through it. Callers
+# use the chosen alias for every broker command of the run, so preflight,
+# launch, presence poll and stop all talk to the same member.
+# Read-only; returns 1 (logging both aliases) when neither answers.
+select_broker_member() {
+    local alias out why skipped=""
+    DG_MEMBER_ALIAS=""
+    for alias in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
+        [[ -n "$alias" ]] || continue
+        out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "/@${alias}" "show configuration")
+        if _bounded_timed_out "$out"; then
+            why="no answer within ${OBSERVER_CONNECT_TIMEOUT}s (DG_OBSERVER_CONNECT_TIMEOUT)"
+        elif printf '%s\n' "$out" | tr -d '\r' | grep -q 'Configuration -'; then
+            DG_MEMBER_ALIAS="$alias"
+            if [[ -z "$skipped" ]]; then
+                log_info "Broker member for this run: $alias (answered SHOW CONFIGURATION)"
+            else
+                log_info "Broker member for this run: $alias (answered SHOW CONFIGURATION; $skipped did not)"
+            fi
+            return 0
+        else
+            why=$(_first_error_line "$out")
+            why="${why:-no configuration in the dgmgrl output}"
+        fi
+        log_warn "Broker member $alias is not usable: $why"
+        skipped="${skipped:+$skipped, }$alias"
+    done
+    log_error "Neither broker member answered through the wallet: $PRIMARY_TNS_ALIAS, $STANDBY_TNS_ALIAS"
+    log_error "Check that at least one database is up, the TNS entries resolve on $(hostname),"
+    log_error "and the wallet holds the observer credential for both aliases."
+    return 1
+}
+
+# _drop_stale_pidfile <reason>: remove a pidfile shown to be stale. Check
+# mode reports it and leaves it; approval mode asks first, and a declined
+# removal stops the command (exit 1).
+_drop_stale_pidfile() {
+    local reason="$1"
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_warn "Check mode: $PID_FILE is stale ($reason) - a real run removes it; left in place"
+        return 0
+    fi
+    if ! confirm_approval_action "Remove stale observer pidfile" "rm -f $PID_FILE   # $reason"; then
+        log_error "Stale pidfile removal declined - stopping here"
+        exit 1
+    fi
+    rm -f "$PID_FILE"
 }
 
 check_wallet_exists() {
@@ -107,20 +236,25 @@ _pid_is_dgmgrl() {
     ps -p "$1" -o args= 2>/dev/null | grep -qi 'dgmgrl'
 }
 
-# observer_present: YES/NO as the broker sees it (any observer, not
+# observer_present [alias...]: YES/NO as the broker sees it (any observer, not
 # necessarily this host's), or nothing at all when it cannot be determined
 # (no connection, no usable output). Always returns 0 so callers can use
-# it under set -e. Primary first, then the standby (the primary may be the
-# member that is down after a failover); V$DATABASE.FS_FAILOVER_OBSERVER_
-# PRESENT is populated on both. Falls back to SHOW OBSERVER when there is
-# no sqlplus (instant-client style observer hosts).
+# it under set -e. Without arguments: primary first, then the standby (the
+# primary may be the member that is down after a failover); with arguments,
+# only those aliases (start passes the member it launched through).
+# V$DATABASE.FS_FAILOVER_OBSERVER_PRESENT is populated on both. Falls back to
+# SHOW OBSERVER when there is no sqlplus (instant-client style observer
+# hosts). Every connection is bounded (_run_bounded).
 observer_present() {
     local alias out="" flag
-    for alias in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
+    if [[ $# -eq 0 ]]; then
+        set -- "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"
+    fi
+    for alias in "$@"; do
         [[ -n "$alias" ]] || continue
         flag=""
         if [[ -x "$ORACLE_HOME/bin/sqlplus" ]]; then
-            out=$("$ORACLE_HOME/bin/sqlplus" -s -L "/@${alias}" as sysdg <<EOF 2>/dev/null || true
+            out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/sqlplus" -s -L "/@${alias}" as sysdg <<EOF
 set pagesize 0 heading off feedback off
 select 'PRESENT=' || fs_failover_observer_present from v\$database;
 exit
@@ -129,7 +263,7 @@ EOF
             flag=$(printf '%s\n' "$out" | sed -n 's/^PRESENT=//p' | tr -d ' \r' | head -1)
         fi
         if [[ -z "$flag" ]]; then
-            out=$("$ORACLE_HOME/bin/dgmgrl" -silent "/@${alias}" "SHOW OBSERVER" 2>&1 || true)
+            out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "/@${alias}" "SHOW OBSERVER")
             if printf '%s\n' "$out" | tr -d '\r' | grep -q '^[[:space:]]*Observer[[:space:]]*"'; then
                 flag="YES"
             elif printf '%s\n' "$out" | grep -q 'Configuration -'; then
@@ -162,7 +296,7 @@ is_observer_running() {
     entry=$(cat "$PID_FILE")
 
     if [[ -z "$entry" ]]; then
-        rm -f "$PID_FILE"
+        _drop_stale_pidfile "empty file"
         return 1
     fi
 
@@ -179,7 +313,7 @@ is_observer_running() {
     esac
 
     if [[ -z "$pid" ]]; then
-        rm -f "$PID_FILE"
+        _drop_stale_pidfile "no PID in it"
         return 1
     fi
 
@@ -192,7 +326,7 @@ is_observer_running() {
 
     if ! _pid_alive "$pid"; then
         # Process is gone - stale pidfile left over from a prior run.
-        rm -f "$PID_FILE"
+        _drop_stale_pidfile "PID $pid is not running"
         return 1
     fi
 
@@ -202,7 +336,7 @@ is_observer_running() {
     # line actually looks like our dgmgrl observer before trusting it.
     if ! _pid_is_dgmgrl "$pid"; then
         log_warn "PID $pid from $PID_FILE is not a dgmgrl process - treating pidfile as stale"
-        rm -f "$PID_FILE"
+        _drop_stale_pidfile "PID $pid is not a dgmgrl process"
         return 1
     fi
 
@@ -317,11 +451,20 @@ do_setup() {
     # $WALLET_DIR after every step below succeeds - so a failure never
     # leaves the live wallet missing or half-written.
     NEW_WALLET_STAGED=false
+    # Check mode: what the wallet part of a real run would do (no prompts)
+    CHECK_WALLET_PLAN=""
 
     if check_wallet_exists; then
         log_warn "Wallet already exists at: $WALLET_DIR"
 
-        if ! confirm_proceed "Do you want to recreate the wallet?"; then
+        if [[ "$CHECK_ONLY" == "1" ]]; then
+            log_info "Check mode: testing the existing wallet's credentials (read-only)..."
+            if test_wallet_connection; then
+                CHECK_WALLET_PLAN="The existing wallet authenticates for both aliases. A real run asks whether to recreate it (typed RECREATE WALLET; the old one is kept as ${WALLET_DIR}.bak.<timestamp>); declining keeps it unchanged."
+            else
+                CHECK_WALLET_PLAN="The existing wallet does NOT authenticate for every alias. A real run asks whether to recreate it (staged rebuild, old one kept as ${WALLET_DIR}.bak.<timestamp>) or to add/update the credentials in place (after copying it to ${WALLET_DIR}.bak.<timestamp>)."
+            fi
+        elif ! confirm_proceed "Do you want to recreate the wallet?"; then
             log_info "Keeping existing wallet"
 
             # Check if credentials already exist
@@ -338,7 +481,10 @@ do_setup() {
             else
                 log_warn "Existing wallet credentials may be invalid"
                 if ! confirm_proceed "Add/update credentials in existing wallet?"; then
-                    exit 0
+                    # Nothing changed, but the wallet in place does not work:
+                    # that is not a completed setup.
+                    log_error "Left the existing wallet unchanged; it does not authenticate for: ${WALLET_TEST_FAILED_ALIASES}"
+                    exit 1
                 fi
                 if [[ ! -f "${WALLET_DIR}/ewallet.p12" ]]; then
                     # Auto-login-only wallet (cwallet.sso with no ewallet.p12):
@@ -365,6 +511,7 @@ do_setup() {
         fi
     else
         NEW_WALLET_STAGED=true
+        CHECK_WALLET_PLAN="No wallet yet: build one in a fresh private temporary directory (mkstore -create, -createSSO) and move it to ${WALLET_DIR}."
     fi
 
     # ============================================================
@@ -418,7 +565,11 @@ SQLNET.WALLET_OVERRIDE = TRUE
                     log_error "  $WALLET_DIR"
                     exit 1
                 fi
-                if [[ -t 0 ]]; then
+                if [[ "$CHECK_ONLY" == "1" ]]; then
+                    log_warn "Check mode: a real run asks (on a TTY) whether to point WALLET_LOCATION at ${WALLET_DIR},"
+                    log_warn "and refuses non-interactively. Alternative: WALLET_DIR=${existing_dir:-<that wallet directory>} ./fsfo/observer.sh setup"
+                    SQLNET_ACTION="repoint"
+                elif [[ -t 0 ]]; then
                     if ! confirm_proceed "Point WALLET_LOCATION at ${WALLET_DIR}? (credentials in the other wallet will stop being used on this host; sqlnet.ora is backed up)"; then
                         log_info "Cancelled. To add the observer credentials to the existing wallet instead, re-run:"
                         log_info "  WALLET_DIR=${existing_dir:-<that wallet directory>} ./fsfo/observer.sh setup"
@@ -441,19 +592,55 @@ SQLNET.WALLET_OVERRIDE = TRUE
     fi
 
     # ============================================================
+    # Check mode: print the plan and stop before the first write
+    # ============================================================
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        local sqlnet_plan
+        case "$SQLNET_ACTION" in
+            create)   sqlnet_plan="Create $SQLNET_FILE with WALLET_LOCATION = $WALLET_DIR and SQLNET.WALLET_OVERRIDE = TRUE" ;;
+            append)   sqlnet_plan="Back up $SQLNET_FILE, then append WALLET_LOCATION = $WALLET_DIR and SQLNET.WALLET_OVERRIDE = TRUE" ;;
+            repoint)  sqlnet_plan="Back up $SQLNET_FILE, comment out its WALLET_LOCATION/SQLNET.WALLET_OVERRIDE and point WALLET_LOCATION at $WALLET_DIR" ;;
+            override) sqlnet_plan="Back up $SQLNET_FILE and set SQLNET.WALLET_OVERRIDE = TRUE (WALLET_LOCATION already names $WALLET_DIR)" ;;
+            *)        sqlnet_plan="Leave $SQLNET_FILE unchanged (already names $WALLET_DIR with SQLNET.WALLET_OVERRIDE = TRUE)" ;;
+        esac
+        log_section "Check Mode - Planned Actions"
+        print_list_block "observer.sh setup would" \
+            "$CHECK_WALLET_PLAN" \
+            "Prompt for the wallet password and the password of ${OBSERVER_USER:-<observer user, prompted>}" \
+            "Store the credential for $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS (mkstore -createCredential, secrets on stdin)" \
+            "$sqlnet_plan" \
+            "Prove the wallet login for $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS as ${OBSERVER_USER:-the observer user} (any failure = setup fails, exit 1)"
+        echo ""
+        log_info "Check mode: no wallet, sqlnet.ora or other file was changed"
+        return 0
+    fi
+
+    # ============================================================
     # Create Wallet Directory
     # ============================================================
 
     log_section "Creating Wallet"
 
     if $NEW_WALLET_STAGED; then
-        if command -v mktemp >/dev/null 2>&1; then
-            WORK_WALLET_DIR=$(mktemp -d "${TMPDIR:-/tmp}/dg_observer_wallet.XXXXXX")
-        else
-            WORK_WALLET_DIR="${TMPDIR:-/tmp}/dg_observer_wallet.$$"
-            mkdir -p "$WORK_WALLET_DIR"
+        if ! confirm_approval_action "Build a new observer wallet" \
+                "mkstore -wrl <new private temp dir> -create; mkstore -createSSO; credentials; then move it to $WALLET_DIR"; then
+            log_error "Wallet build declined - nothing was changed"
+            exit 1
         fi
-        chmod 700 "$WORK_WALLET_DIR"
+        # A private directory this invocation created, or nothing: it will
+        # hold an auto-login cwallet.sso. create_temp_dir (dg_functions.sh)
+        # tries mktemp -d, then its own exclusive mode-700 fallback, and fails
+        # rather than reuse an existing path. `|| true` keeps a failure out of
+        # the ERR trap inside $(...); the checks below decide.
+        WORK_WALLET_DIR=$(create_temp_dir || true)
+        if [[ -z "$WORK_WALLET_DIR" || ! -d "$WORK_WALLET_DIR" || -L "$WORK_WALLET_DIR" || ! -O "$WORK_WALLET_DIR" ]]; then
+            log_error "Could not create a private staging directory for the wallet under ${TMPDIR:-/tmp}"
+            log_error "(mktemp -d and the mode-700 fallback both failed). No wallet was created."
+            log_error "Point TMPDIR at a directory you can write to and re-run."
+            WORK_WALLET_DIR=""
+            exit 1
+        fi
         trap _setup_cleanup EXIT
         trap 'exit 130' INT
         trap 'exit 143' TERM
@@ -464,6 +651,11 @@ SQLNET.WALLET_OVERRIDE = TRUE
         # The wallet is edited in place (delete-then-create per alias): keep a
         # copy first so a failed -createCredential cannot cost the entry.
         WALLET_INPLACE_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
+        if ! confirm_approval_action "Back up the existing wallet and edit it in place" \
+                "cp -pR $WALLET_DIR $WALLET_INPLACE_BACKUP; then mkstore -wrl $WALLET_DIR -deleteCredential/-createCredential"; then
+            log_error "Wallet edit declined - nothing was changed"
+            exit 1
+        fi
         if ! cp -pR "$WALLET_DIR" "$WALLET_INPLACE_BACKUP"; then
             log_error "Could not back up the existing wallet to $WALLET_INPLACE_BACKUP - not modifying it"
             exit 1
@@ -552,6 +744,15 @@ EOF
     log_info "Adding credentials for: $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS"
     log_info "These entries must match your tnsnames.ora entries"
 
+    if ! confirm_approval_action "Store the observer credential for $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS" \
+            "mkstore -wrl $WORK_WALLET_DIR -createCredential <alias> $OBSERVER_USER   # both aliases, secrets on stdin"; then
+        log_error "Credential update declined - the live wallet was not changed"
+        if [[ -n "${WALLET_INPLACE_BACKUP:-}" ]]; then
+            log_error "(the copy made before editing is at: $WALLET_INPLACE_BACKUP)"
+        fi
+        exit 1
+    fi
+
     OBSERVER_PASSWORD=$(prompt_password "Enter password for $OBSERVER_USER")
 
     if [[ -z "$OBSERVER_PASSWORD" ]]; then
@@ -584,6 +785,12 @@ EOF
 
     if $NEW_WALLET_STAGED; then
         log_section "Activating New Wallet"
+
+        if ! confirm_approval_action "Activate the new wallet" \
+                "mv $WALLET_DIR ${WALLET_DIR}.bak.<timestamp> (if present); mv $WORK_WALLET_DIR $WALLET_DIR"; then
+            log_error "Wallet activation declined - $WALLET_DIR was not changed (the staged wallet is discarded)"
+            exit 1
+        fi
 
         if [[ -d "$WALLET_DIR" ]]; then
             WALLET_SWAP_BACKUP="${WALLET_DIR}.bak.$(date '+%Y%m%d_%H%M%S')_$$"
@@ -618,22 +825,38 @@ EOF
 
     log_section "Configuring sqlnet.ora"
 
+    if [[ "$SQLNET_ACTION" != "none" ]] \
+            && ! confirm_approval_action "Update sqlnet.ora" "${SQLNET_ACTION} the observer wallet entries in $SQLNET_FILE"; then
+        log_error "sqlnet.ora update declined - the wallet at $WALLET_DIR is in place, but"
+        log_error "$SQLNET_FILE does not point '/@alias' connections at it yet"
+        exit 1
+    fi
+
     case "$SQLNET_ACTION" in
         create)
             printf '%s\n' "$WALLET_CONFIG" > "$SQLNET_FILE"
             log_info "Created $SQLNET_FILE with wallet configuration"
             ;;
         append)
-            backup_file "$SQLNET_FILE"
+            if ! backup_file "$SQLNET_FILE"; then
+                log_error "Could not back up $SQLNET_FILE - not changing it"
+                exit 1
+            fi
             printf '%s\n' "$WALLET_CONFIG" >> "$SQLNET_FILE"
             log_info "Added wallet configuration to $SQLNET_FILE"
             ;;
         repoint)
-            rewrite_sqlnet_wallet repoint
+            if ! rewrite_sqlnet_wallet repoint; then
+                log_error "Could not back up/rewrite $SQLNET_FILE"
+                exit 1
+            fi
             log_info "Pointed WALLET_LOCATION in $SQLNET_FILE at $WALLET_DIR (previous entry kept as a comment)"
             ;;
         override)
-            rewrite_sqlnet_wallet override
+            if ! rewrite_sqlnet_wallet override; then
+                log_error "Could not back up/rewrite $SQLNET_FILE"
+                exit 1
+            fi
             log_info "Set SQLNET.WALLET_OVERRIDE = TRUE in $SQLNET_FILE (WALLET_LOCATION already pointed at $WALLET_DIR)"
             ;;
         *)
@@ -644,17 +867,18 @@ EOF
     # ============================================================
     # Test Wallet Connection
     # ============================================================
+    # Both members must accept the observer's wallet login: an observer the
+    # standby rejects cannot complete a failover. A failure here is a failed
+    # setup - no SUCCESS summary, exit 1, and the way back is printed.
 
     log_section "Testing Wallet Connection"
 
     if test_wallet_connection; then
         log_info "Wallet authentication test successful"
     else
-        log_warn "Wallet authentication test failed"
-        log_warn "Please verify:"
-        log_warn "  1. TNS entries exist for $PRIMARY_TNS_ALIAS and $STANDBY_TNS_ALIAS"
-        log_warn "  2. Databases are accessible"
-        log_warn "  3. SYSDG user exists and password is correct"
+        report_wallet_test_failure
+        print_summary "FAILED" "Observer wallet does not authenticate for: ${WALLET_TEST_FAILED_ALIASES}"
+        exit 1
     fi
 
     # ============================================================
@@ -684,34 +908,80 @@ EOF
     echo ""
 }
 
-# wallet_identity <alias>: the identity the wallet connection to <alias>
-# authenticates as, as "AUTHENTICATED_IDENTITY|SESSION_USER" (empty when it
-# cannot be read). Under AS SYSDG the session user is always the SYSDG schema,
-# so SESSION_USER alone cannot tell the observer from SYS; the authenticated
-# identity is the name the credential logged in with.
+# What failed in test_wallet_connection, and how to get the previous wallet
+# back. The previous wallet is never restored automatically: the operator
+# may prefer to fix the cause (password file on the standby, TNS entry) and
+# keep the new one.
+report_wallet_test_failure() {
+    local line backup=""
+    log_error "Wallet authentication test FAILED - the observer cannot rely on this wallet"
+    while IFS= read -r line; do
+        if [[ -n "$line" ]]; then
+            log_error "  $line"
+        fi
+    done <<EOF
+${WALLET_TEST_FAILURES}
+EOF
+    log_error "Check: the TNS entry resolves on $(hostname), the database is up, the user exists"
+    log_error "with SYSDG, and the password is right on BOTH sides - a standby ORA-01017 usually"
+    log_error "means the primary's password file has not reached the standby."
+    if [[ -n "${WALLET_SWAP_BACKUP:-}" ]]; then
+        backup="$WALLET_SWAP_BACKUP"
+    elif [[ -n "${WALLET_INPLACE_BACKUP:-}" ]]; then
+        backup="$WALLET_INPLACE_BACKUP"
+    fi
+    if [[ -n "$backup" ]]; then
+        log_error "The wallet as it was before this run is at: $backup"
+        log_error "To restore it:"
+        log_error "  rm -rf $(shell_join "$WALLET_DIR") && mv $(shell_join "$backup" "$WALLET_DIR")"
+    else
+        log_error "There was no wallet at $WALLET_DIR before this run; to undo: rm -rf $(shell_join "$WALLET_DIR")"
+    fi
+    case "$SQLNET_ACTION" in
+        create)
+            log_error "$SQLNET_FILE was created by this run (remove it to undo)" ;;
+        append|repoint|override)
+            log_error "$SQLNET_FILE was changed; its pre-edit copy is the newest ${SQLNET_FILE}.bak.* (logged above)" ;;
+    esac
+}
+
+# wallet_identity <alias>: the raw output of the identity query through the
+# wallet connection to <alias> (bounded). The IDENT= line carries
+# "AUTHENTICATED_IDENTITY|SESSION_USER". Under AS SYSDG the session user is
+# always the SYSDG schema, so SESSION_USER alone cannot tell the observer
+# from SYS; the authenticated identity is the name the credential logged in
+# with.
 wallet_identity() {
-    local alias="$1" out
-    [[ -x "$ORACLE_HOME/bin/sqlplus" ]] || return 0
-    out=$("$ORACLE_HOME/bin/sqlplus" -s -L "/@${alias}" as sysdg <<EOF 2>/dev/null || true
+    local alias="$1"
+    _run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/sqlplus" -s -L "/@${alias}" as sysdg <<EOF
 set pagesize 0 heading off feedback off
 select 'IDENT=' || sys_context('USERENV', 'AUTHENTICATED_IDENTITY') || '|' || sys_context('USERENV', 'SESSION_USER') from dual;
 exit
 EOF
-    )
-    printf '%s\n' "$out" | sed -n 's/^IDENT=//p' | tr -d ' \r' | head -1
-    return 0
 }
 
-test_wallet_connection() {
-    # Test connection using wallet
-    log_info "Testing connection to $PRIMARY_TNS_ALIAS via wallet..."
+# wallet_login_check <alias>: prove '/@alias' logs in through the wallet as
+# the observer user. Sets WALLET_CHECK_ERROR (one line) on failure.
+# dgmgrl passes only when it printed the configuration (an ORA- under a
+# member's line is broker health, not a login problem); the identity query
+# is strict - its healthy output has no ORA-/SP2-/TNS-/DGM-/ERROR line at
+# all, so any such line fails it even when sqlplus exited 0.
+wallet_login_check() {
+    local alias="$1" result err ident auth_user want
+    WALLET_CHECK_ERROR=""
+    log_info "Testing connection to $alias via wallet..."
 
-    local result ident auth_user want
-    result=$("$ORACLE_HOME/bin/dgmgrl" -silent "/@${PRIMARY_TNS_ALIAS}" "show configuration" 2>&1 || true)
-
-    if ! echo "$result" | grep -qE "Configuration -|SUCCESS|WARNING"; then
+    result=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "/@${alias}" "show configuration")
+    if _bounded_timed_out "$result"; then
+        WALLET_CHECK_ERROR="dgmgrl did not answer within ${OBSERVER_CONNECT_TIMEOUT}s"
+        log_warn "$alias: $WALLET_CHECK_ERROR"
+        return 1
+    fi
+    if ! printf '%s\n' "$result" | tr -d '\r' | grep -q 'Configuration -'; then
+        err=$(_first_error_line "$result")
+        WALLET_CHECK_ERROR="dgmgrl: ${err:-no configuration in the output}"
         log_warn "Connection test output:"
-        echo "$result" | head -5
+        printf '%s\n' "$result" | head -5
         return 1
     fi
 
@@ -725,28 +995,69 @@ test_wallet_connection() {
     # with a warning; anything else must equal the observer user.
     want=$(printf '%s' "$OBSERVER_USER" | tr '[:lower:]' '[:upper:]')
     if [[ ! -x "$ORACLE_HOME/bin/sqlplus" || -z "$want" ]]; then
-        log_warn "Connected through the wallet, but could not confirm WHICH user it authenticated as"
+        log_warn "Connected to $alias through the wallet, but could not confirm WHICH user it authenticated as"
         log_warn "(no sqlplus in $ORACLE_HOME/bin, or no observer username known)"
         return 0
     fi
-    ident=$(wallet_identity "$PRIMARY_TNS_ALIAS")
+    result=$(wallet_identity "$alias")
+    if _bounded_timed_out "$result"; then
+        WALLET_CHECK_ERROR="sqlplus did not answer within ${OBSERVER_CONNECT_TIMEOUT}s"
+        log_warn "$alias: $WALLET_CHECK_ERROR"
+        return 1
+    fi
+    err=$(_first_error_line "$result")
+    ident=$(printf '%s\n' "$result" | sed -n 's/^IDENT=//p' | tr -d ' \r' | head -1)
+    if [[ -n "$err" || -z "$ident" ]]; then
+        WALLET_CHECK_ERROR="sqlplus as sysdg: ${err:-no identity returned}"
+        log_warn "$alias: $WALLET_CHECK_ERROR"
+        return 1
+    fi
     auth_user=$(printf '%s' "${ident%%|*}" | tr '[:lower:]' '[:upper:]')
     if [[ "$auth_user" != "$want" ]]; then
+        WALLET_CHECK_ERROR="authenticated as ${auth_user:-<unreadable>}, not the observer user ${want}"
         log_warn "The wallet connection authenticated as ${auth_user:-<unreadable>}, not the observer user ${want}"
-        log_warn "'/@${PRIMARY_TNS_ALIAS}' is resolving against a different wallet or credential."
+        log_warn "'/@${alias}' is resolving against a different wallet or credential."
         log_warn "Check WALLET_LOCATION / SQLNET.WALLET_OVERRIDE in $(dg_net_admin_dir)/sqlnet.ora"
         return 1
     fi
-    log_info "Wallet authenticates as ${auth_user}"
+    log_info "Wallet authenticates as ${auth_user} at ${alias}"
     return 0
+}
+
+# test_wallet_connection: wallet_login_check for BOTH aliases (the observer
+# needs both members). Both are always tried so the report names every
+# failure. Sets WALLET_TEST_FAILURES ("alias: error" lines) and
+# WALLET_TEST_FAILED_ALIASES.
+test_wallet_connection() {
+    local alias rc=0
+    WALLET_TEST_FAILURES=""
+    WALLET_TEST_FAILED_ALIASES=""
+    for alias in "$PRIMARY_TNS_ALIAS" "$STANDBY_TNS_ALIAS"; do
+        if [[ -z "$alias" ]]; then
+            WALLET_TEST_FAILURES="${WALLET_TEST_FAILURES}<empty alias in the configuration>
+"
+            rc=1
+            continue
+        fi
+        if ! wallet_login_check "$alias"; then
+            WALLET_TEST_FAILURES="${WALLET_TEST_FAILURES}${alias}: ${WALLET_CHECK_ERROR}
+"
+            WALLET_TEST_FAILED_ALIASES="${WALLET_TEST_FAILED_ALIASES:+$WALLET_TEST_FAILED_ALIASES, }$alias"
+            rc=1
+        fi
+    done
+    return $rc
 }
 
 do_start() {
     require_observer_tools
     log_info "Starting FSFO observer..."
 
-    # Check if already running
-    if is_observer_running; then
+    # Check if already running. A check-mode restart skips this: its stop
+    # half only planned the stop, so the observer is still up right now.
+    if [[ "${CHECK_ASSUME_STOPPED:-false}" == "true" ]]; then
+        log_info "Check mode: assuming the observer was stopped by the planned stop above"
+    elif is_observer_running; then
         if [[ -n "$OBSERVER_REMOTE_HOST" ]]; then
             # The pidfile is another host's record and its PID cannot be
             # checked from here. Ask the broker: if it lists no observer at
@@ -755,7 +1066,7 @@ do_start() {
             if [[ "$(observer_present)" == "NO" ]]; then
                 log_warn "$PID_FILE names host ${OBSERVER_REMOTE_HOST}, but the broker reports no observer -"
                 log_warn "treating that pidfile as stale and ignoring it"
-                rm -f "$PID_FILE"
+                _drop_stale_pidfile "names host ${OBSERVER_REMOTE_HOST}; the broker reports no observer"
             else
                 log_error "Observer is already running on host ${OBSERVER_REMOTE_HOST} (per $PID_FILE)"
                 log_error "Run './observer.sh stop' on that host first if it must move"
@@ -766,6 +1077,10 @@ do_start() {
         else
             log_warn "Observer is already running (PID: $OBSERVER_PID)"
             log_info "Use './observer.sh status' to check status"
+            if [[ "$CHECK_ONLY" == "1" ]]; then
+                log_info "Check mode: nothing to start"
+                return 0
+            fi
             exit 0
         fi
     fi
@@ -777,9 +1092,21 @@ do_start() {
         exit 1
     fi
 
+    # One reachable member for the whole run: preflight, launch, presence
+    # poll. Not hard-wired to PRIMARY_TNS_ALIAS - after a failover with the
+    # original primary down, that is exactly the member that cannot answer.
+    if ! select_broker_member; then
+        exit 1
+    fi
+    local member="$DG_MEMBER_ALIAS"
+
     # Verify FSFO is enabled
-    log_info "Verifying FSFO is enabled..."
-    FSFO_STATUS=$("$ORACLE_HOME/bin/dgmgrl" -silent "/@${PRIMARY_TNS_ALIAS}" "show fast_start failover" 2>&1 || true)
+    log_info "Verifying FSFO is enabled (via $member)..."
+    FSFO_STATUS=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "/@${member}" "show fast_start failover")
+    if _bounded_timed_out "$FSFO_STATUS"; then
+        log_error "SHOW FAST_START FAILOVER through $member did not answer within ${OBSERVER_CONNECT_TIMEOUT}s"
+        exit 1
+    fi
 
     # Anchored on the field label: "disabled" can appear elsewhere in the
     # output (property values, other fields) while FSFO is in fact enabled.
@@ -801,13 +1128,33 @@ do_start() {
         exit 1
     fi
 
+    local start_cmd="START OBSERVER FILE IS '${OBSERVER_DAT}' LOGFILE IS '${OBSERVER_DGMGRL_LOG}'"
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_section "Check Mode - Planned Actions"
+        print_list_block "observer.sh start would" \
+            "Create $(dirname "$OBSERVER_LOG_FILE") and $OBSERVER_DIR (mode 700) if missing" \
+            "Run in the background: nohup dgmgrl /@${member} \"${start_cmd}\" >> $OBSERVER_LOG_FILE" \
+            "Write <host>:<PID> to $PID_FILE" \
+            "Poll FS_FAILOVER_OBSERVER_PRESENT through $member for up to 30s"
+        echo ""
+        log_info "Check mode: no observer was started and no file was written"
+        return 0
+    fi
+
+    if ! confirm_approval_action "Start the FSFO observer" \
+            "nohup $ORACLE_HOME/bin/dgmgrl /@${member} \"${start_cmd}\" >> $OBSERVER_LOG_FILE 2>&1 &   # then write host:PID to $PID_FILE"; then
+        log_error "Observer start declined - nothing was started"
+        exit 1
+    fi
+
     # Ensure log and state directories exist
     mkdir -p "$(dirname "$OBSERVER_LOG_FILE")"
     mkdir -p "$OBSERVER_DIR"
     chmod 700 "$OBSERVER_DIR" 2>/dev/null || true
 
     # Start observer in background using wallet authentication
-    log_info "Starting observer process..."
+    log_info "Starting observer process (via $member)..."
     log_info "Observer log file: $OBSERVER_LOG_FILE"
     log_info "Observer state file: $OBSERVER_DAT (log: $OBSERVER_DGMGRL_LOG)"
 
@@ -817,14 +1164,14 @@ do_start() {
     # run's boundary visible in the accumulated file.
     {
         printf '\n============================================================\n'
-        printf 'Observer starting: %s (host: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)"
+        printf 'Observer starting: %s (host: %s, via: %s)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$(hostname)" "$member"
         printf '============================================================\n'
     } >> "$OBSERVER_LOG_FILE"
 
     # FILE IS pins the observer's .dat to a known host-local directory
     # instead of whatever the current directory is; LOGFILE IS gives it a log
     # of its own next to it.
-    nohup "$ORACLE_HOME/bin/dgmgrl" "/@${PRIMARY_TNS_ALIAS}" "START OBSERVER FILE IS '${OBSERVER_DAT}' LOGFILE IS '${OBSERVER_DGMGRL_LOG}'" >> "$OBSERVER_LOG_FILE" 2>&1 &
+    nohup "$ORACLE_HOME/bin/dgmgrl" "/@${member}" "$start_cmd" >> "$OBSERVER_LOG_FILE" 2>&1 &
     OBSERVER_PID=$!
 
     # Save host:PID (pidfile lives on the NFS share, PIDs are host-local)
@@ -832,15 +1179,15 @@ do_start() {
 
     # A live process is not an observer the broker knows about (bad
     # credential, unreachable standby, syntax rejected after the process
-    # started...). Poll the broker for up to 30s; stop early if the process
-    # dies.
+    # started...). Poll the broker (same member) for up to 30s; stop early
+    # if the process dies.
     log_info "Waiting for the broker to report the observer (up to 30s)..."
     local tries=0 present=""
     while [[ $tries -lt 15 ]]; do
         sleep 2
         tries=$((tries + 1))
         _pid_alive "$OBSERVER_PID" || break
-        present=$(observer_present)
+        present=$(observer_present "$member")
         [[ "$present" == "YES" ]] && break
     done
 
@@ -879,10 +1226,12 @@ do_start() {
 do_stop() {
     require_observer_tools
     log_info "Stopping FSFO observer..."
+    CHECK_STOP_PLANNED=false
 
     if ! is_observer_running; then
         log_info "Observer is not running"
-        rm -f "$PID_FILE" 2>/dev/null
+        # is_observer_running already dealt with a stale pidfile (removed it,
+        # or reported and kept it in check mode).
         return 0
     fi
 
@@ -892,16 +1241,55 @@ do_stop() {
         exit 1
     fi
 
-    local pid="$OBSERVER_PID"
+    local pid="$OBSERVER_PID" stop_target="" stop_out
 
-    # Try graceful stop via DGMGRL first
-    log_info "Sending stop command via DGMGRL..."
-
+    # Graceful stop goes through the broker: the first member that answers
+    # (bounded), so a stop still works with the original primary down.
     if check_wallet_exists; then
-        "$ORACLE_HOME/bin/dgmgrl" -silent "/@${PRIMARY_TNS_ALIAS}" "STOP OBSERVER" 2>/dev/null || true
+        if select_broker_member; then
+            stop_target="/@${DG_MEMBER_ALIAS}"
+        else
+            log_warn "No broker member answered - skipping STOP OBSERVER; the process will be signalled instead"
+        fi
     else
         # Fallback to OS auth if wallet not available
-        "$ORACLE_HOME/bin/dgmgrl" -silent / "STOP OBSERVER" 2>/dev/null || true
+        stop_target="/"
+    fi
+
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        log_section "Check Mode - Planned Actions"
+        if [[ -n "$stop_target" ]]; then
+            print_list_block "observer.sh stop would" \
+                "Run: dgmgrl -silent $stop_target \"STOP OBSERVER\"" \
+                "Wait up to 30s for PID $pid to exit" \
+                "If it is still a dgmgrl process: SIGTERM, then SIGKILL" \
+                "Remove $PID_FILE"
+        else
+            print_list_block "observer.sh stop would" \
+                "Wait up to 30s for PID $pid to exit (no broker member to send STOP OBSERVER to)" \
+                "If it is still a dgmgrl process: SIGTERM, then SIGKILL" \
+                "Remove $PID_FILE"
+        fi
+        echo ""
+        log_info "Check mode: the observer (PID: $pid) was not stopped or signalled"
+        CHECK_STOP_PLANNED=true
+        return 0
+    fi
+
+    # Try graceful stop via DGMGRL first
+    if [[ -n "$stop_target" ]]; then
+        if ! confirm_approval_action "Stop the FSFO observer through the broker" \
+                "$ORACLE_HOME/bin/dgmgrl -silent $stop_target \"STOP OBSERVER\"   # then wait for PID $pid and remove $PID_FILE"; then
+            log_error "Observer stop declined - nothing was changed"
+            exit 1
+        fi
+        log_info "Sending stop command via DGMGRL..."
+        stop_out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "$stop_target" "STOP OBSERVER")
+        if _bounded_timed_out "$stop_out"; then
+            log_warn "STOP OBSERVER did not answer within ${OBSERVER_CONNECT_TIMEOUT}s"
+        else
+            printf '%s\n' "$stop_out" | sed '/^$/d'
+        fi
     fi
 
     # Wait for process to exit
@@ -929,6 +1317,10 @@ do_stop() {
     # Force kill if still running
     if _pid_alive "$pid"; then
         if _pid_is_dgmgrl "$pid"; then
+            if ! confirm_approval_action "Send SIGTERM to the observer" "kill -TERM $pid"; then
+                log_error "SIGTERM declined - observer (PID: $pid) left running, $PID_FILE kept"
+                exit 1
+            fi
             log_warn "Observer did not stop gracefully, sending SIGTERM..."
             kill -TERM "$pid" 2>/dev/null || true
             sleep 2
@@ -939,6 +1331,10 @@ do_stop() {
 
     if _pid_alive "$pid"; then
         if _pid_is_dgmgrl "$pid"; then
+            if ! confirm_approval_action "Send SIGKILL to the observer" "kill -KILL $pid"; then
+                log_error "SIGKILL declined - observer (PID: $pid) left running, $PID_FILE kept"
+                exit 1
+            fi
             log_warn "Observer still running, sending SIGKILL..."
             kill -KILL "$pid" 2>/dev/null || true
             sleep 1
@@ -980,9 +1376,10 @@ do_status() {
         echo "Script Log     : $LOG_FILE"
     else
         echo "Process Status : NOT RUNNING"
+        # is_observer_running removed a stale pidfile already; one that is
+        # still there was kept on purpose (check mode).
         if [[ -f "$PID_FILE" ]]; then
-            echo "Note: Stale PID file found, removing..."
-            rm -f "$PID_FILE"
+            echo "Note: Stale PID file left in place (check mode): $PID_FILE"
         fi
     fi
 
@@ -1003,12 +1400,24 @@ do_status() {
     echo "-------------------------"
     echo ""
 
+    # Bounded, and through whichever member answers (the original primary
+    # may be the one that is down).
+    local fsfo_out
     if check_wallet_exists; then
-        "$ORACLE_HOME/bin/dgmgrl" -silent "/@${PRIMARY_TNS_ALIAS}" "show fast_start failover" 2>&1 || true
+        if select_broker_member; then
+            fsfo_out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent "/@${DG_MEMBER_ALIAS}" "show fast_start failover")
+        else
+            fsfo_out="(Unable to reach $PRIMARY_TNS_ALIAS or $STANDBY_TNS_ALIAS through the wallet)"
+        fi
     else
         # Fallback to OS auth for status check (works if on primary/standby)
-        "$ORACLE_HOME/bin/dgmgrl" -silent / "show fast_start failover" 2>&1 || echo "(Unable to connect - wallet not configured)"
+        fsfo_out=$(_run_bounded "$OBSERVER_CONNECT_TIMEOUT" "$ORACLE_HOME/bin/dgmgrl" -silent / "show fast_start failover")
+        [[ -n "$fsfo_out" ]] || fsfo_out="(Unable to connect - wallet not configured)"
     fi
+    if _bounded_timed_out "$fsfo_out"; then
+        fsfo_out="(No answer within ${OBSERVER_CONNECT_TIMEOUT}s)"
+    fi
+    printf '%s\n' "$fsfo_out"
     echo ""
 
     # Get observer info from V$DATABASE (if local)
@@ -1058,7 +1467,12 @@ do_status() {
 
 do_restart() {
     do_stop
-    sleep 2
+    if [[ "$CHECK_ONLY" == "1" ]]; then
+        # Plan the start as if the planned stop had happened.
+        CHECK_ASSUME_STOPPED="$CHECK_STOP_PLANNED"
+    else
+        sleep 2
+    fi
     do_start
 }
 
@@ -1098,8 +1512,19 @@ case "$COMMAND" in
         ;;
 esac
 
-# Basic environment checks
-check_nfs_mount || exit 1
+# Basic environment checks. check_nfs_mount proves the share is writable by
+# creating and deleting a file; check mode creates nothing, so it only looks.
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    if [[ ! -d "$NFS_SHARE" ]]; then
+        log_error "NFS share directory does not exist: $NFS_SHARE"
+        exit 1
+    fi
+    if [[ ! -w "$NFS_SHARE" ]]; then
+        log_warn "NFS share is not writable by $(id -un 2>/dev/null || echo this user): $NFS_SHARE (a real run writes the pidfile there)"
+    fi
+else
+    check_nfs_mount || exit 1
+fi
 
 # Load configuration
 get_config
@@ -1129,3 +1554,7 @@ case "$COMMAND" in
         usage
         ;;
 esac
+
+if [[ "$CHECK_ONLY" == "1" ]]; then
+    finish_check_mode "Check mode: observer ${COMMAND} - nothing was changed"
+fi

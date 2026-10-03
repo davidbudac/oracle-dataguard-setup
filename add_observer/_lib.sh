@@ -196,6 +196,125 @@ tns_descriptor() {
 EOF
 }
 
+# ------------------------------------------------------------
+# Observer liveness (SHOW OBSERVER)
+# ------------------------------------------------------------
+# Being listed is not the same as running: the broker keeps a crashed
+# observer registered, and only its 'Last Ping to ...' age (which keeps
+# growing, or reads '(unknown)') gives it away. 19c prints one block per
+# observer:
+#
+#   Observer "dg_observer" - Master
+#
+#     Host Name:                    ol9-19-dg3.localdomain
+#     Last Ping to Primary:         0 seconds ago
+#     Last Ping to Target:          1 second ago
+#
+# observer_block "<SHOW OBSERVER output>" NAME HOST -> KEY=VALUE lines for
+# THIS observer's block only, so another observer's healthy ping can never
+# vouch for this one. The block is the one named NAME (case-insensitive),
+# else the first one whose Host Name is HOST (full or short form) - the same
+# rule the kit has always used to recognise "this" observer.
+#   BLOCKS=<n>                 observer blocks found; 0 = nothing parseable
+#   MATCH=name|host|none
+#   NAME= ROLE= HOST=          the matched block's name, Master/Backup, host
+#   PING_PRIMARY= PING_TARGET= whole seconds; empty unless the value reads
+#                              'N second(s) ago'
+#   PING_PRIMARY_TEXT= PING_TARGET_TEXT=   the value as printed
+# CRLF line endings are tolerated. POSIX awk only (no arrays at all).
+observer_block() {
+    local __name __host
+    __name=$(printf '%s' "$2" | tr '[:upper:]' '[:lower:]')
+    __host=$(printf '%s' "$3" | tr -d ' \r' | tr '[:upper:]' '[:lower:]')
+    printf '%s\n' "$1" | tr -d '\r' | awk -v me_name="$__name" -v me_host="$__host" -v me_short="${__host%%.*}" '
+        function val(l) { sub(/^[^:]*:[ \t]*/, "", l); sub(/[ \t]*$/, "", l); return l }
+        function secs(v) {
+            if (v ~ /^[0-9][0-9]* seconds? ago$/) { sub(/ .*$/, "", v); return v }
+            return ""
+        }
+        function flush(  lh, sh) {
+            if (!inblk) return
+            if (!nm && me_name != "" && tolower(bname) == me_name) {
+                nm = 1; n_name = bname; n_role = brole; n_host = bhost; n_pp = bpp; n_pt = bpt
+            }
+            if (!hm && me_host != "" && bhost != "") {
+                lh = tolower(bhost); gsub(/ /, "", lh); sh = lh; sub(/\..*$/, "", sh)
+                if (lh == me_host || sh == me_short) {
+                    hm = 1; h_name = bname; h_role = brole; h_host = bhost; h_pp = bpp; h_pt = bpt
+                }
+            }
+        }
+        BEGIN { inblk = 0; blocks = 0; nm = 0; hm = 0 }
+        /^[ \t]*Observer[ \t]*"/ {
+            flush(); inblk = 1; blocks = blocks + 1
+            bname = $0; sub(/^[ \t]*Observer[ \t]*"/, "", bname); sub(/".*$/, "", bname)
+            brole = ""
+            if ($0 ~ /-[ \t]*Master/) brole = "Master"
+            if ($0 ~ /-[ \t]*Backup/) brole = "Backup"
+            bhost = ""; bpp = ""; bpt = ""
+            next
+        }
+        inblk && /^[ \t]*Host Name:/            { bhost = val($0); next }
+        inblk && /^[ \t]*Last Ping to Primary:/ { bpp = val($0); next }
+        inblk && /^[ \t]*Last Ping to Target:/  { bpt = val($0); next }
+        END {
+            flush()
+            m = "none"; o_name = ""; o_role = ""; o_host = ""; o_pp = ""; o_pt = ""
+            if (nm)      { m = "name"; o_name = n_name; o_role = n_role; o_host = n_host; o_pp = n_pp; o_pt = n_pt }
+            else if (hm) { m = "host"; o_name = h_name; o_role = h_role; o_host = h_host; o_pp = h_pp; o_pt = h_pt }
+            print "BLOCKS=" blocks
+            print "MATCH=" m
+            print "NAME=" o_name
+            print "ROLE=" o_role
+            print "HOST=" o_host
+            print "PING_PRIMARY=" secs(o_pp)
+            print "PING_PRIMARY_TEXT=" o_pp
+            print "PING_TARGET=" secs(o_pt)
+            print "PING_TARGET_TEXT=" o_pt
+        }
+    '
+}
+
+# obs_field "<observer_block output>" KEY -> value
+obs_field() { printf '%s\n' "$1" | sed -n "s/^${2}=//p" | head -1; }
+
+# observer_ping "<observer_block output>" primary|target|either
+#   -> "<seconds>|<label>|<value as printed>"; seconds is empty when the age
+#   is missing or not a number ('(unknown)'), which counts as not live.
+#   'either' takes the fresher of the two pings of THIS block: for a session
+#   whose member's role is not known - after a failover the standby alias is
+#   the new primary, before one it is still the target.
+observer_ping() {
+    local __p __t __pt __tt
+    __p=$(obs_field "$1" PING_PRIMARY); __pt=$(obs_field "$1" PING_PRIMARY_TEXT)
+    __t=$(obs_field "$1" PING_TARGET);  __tt=$(obs_field "$1" PING_TARGET_TEXT)
+    case "$2" in
+        primary) printf '%s|last ping to primary|%s\n' "$__p" "${__pt:-(none)}" ;;
+        target)  printf '%s|last ping to target|%s\n'  "$__t" "${__tt:-(none)}" ;;
+        *)
+            if [[ -n "$__t" ]] && { [[ -z "$__p" ]] || (( 10#$__t < 10#$__p )); }; then
+                printf '%s|last ping to target|%s\n' "$__t" "${__tt:-(none)}"
+            else
+                printf '%s|last ping to primary|%s\n' "$__p" "${__pt:-(none)}"
+            fi
+            ;;
+    esac
+}
+
+# ping_is_fresh SECONDS LIMIT -> 0 when SECONDS is a number no larger than LIMIT
+ping_is_fresh() {
+    [[ -n "$1" ]] || return 1
+    case "$1" in *[!0-9]*) return 1 ;; esac
+    (( 10#$1 <= 10#$2 ))
+}
+
+# valid_ping_age VALUE -> 0 when VALUE is a positive whole number of seconds
+# (at most 9 digits, no leading zero) - the DG_OBS_MAX_PING_AGE contract.
+valid_ping_age() {
+    case "$1" in ''|*[!0-9]*|0*) return 1 ;; esac
+    [[ ${#1} -le 9 ]]
+}
+
 # valid_db_username NAME -> 0 when it is a usable unquoted identifier
 valid_db_username() {
     printf '%s' "$1" | grep -q '^[A-Za-z][A-Za-z0-9_$#]*$' && [[ ${#1} -le 30 ]]

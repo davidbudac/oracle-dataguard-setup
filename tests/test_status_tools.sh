@@ -19,7 +19,8 @@
 #   - wallet CONNECT keeps the alias text; SET DEFINE OFF first (H5, C1)
 #   - the background-and-kill watchdog (H5)
 #   - dg_status.sh end to end: healthy run, ssh stderr noise (M13),
-#     --standby-sid / multi-pmon (M11), hung remote job (M10), bad inputs
+#     --standby-sid / multi-pmon (M11), hung remote job (M10), hung
+#     discovery calls (probe / pmon scan / DB_NAME query), bad inputs
 #   - dg_triage_sid.sh: missing lag data -> UNKNOWN + warning, primary
 #     switchover status graded (M12)
 # ============================================================
@@ -89,6 +90,8 @@ for a in "$@"; do
     last="$a"
 done
 echo "Warning: Permanently added 'stub' (ED25519) to the list of known hosts." >&2
+# Discovery-hang hook: the reachability probe never answers on this side.
+if [ "$last" = "echo DG_SSH_OK" ] && [ "${STUB_PROBE_HANG_SIDE:-}" = "$side" ]; then exec sleep 67; fi
 STUB_SIDE=$side
 export STUB_SIDE
 exec sh -c "$last"
@@ -99,6 +102,8 @@ EOS
 cat > "$BIN/ps" <<'EOS'
 #!/bin/sh
 if [ "$1" = "-ef" ]; then
+    # Discovery-hang hook: the pmon scan never returns on this side.
+    if [ -n "${STUB_PS_HANG_SIDE:-}" ] && [ "$STUB_SIDE" = "$STUB_PS_HANG_SIDE" ]; then exec sleep 67; fi
     if [ "$STUB_SIDE" = standby ]; then printf '%s\n' "$STUB_PS_STANDBY"; else printf '%s\n' "$STUB_PS_PRIMARY"; fi
     exit 0
 fi
@@ -113,6 +118,8 @@ if [ -n "$STUB_SQLPLUS_LOG" ]; then printf '%s\n' "$in" >> "$STUB_SQLPLUS_LOG"; 
 case "$in" in
     *"Diag Trace"*) echo "  $STUB_DIAG  "; exit 0 ;;
     *DG_DBNAME*)
+        # Discovery-hang hook: the DB_NAME query never returns on this side.
+        if [ -n "${STUB_DBNAME_HANG_SIDE:-}" ] && [ "$STUB_SIDE" = "$STUB_DBNAME_HANG_SIDE" ]; then exec sleep 67; fi
         case "$ORACLE_SID" in OTHER*) echo "DG_DBNAME|OTHERDB" ;; *) echo "DG_DBNAME|CDB1" ;; esac
         exit 0 ;;
     *WALLET_OK*) echo WALLET_OK; exit 0 ;;
@@ -346,6 +353,65 @@ else
     echo "  FAIL: took ${elapsed}s"; FAIL=$((FAIL + 1))
 fi
 assert_no_orphans "hung remote processes were killed (no orphans)"
+
+# ============================================================
+echo "Case 6a: discovery is bounded too - a hung DB_NAME query on a healthy ssh connection"
+# ============================================================
+# Two pmon SIDs on the standby force the remote `sqlplus / as sysdba` DB_NAME
+# queries; the standby's never returns. ssh keepalives cannot help (the stub
+# connection is alive), only the bounded-execution watchdog can.
+PS_STB_MULTI="oracle 1 1 0 10:00 ? 00:00:01 ora_pmon_OTHER
+oracle 2 1 0 10:00 ? 00:00:01 ora_pmon_cdb1"
+start=$SECONDS
+OUT=$(env -u ORACLE_SID PATH="$STUB_PATH" STUB_DIAG="$WORK/diag" STUB_PS_PRIMARY="$PS_ONE" STUB_PS_STANDBY="$PS_STB_MULTI" \
+    STUB_DBNAME_HANG_SIDE=standby DG_REMOTE_TIMEOUT=3 bash "$ROOT/dg_status.sh" -c "$WORK/config.env" --no-color 2>&1); RC=$?
+elapsed=$((SECONDS - start))
+assert_eq "hung standby DB_NAME query -> exit 2 (never a healthy-looking pass)" "2" "$RC"
+assert_contains "timeout message names the standby host" "$OUT" "Discovery on standby stb.example"
+assert_contains "timeout message names the limit and what hung" "$OUT" "after 3s (DB_NAME query for SID OTHER)"
+assert_contains "existing could-not-match fallback still applies" "$OUT" "Several Oracle instances run on standby"
+if (( elapsed < 20 )); then
+    echo "  PASS: dashboard finished in ${elapsed}s instead of hanging"; PASS=$((PASS + 1))
+else
+    echo "  FAIL: took ${elapsed}s"; FAIL=$((FAIL + 1))
+fi
+assert_no_orphans "hung DB_NAME query tree was killed (no orphans)"
+
+echo "Case 6a-2: hung pmon detection on the primary -> bounded, exit 2"
+start=$SECONDS
+OUT=$(env -u ORACLE_SID PATH="$STUB_PATH" STUB_DIAG="$WORK/diag" STUB_PS_PRIMARY="$PS_ONE" STUB_PS_STANDBY="$PS_ONE" \
+    STUB_PS_HANG_SIDE=primary DG_REMOTE_TIMEOUT=3 bash "$ROOT/dg_status.sh" -c "$WORK/config.env" --no-color 2>&1); RC=$?
+elapsed=$((SECONDS - start))
+assert_eq "hung primary pmon scan -> exit 2 (errors present, not usage)" "2" "$RC"
+assert_contains "primary timeout is reported" "$OUT" "instance detection on primary (pri.example:2201) timed out after 3s"
+if (( elapsed < 20 )); then
+    echo "  PASS: finished in ${elapsed}s instead of hanging"; PASS=$((PASS + 1))
+else
+    echo "  FAIL: took ${elapsed}s"; FAIL=$((FAIL + 1))
+fi
+assert_no_orphans "hung pmon scan tree was killed (no orphans)"
+
+echo "Case 6a-3: hung pmon detection on the standby -> standby not collected, exit 2"
+OUT=$(env -u ORACLE_SID PATH="$STUB_PATH" STUB_DIAG="$WORK/diag" STUB_PS_PRIMARY="$PS_ONE" STUB_PS_STANDBY="$PS_ONE" \
+    STUB_PS_HANG_SIDE=standby DG_REMOTE_TIMEOUT=3 bash "$ROOT/dg_status.sh" -c "$WORK/config.env" --no-color 2>&1); RC=$?
+assert_eq "hung standby pmon scan -> exit 2" "2" "$RC"
+assert_contains "standby timeout names the host and the step" "$OUT" "Discovery on standby stb.example:2202"
+assert_contains "standby row says why it was not collected" "$OUT" "UNREACHABLE (discovery timed out)"
+assert_no_orphans "hung standby pmon scan tree was killed (no orphans)"
+
+echo "Case 6a-4: hung ssh reachability probe -> bounded, host reported"
+start=$SECONDS
+OUT=$(env -u ORACLE_SID PATH="$STUB_PATH" STUB_DIAG="$WORK/diag" STUB_PS_PRIMARY="$PS_ONE" STUB_PS_STANDBY="$PS_ONE" \
+    STUB_PROBE_HANG_SIDE=standby DG_REMOTE_TIMEOUT=3 bash "$ROOT/dg_status.sh" -c "$WORK/config.env" --no-color 2>&1); RC=$?
+elapsed=$((SECONDS - start))
+assert_eq "hung standby probe -> exit 2" "2" "$RC"
+assert_contains "probe timeout names the standby host" "$OUT" "SSH probe to standby (stb.example:2202) timed out after 3s"
+if (( elapsed < 20 )); then
+    echo "  PASS: finished in ${elapsed}s instead of hanging"; PASS=$((PASS + 1))
+else
+    echo "  FAIL: took ${elapsed}s"; FAIL=$((FAIL + 1))
+fi
+assert_no_orphans "hung probe tree was killed (no orphans)"
 
 echo "Case 6b: invalid DG_REMOTE_TIMEOUT / thresholds are usage errors"
 OUT=$(env -u ORACLE_SID PATH="$STUB_PATH" DG_REMOTE_TIMEOUT=abc bash "$ROOT/dg_status.sh" -c "$WORK/config.env" 2>&1); RC=$?

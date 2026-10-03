@@ -117,7 +117,27 @@ VIOLATIONS=""
 # report findings) - those are not real production grep invocations, so
 # exclude it from the sweep rather than trying to out-clever false
 # positives on our own source.
-mapfile -t SH_FILES < <(find . \( -path ./.git -o -path ./.claude \) -prune -o -type f -name '*.sh' -print | sed 's#^\./##' | grep -v '^tests/test_grep_portability\.sh$')
+# The list is built with a while-read loop (mapfile is Bash 4+; the supported
+# shell is Bash 3.2+). A list that cannot be built - or is empty - FAILS the
+# sweep instead of reporting PASS for files that were never scanned.
+LIST_FAILED=0
+SH_FILES=()
+FILE_LIST=$(find . \( -path ./.git -o -path ./.claude \) -prune -o -type f -name '*.sh' -print)
+FIND_RC=$?
+while IFS= read -r _f; do
+    [[ -z "$_f" ]] && continue
+    _f="${_f#./}"
+    [[ "$_f" == "tests/test_grep_portability.sh" ]] && continue
+    SH_FILES[${#SH_FILES[@]}]="$_f"
+done <<EOF_FILES
+$FILE_LIST
+EOF_FILES
+
+if [[ $FIND_RC -ne 0 || ${#SH_FILES[@]} -eq 0 ]]; then
+    echo "  FAIL: could not build the *.sh file list (find rc=$FIND_RC, ${#SH_FILES[@]} files) - nothing was swept"
+    FAIL=$((FAIL + 1))
+    LIST_FAILED=1
+fi
 
 for f in "${SH_FILES[@]}"; do
     # Candidate lines: strip pure comment lines (first non-blank char is #)
@@ -156,8 +176,8 @@ if [[ -n "$VIOLATIONS" ]]; then
     echo "  FAIL: non-portable grep usage found:"
     printf '%s' "$VIOLATIONS"
     FAIL=$((FAIL + 1))
-else
-    echo "  PASS: no grep -P, \\s/\\S, or BRE \\| alternation found in any *.sh file"
+elif [[ $LIST_FAILED -eq 0 ]]; then
+    echo "  PASS: no grep -P, \\s/\\S, or BRE \\| alternation found in any of the ${#SH_FILES[@]} *.sh files swept"
     PASS=$((PASS + 1))
 fi
 

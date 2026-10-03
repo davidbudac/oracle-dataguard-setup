@@ -118,7 +118,8 @@ What it checks:
   (a wrong `*_ORACLE_SID` is a blocker).
 * Disk: target PDB datafile directory exists / can be created, and the staging
   area and the target directory have room for the source datafiles.
-* **CDB standby (direct connection):** role PHYSICAL STANDBY of the right CDB,
+* **CDB standby (direct connection):** role PHYSICAL STANDBY of the right CDB
+  (DB name and `TARGET_CDB_STANDBY_UNIQUE_NAME`, compared case-insensitively),
   `standby_file_management=AUTO`, `db_file_name_convert` covers the PDB directory
   (or `db_create_file_dest` is set), the resulting directory exists on the
   standby host with room, and the staging dir is visible there. With
@@ -256,7 +257,11 @@ intended and, if the original-directory pairs turn out to be unnecessary, drop
 them.
 
 Step 04 cannot be resumed once the PDB exists (`ORA-65012`): it detects that and
-tells you whether to run step 05 or to drop the leftover PDB first.
+tells you whether to run step 05 or to drop the leftover PDB first. All of its
+refusals (existing PDB, missing manifest, incomplete stage, unreachable standby)
+come before it clears the `plug_done`/`verify_done` flags, so an accidental
+re-run after a successful plug-in leaves `state.env` as it was and step 05 still
+runs.
 
 The CDB standby, once it sees the redo, looks up
 `STANDBY_PDB_SOURCE_FILE_DIRECTORY`, finds the staged copies, and writes them
@@ -287,10 +292,21 @@ replicated. It loops `SHOW DATABASE VERBOSE` on the standby until both lags are
 * Checks `pdb_plug_in_violations` for any open `ERROR` rows.
 * Performs a write smoke test inside the new PDB (CREATE TABLE / INSERT /
   COMMIT / DROP), takes an SCN after it, forces log switches and requires the
-  standby's `applied_scn` (from `v$archive_dest_status`) to reach that SCN. The
-  SCN is taken after the write, hence after the plug-in redo, so reaching it
-  proves the plug-in was applied; "the SCN a few seconds later" would be the
-  wrong gate because the SCN advances without redo on an idle system.
+  standby's applied SCN to reach that SCN. The applied SCN is read **on the
+  standby** through the direct connection: its own `V$DATABASE.CURRENT_SCN`
+  (on a physical standby, mounted or open read-only, the SCN recovery has
+  applied through), with `DATABASE_ROLE` and `DB_UNIQUE_NAME` in the same query
+  - an alias that reaches the primary or another database is a failure, since
+  its `CURRENT_SCN` would pass trivially. `V$ARCHIVE_DEST_STATUS` has no
+  `APPLIED_SCN` column in 19c, and the primary's `V$ARCHIVE_DEST.APPLIED_SCN`
+  is refreshed lazily and trails the standby. The SCN is taken after the
+  write, hence after the plug-in redo, so reaching it proves the plug-in was
+  applied; "the SCN a few seconds later" would be the wrong gate because the
+  SCN advances without redo on an idle system. Three outcomes are reported as
+  what they are: reached; **apply lag** (connected, still behind after
+  `MIGRATE_SCN_WAIT_SECS`, default 120 s, polled every `MIGRATE_SCN_POLL_SECS`,
+  default 5 s - both SCNs are logged); **error** (the ORA-/SP2- text, after
+  two retries - not waited out as if it were lag).
 
 `verify_done` is `false` from the start of the step and set to `true` only when
 every check passed.
@@ -300,6 +316,7 @@ A successful tail looks like:
 ```
 [OK]   2026-04-30 18:36:11 - CDB standby fully caught up (apply=0s, transport=0s)
 …
+[OK]   2026-04-30 18:36:24 - Standby applied SCN 20030716 >= gate SCN 20030700 (everything up to and including the PDB round-trip write is applied)
 [OK]   2026-04-30 18:36:25 - Verification PASSED. dgnonc_pdb is in DG, applied on dgcdb_s.
 ```
 
@@ -386,7 +403,10 @@ Every script appends to:
 
 `state.env` is what each step inspects to refuse to run before its predecessor
 has completed (step 06 additionally requires a clean step 05). Step 01 resets
-the flags, so an old `verify_done=true` cannot survive into a new attempt. You can also `cat` it to see SCNs, timings, and
+the flags, so an old `verify_done=true` cannot survive into a new attempt.
+Steps 02-04 clear their own and later flags only once a new attempt begins
+(after their refusal checks, before their first change), so a refused re-run
+changes nothing; step 05 sets `verify_done=false` first thing, on purpose. You can also `cat` it to see SCNs, timings, and
 pointers to each step's log file.
 
 ---

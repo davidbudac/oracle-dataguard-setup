@@ -57,7 +57,8 @@ usage() {
     printf "  --standby-sid SID   Standby Oracle SID (default: auto-detect from pmon)\n"
     printf "  --no-color          Disable colored output (also honors NO_COLOR)\n"
     printf "\n"
-    printf "Env: DG_REMOTE_TIMEOUT=SECONDS (default 120) bounds the whole remote collection\n"
+    printf "Env: DG_REMOTE_TIMEOUT=SECONDS (default 120) bounds the remote collection, and each\n"
+    printf "     discovery call (ssh probe, pmon scan, DB_NAME query); discovery overall: 2x\n"
     printf "\n"
     printf "Exit codes: 0 healthy, 1 warnings, 2 errors, %s usage/pre-flight error\n" "$EXIT_USAGE"
 }
@@ -272,31 +273,163 @@ add_summary_warning() {
     warn
 }
 
+# -- Scratch space, job tracking, bounded execution ---------------------------
+TMP=$(make_temp_dir)
+if [[ -z "$TMP" || ! -d "$TMP" ]]; then
+    printf "ERROR: cannot create a temporary directory (check TMPDIR / permissions)\n" >&2
+    exit $EXIT_USAGE
+fi
+
+# M10: every remote job is tracked (pid, host, label, output file) so the
+# collection can be bounded. A hung sqlplus/dgmgrl used to hang a bare `wait`
+# forever and cron never saw exit 2.
+JOB_PIDS=(); JOB_HOSTS=(); JOB_LABELS=(); JOB_FILES=()
+_track_job() {
+    JOB_PIDS+=("$1"); JOB_HOSTS+=("$2"); JOB_LABELS+=("$3"); JOB_FILES+=("$4")
+}
+
+# Kill a process and its descendants (the background job is a subshell whose
+# child is the ssh). `ps -eo pid,ppid` exists on Linux, macOS and AIX; there is
+# no pkill -P / timeout dependency.
+_kill_tree() {
+    local pid="$1" child
+    for child in $(ps -eo pid,ppid 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }'); do
+        _kill_tree "$child"
+    done
+    kill "$pid" 2>/dev/null
+}
+
+_jobs_alive() {
+    local i
+    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
+        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && return 0
+    done
+    return 1
+}
+
+# The one bounded job (and its sidecar watchdog) in flight during discovery,
+# see _run_bounded.
+BOUNDED_PID=""; BOUNDED_WATCHDOG=""; BOUNDED_RC=0
+
+_cleanup() {
+    local i
+    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
+        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && _kill_tree "${JOB_PIDS[i]}"
+    done
+    [[ -n "$BOUNDED_PID" ]] && kill -0 "$BOUNDED_PID" 2>/dev/null && _kill_tree "$BOUNDED_PID"
+    [[ -n "$BOUNDED_WATCHDOG" ]] && kill "$BOUNDED_WATCHDOG" 2>/dev/null
+    rm -rf "$TMP"
+}
+trap _cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Bounded execution for everything that runs over ssh BEFORE the parallel
+# collection (reachability probes, pmon detection, DB_NAME queries). ssh
+# keepalives do not help against a hung sqlplus on a healthy connection, so
+# each call runs as a background job under the same tree-killing watchdog the
+# collection uses - no `timeout` binary (AIX has none).
+#
+# Each call is bounded by DG_REMOTE_TIMEOUT; all of discovery together by
+# 2 x DG_REMOTE_TIMEOUT (a call starting after the budget is spent is not
+# issued and counts as timed out). The caller also stops issuing calls to a
+# host after its first timeout, so the real worst case is one timeout per
+# host. Collection then gets its own DG_REMOTE_TIMEOUT: worst case for the
+# whole run is about 3 x DG_REMOTE_TIMEOUT.
+DISCOVERY_BUDGET=$((DG_REMOTE_TIMEOUT * 2))
+DISCOVERY_START=$SECONDS
+BOUNDED_LIMIT=$DG_REMOTE_TIMEOUT
+
+# _run_bounded OUTFILE CMD [ARGS...]
+# Runs CMD with its stdout in OUTFILE (never a pipe: a killed job cannot keep a
+# caller's `$(...)` open). Returns CMD's status, or 124 when it was cut off - in
+# which case its process tree is killed and OUTFILE emptied (partial output must
+# not be parsed). Call it in the MAIN shell, not inside `$(...)`, or the caller
+# cannot see the 124. $BOUNDED_LIMIT is left holding the limit that applied.
+# The caller blocks in `wait` (no polling latency on the fast, normal case); a
+# sidecar sleeper does the killing and leaves OUTFILE.timeout behind as proof.
+_run_bounded() {
+    local out="$1" left pid
+    shift
+    left=$((DISCOVERY_BUDGET - (SECONDS - DISCOVERY_START)))
+    BOUNDED_LIMIT=$DG_REMOTE_TIMEOUT
+    (( left < BOUNDED_LIMIT )) && BOUNDED_LIMIT=$left
+    : > "$out"
+    rm -f "${out}.timeout"
+    (( BOUNDED_LIMIT > 0 )) || return 124
+    "$@" > "$out" &
+    pid=$!
+    BOUNDED_PID=$pid
+    # The sidecar's TERM trap takes its own sleep down with it and exits before
+    # touching the marker, so dismissing it can neither orphan a sleep nor
+    # fake a timeout.
+    (
+        _sp=""
+        trap '[ -n "$_sp" ] && kill "$_sp" 2>/dev/null; exit 0' TERM
+        sleep "$BOUNDED_LIMIT" &
+        _sp=$!
+        wait "$_sp"
+        : > "${out}.timeout"
+        _kill_tree "$pid"
+    ) > /dev/null 2>&1 &
+    BOUNDED_WATCHDOG=$!
+    { wait "$pid"; } 2>/dev/null
+    BOUNDED_RC=$?
+    kill "$BOUNDED_WATCHDOG" 2>/dev/null
+    { wait "$BOUNDED_WATCHDOG"; } 2>/dev/null
+    BOUNDED_PID=""; BOUNDED_WATCHDOG=""
+    if [[ -e "${out}.timeout" ]]; then
+        : > "$out"
+        return 124
+    fi
+    return $BOUNDED_RC
+}
+
 # -- Connectivity pre-check ----------------------------------------------------
 # A dead host must never render as blank fields with an overall HEALTHY
 # status. Check both sides can be reached before we try to use them for
 # anything (SID auto-detection included).
 PRIMARY_REACHABLE=true
 STANDBY_REACHABLE=true
+# Why a side is not collected, for the "UNREACHABLE (...)" row.
+PRIMARY_DOWN_WHY="SSH failed"
+STANDBY_DOWN_WHY="SSH failed"
 
+# Returns 0 reachable, 1 not reachable, 124 the probe itself hung (bounded by
+# _run_bounded - a half-open connection can swallow the probe forever).
 _check_ssh_host() {
-    local host="$1" port="$2"
-    local out
-    out=$(_ssh_raw "${host}" "${port}" "echo DG_SSH_OK")
-    printf '%s\n' "$out" | grep -q '^DG_SSH_OK$'
+    local host="$1" port="$2" rc
+    _run_bounded "$TMP/ssh_probe" _ssh_raw "${host}" "${port}" "echo DG_SSH_OK"
+    rc=$?
+    [[ $rc -eq 124 ]] && return 124
+    grep -q '^DG_SSH_OK$' "$TMP/ssh_probe"
 }
 
-if ! _check_ssh_host "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}"; then
-    PRIMARY_REACHABLE=false
-    printf "ERROR: cannot SSH to primary (%s:%s)\n" "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}"
-    add_summary_error "Cannot SSH to primary host ${PRIMARY_HOST}:${PRIMARY_SSH_PORT}"
-fi
+_check_ssh_host "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}"
+case $? in
+    0) ;;
+    124)
+        PRIMARY_REACHABLE=false; PRIMARY_DOWN_WHY="SSH probe timed out"
+        printf "ERROR: SSH probe to primary (%s:%s) timed out after %ss\n" "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "$BOUNDED_LIMIT"
+        add_summary_error "Discovery on primary ${PRIMARY_HOST}:${PRIMARY_SSH_PORT} timed out after ${BOUNDED_LIMIT}s (SSH reachability probe); host not collected - raise DG_REMOTE_TIMEOUT or check the host" ;;
+    *)
+        PRIMARY_REACHABLE=false
+        printf "ERROR: cannot SSH to primary (%s:%s)\n" "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}"
+        add_summary_error "Cannot SSH to primary host ${PRIMARY_HOST}:${PRIMARY_SSH_PORT}" ;;
+esac
 
-if ! _check_ssh_host "${STANDBY_HOST}" "${STANDBY_SSH_PORT}"; then
-    STANDBY_REACHABLE=false
-    printf "ERROR: cannot SSH to standby (%s:%s)\n" "${STANDBY_HOST}" "${STANDBY_SSH_PORT}"
-    add_summary_error "Cannot SSH to standby host ${STANDBY_HOST}:${STANDBY_SSH_PORT}"
-fi
+_check_ssh_host "${STANDBY_HOST}" "${STANDBY_SSH_PORT}"
+case $? in
+    0) ;;
+    124)
+        STANDBY_REACHABLE=false; STANDBY_DOWN_WHY="SSH probe timed out"
+        printf "ERROR: SSH probe to standby (%s:%s) timed out after %ss\n" "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$BOUNDED_LIMIT"
+        add_summary_error "Discovery on standby ${STANDBY_HOST}:${STANDBY_SSH_PORT} timed out after ${BOUNDED_LIMIT}s (SSH reachability probe); host not collected - raise DG_REMOTE_TIMEOUT or check the host" ;;
+    *)
+        STANDBY_REACHABLE=false
+        printf "ERROR: cannot SSH to standby (%s:%s)\n" "${STANDBY_HOST}" "${STANDBY_SSH_PORT}"
+        add_summary_error "Cannot SSH to standby host ${STANDBY_HOST}:${STANDBY_SSH_PORT}" ;;
+esac
 
 # -- Resolve SID --------------------------------------------------------------
 # Priority: -s flag > $ORACLE_SID > auto-detect from pmon
@@ -323,13 +456,19 @@ _pmon_sids_from_stream() {
         | awk '!seen[$0]++'
 }
 
-# All candidate SIDs on a host, one per line. _ssh_raw_stdout keeps ssh's
-# stderr out of the parsed stream.
+# All candidate SIDs on a host, one per line, written to $3. Bounded (see
+# _run_bounded), so it runs in the main shell: returns 124 when the host hung
+# (the file is then empty), 0 otherwise. _ssh_raw_stdout keeps ssh's stderr out
+# of the parsed stream.
 _detect_pmon_sids() {
-    local host="$1" port="$2"
-    _ssh_raw_stdout "${host}" "${port}" \
-        "ps -ef 2>/dev/null | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'" \
-        | _pmon_sids_from_stream
+    local host="$1" port="$2" out="$3" rc
+    _run_bounded "${out}.raw" _ssh_raw_stdout "${host}" "${port}" \
+        "ps -ef 2>/dev/null | grep '[o]ra_pmon_' | grep -v '+ASM' | sed 's/^/DG_PMON|/'"
+    rc=$?
+    : > "$out"
+    [[ $rc -eq 124 ]] && return 124
+    _pmon_sids_from_stream < "${out}.raw" > "$out"
+    return 0
 }
 
 _validate_sid() {
@@ -343,14 +482,21 @@ _select_sid_by_dbname() {
     awk -F'|' -v w="$wanted" 'BEGIN { w = tolower(w) } w != "" && tolower($2) == w { print $1; exit }'
 }
 
-# DB_NAME of the instance <sid> on a host ('' when it cannot be queried).
+# DB_NAME of the instance <sid> on a host, left in $DB_NAME_RESULT ('' when it
+# cannot be queried). Bounded and main-shell like _detect_pmon_sids: returns 124
+# when the query hung.
 _db_name_for_sid() {
-    local host="$1" port="$2" sid="$3"
-    _ssh_ora_stdout "${host}" "${port}" "${sid}" "sqlplus -s / as sysdba <<'SQL' 2>&1
+    local host="$1" port="$2" sid="$3" rc
+    DB_NAME_RESULT=""
+    _run_bounded "$TMP/dbname" _ssh_ora_stdout "${host}" "${port}" "${sid}" "sqlplus -s / as sysdba <<'SQL' 2>&1
 SET HEADING OFF FEEDBACK OFF PAGESIZE 0 LINESIZE 300
 SELECT 'DG_DBNAME|' || NAME FROM V\$DATABASE;
 EXIT;
-SQL" | grep '^DG_DBNAME|' | head -1 | sed 's/^DG_DBNAME|//' | dg_trim
+SQL"
+    rc=$?
+    [[ $rc -eq 124 ]] && return 124
+    DB_NAME_RESULT=$(grep '^DG_DBNAME|' "$TMP/dbname" | head -1 | sed 's/^DG_DBNAME|//' | dg_trim)
+    return 0
 }
 
 if [[ -n "$ORACLE_SID_OVERRIDE" ]]; then
@@ -366,7 +512,14 @@ elif [[ -n "${ORACLE_SID:-}" ]]; then
         exit $EXIT_USAGE
     fi
 elif $PRIMARY_REACHABLE; then
-    PRI_SID_CANDIDATES=( $(_detect_pmon_sids "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}") )
+    _detect_pmon_sids "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "$TMP/pri_sids"
+    if [[ $? -eq 124 ]]; then
+        # A hung host is a finding (exit 2), not an operator mistake.
+        printf "ERROR: Oracle instance detection on primary (%s:%s) timed out after %ss - raise DG_REMOTE_TIMEOUT, check the host, or use -s/--sid\n" \
+            "$PRIMARY_HOST" "$PRIMARY_SSH_PORT" "$BOUNDED_LIMIT" >&2
+        exit 2
+    fi
+    PRI_SID_CANDIDATES=( $(cat "$TMP/pri_sids") )
     DETECTED_SID="${PRI_SID_CANDIDATES[0]:-}"
     if [[ -z "$DETECTED_SID" ]]; then
         # Reachable host, no pmon: the instance is down. That is a genuine
@@ -401,9 +554,17 @@ if [[ -n "$STANDBY_SID_OVERRIDE" ]]; then
         exit $EXIT_USAGE
     fi
 elif $STANDBY_REACHABLE; then
-    STB_SID_CANDIDATES=( $(_detect_pmon_sids "${STANDBY_HOST}" "${STANDBY_SSH_PORT}") )
+    _detect_pmon_sids "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$TMP/stb_sids"
+    _stb_detect_rc=$?
+    STB_SID_CANDIDATES=( $(cat "$TMP/stb_sids") )
     DETECTED_SID_STB="${STB_SID_CANDIDATES[0]:-}"
-    if [[ -z "$DETECTED_SID_STB" ]]; then
+    if [[ $_stb_detect_rc -eq 124 ]]; then
+        # No instance list and no point sending more commands to a host that
+        # hangs: report it, and skip its collection like an unreachable side.
+        DETECTED_SID_STB="$DETECTED_SID"
+        STANDBY_REACHABLE=false; STANDBY_DOWN_WHY="discovery timed out"
+        add_summary_error "Discovery on standby ${STANDBY_HOST}:${STANDBY_SSH_PORT} timed out after ${BOUNDED_LIMIT}s (Oracle instance detection); host not collected - raise DG_REMOTE_TIMEOUT or check the host"
+    elif [[ -z "$DETECTED_SID_STB" ]]; then
         DETECTED_SID_STB="$DETECTED_SID"
         add_summary_error "No Oracle instance detected on standby ${STANDBY_HOST}:${STANDBY_SSH_PORT} (no ora_pmon_ process)"
     elif ! _validate_sid "$DETECTED_SID_STB"; then
@@ -415,11 +576,27 @@ elif $STANDBY_REACHABLE; then
         # when that cannot decide is the first used - with a warning.
         _stb_pick=""
         if $PRIMARY_REACHABLE; then
-            _pri_dbname=$(_db_name_for_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}")
+            _db_name_for_sid "${PRIMARY_HOST}" "${PRIMARY_SSH_PORT}" "${DETECTED_SID}"
+            if [[ $? -eq 124 ]]; then
+                add_summary_error "Discovery on primary ${PRIMARY_HOST} timed out after ${BOUNDED_LIMIT}s (DB_NAME query for SID ${DETECTED_SID}); the standby SID could not be matched - raise DG_REMOTE_TIMEOUT or check the host"
+                DB_NAME_RESULT=""
+            fi
+            _pri_dbname="$DB_NAME_RESULT"
             if [[ -n "$_pri_dbname" ]]; then
-                _stb_pick=$(for _c in "${STB_SID_CANDIDATES[@]}"; do
-                    printf '%s|%s\n' "$_c" "$(_db_name_for_sid "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$_c")"
-                done | _select_sid_by_dbname "$_pri_dbname")
+                _pairs=""
+                for _c in "${STB_SID_CANDIDATES[@]}"; do
+                    _db_name_for_sid "${STANDBY_HOST}" "${STANDBY_SSH_PORT}" "$_c"
+                    if [[ $? -eq 124 ]]; then
+                        # One timeout ends the matching; the first-SID fallback
+                        # and its warning below apply.
+                        add_summary_error "Discovery on standby ${STANDBY_HOST} timed out after ${BOUNDED_LIMIT}s (DB_NAME query for SID ${_c}); SID selection abandoned - raise DG_REMOTE_TIMEOUT or check the host"
+                        _pairs=""
+                        break
+                    fi
+                    _pairs="${_pairs}${_c}|${DB_NAME_RESULT}
+"
+                done
+                _stb_pick=$(printf '%s' "$_pairs" | _select_sid_by_dbname "$_pri_dbname")
             fi
         fi
         if [[ -n "$_stb_pick" ]]; then
@@ -427,7 +604,7 @@ elif $STANDBY_REACHABLE; then
         else
             add_summary_warning "Several Oracle instances run on standby ${STANDBY_HOST} (${STB_SID_CANDIDATES[*]}) and none could be matched to the primary's DB_NAME; using '${DETECTED_SID_STB}' - pass --standby-sid to choose"
         fi
-        unset _stb_pick _pri_dbname _c
+        unset _stb_pick _pri_dbname _pairs _c
     fi
 else
     DETECTED_SID_STB="$DETECTED_SID"
@@ -438,49 +615,8 @@ printf "\n ${BOLD}${CYAN}Data Guard Status Dashboard${NC}  ${DIM}$(date '+%Y-%m-
 printf " ${DIM}Primary: ${PRIMARY_ORACLE_HOSTNAME} (SID: ${DETECTED_SID})  |  Standby: ${STANDBY_ORACLE_HOSTNAME} (SID: ${DETECTED_SID_STB})${NC}\n"
 
 # -- Collect data in parallel -------------------------------------------------
-TMP=$(make_temp_dir)
-if [[ -z "$TMP" || ! -d "$TMP" ]]; then
-    printf "ERROR: cannot create a temporary directory (check TMPDIR / permissions)\n" >&2
-    exit $EXIT_USAGE
-fi
-
-# M10: every remote job is tracked (pid, host, label, output file) so the
-# collection can be bounded. A hung sqlplus/dgmgrl used to hang a bare `wait`
-# forever and cron never saw exit 2.
-JOB_PIDS=(); JOB_HOSTS=(); JOB_LABELS=(); JOB_FILES=()
-_track_job() {
-    JOB_PIDS+=("$1"); JOB_HOSTS+=("$2"); JOB_LABELS+=("$3"); JOB_FILES+=("$4")
-}
-
-# Kill a process and its descendants (the background job is a subshell whose
-# child is the ssh). `ps -eo pid,ppid` exists on Linux, macOS and AIX; there is
-# no pkill -P / timeout dependency.
-_kill_tree() {
-    local pid="$1" child
-    for child in $(ps -eo pid,ppid 2>/dev/null | awk -v p="$pid" '$2 == p { print $1 }'); do
-        _kill_tree "$child"
-    done
-    kill "$pid" 2>/dev/null
-}
-
-_jobs_alive() {
-    local i
-    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
-        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && return 0
-    done
-    return 1
-}
-
-_cleanup() {
-    local i
-    for ((i = 0; i < ${#JOB_PIDS[@]}; i++)); do
-        kill -0 "${JOB_PIDS[i]}" 2>/dev/null && _kill_tree "${JOB_PIDS[i]}"
-    done
-    rm -rf "$TMP"
-}
-trap _cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
+# (TMP, the job tracking, _kill_tree and the cleanup trap are set up above,
+# before discovery, because discovery is bounded by the same machinery.)
 
 # Wait for the tracked jobs for at most DG_REMOTE_TIMEOUT seconds. Whatever is
 # still running at the deadline is killed and its output file emptied (partial
@@ -837,7 +973,7 @@ fi
 header "PRIMARY DATABASE  (${PRIMARY_ORACLE_HOSTNAME} / ${PRI_DBUNIQ:-?})"
 
 if ! $PRIMARY_REACHABLE; then
-    row "Status" "UNREACHABLE (SSH failed)" "$FAIL"
+    row "Status" "UNREACHABLE (${PRIMARY_DOWN_WHY})" "$FAIL"
 else
 subheader "Identity"
 
@@ -913,7 +1049,7 @@ fi
 header "STANDBY DATABASE  (${STANDBY_ORACLE_HOSTNAME} / ${STB_DBUNIQ:-?})"
 
 if ! $STANDBY_REACHABLE; then
-    row "Status" "UNREACHABLE (SSH failed)" "$FAIL"
+    row "Status" "UNREACHABLE (${STANDBY_DOWN_WHY})" "$FAIL"
 else
 subheader "Identity"
 
