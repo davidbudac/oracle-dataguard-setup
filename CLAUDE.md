@@ -172,7 +172,7 @@ bash dg_status.sh -c myconfig.env    # Custom SSH config
 
 **Output control:** `--no-color` (or the `NO_COLOR` env var) disables ANSI color codes.
 
-**Configurable thresholds** (env vars, override by exporting before running): `DG_FRA_WARN_PCT` (default 80), `DG_FRA_CRIT_PCT` (default 90), `DG_SEQ_GAP_WARN` (default 1), `DG_SEQ_GAP_CRIT` (default 5), `DG_LAG_WARN_SECONDS` (default 60). Values must be non-negative integers (exit 3 in `dg_status.sh`, 64 in the local tools otherwise). FRA numbers are formatted with `NLS_NUMERIC_CHARACTERS='.,'` in SQL and passed to awk with `-v` under `LC_ALL=C`, so a comma-decimal `NLS_LANG` (CZECH, GERMAN) cannot silently disable the FRA checks.
+**Configurable thresholds** (env vars, override by exporting before running): `DG_FRA_WARN_PCT` (default 80), `DG_FRA_CRIT_PCT` (default 90), `DG_SEQ_GAP_WARN` (default 1), `DG_SEQ_GAP_CRIT` (default 5), `DG_LAG_WARN_SECONDS` (default 60). The sequence lag is `received - applied` from `V$ARCHIVED_LOG` on the standby, where "applied" counts `APPLIED IN ('YES','IN-MEMORY')` and takes MRP0's current `SEQUENCE# - 1` (`V$MANAGED_STANDBY`) as the floor: under real-time apply a log applied straight from the standby redo logs stays `IN-MEMORY` (or even `NO`) until the next checkpoint, and counting only `YES` reported a lag of 5-6 sequences - escalated to an ERROR - on a standby whose `V$DATAGUARD_STATS` apply lag was 0 (found by the E2E suite on 19.27, 2026-10-08). The same definition lives in `common/dg_render_common.sh` (`DG_SQL_SELECT_APPLYINFO`, shared with the local triage/diag tools) and `sql/queries/get_apply_info_pipe.sql` / `get_archive_apply_status.sql`. Values must be non-negative integers (exit 3 in `dg_status.sh`, 64 in the local tools otherwise). FRA numbers are formatted with `NLS_NUMERIC_CHARACTERS='.,'` in SQL and passed to awk with `-v` under `LC_ALL=C`, so a comma-decimal `NLS_LANG` (CZECH, GERMAN) cannot silently disable the FRA checks.
 
 See [docs/DG_STATUS.md](docs/DG_STATUS.md) for full details.
 
@@ -219,25 +219,26 @@ See [docs/DG_CHECK.md](docs/DG_CHECK.md) for full details.
 - `tests/test_sync_impact.sh` - Tests `dg_sync_impact.sh` with a stubbed `sqlplus` dispatching on the `-- QTAG:` markers embedded in every query (argument validation, fatal paths, derived-number math, the top-latency-spike rankings and their ordering, per-section degradation, `--no-pack`, no-SYNC-destination mode, and the `--auto-baseline` scenarios: happy-path window pick, all-SYNC / no-SYNC-snapshots retention edges, flag conflicts, degradation). Also guards the `--html` renderer's AIX-awk portability rules (no function-local arrays, globals seeded in `BEGIN`, no `arr[i,j]` multi-subscripts — AIX 7.2 awk aborts with `0602-558 cannot be used as an array`) and the Markdown-verbatim fallback when the converter's awk dies
 - `tests/test_handoff.sh` - Tests `dg_handoff.sh` with a stubbed `sqlplus` dispatching on the `-- QTAG:` markers (including the `standby_direct` query issued through `--standby-tns-alias`) and a stubbed `$ORACLE_HOME/bin/dgmgrl` dispatching on the piped command: happy-path HEALTHY report plus the full deliverable pack (`.html`/`.json`/`_tnsnames.ora`/`_jdbc.properties`/executable `_verify.sh`, JSON validated with python3), the "Changes Since Last Report" diff across consecutive runs and against an explicit `--previous` baseline, verdict escalation (archive gaps, apply lag, broker ERROR, missing role trigger, non-primary host, broker down), service filters, flag handling and exit code 3 paths, per-query degradation into "Discovery Warnings", the descriptor/pool math derived from `--connect-timeout`, the generated `_verify.sh` run against stub `getent`/`nc`/`sqlplus`, and a byte-identical HTML render under `mawk`/`busybox awk` (skipped when neither exists)
 
-### End-to-End Tests
-- `tests/e2e/run_e2e_test.sh` - Full E2E test orchestrator
-- `tests/e2e/config.env` - Test environment configuration (jump host, DB hosts, Oracle paths)
-- `tests/e2e/TEST_INSTRUCTIONS.md` - Full runbook with known issues and fixes
+### End-to-End Tests (scenario suite)
+- `tests/e2e/e2e.sh` - the single runner: `doctor | list | run [--tier smoke|core|full | --scenario ID] [--from PHASE] [--from-step stepN] [--keep] | clean --scenario ID`
+- `tests/e2e/config.env` - one lab config (hosts, paths, passwords, the oracle-writable `LAB_FS_SLOTS`, optional `HOST3`); `config.env.template` documents it
+- `tests/e2e/README.md` - design and catalog; `tests/e2e/TEST_INSTRUCTIONS.md` - the lab runbook for Claude
+- `tests/e2e/scenarios/primaries/pNN_*.env` (6 primary shapes) x `scenarios/sNN_*.scenario.env` (11 builds) + `rNN_*.scenario.env` (3 refusal packs); `checks/` (one standalone tool or contract each, run after every build) and `proofs/` (redo roundtrip, switchover, FSFO failover + reinstate, new datafile/PDB, uncovered dir -> UNNAMED -> fix)
+- `tests/test_e2e_harness.sh` - offline tests of the harness itself (prompt driver, syntax, scenario loading/expansion, rule composition, the review-table backreference mechanics, doctor resolution); no lab needed
 
-**To run E2E tests:**
 ```bash
-bash ./tests/e2e/run_e2e_test.sh           # Full run (~20 min)
-bash ./tests/e2e/run_e2e_test.sh --from step5  # Resume from a phase
-bash ./tests/e2e/run_e2e_test.sh --only cleanup # Clean up
+bash tests/e2e/e2e.sh doctor               # probe the lab; per-scenario RUNNABLE/SKIP with the fix for each unmet need
+bash tests/e2e/e2e.sh run --tier smoke     # s01 + r03 (~40 min); core ~3 h; full ~6 h
+bash tests/e2e/e2e.sh run --scenario s02 --from-step step5   # resume a kept build after a fix
 ```
 
-The test creates a database (DBCA, no OMF/FRA), runs all walkthrough steps, validates each step, and cleans up. It connects through a jump host via SSH ProxyJump and automates interactive prompts via piped stdin.
-
-**Key gotchas for the test framework:**
-- Always run with `bash` explicitly (zsh breaks SSH_OPTS word splitting)
-- Config files auto-select when only one exists (no "1" needed in piped input)
-- RMAN uses `cmdfile` parameter instead of heredoc (heredoc consumes piped stdin)
-- `stty` calls in `prompt_password()` use `2>/dev/null || true` for piped stdin compatibility
+Design points (details in `tests/e2e/README.md`):
+- **Prompts are answered by pattern, not position.** `lib/answer.py` (stdlib pty) runs each script in a real TTY on the DB host and matches `answers/*.rules` (`regex<TAB>answer[<TAB>secret|once|fail]`) against the output since the last answer, so the TTY-gated prompts (Q1b, review table, `ORACLE_BASE`, online-log dests, second control file) are exercised. An unmatched prompt fails the step with `UNANSWERED PROMPT: <text>` (exit 97); a `fail`-flagged prompt that appears exits 96. Every answered prompt is recorded as `[prompt] text => answer` in `build/stepN.tty`.
+- **Zero root.** Q1b keys on the FIRST path component, so `LAB_FS_SLOTS` (e.g. `/u01/app/oracle /home/oracle /var/tmp/oracle`) are the lab's "filesystems"; profiles use `{FS1}`..`{FS3}`, `{FSn:fs}`, `{RENAME}` (world-writable `/tmp` on the standby for the renamed-filesystem scenario). Every scenario but s01 runs in its own scratch `TNS_ADMIN` + listener on `LAB_SCRATCH_PORT`, never touching the shared `network/admin` or other databases on the hosts.
+- **Skip, don't fail, on missing prerequisites:** `S_NEEDS` is derived per scenario (fs2/fs3, rename-target, obase-sibling, host3, mem1g/mem2g, flashback-space); the doctor resolves it against `logs/lab.caps` and prints the fix.
+- **The primary's shape is verified** after provisioning (`provision/shape.txt`): a profile that did not take fails the scenario before the build starts.
+- Always run with `bash`; `LOCAL_DEPLOY=true` rsyncs the working tree to the hosts at the start of each run.
+- The previous fixed-stdin runners `run_e2e_test.sh` / `run_e2e_test_cdb.sh` are retired once s01 and s04 are green on the lab.
 
 ## Fast-Start Failover (Optional)
 

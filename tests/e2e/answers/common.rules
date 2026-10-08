@@ -1,0 +1,9 @@
+# common.rules - appended to every step. Lowest priority: step and scenario rules come first.
+# NFS share path confirmation (step 1 and others): keep the default
+Press Enter to use this path, or type a different path:	
+# SYS password wherever the workflow asks for it
+Enter SYS password[^:\n]*:	@SYS_PASSWORD@	secret
+# Generic yes to a confirm_proceed(). Step/scenario rules that need "n" must come earlier and carry their context line.
+Do you want to proceed\? \[y/N\]:	y
+# Config-file menu (only when several standby_config_*.env exist): take the newest
+Select [a-z ]* \[1-[0-9]+, default=[0-9]+\]:	

@@ -1,0 +1,6 @@
+# step6.rules - primary/06_configure_broker.sh
+# Re-run over an existing configuration of OUR members: remove and recreate
+Do you want to remove the existing configuration and create a new one\?\nDo you want to proceed\? \[y/N\]:	y
+# A foreign member means a typed confirmation; a normal build must never see it
+Type 'REMOVE CONFIGURATION' to continue:	REMOVE CONFIGURATION	fail
+Continue setting up the broker configuration anyway\?\nDo you want to proceed\? \[y/N\]:	y

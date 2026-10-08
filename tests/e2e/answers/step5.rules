@@ -1,0 +1,3 @@
+# step5.rules - standby/05_clone_standby.sh
+Continue anyway\?\nDo you want to proceed\? \[y/N\]:	y
+Type '@STANDBY_NAME@' to continue:	@STANDBY_NAME@

@@ -1,0 +1,32 @@
+# step2.rules - primary/02_generate_standby_config.sh (interactive, TTY-gated prompts included)
+Standby server hostname:	@ANS_STANDBY_HOST@
+Standby DB_UNIQUE_NAME:	@STANDBY_NAME@
+Standby ORACLE_SID \[[^]]*\]:	@STANDBY_SID@
+Storage mode \[1\]:	@STORAGE_CHOICE@
+# Q1b - are filesystems named differently on the standby? Per-filesystem answers are scenario rules (prepended).
+Are any of these filesystems named DIFFERENTLY on the standby host\? \[y/N\]:	@Q1B_ANSWER@
+Standby filesystem for [^\n]*:	
+# OMF mode
+Standby db_create_file_dest:	@OMF_FILE_DEST@
+Standby db_create_online_log_dest_[0-9] \(primary: [^)]*\) \[[^]]*\]:	
+# Q2 archive destination (1 = FRA, 2 = explicit)
+Archive destination \[[12]\]:	@ARCHIVE_CHOICE@
+Standby FRA path \(db_recovery_file_dest\) \[[^]]*\]:	@STANDBY_FRA_PATH@
+Standby FRA path \(db_recovery_file_dest\):	@STANDBY_FRA_PATH@
+Standby FRA size \(db_recovery_file_dest_size\) \[[^]]*\]:	@STANDBY_FRA_SIZE@
+Standby archive log directory \[[^]]*\]:	@STANDBY_ARCHIVE_DIR@
+Standby archive log directory:	@STANDBY_ARCHIVE_DIR@
+# Unmapped-path confirmation (only when Q1b was not asked): keep the identical path
+Standby (datafile|redo log) directory for [^\n]*:	
+# Review table: accept unless scenario rules (prepended, once) pick entries to edit
+Accept all mappings \[Enter\], or enter a number to edit:	
+New standby (data|redo) directory for [^\n]*:	
+# Separate standby redo log directory
+Use a SEPARATE directory for standby redo logs\? \[y/N\]:	@SRL_ANSWER@
+Primary SRL directory \[[^]]*\]:	
+Standby SRL directory \[[^]]*\]:	@STANDBY_SRL_DIR@
+# Standby software locations
+Standby ORACLE_BASE \[[^]]*\]:	@STANDBY_ORACLE_BASE@
+Standby ORACLE_HOME \[[^]]*\]:	
+# Second control file copy
+Enter a SEPARATE directory for the second control file copy \(blank to keep both in [^)]*\):	@CONTROL_FILE_2_DIR@

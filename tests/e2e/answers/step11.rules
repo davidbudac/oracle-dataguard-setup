@@ -1,0 +1,8 @@
+# step11.rules - trigger/create_role_trigger*.sh
+Enter schema name for DG service objects \[[^]]*\]:	@TRIGGER_SCHEMA@
+Enter password for [^:\n]*:	@TRIGGER_PASSWORD@	secret
+Action \[Enter/a/r/c\]:	
+Add '[^']*' anyway\?\nDo you want to proceed\? \[y/N\]:	y
+Replace existing DG_SERVICE_MGR package and triggers\?\nDo you want to proceed\? \[y/N\]:	y
+Deploy [^\n]*anyway\?\nDo you want to proceed\? \[y/N\]:	y
+Deploy DG_SERVICE_MGR package and triggers\?\nDo you want to proceed\? \[y/N\]:	y

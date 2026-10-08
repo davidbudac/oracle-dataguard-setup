@@ -1,0 +1,6 @@
+# step13.rules - primary/13_set_max_availability.sh
+# The validation prompts fire only on an unhealthy configuration: a verified build must not see them
+Continue despite broker warnings\?\nDo you want to proceed\? \[y/N\]:	n	fail
+Continue anyway despite validation warnings\?\nDo you want to proceed\? \[y/N\]:	n	fail
+Continue despite archive destination errors\?\nDo you want to proceed\? \[y/N\]:	n	fail
+Proceed with protection mode change\?\nDo you want to proceed\? \[y/N\]:	y

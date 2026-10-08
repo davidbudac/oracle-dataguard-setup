@@ -1,0 +1,3 @@
+# step3.rules - standby/03_setup_standby_env.sh
+# Hostname mismatch (the standby host does not call itself STANDBY_HOSTNAME): continue
+Continue anyway\?\nDo you want to proceed\? \[y/N\]:	y

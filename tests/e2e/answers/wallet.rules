@@ -1,0 +1,5 @@
+# wallet.rules - common/setup_dg_wallet.sh
+Enter new wallet password \(protects the wallet file\):	@WALLET_PASSWORD@	secret
+Confirm wallet password:	@WALLET_PASSWORD@	secret
+Enter existing wallet password:	@WALLET_PASSWORD@	secret
+Type 'RECREATE WALLET' to replace it, or press Enter to [^:\n]*:	RECREATE WALLET

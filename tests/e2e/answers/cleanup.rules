@@ -1,0 +1,3 @@
+# cleanup.rules - common/cleanup_nfs_artifacts.sh
+Type 'DELETE @STANDBY_NAME@' to continue:	DELETE @STANDBY_NAME@
+Remove the shared password file copy anyway\?\nDo you want to proceed\? \[y/N\]:	y

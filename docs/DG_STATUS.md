@@ -54,7 +54,7 @@ bash dg_status.sh --no-color
 | MRP Status | `V$MANAGED_STANDBY (MRP0)` | APPLYING_LOG / WAIT_FOR_LOG | - | Not running / other |
 | Transport Lag | `V$DATAGUARD_STATS` | <= `DG_LAG_WARN_SECONDS` (60 s) | Above that | - |
 | Apply Lag | `V$DATAGUARD_STATS` | <= `DG_LAG_WARN_SECONDS` (60 s) | Above that | - |
-| Sequences | `V$ARCHIVED_LOG` | Lag <= 1 | Lag 2-5 | Lag > 5 |
+| Sequences | `V$ARCHIVED_LOG` (applied = `YES`/`IN-MEMORY`, floor MRP0 `SEQUENCE#-1`) | Lag <= 1 | Lag 2-5 | Lag > 5 |
 | Replication state (summary row) | derived | IN SYNC | LAGGING / BEHIND / **UNKNOWN** | BEHIND (> `DG_SEQ_GAP_CRIT`) |
 | Standby Redo Logs | `V$STANDBY_LOG` | Count > 0 | - | NONE |
 | Archive Gaps | `V$ARCHIVE_GAP` | 0 | - | > 0 |

@@ -1,0 +1,14 @@
+# step9.rules - primary/09_configure_fsfo.sh
+Enter username for observer \[[^]]*\]:	@OBSERVER_USER@
+Auto-prefix the username as C##[^\n]*\?\nDo you want to proceed\? \[y/N\]:	y
+Enter password for new user [^:\n]*:	@OBSERVER_PASSWORD@	secret
+Do you want to reset the password for [^\n]*\?\nDo you want to proceed\? \[y/N\]:	y
+Enter new password for [^:\n]*:	@OBSERVER_PASSWORD@	secret
+Confirm password:	@OBSERVER_PASSWORD@	secret
+# Observer placement (asked only on a TTY, only when no observer is connected)
+Is an observer already set up on another host\? \(y/n\) \[n\]:	@OBS_ALREADY@
+Select option \[1\]:	@OBS_PLACEMENT@
+# add_observer/01_prepare_primary.sh, when placement 2 was chosen
+Hostname of the third host that will run the observer \[[^]]*\]:	@HOST3_NAME@
+Reset the password for [^\n]* now\? \[y/N\]:	n
+Enable Fast-Start Failover anyway\? \[y/N\]:	y

@@ -1,0 +1,9 @@
+# observer.rules - fsfo/observer.sh setup|start|stop|restart
+Enter wallet password \(used to protect the wallet\):	@WALLET_PASSWORD@	secret
+Confirm wallet password:	@WALLET_PASSWORD@	secret
+Enter existing wallet password:	@WALLET_PASSWORD@	secret
+Enter password for [^:\n]*:	@OBSERVER_PASSWORD@	secret
+Do you want to recreate the wallet\?\nDo you want to proceed\? \[y/N\]:	y
+Add/update credentials in existing wallet\?\nDo you want to proceed\? \[y/N\]:	y
+Type 'RECREATE WALLET' to continue:	RECREATE WALLET
+Point WALLET_LOCATION at [^\n]*\nDo you want to proceed\? \[y/N\]:	y

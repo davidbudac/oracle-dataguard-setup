@@ -1,0 +1,12 @@
+# add_observer.rules - add_observer/02_setup_observer_host.sh, 03_observer_ctl.sh (third host)
+Observer database username \(SYSDG\) \[[^]]*\]:	@OBSERVER_USER@
+TNS alias for the PRIMARY \[[^]]*\]:	@PRIMARY_ALIAS@
+TNS alias for the STANDBY \[[^]]*\]:	@STANDBY_ALIAS@
+Database password for [^:\n]*:	@OBSERVER_PASSWORD@	secret
+Enter a NEW wallet password \(protects the wallet file itself\):	@WALLET_PASSWORD@	secret
+Confirm wallet password:	@WALLET_PASSWORD@	secret
+Enter the existing wallet password for [^:\n]*:	@WALLET_PASSWORD@	secret
+Back up [^\n]* and build a fresh wallet\? \[y/N\]:	y
+Add the observer credentials to the EXISTING wallet \(answer No to rebuild it\)\? \[y/N\]:	y
+Continue anyway\? \[y/N\]:	y
+Kill them\? \[y/N\]:	y
